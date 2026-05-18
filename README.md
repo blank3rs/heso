@@ -38,7 +38,7 @@ Each run produces a **plat** — a content-hashed, agent-shaped JSON map of the 
 | Cold start + JS engine init (`eval-js '1+1'`, median) | **40 ms** *(min 38, p95 40)* |
 | Full fetch + parse + extract (`fetch https://example.com`, median) | **85 ms** *(min 82, p95 86)* |
 | Full DOM eval over network (`eval-dom news.ycombinator.com`, median of 5) | **396 ms** *(min 379)* |
-| Workspace lib tests | **273 passing** |
+| Workspace lib tests | **291 passing** |
 | Idle RAM | TBD (not benchmarked) |
 
 Headless Chromium for comparison: ~240 MB on disk, 1–2 s cold start, 100+ MB idle RAM.
@@ -93,6 +93,38 @@ $ heso eval-dom https://example.com \
   }
 }
 ```
+
+### Click, fill, submit — wired to the JS event model
+
+```console
+$ heso click https://example.com/ @e0
+{
+  "console": [],
+  "ok": true,
+  "op": "click",
+  "ref": "@e0",
+  "selector": "a[href=\"https://iana.org/domains/example\"]",
+  "url": "https://example.com/",
+  "value": true
+}
+```
+
+`fill` mutates `.value` and fires both `input` and `change`. `submit` walks the form and clicks its first submit control. The same `@e0/@e1/…` refs `heso find` and `heso open` hand back are how you address an element across a click/fill/submit cycle.
+
+### Same seed, same bytes
+
+```console
+$ heso eval-js --seed 42 'Math.random()'
+{ "console": [], "ok": true, "value": 0.5140492957650241 }
+
+$ heso eval-js --seed 42 'Math.random()'
+{ "console": [], "ok": true, "value": 0.5140492957650241 }
+
+$ heso eval-js --seed 99 'Math.random()'
+{ "console": [], "ok": true, "value": 0.5052084295432834 }
+```
+
+`--seed N` reroutes `Math.random`, `crypto.getRandomValues`, and `crypto.randomUUID` through a seeded ChaCha20 PRNG. Same seed, byte-identical output. Works on `eval-dom` too. `Date.now` / `new Date()` are the one remaining nondeterminism source; clock-seeding is next.
 
 ### Metadata extract — JSON-LD, OpenGraph, the lot
 
@@ -164,7 +196,7 @@ If your data is locked behind canvas, video, computed CSS layout, WebGL, or serv
 | JavaScript execution | ✓ QuickJS | ✓ V8 | ✓ V8 |
 | Full CSS layout / canvas / WebGL | ✗ (the bet) | ✓ | ✓ |
 | Content-hashed page artefacts | ✓ | ✗ | ✗ |
-| Deterministic by construction | partial | ✗ | ✗ |
+| Deterministic by construction | mostly (clock + RNG seeded; `Date.now` next) | ✗ | ✗ |
 | Signed audit receipts | planned | ✗ | ✗ |
 | Render pixels / screenshots of layout | ✗ | ✓ | ✓ |
 | Cold start | 40 ms | 1–2 s | 1–2 s |
@@ -182,9 +214,12 @@ heso loses every cell where the rendering pipeline matters. That's the trade.
 | DOM mutations (`setAttribute`, `textContent =`, `innerHTML =`, `appendChild`, `classList`…) | done |
 | Events (`addEventListener`, `dispatchEvent`, `CustomEvent`, `AbortController`, `DOMException`) | done |
 | Timers (`setTimeout`/`setInterval`, deterministic virtual clock) | done |
+| Click / submit / fill primitives wired to event dispatch | done (`heso click/fill/submit <url> @ref`) |
+| Seeded RNG shims (`Math.random`, `crypto.getRandomValues`, `crypto.randomUUID`) | done (`--seed N`) |
 | Page-load `<script>` execution (SPA hydration) | next |
-| Click / submit / fill primitives wired to event dispatch | next |
+| `Date.now` / `new Date()` seeding | after `<script>`-on-load |
 | `fetch()` inside JS | 1–2 weeks (proxy `reqwest` into QuickJS) |
+| Listener persistence across CLI calls | needs `<script>`-on-load + session model |
 | `localStorage` / `sessionStorage` | days |
 | Multi-page sessions | designed in (`page_id` in `heso serve`) |
 | Ed25519 signed receipts | planned |
@@ -230,24 +265,29 @@ cargo build --release -p heso-cli
 - **`heso meta <url>`** — JSON-LD, OpenGraph, Twitter cards, `<meta>`, canonical, icons, `<html lang>`. Sorted, deterministic.
 - **`heso tree <url>` / `heso ls <url> [path]` / `heso cat <url> <path|@ref>`** — the page as a filesystem of heading-defined sections. `cat` is polymorphic: tree path or `@e7` action ref.
 - **`heso find <url> [--role link|button|…] [--name SUBSTR] [--section /pricing]`** — interactive elements with stable `@e0/@e1/…` refs (ARIA-role aware).
-- **`heso eval-js <js>`** — sandboxed QuickJS, `console.*` capture, typed exceptions. No DOM.
-- **`heso eval-dom <url> <js>`** — fetch + parse + run JS against `document`. Live on real pages.
+- **`heso click <url> @ref`** — fetch `<url>`, resolve `@ref` against the action graph, dispatch a real `click` event through `addEventListener`. Handlers fire.
+- **`heso fill <url> @ref <value>`** — set the input's `.value` and fire both `input` and `change`, matching browser typing behavior.
+- **`heso submit <url> @form-ref` ** — find the form, click its first `button[type=submit]` / `input[type=submit]` descendant. (A real `reqwest::post` of the serialized form lands when sessions do.)
+- **`heso eval-js [--seed N] <js>`** — sandboxed QuickJS, `console.*` capture, typed exceptions. No DOM. `--seed N` reroutes `Math.random` / `crypto.getRandomValues` / `crypto.randomUUID` through ChaCha20 (default 0).
+- **`heso eval-dom [--seed N] <url> <js>`** — fetch + parse + run JS against `document`. Live on real pages. Same `--seed` flag.
 - **`heso serve`** — long-running JSON-RPC 2.0 over stdin/stdout. Stateful page cache keyed by `page_id`.
 - **`heso fetch <url>`** — low-level `{ url, text }`.
 - **`heso plat-hash <file>` / `heso plat-verify <file>`** — BLAKE3 over canonical JSON. Exit codes for scripts and CI.
 
 ## What's not real yet
 
-- **`<script>` on page load.** The DOM exists; JS can run; events and timers are in. heso does not yet execute the page's own scripts during `open`. SPA-mounted content (the stuff that's empty until React/Vue hydrates) is still invisible. Next major lift.
-- **Click / submit / fill wired through.** The action-graph refs exist; the event model exists. They're not joined up yet.
+- **`<script>` on page load.** The DOM, JS engine, events, timers, click/fill/submit dispatch, and seeded RNG are all in. heso does not yet execute the page's own `<script>` tags during `open`. SPA-mounted content (the stuff that's empty until React/Vue hydrates) is still invisible. Next major lift; in flight.
+- **`fetch()` inside JS.** No `XMLHttpRequest` either. Page scripts that talk to an API will throw `fetch is not defined`. Two items out — proxies through `reqwest` so the engine's cookie jar stays coherent.
+- **`Date.now` / `new Date()` seeding.** `Math.random`, `crypto.getRandomValues`, `crypto.randomUUID` are routed through `--seed N` today; the clock is the one remaining nondeterminism source. Lands alongside `<script>`-on-load.
+- **Listener persistence across CLI calls.** Each `heso click` / `heso fill` / `heso eval-dom` re-parses HTML and re-installs `document` from scratch — a listener attached in one invocation isn't visible to the next. Closes when `heso serve` exposes a session model.
+- **`heso submit` doesn't yet hit the network.** It clicks the form's first submit control through the event model. A real `reqwest::post` of the serialized form lands with sessions.
 - **Cross-fetch ref stability.** `@e0/@e1/…` are stable within one fetch only.
-- **Full determinism.** Sorted maps and content-hashed plats are real today. Fake clock for `Date.now` / `Math.random` / `crypto.getRandomValues` isn't wired yet.
 - **Signed plats.** BLAKE3 content hash today; Ed25519 signing next.
 - **`heso run <url> <request>`** — stub. Navigates only; the natural-language request isn't interpreted yet. Waits on the planner.
 
 ## Roadmap
 
-**Now → 1 month:** finish Phase 1B (events into `eval-dom`, `click()` actually fires handlers) + Phase 1C (run `<script>` on page load so SPAs hydrate). This is where heso starts working on real React/Vue pages.
+**Now → 1 month:** Phase 1B is done — events, timers, `click/fill/submit` wired through `dispatchEvent`, seeded RNG shims. Phase 1C is next: run `<script>` on page load so SPAs actually hydrate, seed `Date.now` / `new Date()` to close the last nondeterminism source, ship `fetch()` inside JS. This is where heso starts working on real React/Vue pages.
 
 **1 → 3 months:** cookies + storage, `fetch()` inside JS proxied through the native client (so the engine's cookie jar and audit receipts stay coherent), Ed25519 signed receipts, a planner v0. A 100-URL compatibility harness to keep regressions out.
 
@@ -258,7 +298,7 @@ cargo build --release -p heso-cli
 - **No Chromium dep.** Single Rust binary. `cargo build && ./heso`.
 - **The plat is an artefact, not a session.** Every other agent-browser tool produces a live session — act, observe, decide. heso produces a serializable, content-hashed map. The same plat of `stripe.com/pricing` serves every agent.
 - **Engine as semantic extractor.** The engine doesn't hand back raw HTML — it pre-extracts metadata, the heading tree, an action graph with ARIA-role-aware refs, inline-script hydration data (Next.js `__next_f`, Apple `__ACGH_DATA__`, Netflix `netflix.reactContext`, `window.X` assignments), `data-*` JSON payloads, and (with `--explore-links`) the cartography of linked sub-pages. Many views, one parse.
-- **Deterministic by construction (where it counts).** Sorted maps, document-ordered vectors, BLAKE3 over canonical JSON. The fake clock + seeded RNG that close the remaining gaps land with Phase 1C.
+- **Deterministic by construction (where it counts).** Sorted maps, document-ordered vectors, BLAKE3 over canonical JSON, virtual clock for `setTimeout`/`setInterval`, seeded `Math.random` / `crypto.getRandomValues` / `crypto.randomUUID` under `--seed N`. `Date.now` / `new Date()` is the one remaining nondeterminism source; lands with Phase 1C.
 - **Honest scope.** No layout, no paint, no canvas/WebGL, no workers, no IndexedDB, no CSS engine. heso runs the JS that handles clicks, fills forms, computes state. It does not run the JS that paints pixels.
 
 ## License

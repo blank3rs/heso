@@ -25,6 +25,19 @@
 //! - `heso find <url> [--role X] [--name SUBSTR] [--section /p]` — list
 //!   interactive elements from the page's action graph. Filters compose.
 //!   Returns `{ url, filters, count, matches: [ElementRef, ...] }`.
+//! - `heso click <url> <@ref>` — Fetch `<url>`, resolve `<@ref>` against
+//!   the action graph, dispatch a real `click` event through the DOM event
+//!   model (handlers registered via `addEventListener` fire). Returns
+//!   `{ url, op: "click", ref, selector, value, console, ok }`.
+//! - `heso fill <url> <@ref> <value>` — Fetch `<url>`, find the input at
+//!   `<@ref>`, set its `.value`, and fire both `input` and `change` events
+//!   (matches real browser typing behavior). Returns the same shape as
+//!   `click` with `op: "fill"`.
+//! - `heso submit <url> <@form-ref>` — Fetch `<url>`, find the form at
+//!   `<@form-ref>`, click its first `button[type=submit]` /
+//!   `input[type=submit]` descendant. Real `reqwest::post` of the
+//!   serialized form lands with sessions; today this drives only the JS
+//!   side of submission.
 //! - `heso meta <url>` — Fetch + extract structured metadata (JSON-LD,
 //!   OpenGraph, Twitter cards, SEO meta, canonical, icons, lang). Returns
 //!   the [`PageMetadata`] as JSON.

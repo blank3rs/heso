@@ -19,14 +19,25 @@
 //! **Phase 1A** (the language) landed: evaluate a string of JavaScript
 //! inside a sandboxed QuickJS context and return the result as a
 //! [`serde_json::Value`] alongside any captured `console.*` output.
-//! **Phase 1B** (the agent-shaped DOM) is under way — `Document` and
+//! **Phase 1B** (the agent-shaped DOM) is done — `Document` and
 //! `Element` types backed by `dom_query::Document` (a mutable
 //! `html5ever`-backed tree), exposing both the read half
 //! (querySelector / textContent / getAttribute / ...) and the
 //! mutation surface real pages reach for during hydration
-//! (setAttribute / innerHTML setter / appendChild / classList).
-//! Phase 1C runs `<script>` tags on load so SPA hydration actually
-//! happens. Phase 1D fills out window globals.
+//! (setAttribute / innerHTML setter / appendChild / classList);
+//! the [`events`] module (`addEventListener` / `dispatchEvent` /
+//! `CustomEvent` / `AbortController` / `DOMException`); the [`timers`]
+//! module (`setTimeout` / `setInterval` over a [`VirtualClock`]); the
+//! [`rng`] module (`Math.random` / `crypto.getRandomValues` /
+//! `crypto.randomUUID` over a ChaCha20 [`SeededRng`]); and the
+//! [`JsEngine::dispatch_click`] / [`JsEngine::set_input_value`] /
+//! [`JsEngine::submit_form`] bridges that let `heso click` /
+//! `heso fill` / `heso submit` fire real events through the DOM.
+//! **Phase 1C** is next: run `<script>` tags on page load so SPA
+//! hydration actually happens, route `Date.now` / `new Date()`
+//! through [`VirtualClock`] to close the last nondeterminism source,
+//! and ship `fetch()` inside JS (proxied through `reqwest`). Phase 1D
+//! fills out the remaining window globals.
 //!
 //! ## Why QuickJS
 //!
@@ -41,12 +52,23 @@
 //!
 //! ## Determinism
 //!
-//! QuickJS itself is deterministic. The remaining sources of
-//! nondeterminism — `setTimeout`, `Date.now`, `Math.random`,
-//! `crypto.getRandomValues`, `performance.now`, `fetch` — are not
-//! installed in Phase 1A; Phase 2 will replace them with fake-clock /
-//! seeded-PRNG / recorded-network shims so the determinism
-//! guarantees from ADR 0008 carry over.
+//! QuickJS itself is deterministic. The other JS sources of
+//! nondeterminism are mostly closed:
+//!
+//! - `setTimeout` / `setInterval` route through [`VirtualClock`] — fired
+//!   in `(scheduled_time, sequence)` order via [`JsEngine::tick`], no
+//!   wall clock involved.
+//! - `Math.random`, `crypto.getRandomValues`, and `crypto.randomUUID`
+//!   route through [`SeededRng`] (ChaCha20). Construct the engine with
+//!   [`JsEngine::new_with_seed`] (the CLI exposes this as `--seed N` on
+//!   `heso eval-js` and `heso eval-dom`); same seed, byte-identical
+//!   output across runs and machines.
+//!
+//! `Date.now` and `new Date()` still hit the host clock — clock-seeding
+//! lands in Phase 1C alongside `<script>`-on-load. `fetch()` /
+//! `XMLHttpRequest` are not installed yet and will arrive as recorded-
+//! network shims so the determinism guarantees from ADR 0008 carry over
+//! to JS-issued network calls too.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
