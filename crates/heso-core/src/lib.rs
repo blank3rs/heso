@@ -2,11 +2,20 @@
 //!
 //! Shared types and the canonical error enum for the heso workspace.
 //!
-//! Other crates depend on this for: [`Url`] re-export, [`Error`] enum, [`Result`] alias.
-//! Keep this crate small — it sits at the bottom of the dependency graph and changes here
-//! ripple everywhere.
+//! Other crates depend on this for: [`Url`] re-export, [`Error`] enum,
+//! [`Result`] alias, and (since item H) the Ed25519-based [`IdentityKey`]
+//! that signs Receipts per [ADR 0005]. Keep this crate small — it sits at
+//! the bottom of the dependency graph and changes here ripple everywhere.
+//!
+//! [ADR 0005]: ../../decisions/0005-ed25519-identity.md
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub use url::Url;
+
+mod identity;
+pub use identity::{IdentityError, IdentityKey, Signature, SignaturePayload, SIG_ALGORITHM};
 
 /// Workspace-wide result alias. Use this in public APIs of crates that
 /// build on `heso-core`.
@@ -27,6 +36,10 @@ pub enum Error {
     /// An I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// An identity-key error (load/save/sign/verify).
+    #[error("identity: {0}")]
+    Identity(#[from] IdentityError),
 
     /// Catch-all for unimplemented surface during M0 skeleton work.
     /// Should not exist in released crates — replace with a real variant when filled in.

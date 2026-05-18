@@ -12,6 +12,14 @@ description = "Shared types, error enum, and core traits for heso."
 thiserror.workspace = true
 url.workspace = true
 serde = { workspace = true }
+# Identity / signing (item H, ADR 0005). On-disk key format + signing API.
+ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -85,17 +85,23 @@
 mod serve;
 
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use heso_core::Url;
+use heso_core::{IdentityKey, Url};
 use heso_engine_api::{EngineApi, Page};
 use heso_engine_fetch::{
     linked_pages_to_json, resolve_action, ElementRef, ExploreOptions, FetchEngine,
     DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use heso_primitives::{CdInput, CdTarget, PrimitiveOp, Trace};
-use heso_trace::Mode;
-use heso_trace_exec::{run, SessionConfig};
+use heso_trace::{verify_receipt, Mode, Receipt, VerifyOutcome};
+use heso_trace_exec::{run, run_signed, SessionConfig};
+
+/// Default identity-key path. Created by `heso identity init`; auto-loaded
+/// by `heso run` when present. Lives under the gitignored
+/// `heso-local-data/` directory.
+const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
 
 fn print_banner() {
     let version = env!("CARGO_PKG_VERSION");
@@ -128,6 +134,12 @@ fn print_banner() {
     println!("                                Under --seed N + --js-fetch, fetch() rejects with a clear cassette error (ADR 0008).");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso run   <url> <request>    [STUB] navigates to <url> only; request is ignored. Planner not yet wired.");
+    println!("    [--identity <path>]            Sign the receipt with the Ed25519 key at <path>; defaults to heso-local-data/identity.key when present");
+    println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
+    println!(
+        "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
+    );
+    println!("  heso receipt-verify <file>    Verify a signed receipt (exit 0 valid, 1 invalid, 2 missing/malformed)");
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See state.json + decisions/0012-fetch-only-native-engine.md (static engine) and");
@@ -1304,19 +1316,52 @@ async fn cmd_plat_verify(args: &[String]) -> ExitCode {
 ///   3. stashes the user's `request` string in `planner_id` only so the
 ///      receipt can be correlated back; **the request is NOT interpreted**.
 ///
+/// Optional flags:
+/// - `--identity <path>` — sign the receipt with the Ed25519 key at `<path>`.
+///   When omitted, `heso-local-data/identity.key` is loaded if it exists;
+///   otherwise the receipt is unsigned.
+///
 /// A genuine `heso.run` arrives when T-022 lands. Until then, agents that
 /// want page content should use `heso open` (full agent-shaped payload) or
 /// `heso fetch` / `heso tree` / `heso ls` / `heso cat`.
 async fn cmd_run(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("usage: heso run <url> <request...>");
+    // Walk the args: an `--identity <path>` flag (optional) anywhere, then
+    // a positional URL, then the request string (everything else joined).
+    let mut identity_path: Option<PathBuf> = None;
+    let mut explicit_identity = false;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--identity" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--identity needs a path");
+                    return ExitCode::from(2);
+                };
+                identity_path = Some(PathBuf::from(v));
+                explicit_identity = true;
+                i += 2;
+            }
+            other if other.starts_with("--") && other != "--" => {
+                eprintln!("unknown flag `{other}`");
+                eprintln!("usage: heso run [--identity <path>] <url> <request...>");
+                return ExitCode::from(2);
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if positional.len() < 2 {
+        eprintln!("usage: heso run [--identity <path>] <url> <request...>");
         eprintln!("note: today `heso run` only navigates to <url>; the");
         eprintln!("      request text is recorded on the Receipt but not");
         eprintln!("      interpreted. Planner is T-022 (pending).");
         return ExitCode::from(2);
     }
-    let url_arg = &args[0];
-    let request = args[1..].join(" ");
+    let url_arg = &positional[0];
+    let request = positional[1..].join(" ");
 
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
@@ -1325,6 +1370,41 @@ async fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Identity resolution:
+    //   --identity <path> explicit → must exist, hard error on miss.
+    //   no flag → try DEFAULT_IDENTITY_PATH; absent is fine (unsigned).
+    let resolved_identity: Option<IdentityKey> = match identity_path {
+        Some(ref p) => match IdentityKey::load(p) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                eprintln!("failed to load identity at `{}`: {e}", p.display());
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let default_path = Path::new(DEFAULT_IDENTITY_PATH);
+            if default_path.exists() {
+                match IdentityKey::load(default_path) {
+                    Ok(k) => Some(k),
+                    Err(e) => {
+                        eprintln!(
+                            "default identity at `{}` exists but failed to load: {e}",
+                            default_path.display()
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    // Honor ADR 0008: identity must not sign in `live` mode. Today
+    // `heso run` always runs in `deterministic` mode (the planner stub
+    // hard-codes it), so this branch is here for when modes get a flag.
+    let _ = explicit_identity; // currently informational only
 
     let engine = match FetchEngine::new() {
         Ok(e) => e,
@@ -1348,7 +1428,10 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         planner_id: format!("stub-cli:{request}"),
     };
 
-    let receipt = run(&engine, &trace, &cfg).await;
+    let receipt = match resolved_identity.as_ref() {
+        Some(id) => run_signed(&engine, &trace, &cfg, id).await,
+        None => run(&engine, &trace, &cfg).await,
+    };
     match serde_json::to_string_pretty(&receipt) {
         Ok(s) => {
             println!("{s}");
@@ -1357,6 +1440,167 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         Err(e) => {
             eprintln!("failed to serialize receipt: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+// ============================================================================
+// Identity subcommands (item H, ADR 0005)
+// ============================================================================
+
+/// `heso identity <sub> [args]` dispatcher.
+///
+/// Subcommands:
+///   - `heso identity init [--path <p>]` — generate + write a new key.
+///   - `heso identity show [--path <p>]` — print the base64 public key.
+///
+/// Default path is `heso-local-data/identity.key`. The directory is
+/// already gitignored.
+fn cmd_identity(args: &[String]) -> ExitCode {
+    let Some(sub) = args.first() else {
+        eprintln!("usage: heso identity <init|show> [--path <p>]");
+        return ExitCode::from(2);
+    };
+    match sub.as_str() {
+        "init" => cmd_identity_init(&args[1..]),
+        "show" => cmd_identity_show(&args[1..]),
+        other => {
+            eprintln!("unknown identity subcommand: {other}");
+            eprintln!("usage: heso identity <init|show> [--path <p>]");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Parse `[--path <p>]` from the tail args. Returns the chosen path (the
+/// default if `--path` is absent) or an exit code on usage error.
+fn parse_identity_path(args: &[String]) -> Result<PathBuf, ExitCode> {
+    let mut path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--path" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--path needs a value");
+                    return Err(ExitCode::from(2));
+                };
+                path = Some(PathBuf::from(v));
+                i += 2;
+            }
+            other => {
+                eprintln!("unknown flag `{other}`");
+                return Err(ExitCode::from(2));
+            }
+        }
+    }
+    Ok(path.unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH)))
+}
+
+fn cmd_identity_init(args: &[String]) -> ExitCode {
+    let path = match parse_identity_path(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    if path.exists() {
+        eprintln!(
+            "identity already exists at `{}` — refusing to overwrite. \
+             Delete it explicitly if you want to rotate.",
+            path.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    let key = IdentityKey::generate();
+    if let Err(e) = key.save(&path) {
+        eprintln!("failed to save identity to `{}`: {e}", path.display());
+        return ExitCode::FAILURE;
+    }
+    // Print a small JSON envelope so callers can pipe it.
+    let body = serde_json::json!({
+        "path": path.display().to_string(),
+        "public_key": key.public_key_b64(),
+        "algorithm": "Ed25519",
+    });
+    match serde_json::to_string_pretty(&body) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize identity envelope: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_identity_show(args: &[String]) -> ExitCode {
+    let path = match parse_identity_path(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let key = match IdentityKey::load(&path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("failed to load identity at `{}`: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let body = serde_json::json!({
+        "path": path.display().to_string(),
+        "public_key": key.public_key_b64(),
+        "algorithm": "Ed25519",
+    });
+    match serde_json::to_string_pretty(&body) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize identity envelope: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `heso receipt-verify <file>` — read a receipt JSON, verify its
+/// embedded Ed25519 signature. Exit 0 if valid, 1 if invalid
+/// (tampered/wrong key), 2 if the receipt has no signature or fails to
+/// parse.
+async fn cmd_receipt_verify(args: &[String]) -> ExitCode {
+    let Some(file) = args.first() else {
+        eprintln!("usage: heso receipt-verify <file>");
+        return ExitCode::from(2);
+    };
+    let contents = match tokio::fs::read_to_string(file).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to read `{file}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let receipt: Receipt = match serde_json::from_str(&contents) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("`{file}` is not a valid Receipt JSON: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match verify_receipt(&receipt) {
+        VerifyOutcome::Valid => {
+            let pk = receipt
+                .signature
+                .as_ref()
+                .map(|s| s.public_key.as_str())
+                .unwrap_or("(unknown)");
+            println!("OK {pk}");
+            ExitCode::SUCCESS
+        }
+        VerifyOutcome::Invalid(e) => {
+            eprintln!("INVALID: {e}");
+            ExitCode::from(1)
+        }
+        VerifyOutcome::Missing => {
+            eprintln!("MISSING: receipt has no `signature` field");
+            ExitCode::from(2)
         }
     }
 }
@@ -1381,6 +1625,8 @@ async fn main() -> ExitCode {
         Some("submit") => cmd_submit(&args[1..]).await,
         Some("serve") => serve::run().await,
         Some("run") => cmd_run(&args[1..]).await,
+        Some("identity") => cmd_identity(&args[1..]),
+        Some("receipt-verify") => cmd_receipt_verify(&args[1..]).await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             print_banner();

@@ -5,25 +5,35 @@
 //! - [`Trace`], [`PrimitiveOp`], [`PrimitiveResult`] — re-exported from
 //!   `heso-primitives`.
 //! - [`Receipt`] — what every `heso.run` call returns under the hood. Records
-//!   what was run, what came back, cost, and (M4+) a signature.
+//!   what was run, what came back, cost, and an optional Ed25519
+//!   [`Signature`] (item H, [ADR 0005]).
 //! - [`Cost`] — bytes / cpu_ms / wall_ms / planner_tokens.
 //! - [`Mode`] — `deterministic` (default) / `recording` / `live` per
 //!   [ADR 0008].
 //! - [`ContentHash`] — BLAKE3 hex digest, used for page-hash fingerprints.
 //! - [`trace_hash`] — BLAKE3 over the canonical JSON of a [`Trace`]. Two
 //!   equal traces produce the same hash byte-for-byte.
+//! - [`canonical_receipt_json`] — sign-it-and-stamp canonical form: the
+//!   receipt's JSON with `signature: null`, sorted keys, compact.
+//! - [`sign_receipt`] / [`verify_receipt`] — stamp/check the Ed25519
+//!   signature on a [`Receipt`].
 //!
 //! **No engine dependency.** The execution that produces a [`Receipt`] lives
-//! in `heso-trace-exec`. This crate is pure data so consumers (planners,
-//! verifiers, downstream tools) can depend on it without dragging in Servo.
+//! in `heso-trace-exec`. This crate is pure data + signing so consumers
+//! (planners, verifiers, downstream tools) can depend on it without dragging
+//! in Servo.
 //!
+//! [ADR 0005]: ../../decisions/0005-ed25519-identity.md
 //! [ADR 0008]: ../../decisions/0008-deterministic-execution.md
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use heso_core::{IdentityError, IdentityKey, Signature, SignaturePayload};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+pub use heso_core::Signature as ReceiptSignature;
 pub use heso_primitives::{PrimitiveOp, PrimitiveResult, Trace};
 
 /// Operating mode for one trace run. Per [ADR 0008].
@@ -82,9 +92,16 @@ pub struct Cost {
 /// Receipt of one trace run.
 ///
 /// Per [ADR 0009], every `heso.run` call returns a receipt. The receipt
-/// records the trace that was executed, what happened, the cost, and (in
-/// M4+) a signature over a canonical encoding of all of the above.
+/// records the trace that was executed, what happened, the cost, and an
+/// optional Ed25519 [`signature`](Receipt::signature) over a canonical
+/// encoding of all of the above (item H, [ADR 0005]).
 ///
+/// The unsigned receipt and the signed receipt are the same shape — the
+/// `signature` field is optional. Serializing a receipt with
+/// `signature == None` omits the field entirely, so unsigned receipts
+/// remain backwards-compatible.
+///
+/// [ADR 0005]: ../../decisions/0005-ed25519-identity.md
 /// [ADR 0009]: ../../decisions/0009-heso-run-single-tool.md
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -116,16 +133,27 @@ pub struct Receipt {
     /// Error message from the failed op, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Ed25519 signature over a canonical encoding of all of the above.
-    /// Empty until M4 lands the signing layer.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub signed: String,
+    /// Ed25519 signature over the canonical-JSON of this receipt with the
+    /// `signature` field set to `null`. `None` when the receipt has not
+    /// been signed (item H, [ADR 0005]).
+    ///
+    /// [ADR 0005]: ../../decisions/0005-ed25519-identity.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
 }
 
 impl Receipt {
     /// `true` if the trace ran to completion (every op produced a result).
     pub fn is_ok(&self) -> bool {
         self.failed_at.is_none()
+    }
+}
+
+impl SignaturePayload for Receipt {
+    /// Canonical-JSON of the receipt with `signature` cleared, encoded as
+    /// UTF-8 bytes. The same shape verifiers use to recompute the digest.
+    fn signing_payload(&self) -> Vec<u8> {
+        canonical_receipt_json(self).into_bytes()
     }
 }
 
@@ -152,6 +180,139 @@ pub fn trace_hash(trace: &Trace) -> String {
 }
 
 // ============================================================================
+// Canonical-JSON for signing
+// ============================================================================
+
+/// Canonical-JSON form of a receipt with `signature` cleared, suitable as
+/// the byte input to Ed25519 signing/verifying.
+///
+/// Canonicalization rules (same as the [`plat`] module — chosen so two
+/// implementations produce identical bytes):
+///
+/// - Object keys sorted lexicographically (recursively, depth-first).
+/// - Compact: no insignificant whitespace.
+/// - Strings escaped via `serde_json::to_string` for the string-value
+///   subset (handles `\"`, `\\`, `\n`, `\t`, `\uXXXX`, etc.).
+/// - Numbers via `serde_json::Number`'s `Display`, which preserves the
+///   integer-vs-float distinction.
+/// - The `signature` field is forced to `null` on the receipt object
+///   itself before canonicalizing. The "sign it and stamp it" pattern:
+///   sign over the receipt-without-signature, then write the signature
+///   back into the same struct.
+///
+/// This is a subset of RFC 8785 (JSON Canonicalization Scheme) sufficient
+/// for the value shapes a receipt emits. If we ever need full RFC 8785
+/// conformance for cross-vendor interop we can swap in a JCS crate; for
+/// v1 the in-tree implementation is small, dependency-free, and explicit
+/// about its constraints.
+///
+/// [`plat`]: ../heso_engine_fetch/plat/index.html
+pub fn canonical_receipt_json(receipt: &Receipt) -> String {
+    let mut v = serde_json::to_value(receipt).expect("receipt serializes");
+    // Force `signature` to JSON `null` on the top-level object. That gives
+    // a single canonical "unsigned" shape regardless of whether the input
+    // is a fresh (no field) or already-signed (Some(...)) receipt.
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("signature".to_owned(), Value::Null);
+    }
+    let mut out = String::new();
+    write_canonical(&v, &mut out);
+    out
+}
+
+fn write_canonical(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => {
+            let escaped = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
+            out.push_str(&escaped);
+        }
+        Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                let escaped = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
+                out.push_str(&escaped);
+                out.push(':');
+                // SAFETY: `keys` came from `map.keys()`, so the lookup
+                // can't fail.
+                write_canonical(&map[*key], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+// ============================================================================
+// Signing / verifying
+// ============================================================================
+
+/// Sign `receipt` with `key`. Mutates the receipt in place: when this
+/// returns, `receipt.signature` is `Some(sig)`.
+///
+/// Any pre-existing signature is discarded before the new one is
+/// computed (the canonical form clears it anyway, so this just keeps the
+/// in-memory struct consistent with what was signed).
+pub fn sign_receipt(key: &IdentityKey, receipt: &mut Receipt) {
+    receipt.signature = None;
+    let payload = canonical_receipt_json(receipt).into_bytes();
+    let sig = key.sign(&payload);
+    receipt.signature = Some(sig);
+}
+
+/// Verify a receipt's embedded signature against its canonical form.
+/// Returns:
+///
+/// - [`VerifyOutcome::Valid`] — the signature is present, the algorithm
+///   matches, the public key + signature decode, and the verification
+///   succeeds against the canonical receipt-without-signature bytes.
+/// - [`VerifyOutcome::Missing`] — the receipt has no `signature` field.
+/// - [`VerifyOutcome::Invalid(_)`] — the signature is present but
+///   doesn't verify (tampered receipt, wrong key, malformed envelope).
+pub fn verify_receipt(receipt: &Receipt) -> VerifyOutcome {
+    let Some(sig) = receipt.signature.as_ref() else {
+        return VerifyOutcome::Missing;
+    };
+    // Recompute canonical form with `signature` cleared.
+    let mut probe = receipt.clone();
+    probe.signature = None;
+    let payload = canonical_receipt_json(&probe).into_bytes();
+    match sig.verify(&payload) {
+        Ok(()) => VerifyOutcome::Valid,
+        Err(e) => VerifyOutcome::Invalid(e),
+    }
+}
+
+/// Result of [`verify_receipt`]. Three-way for the CLI exit-code shape
+/// the `receipt-verify` subcommand needs (0 valid / 1 invalid / 2
+/// missing-or-malformed).
+#[derive(Debug)]
+pub enum VerifyOutcome {
+    /// Signature present and verifies.
+    Valid,
+    /// Receipt has no `signature` field at all.
+    Missing,
+    /// Signature is present but verification failed.
+    Invalid(IdentityError),
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -169,6 +330,28 @@ mod tests {
             }),
             PrimitiveOp::Pwd(PwdInput::default()),
         ]
+    }
+
+    fn sample_receipt() -> Receipt {
+        let trace = url("https://example.com/");
+        Receipt {
+            trace: trace.clone(),
+            results: vec![],
+            pages_seen: vec![ContentHash::of(b"page")],
+            trace_hash: trace_hash(&trace),
+            planner_id: "planner-v0".into(),
+            seed: 42,
+            mode: Mode::Deterministic,
+            cost: Cost {
+                bytes: 1024,
+                cpu_ms: 5,
+                wall_ms: 200,
+                planner_tokens: 0,
+            },
+            failed_at: None,
+            error: None,
+            signature: None,
+        }
     }
 
     #[test]
@@ -221,25 +404,9 @@ mod tests {
 
     #[test]
     fn receipt_roundtrips_through_json() {
-        let trace = url("https://example.com/");
-        let receipt = Receipt {
-            trace: trace.clone(),
-            results: vec![],
-            pages_seen: vec![ContentHash::of(b"page")],
-            trace_hash: trace_hash(&trace),
-            planner_id: "planner-v0".into(),
-            seed: 42,
-            mode: Mode::Deterministic,
-            cost: Cost {
-                bytes: 1024,
-                cpu_ms: 5,
-                wall_ms: 200,
-                planner_tokens: 0,
-            },
-            failed_at: Some(3),
-            error: Some("oops".into()),
-            signed: String::new(),
-        };
+        let mut receipt = sample_receipt();
+        receipt.failed_at = Some(3);
+        receipt.error = Some("oops".into());
         let json = serde_json::to_string(&receipt).unwrap();
         let back: Receipt = serde_json::from_str(&json).unwrap();
         assert_eq!(receipt, back);
@@ -247,39 +414,227 @@ mod tests {
 
     #[test]
     fn receipt_is_ok_when_no_failure() {
-        let trace = url("https://example.com/");
-        let r = Receipt {
-            trace,
-            results: vec![],
-            pages_seen: vec![],
-            trace_hash: String::new(),
-            planner_id: String::new(),
-            seed: 0,
-            mode: Mode::Deterministic,
-            cost: Cost::default(),
-            failed_at: None,
-            error: None,
-            signed: String::new(),
-        };
+        let r = sample_receipt();
         assert!(r.is_ok());
     }
 
     #[test]
     fn receipt_is_not_ok_when_failed() {
-        let trace = url("https://example.com/");
-        let r = Receipt {
-            trace,
-            results: vec![],
-            pages_seen: vec![],
-            trace_hash: String::new(),
-            planner_id: String::new(),
-            seed: 0,
-            mode: Mode::Deterministic,
-            cost: Cost::default(),
-            failed_at: Some(2),
-            error: Some("err".into()),
-            signed: String::new(),
-        };
+        let mut r = sample_receipt();
+        r.failed_at = Some(2);
+        r.error = Some("err".into());
         assert!(!r.is_ok());
+    }
+
+    #[test]
+    fn unsigned_receipt_omits_signature_field_from_json() {
+        let r = sample_receipt();
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(
+            !s.contains("\"signature\""),
+            "unsigned receipt JSON must omit signature field: {s}"
+        );
+    }
+
+    // ------- canonical form -------
+
+    #[test]
+    fn canonical_form_clears_signature_field() {
+        let mut r = sample_receipt();
+        let unsigned = canonical_receipt_json(&r);
+
+        // Now sign and recompute — the canonical form must be byte-identical
+        // because canonicalization clears the signature before hashing.
+        let key = IdentityKey::generate();
+        sign_receipt(&key, &mut r);
+        assert!(r.signature.is_some());
+        let signed = canonical_receipt_json(&r);
+        assert_eq!(unsigned, signed,
+            "canonical form must clear signature; got\n  unsigned: {unsigned}\n  signed:   {signed}");
+    }
+
+    #[test]
+    fn canonical_form_is_deterministic_for_equal_receipts() {
+        let a = sample_receipt();
+        let b = sample_receipt();
+        assert_eq!(canonical_receipt_json(&a), canonical_receipt_json(&b));
+    }
+
+    #[test]
+    fn canonical_form_does_not_pretty_print() {
+        let r = sample_receipt();
+        let c = canonical_receipt_json(&r);
+        assert!(!c.contains('\n'));
+        assert!(!c.contains("  "));
+    }
+
+    #[test]
+    fn canonical_form_sorts_keys_at_top_level() {
+        // The serialized receipt has many fields; canonical form must list
+        // them in lexicographic order. Quick check: `cost` precedes
+        // `error` precedes `failed_at` precedes `mode` precedes `pages_seen`
+        // precedes `planner_id` precedes `results` precedes `seed`
+        // precedes `signature` precedes `trace` precedes `trace_hash`.
+        let mut r = sample_receipt();
+        r.error = Some("e".into());
+        r.failed_at = Some(1);
+        let c = canonical_receipt_json(&r);
+        let positions = [
+            "\"cost\"",
+            "\"error\"",
+            "\"failed_at\"",
+            "\"mode\"",
+            "\"pages_seen\"",
+            "\"planner_id\"",
+            "\"results\"",
+            "\"seed\"",
+            "\"signature\"",
+            "\"trace\"",
+            "\"trace_hash\"",
+        ];
+        let mut prev = 0usize;
+        for needle in positions {
+            let idx = c
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing key {needle} in canonical form"));
+            assert!(
+                idx > prev || prev == 0,
+                "key {needle} at {idx} expected after position {prev} in {c}"
+            );
+            prev = idx;
+        }
+    }
+
+    // ------- sign / verify roundtrip -------
+
+    #[test]
+    fn sign_then_verify_roundtrip_succeeds() {
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        sign_receipt(&key, &mut r);
+        assert!(r.signature.is_some());
+        match verify_receipt(&r) {
+            VerifyOutcome::Valid => {}
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_missing_signature_returns_missing() {
+        let r = sample_receipt();
+        match verify_receipt(&r) {
+            VerifyOutcome::Missing => {}
+            other => panic!("expected Missing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signature_verifies_after_json_roundtrip() {
+        // Signing must survive serialize → deserialize, since the CLI is
+        // going to write JSON and a separate process is going to read it.
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        sign_receipt(&key, &mut r);
+        let json = serde_json::to_string(&r).unwrap();
+        let back: Receipt = serde_json::from_str(&json).unwrap();
+        match verify_receipt(&back) {
+            VerifyOutcome::Valid => {}
+            other => panic!("expected Valid after roundtrip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampering_with_trace_hash_invalidates_signature() {
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        sign_receipt(&key, &mut r);
+        // Mutate one byte of trace_hash.
+        let mut chars: Vec<char> = r.trace_hash.chars().collect();
+        chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
+        r.trace_hash = chars.into_iter().collect();
+        match verify_receipt(&r) {
+            VerifyOutcome::Invalid(_) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampering_with_seed_invalidates_signature() {
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        sign_receipt(&key, &mut r);
+        r.seed = r.seed.wrapping_add(1);
+        match verify_receipt(&r) {
+            VerifyOutcome::Invalid(_) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn re_signing_overwrites_old_signature() {
+        let k1 = IdentityKey::generate();
+        let k2 = IdentityKey::generate();
+        let mut r = sample_receipt();
+        sign_receipt(&k1, &mut r);
+        let pk1 = r.signature.as_ref().unwrap().public_key.clone();
+        sign_receipt(&k2, &mut r);
+        let pk2 = r.signature.as_ref().unwrap().public_key.clone();
+        assert_ne!(pk1, pk2, "re-signing must rewrite the signature");
+        match verify_receipt(&r) {
+            VerifyOutcome::Valid => {}
+            other => panic!("expected Valid after re-sign, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_form_is_invariant_under_object_key_shuffles() {
+        // Property: two semantically-equal receipts produce byte-identical
+        // canonical bytes regardless of the *construction* order of any
+        // embedded objects.
+        //
+        // We test this at the canonicalizer level by routing a receipt
+        // through `serde_json::Value` two ways: once via the natural
+        // `to_value(&receipt)` path, and once via a hand-constructed Value
+        // with all object key orderings reversed at every level. Both must
+        // produce the same canonical bytes — which is the same guarantee a
+        // signature relies on.
+        let r = sample_receipt();
+        let v_natural = serde_json::to_value(&r).unwrap();
+        let v_shuffled = reverse_object_keys(v_natural.clone());
+
+        // The two Values are NOT structurally equal as Rust types if the
+        // backing maps preserve order; but their canonical JSON must be.
+        let mut a = String::new();
+        let mut b = String::new();
+        super::write_canonical(&v_natural, &mut a);
+        super::write_canonical(&v_shuffled, &mut b);
+        assert_eq!(
+            a, b,
+            "canonical form must not depend on object-key insertion order"
+        );
+    }
+
+    /// Walk a `Value`, returning a copy with every object's keys
+    /// inserted in reverse order. With `serde_json`'s
+    /// `preserve_order = off` (the default), maps are `BTreeMap` and the
+    /// canonical form is naturally stable; with `preserve_order = on`,
+    /// this exercise actually shuffles. Either way, the canonical
+    /// writer's `keys.sort()` defends the property.
+    fn reverse_object_keys(v: Value) -> Value {
+        match v {
+            Value::Array(items) => {
+                Value::Array(items.into_iter().map(reverse_object_keys).collect())
+            }
+            Value::Object(map) => {
+                let mut entries: Vec<_> = map.into_iter().collect();
+                entries.reverse();
+                let mut out = serde_json::Map::new();
+                for (k, child) in entries {
+                    out.insert(k, reverse_object_keys(child));
+                }
+                Value::Object(out)
+            }
+            other => other,
+        }
     }
 }

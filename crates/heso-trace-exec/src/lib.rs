@@ -15,10 +15,18 @@
 //! - Build a [`Receipt`] with [`trace_hash`] over the canonical JSON of the
 //!   trace.
 //!
+//! ## Optional signing
+//!
+//! [`run`] produces an unsigned [`Receipt`]. Callers that want a signed
+//! receipt (item H, [ADR 0005]) pass an [`heso_core::IdentityKey`] to
+//! [`run_signed`], which signs the receipt over its canonical-JSON form
+//! before returning. Callers that already have an unsigned receipt in
+//! hand can also call [`heso_trace::sign_receipt`] directly.
+//!
+//! [ADR 0005]: ../../decisions/0005-ed25519-identity.md
+//!
 //! ## Out of scope (later milestones)
 //!
-//! - **Signing.** `Receipt::signed` is left empty here; M4 (`heso-identity`)
-//!   adds Ed25519 signing.
 //! - **Cost accounting.** `Receipt::cost` is zeroed today; the engine has to
 //!   feed back byte counts + CPU time once T-013/T-017 land.
 //! - **Page hashes.** `Receipt::pages_seen` is empty until the engine reports
@@ -34,9 +42,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use heso_core::IdentityKey;
 use heso_engine_api::EngineApi;
 use heso_primitives::{execute, PrimitiveResult};
-use heso_trace::{trace_hash, Cost, Mode, Receipt, Trace};
+use heso_trace::{sign_receipt, trace_hash, Cost, Mode, Receipt, Trace};
 
 /// Per-session configuration the runner needs to build a [`Receipt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,7 +70,7 @@ impl Default for SessionConfig {
     }
 }
 
-/// Run a trace and return a [`Receipt`].
+/// Run a trace and return an unsigned [`Receipt`].
 ///
 /// Stops at the first failed primitive. The receipt records:
 /// - the full trace
@@ -71,8 +80,11 @@ impl Default for SessionConfig {
 ///
 /// `Receipt::trace_hash` is BLAKE3 over the trace's canonical JSON.
 ///
-/// No signing (M4). `pages_seen` empty until the engine reports content
-/// hashes (T-013). `cost` zeroed until the engine threads cost data through.
+/// `Receipt::signature` is `None`. Pass an [`IdentityKey`] to
+/// [`run_signed`] (or call [`heso_trace::sign_receipt`] after) to add an
+/// Ed25519 signature. `pages_seen` empty until the engine reports content
+/// hashes (T-013). `cost` zeroed until the engine threads cost data
+/// through.
 pub async fn run<E: EngineApi>(engine: &E, trace: &Trace, config: &SessionConfig) -> Receipt {
     let mut results: Vec<PrimitiveResult> = Vec::with_capacity(trace.len());
     let mut failed_at: Option<usize> = None;
@@ -100,8 +112,23 @@ pub async fn run<E: EngineApi>(engine: &E, trace: &Trace, config: &SessionConfig
         cost: Cost::default(),
         failed_at,
         error,
-        signed: String::new(),
+        signature: None,
     }
+}
+
+/// Like [`run`], but signs the resulting [`Receipt`] with `identity`
+/// before returning. The signature is over the canonical-JSON of the
+/// receipt with its `signature` field set to `null`; see
+/// [`heso_trace::canonical_receipt_json`] for the exact rules.
+pub async fn run_signed<E: EngineApi>(
+    engine: &E,
+    trace: &Trace,
+    config: &SessionConfig,
+    identity: &IdentityKey,
+) -> Receipt {
+    let mut receipt = run(engine, trace, config).await;
+    sign_receipt(identity, &mut receipt);
+    receipt
 }
 
 // ============================================================================
@@ -236,5 +263,30 @@ mod tests {
         assert!(r.is_ok());
         assert_eq!(r.results.len(), 0);
         assert_eq!(r.trace.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn run_returns_unsigned_receipt() {
+        let trace = vec![cd("https://example.com/")];
+        let r = run(&DummyEngine, &trace, &SessionConfig::default()).await;
+        assert!(
+            r.signature.is_none(),
+            "run() must leave receipts unsigned; got {:?}",
+            r.signature
+        );
+    }
+
+    #[tokio::test]
+    async fn run_signed_returns_a_verifying_signed_receipt() {
+        let trace = vec![cd("https://example.com/")];
+        let key = IdentityKey::generate();
+        let r = run_signed(&DummyEngine, &trace, &SessionConfig::default(), &key).await;
+        let sig = r.signature.as_ref().expect("signed receipt has signature");
+        assert_eq!(sig.algorithm, "Ed25519");
+        // Verify via heso_trace's public verify path.
+        match heso_trace::verify_receipt(&r) {
+            heso_trace::VerifyOutcome::Valid => {}
+            other => panic!("expected Valid, got {other:?}"),
+        }
     }
 }
