@@ -24,6 +24,7 @@ use rquickjs::{
 };
 
 use crate::dom::{self, Document};
+use crate::timers::{self, TimerScheduler};
 
 /// Memory cap per [`JsEngine`]. 10 MB is enough for typical
 /// page-hydration JS but cheap to bump if a real page needs more.
@@ -138,6 +139,12 @@ pub struct JsEngine {
     _runtime: Runtime,
     context: Context,
     console_buffer: Arc<Mutex<Vec<ConsoleEntry>>>,
+    /// Per-engine timer scheduler. Owns the virtual clock and the
+    /// pending-timer heap; shared with the JS-side `setTimeout` /
+    /// `setInterval` closures and the Rust-side `advance_clock` /
+    /// `pending_timers` methods. See [`crate::timers`] for the full
+    /// design.
+    timers: Arc<Mutex<TimerScheduler>>,
 }
 
 impl JsEngine {
@@ -157,12 +164,89 @@ impl JsEngine {
 
         install_console(&context, console_buffer.clone())?;
         install_dom_classes(&context)?;
+        crate::events::install_events(&context)?;
+
+        // rquickjs's `Persistent<Function<'static>>` (held inside
+        // [`TimerScheduler`]'s entries) is not `Send + Sync` because
+        // QuickJS objects are pinned to their parent runtime. The
+        // engine is single-threaded so the `Arc` will never cross
+        // threads in practice; we keep `Arc` (rather than `Rc`) for
+        // consistency with the existing `console_buffer: Arc<Mutex>`
+        // pattern.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let timers: Arc<Mutex<TimerScheduler>> = Arc::new(Mutex::new(TimerScheduler::new()));
+        timers::install_timers(&context, timers.clone())
+            .map_err(|e| EvalError::Engine(format!("install timers: {e}")))?;
 
         Ok(Self {
             _runtime: runtime,
             context,
             console_buffer,
+            timers,
         })
+    }
+
+    /// Advance the deterministic virtual clock by `delta_ms`
+    /// milliseconds. Fires every `setTimeout` / `setInterval`
+    /// callback whose recorded fire-time is now `<= virtual_now`, in
+    /// ascending `(fire_time, insertion_seq)` order.
+    ///
+    /// Tie-breaking is by insertion order — an earlier `setTimeout`
+    /// fires before a later `setTimeout` that resolves at the same
+    /// virtual time.
+    ///
+    /// Per [ADR 0008], a callback that throws is captured into the
+    /// engine's console buffer as a [`ConsoleLevel::Error`] entry and
+    /// the timer pump continues — halting on a JS throw would make
+    /// firing order observably affect the engine's continued
+    /// operation, which is a determinism trap.
+    ///
+    /// The console buffer is **not** cleared by this call (unlike
+    /// [`Self::eval`]) — captured throws accumulate alongside any
+    /// `console.*` output produced from prior evals or by the
+    /// callbacks themselves. Use [`Self::drain_console`] to snapshot
+    /// and clear if you want a clean slate.
+    pub fn advance_clock(&self, delta_ms: u64) -> Result<(), EvalError> {
+        timers::advance_clock(&self.context, &self.timers, &self.console_buffer, delta_ms)
+            .map_err(|e| EvalError::Engine(format!("advance_clock: {e}")))?;
+        Ok(())
+    }
+
+    /// Advance the deterministic virtual clock and return a snapshot
+    /// of the **entire** console buffer (including entries left over
+    /// from prior evals) after the advance completes.
+    ///
+    /// Test-and-introspection helper — production callers should use
+    /// [`Self::advance_clock`] plus [`Self::drain_console`] or the
+    /// per-eval `console` field on [`EvalOutcome`].
+    pub fn advance_clock_capture(&self, delta_ms: u64) -> Result<Vec<ConsoleEntry>, EvalError> {
+        self.advance_clock(delta_ms)?;
+        Ok(self
+            .console_buffer
+            .lock()
+            .expect("console buffer poisoned")
+            .clone())
+    }
+
+    /// Number of un-fired timers currently scheduled. Counts both
+    /// one-shots (`setTimeout`) and intervals (`setInterval`); an
+    /// interval counts as `1` regardless of how many times it has
+    /// already fired.
+    pub fn pending_timers(&self) -> usize {
+        self.timers
+            .lock()
+            .expect("timer scheduler poisoned")
+            .pending_count()
+    }
+
+    /// Drain and return the console buffer. Useful between calls to
+    /// [`Self::advance_clock`] to observe what timer callbacks
+    /// logged (or threw) since the last drain.
+    pub fn drain_console(&self) -> Vec<ConsoleEntry> {
+        let mut buf = self.console_buffer.lock().expect("console buffer poisoned");
+        let out = buf.clone();
+        buf.clear();
+        out
     }
 
     /// Evaluate `js` against a parsed HTML page.
@@ -236,6 +320,30 @@ impl JsEngine {
 impl Default for JsEngine {
     fn default() -> Self {
         Self::new().expect("rquickjs Runtime + Context construction should never fail on default config")
+    }
+}
+
+impl Drop for JsEngine {
+    /// Drain the timer scheduler before the runtime tears down so any
+    /// [`rquickjs::Persistent`] callbacks still in the heap drop while
+    /// their parent [`rquickjs::Runtime`] is still alive. Dropping a
+    /// `Persistent` after the runtime is gone trips QuickJS's
+    /// `list_empty(&rt->gc_obj_list)` debug assertion and aborts the
+    /// process.
+    ///
+    /// This runs even on panic-unwind: the scheduler is dropped
+    /// regardless and we just need its inner `Persistent`s released
+    /// first.
+    fn drop(&mut self) {
+        // Hold the context for the drain so the Persistents drop
+        // inside `ctx.with` and the QuickJS engine can free their
+        // bound objects synchronously.
+        let timers = self.timers.clone();
+        self.context.with(|_ctx| {
+            if let Ok(mut s) = timers.lock() {
+                s.clear_all();
+            }
+        });
     }
 }
 
@@ -793,5 +901,298 @@ mod tests {
             )
             .expect("eval_with_html ok");
         assert_eq!(out.value, serde_json::json!([0, 1, "item"]));
+    }
+
+    // ===== Timer integration (Phase 2 — virtual clock + setTimeout) =====
+
+    #[test]
+    fn engine_advance_clock_fires_three_timers_into_console_in_order() {
+        // Schedule three timers from JS, advance the virtual clock
+        // from Rust, observe their messages appear on the engine's
+        // console buffer in the right order.
+        let e = engine();
+        let _ = e
+            .eval(
+                r#"
+                setTimeout(() => console.log('third'), 30);
+                setTimeout(() => console.log('first'), 10);
+                setTimeout(() => console.log('second'), 20);
+                "#,
+            )
+            .expect("schedule ok");
+        // Nothing fired yet — the eval above didn't advance the clock.
+        assert_eq!(e.pending_timers(), 3);
+
+        let console_after = e.advance_clock_capture(100).expect("advance ok");
+        let msgs: Vec<&str> = console_after
+            .iter()
+            .filter(|c| c.level == ConsoleLevel::Log)
+            .filter_map(|c| c.args.first().and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(msgs, vec!["first", "second", "third"]);
+        assert_eq!(e.pending_timers(), 0);
+    }
+
+    #[test]
+    fn engine_advance_clock_in_steps_fires_partial_then_remaining() {
+        // Verify the virtual clock is *cumulative* across multiple
+        // `advance_clock` calls: a timer at 250ms fires after
+        // advance(100) + advance(150), not before.
+        let e = engine();
+        let _ = e
+            .eval(
+                r#"
+                setTimeout(() => console.log('early'), 50);
+                setTimeout(() => console.log('late'), 250);
+                "#,
+            )
+            .expect("schedule ok");
+
+        // Advance to virtual time 100. Only the 50ms timer fires.
+        e.advance_clock(100).expect("advance 1 ok");
+        let first = e.drain_console();
+        let first_msgs: Vec<&str> = first
+            .iter()
+            .filter_map(|c| c.args.first().and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(first_msgs, vec!["early"]);
+        assert_eq!(e.pending_timers(), 1);
+
+        // Advance another 150 (cumulative virtual time = 250). The
+        // remaining timer fires.
+        e.advance_clock(150).expect("advance 2 ok");
+        let second = e.drain_console();
+        let second_msgs: Vec<&str> = second
+            .iter()
+            .filter_map(|c| c.args.first().and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(second_msgs, vec!["late"]);
+        assert_eq!(e.pending_timers(), 0);
+    }
+
+    #[test]
+    fn engine_set_interval_from_js_fires_correct_count_after_advance() {
+        // Schedule an interval, advance, observe the count.
+        let e = engine();
+        let _ = e
+            .eval(
+                r#"
+                globalThis.count = 0;
+                setInterval(() => {
+                    globalThis.count += 1;
+                    console.log('tick ' + globalThis.count);
+                }, 30);
+                "#,
+            )
+            .expect("schedule ok");
+        e.advance_clock(100).expect("advance ok");
+
+        // Drain BEFORE the next `eval`, because [`Self::eval`] resets
+        // the console buffer at the start of each call.
+        let drained = e.drain_console();
+        let ticks: Vec<&str> = drained
+            .iter()
+            .filter_map(|c| c.args.first().and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(ticks, vec!["tick 1", "tick 2", "tick 3"]);
+
+        // Fires at 30, 60, 90 — count should be 3.
+        let count = e.eval("globalThis.count").expect("eval ok");
+        assert_eq!(count.value, serde_json::json!(3));
+    }
+
+    #[test]
+    fn engine_clear_timeout_from_js_prevents_advance_from_firing() {
+        // JS schedules a timer and then clears it; advance_clock
+        // observes no fire.
+        let e = engine();
+        let _ = e
+            .eval(
+                r#"
+                const id = setTimeout(() => console.log('should not fire'), 50);
+                clearTimeout(id);
+                "#,
+            )
+            .expect("schedule+clear ok");
+        assert_eq!(e.pending_timers(), 0);
+
+        e.advance_clock(1000).expect("advance ok");
+        let drained = e.drain_console();
+        let logs: Vec<&ConsoleEntry> = drained
+            .iter()
+            .filter(|c| c.level == ConsoleLevel::Log)
+            .collect();
+        assert_eq!(logs.len(), 0, "no logs expected after clear");
+    }
+
+    #[test]
+    fn engine_advance_clock_with_zero_delta_fires_zero_delay_timer() {
+        // Engine-level equivalent of the timers::tests version, this
+        // time verifying the public surface produces a real
+        // console-side observation.
+        let e = engine();
+        let _ = e
+            .eval("setTimeout(() => console.log('immediate'), 0)")
+            .expect("schedule ok");
+        e.advance_clock(0).expect("advance ok");
+        let drained = e.drain_console();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].level, ConsoleLevel::Log);
+        assert_eq!(drained[0].args[0], "immediate");
+    }
+
+    #[test]
+    fn engine_throwing_timer_writes_console_error_and_pump_keeps_going() {
+        // Critical determinism property (ADR 0008): a throwing
+        // callback must not stop subsequent timers from firing.
+        // Validated at the engine surface using `advance_clock`.
+        let e = engine();
+        let _ = e
+            .eval(
+                r#"
+                setTimeout(() => console.log('A'), 10);
+                setTimeout(() => { throw new Error('mid-throw'); }, 20);
+                setTimeout(() => console.log('C'), 30);
+                "#,
+            )
+            .expect("schedule ok");
+
+        e.advance_clock(100).expect("advance ok");
+
+        let drained = e.drain_console();
+        // We should see exactly: log 'A', error 'mid-throw', log 'C'.
+        let log_msgs: Vec<&str> = drained
+            .iter()
+            .filter(|c| c.level == ConsoleLevel::Log)
+            .filter_map(|c| c.args.first().and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(log_msgs, vec!["A", "C"]);
+
+        let errors: Vec<&ConsoleEntry> = drained
+            .iter()
+            .filter(|c| c.level == ConsoleLevel::Error)
+            .collect();
+        assert_eq!(errors.len(), 1);
+        let err_msg = errors[0].args[0].as_str().expect("err arg is string");
+        assert!(err_msg.contains("mid-throw"), "got: {err_msg:?}");
+    }
+
+    // ===== Phase 1B event-model integration tests =====
+    //
+    // These exercise the global classes installed by
+    // `crate::events::install_events` end-to-end from JavaScript:
+    // create an EventTarget, wire a listener, dispatch, and observe
+    // the side effect via console capture or the dispatch return.
+
+    #[test]
+    fn js_event_target_dispatch_runs_listener_and_console_observes() {
+        let out = engine()
+            .eval(
+                r#"
+                const t = new EventTarget();
+                t.addEventListener('demo', (ev) => {
+                    console.log('saw', ev.type);
+                });
+                const r = t.dispatchEvent(new Event('demo'));
+                r
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value, true);
+        assert_eq!(out.console.len(), 1);
+        assert_eq!(out.console[0].args[0], "saw");
+        assert_eq!(out.console[0].args[1], "demo");
+    }
+
+    #[test]
+    fn js_custom_event_detail_is_visible_to_listener() {
+        // A listener attached via addEventListener should receive a
+        // CustomEvent whose `detail` carries through the dispatch
+        // intact.
+        let out = engine()
+            .eval(
+                r#"
+                const t = new EventTarget();
+                let saw = null;
+                t.addEventListener('payload', (ev) => { saw = ev.detail; });
+                t.dispatchEvent(new CustomEvent('payload', {detail: {id: 7, name: 'alice'}}));
+                saw
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value["id"], 7);
+        assert_eq!(out.value["name"], "alice");
+    }
+
+    #[test]
+    fn js_abort_controller_signals_listener_and_flips_state() {
+        // Create an AbortController, subscribe to "abort" on its
+        // signal, abort, and verify both that the listener fires and
+        // that the signal's state reflects the abort.
+        let out = engine()
+            .eval(
+                r#"
+                const c = new AbortController();
+                let count = 0;
+                let reasonSeen = null;
+                c.signal.addEventListener('abort', () => {
+                    count += 1;
+                    reasonSeen = c.signal.reason;
+                });
+                const before = c.signal.aborted;
+                c.abort('shutdown');
+                // Calling abort() twice should be idempotent.
+                c.abort('ignored');
+                [before, c.signal.aborted, count, reasonSeen]
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value[0], false);
+        assert_eq!(out.value[1], true);
+        // Listener should have fired exactly once even though we
+        // called abort twice.
+        assert_eq!(out.value[2], 1);
+        assert_eq!(out.value[3], "shutdown");
+    }
+
+    #[test]
+    fn js_prevent_default_propagates_back_to_caller_via_dispatch_return() {
+        // dispatchEvent should return false iff a listener called
+        // preventDefault on a cancelable event. We observe both
+        // outcomes within the same engine to confirm the contract.
+        let out = engine()
+            .eval(
+                r#"
+                const t = new EventTarget();
+                t.addEventListener('cancelable', (ev) => { ev.preventDefault(); });
+                t.addEventListener('plain', () => { /* no preventDefault */ });
+                const a = t.dispatchEvent(new Event('cancelable', {cancelable: true}));
+                const b = t.dispatchEvent(new Event('plain'));
+                [a, b]
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value[0], false);
+        assert_eq!(out.value[1], true);
+    }
+
+    #[test]
+    fn js_dom_exception_round_trips_from_js() {
+        // DOMException should be reachable from JS as a constructor,
+        // with name → code mapping working end-to-end through the
+        // engine. This shores up the engine-wiring path even though
+        // events.rs has its own unit tests for the table.
+        let out = engine()
+            .eval(
+                r#"
+                const e = new DOMException('not here', 'NotFoundError');
+                [e.message, e.name, e.code, e.toString()]
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value[0], "not here");
+        assert_eq!(out.value[1], "NotFoundError");
+        assert_eq!(out.value[2], 8);
+        assert_eq!(out.value[3], "DOMException: not here");
     }
 }

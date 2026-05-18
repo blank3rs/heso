@@ -53,6 +53,10 @@
 
 pub mod dom;
 pub mod engine;
+pub mod events;
+pub mod timers;
 
 pub use dom::{Document, DomTokenList, Element};
 pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};
+pub use events::{AbortController, AbortSignal, CustomEvent, DOMException, Event, EventTarget};
+pub use timers::VirtualClock;
