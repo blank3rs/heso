@@ -119,9 +119,11 @@ fn print_banner() {
     println!("  heso eval-js [--seed N] <js>  [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window yet — Phase 1B.");
     println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
-    println!("  heso eval-dom [--seed N] <url> <js>");
-    println!("                                [Phase 1B — ADR 0014] Fetch <url>, install document, evaluate <js>; print value+console as JSON");
-    println!("                                Pass `-` for <js> to read from stdin. --seed N seeds the determinism shims (default 0).");
+    println!("  heso eval-dom [--seed N] [--js-fetch] <url> <js>");
+    println!("                                [Phase 1C — ADR 0014] Fetch <url>, run every <script> in document order, then eval <js>");
+    println!("                                against the post-hydration DOM. Pass `-` for <js> to read from stdin.");
+    println!("                                --seed N seeds the determinism shims (default 0). Default skips <script src=...>;");
+    println!("                                pass --js-fetch to surface a structured error (real subresource fetch is PR C).");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso run   <url> <request>    [STUB] navigates to <url> only; request is ignored. Planner not yet wired.");
     println!();
@@ -707,28 +709,42 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
     }
 }
 
-/// `heso eval-dom <url> <js>` — fetch a URL, parse it, install
-/// `document` as the global, then evaluate `js` against the loaded
-/// DOM. Prints `{ok, value, console}` (or `{ok:false, error:{...}}`)
-/// as pretty JSON.
+/// `heso eval-dom [--js-fetch] <url> <js>` — fetch a URL, parse it,
+/// install `document` as the global, run every `<script>` tag on the
+/// page in document order, then evaluate `js` against the
+/// post-hydration DOM. Prints `{ok, value, console, scripts}` (or
+/// `{ok:false, error:{...}}`) as pretty JSON. The `scripts` object
+/// surfaces the [`ScriptOutcome`] counts so callers can see how many
+/// inline scripts ran, how many threw, and how many external `src=`
+/// refs were touched.
 ///
-/// Phase 1B demonstration surface (per ADR 0014). The DOM is
-/// read-only — `document.querySelector`, `element.textContent`,
-/// `element.getAttribute`, etc. all work; mutation methods will land
-/// in Phase 1C. No `<script>` tags are auto-executed yet — Phase 1C
-/// adds that too, so this command currently reads the post-parse DOM
-/// only (which is enough for many SSR pages).
+/// Phase 1C demonstration surface (per ADR 0014). DOM mutation
+/// methods, the event model, and the timer pump all work; what
+/// landed in this PR is the **page-script execution pass on load**,
+/// so an SSR page that hydrates by setting `document.title =`,
+/// mutating `<div id="root">` children, or stashing state on
+/// `globalThis` will already have done so by the time `js` runs.
 ///
-/// Argument forms:
+/// Argument forms (flag is order-tolerant — may appear before or
+/// after the URL):
 ///
-/// - `heso eval-dom <url> <js>` — JS source inline
-/// - `heso eval-dom <url> -` — JS source from stdin
+/// - `heso eval-dom <url> <js>` — JS source inline (default policy:
+///   external `<script src=...>` refs are skipped with a console.warn).
+/// - `heso eval-dom <url> -` — JS source from stdin.
+/// - `heso eval-dom --js-fetch <url> <js>` — opt-in flag: external
+///   `<script src=...>` currently surfaces a `console.error`
+///   explaining the fetch path is not wired yet. PR C (vendoring
+///   `llrt_fetch`) will flip this branch to issue an actual GET
+///   through the shared `reqwest::Client`. The flag exists in this
+///   PR so downstream tooling can stage on its CLI shape.
 ///
 /// Exit codes: 0 on success, 1 on fetch or JS error, 2 on usage.
 async fn cmd_eval_dom(args: &[String]) -> ExitCode {
-    // Same order-tolerant flag walk as `cmd_eval_js`: `--seed N` can
-    // appear in any position; positionals are `<url> <js>` in order.
+    // Order-tolerant flag walk: `--seed N` (with value) and
+    // `--js-fetch` / `--no-js-fetch` (boolean toggles) can appear in
+    // any position; positionals are `<url> <js>` in order.
     let mut seed: u64 = 0;
+    let mut js_fetch = false;
     let mut positional: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -747,9 +763,17 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
                 };
                 i += 2;
             }
+            "--js-fetch" => {
+                js_fetch = true;
+                i += 1;
+            }
+            "--no-js-fetch" => {
+                js_fetch = false;
+                i += 1;
+            }
             other if other.starts_with("--") && other != "-" => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso eval-dom [--seed N] <url> <js> | heso eval-dom [--seed N] <url> -  < script.js");
+                eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] <url> <js> | heso eval-dom [--seed N] [--js-fetch] <url> -  < script.js");
                 return ExitCode::from(2);
             }
             _ => {
@@ -759,7 +783,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
     }
     if positional.len() < 2 {
-        eprintln!("usage: heso eval-dom [--seed N] <url> <js> | heso eval-dom [--seed N] <url> -  < script.js");
+        eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] <url> <js> | heso eval-dom [--seed N] [--js-fetch] <url> -  < script.js");
         return ExitCode::from(2);
     }
     let url_arg = &positional[0];
@@ -805,13 +829,20 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
     };
 
-    match js_engine.eval_with_html(&html, &js_src) {
-        Ok(outcome) => {
+    let policy = if js_fetch {
+        heso_engine_js::ScriptFetchPolicy::Error
+    } else {
+        heso_engine_js::ScriptFetchPolicy::Skip
+    };
+
+    match js_engine.eval_with_html_capture(&html, &js_src, policy) {
+        Ok((outcome, script_outcome)) => {
             let body = serde_json::json!({
                 "ok": true,
                 "url": final_url.to_string(),
                 "value": outcome.value,
                 "console": outcome.console,
+                "scripts": script_outcome,
             });
             match serde_json::to_string_pretty(&body) {
                 Ok(s) => println!("{s}"),

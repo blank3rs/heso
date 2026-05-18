@@ -25,6 +25,7 @@ use rquickjs::{
 
 use crate::dom::{self, Document};
 use crate::rng::SeededRng;
+use crate::scripts::{self, ScriptFetchPolicy, ScriptOutcome};
 use crate::timers::{self, TimerScheduler};
 
 /// Memory cap per [`JsEngine`]. 10 MB is enough for typical
@@ -303,16 +304,84 @@ impl JsEngine {
     ///
     /// Parses `html` into a [`dom_query::Document`], wraps it in an
     /// [`Arc`], constructs a [`Document`] instance, installs it as
-    /// the `document` global, and then runs [`Self::eval`]. JS can
-    /// call the full Phase 1B DOM — `document.querySelector`,
-    /// `element.textContent`, `element.getAttribute`,
-    /// `element.setAttribute`, `element.innerHTML = ...`,
-    /// `element.classList.add(...)`, `element.appendChild(...)`, and
-    /// the rest.
+    /// the `document` global, **runs every `<script>` element in
+    /// document order** (Phase 1C, ADR 0014), and then runs
+    /// [`Self::eval`]. JS can call the full Phase 1B DOM —
+    /// `document.querySelector`, `element.textContent`,
+    /// `element.getAttribute`, `element.setAttribute`,
+    /// `element.innerHTML = ...`, `element.classList.add(...)`,
+    /// `element.appendChild(...)`, and the rest — and observe the
+    /// post-hydration DOM that page scripts produced.
+    ///
+    /// External `<script src="...">` references are skipped with a
+    /// `console.warn` entry. To choose a different policy (e.g. to
+    /// surface a hard error so callers know a real fetch was needed),
+    /// use [`Self::eval_with_html_policy`].
+    ///
+    /// A script that throws is captured into the engine's console
+    /// buffer as a `console.error` and the next script still runs —
+    /// see [`crate::scripts`] for the determinism rationale.
     ///
     /// Errors propagate the same way as [`Self::eval`].
     pub fn eval_with_html(&self, html: &str, js: &str) -> Result<EvalOutcome, EvalError> {
+        self.eval_with_html_policy(html, js, ScriptFetchPolicy::default())
+    }
+
+    /// Same as [`Self::eval_with_html`] but lets the caller pick the
+    /// [`ScriptFetchPolicy`] for external `<script src=...>` refs.
+    /// Returns the same [`EvalOutcome`] as [`Self::eval_with_html`];
+    /// the per-script [`ScriptOutcome`] tally is appended onto the
+    /// console buffer via the warn/error entries the policy emits and
+    /// is otherwise discarded here. Callers that need the structured
+    /// counts should use [`Self::eval_with_html_capture`].
+    pub fn eval_with_html_policy(
+        &self,
+        html: &str,
+        js: &str,
+        policy: ScriptFetchPolicy,
+    ) -> Result<EvalOutcome, EvalError> {
+        let (outcome, _scripts) = self.eval_with_html_capture(html, js, policy)?;
+        Ok(outcome)
+    }
+
+    /// Lowest-level wrapper around [`Self::eval_with_html`] that also
+    /// returns the [`ScriptOutcome`] tally from the script-pump pass.
+    /// Used by tests and by callers that want to surface a per-page
+    /// "ran N scripts, M errored" stat in their own receipt.
+    ///
+    /// Unlike a bare [`Self::eval`] call, this method **does not**
+    /// clear the console buffer between the `<script>`-pump pass and
+    /// the user's `js` evaluation. The returned [`EvalOutcome`]
+    /// therefore contains *both* (a) any console output emitted by
+    /// page scripts as they ran (including the `console.warn` /
+    /// `console.error` entries [`crate::scripts`] adds for
+    /// external-src refs and script throws), *and* (b) anything the
+    /// user's `js` argument logged. The structured counts in
+    /// [`ScriptOutcome`] are a parallel, per-eval-fresh tally for
+    /// callers that only care about totals.
+    ///
+    /// Rationale: page-script output is part of "what happened on
+    /// this page" and an agent debugging a hydration failure wants to
+    /// see it without a second roundtrip. The cost is that the
+    /// per-eval-fresh contract of [`Self::eval`] *does not extend*
+    /// here — callers explicitly choose this method when they want
+    /// the merged transcript.
+    pub fn eval_with_html_capture(
+        &self,
+        html: &str,
+        js: &str,
+        policy: ScriptFetchPolicy,
+    ) -> Result<(EvalOutcome, ScriptOutcome), EvalError> {
         let document = Document::from_html(html);
+        let dom = document.dom_arc();
+
+        // Clear once at the entry point so the merged transcript is
+        // bounded to this single call.
+        self.console_buffer
+            .lock()
+            .expect("console buffer poisoned")
+            .clear();
+
         self.context
             .with(|ctx| -> rquickjs::Result<()> {
                 let doc = Class::instance(ctx.clone(), document)?;
@@ -320,7 +389,55 @@ impl JsEngine {
                 Ok(())
             })
             .map_err(|e| EvalError::Engine(format!("install document global: {e}")))?;
-        self.eval(js)
+
+        // Run every <script> against the shared context — mutations
+        // land on the same `Arc<dom_query::Document>` the JS-side
+        // `document` global wraps, so by the time we eval `js` below,
+        // the DOM reflects post-hydration state.
+        let script_outcome =
+            scripts::run_scripts(&self.context, &dom, policy, &self.console_buffer)?;
+
+        let user_outcome = self.eval_no_clear(js)?;
+        Ok((user_outcome, script_outcome))
+    }
+
+    /// Variant of [`Self::eval`] that does **not** clear the console
+    /// buffer first. Used by [`Self::eval_with_html_capture`] so the
+    /// page-script transcript and the user-script transcript merge
+    /// into a single returned [`EvalOutcome::console`].
+    ///
+    /// Empty `code` is a fast no-op: skip the rquickjs eval and
+    /// return the current buffer snapshot. This lets a caller pass
+    /// `js = ""` to mean "just run the scripts; give me whatever
+    /// they produced."
+    fn eval_no_clear(&self, code: &str) -> Result<EvalOutcome, EvalError> {
+        let value = if code.is_empty() {
+            serde_json::Value::Null
+        } else {
+            self.context
+                .with(|ctx| -> Result<serde_json::Value, EvalError> {
+                    match ctx.eval::<Value, _>(code).catch(&ctx) {
+                        Ok(v) => js_value_to_json(&ctx, v),
+                        Err(CaughtError::Exception(exc)) => Err(EvalError::Exception {
+                            message: exc.message().unwrap_or_default(),
+                            stack: exc.stack(),
+                        }),
+                        Err(CaughtError::Value(v)) => {
+                            let repr = js_value_to_json(&ctx, v).unwrap_or(serde_json::Value::Null);
+                            Err(EvalError::ThrownValue { value: repr })
+                        }
+                        Err(CaughtError::Error(e)) => Err(EvalError::Engine(e.to_string())),
+                    }
+                })?
+        };
+
+        let console = self
+            .console_buffer
+            .lock()
+            .expect("console buffer poisoned")
+            .clone();
+
+        Ok(EvalOutcome { value, console })
     }
 
     /// Load `html`, find the element at `selector`, and dispatch a
@@ -1619,5 +1736,239 @@ mod tests {
             a.value, c.value,
             "different seed should produce different bytes"
         );
+    }
+
+    // ===== Phase 1C script-on-load integration tests =====
+    //
+    // These pin the load-bearing behavior of the script pump:
+    // inline scripts in document order, error containment, type-attr
+    // classification (data blocks skipped, JS MIMEs honored), external
+    // src= policy gating, and the user-eval-sees-post-hydration
+    // invariant.
+
+    #[test]
+    fn inline_script_runs_before_user_js_and_sets_document_title() {
+        let html = r#"<html><head><script>document.title = "set by script"</script></head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "document.title")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!("set by script"));
+    }
+
+    #[test]
+    fn two_inline_scripts_run_in_document_order() {
+        // script 1 sets window.x = 1; script 2 reads window.x and
+        // sets window.y. If document-order is broken, window.y will
+        // be NaN/undefined and the assertion fails.
+        let html = r#"<html><head>
+            <script>globalThis.x = 1;</script>
+            <script>globalThis.y = globalThis.x + 1;</script>
+        </head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "globalThis.y")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(2));
+    }
+
+    #[test]
+    fn syntax_error_in_one_script_does_not_prevent_next_script_from_running() {
+        // Critical determinism property: one bad script doesn't poison
+        // the rest of the page.
+        let html = r#"<html><head>
+            <script>globalThis.before = 'ok';</script>
+            <script>this is not valid javascript (((</script>
+            <script>globalThis.after = 'ok';</script>
+        </head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "[globalThis.before, globalThis.after]")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(["ok", "ok"]));
+    }
+
+    #[test]
+    fn throwing_script_does_not_prevent_next_script_from_running() {
+        // Same as the syntax-error case but a runtime throw rather
+        // than a parse failure. jsdom and happy-dom both keep going.
+        let html = r#"<html><head>
+            <script>globalThis.a = 1;</script>
+            <script>throw new Error('boom');</script>
+            <script>globalThis.b = 2;</script>
+        </head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "[globalThis.a, globalThis.b]")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn external_script_src_is_skipped_with_console_warn_under_default_policy() {
+        // External src= must NOT trigger a network fetch under the
+        // default ScriptFetchPolicy::Skip; a console.warn entry
+        // identifies what was skipped.
+        let html = r#"<html><head><script src="https://example.com/app.js"></script></head><body></body></html>"#;
+        let e = engine();
+        let _ = e.eval_with_html(html, "'done'").expect("eval ok");
+        // User-facing eval doesn't see the warn — buffer was cleared
+        // before the user's `js` ran (per the documented contract).
+        // Use eval_with_html_capture to see the warn + count.
+        let (out, script_outcome) = e
+            .eval_with_html_capture(html, "", ScriptFetchPolicy::Skip)
+            .expect("eval ok");
+        // Empty user-js path: the buffer survives (we cleared once,
+        // then ran one script, then ran `""`). Verify both pieces.
+        assert_eq!(script_outcome.external_handled, 1);
+        assert_eq!(script_outcome.executed, 0);
+        // The warn entry from the script pump remains on the buffer
+        // because `js=""` is a no-op that doesn't push anything.
+        assert!(
+            out.console
+                .iter()
+                .any(|c| matches!(c.level, ConsoleLevel::Warn)
+                    && c.args
+                        .first()
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("example.com/app.js"))
+                        .unwrap_or(false)),
+            "expected a warn naming app.js, got: {:?}",
+            out.console
+        );
+    }
+
+    #[test]
+    fn external_script_src_under_error_policy_emits_console_error() {
+        let html = r#"<html><head><script src="/bundle.js"></script></head><body></body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(html, "", ScriptFetchPolicy::Error)
+            .expect("eval ok");
+        assert_eq!(script_outcome.external_handled, 1);
+        assert!(
+            out.console
+                .iter()
+                .any(|c| matches!(c.level, ConsoleLevel::Error)
+                    && c.args
+                        .first()
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.contains("bundle.js") && s.contains("PR C"))
+                        .unwrap_or(false)),
+            "expected an error naming bundle.js + PR C, got: {:?}",
+            out.console
+        );
+    }
+
+    #[test]
+    fn script_can_mutate_dom_and_user_js_sees_post_mutation_state() {
+        let html = r#"<html><body>
+            <div id="target">original</div>
+            <script>
+                document.getElementById('target').textContent = 'hydrated';
+                document.getElementById('target').setAttribute('data-state', 'ready');
+            </script>
+        </body></html>"#;
+        let out = engine()
+            .eval_with_html(
+                html,
+                r#"
+                const el = document.getElementById('target');
+                [el.textContent, el.getAttribute('data-state')]
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(["hydrated", "ready"]));
+    }
+
+    #[test]
+    fn script_can_query_selector_and_append_new_element() {
+        let html = r#"<html><body>
+            <ul id="list"><li>a</li></ul>
+            <script>
+                const li = document.getElementById('list').querySelector('li');
+                li.setAttribute('data-marked', '1');
+                document.getElementById('list').innerHTML += '<li>b</li>';
+            </script>
+        </body></html>"#;
+        let out = engine()
+            .eval_with_html(
+                html,
+                r#"
+                const items = Array.from(document.querySelectorAll('#list li'))
+                  .map(el => el.textContent);
+                [items, document.querySelector('#list li').getAttribute('data-marked')]
+                "#,
+            )
+            .expect("eval ok");
+        // First item carries the mutation; second appended via innerHTML +=
+        assert_eq!(out.value[0][0], "a");
+        assert!(out.value[0].as_array().expect("array").len() >= 2);
+        assert_eq!(out.value[1], "1");
+    }
+
+    #[test]
+    fn data_block_script_type_is_skipped_not_executed() {
+        // <script type="application/ld+json"> is structured data, not
+        // code. We must NOT eval its contents (which would be a
+        // SyntaxError because JSON object literals at statement
+        // position parse as labelled statements).
+        let html = r#"<html><head>
+            <script type="application/ld+json">{"@type":"Article","headline":"x"}</script>
+            <script>globalThis.ran = true;</script>
+        </head><body></body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(html, "globalThis.ran", ScriptFetchPolicy::default())
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(true));
+        // The JSON data block was not executed; the JS script was.
+        assert_eq!(script_outcome.executed, 1);
+        assert_eq!(script_outcome.executed_with_error, 0);
+        assert_eq!(script_outcome.skipped_non_script_type, 1);
+    }
+
+    #[test]
+    fn explicit_text_javascript_type_attr_runs_as_classic_script() {
+        let html = r#"<html><head>
+            <script type="text/javascript">globalThis.flag = 7;</script>
+        </head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "globalThis.flag")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(7));
+    }
+
+    #[test]
+    fn module_type_attr_runs_as_classic_for_now_phase_1c_punt() {
+        // We do NOT implement real ES module loading; we just treat
+        // type="module" as classic so the body of a simple module
+        // still gets a chance to populate the DOM. This documents
+        // the punt so a follow-up agent doesn't break the test
+        // without realizing it.
+        let html = r#"<html><head>
+            <script type="module">globalThis.moduleRan = 'yes';</script>
+        </head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "globalThis.moduleRan")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!("yes"));
+    }
+
+    #[test]
+    fn eval_with_html_capture_returns_script_outcome_counts() {
+        let html = r#"<html><head>
+            <script>globalThis.ok1 = true;</script>
+            <script type="application/json">{"x":1}</script>
+            <script src="/missing.js"></script>
+            <script>throw new Error('intentional');</script>
+            <script>globalThis.ok2 = true;</script>
+        </head><body></body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(
+                html,
+                "[globalThis.ok1, globalThis.ok2]",
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!([true, true]));
+        assert_eq!(script_outcome.executed, 2);
+        assert_eq!(script_outcome.executed_with_error, 1);
+        assert_eq!(script_outcome.external_handled, 1);
+        assert_eq!(script_outcome.skipped_non_script_type, 1);
     }
 }

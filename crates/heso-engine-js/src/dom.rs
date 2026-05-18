@@ -128,6 +128,19 @@ impl Document {
     pub fn dom(&self) -> &DqDocument {
         &self.doc
     }
+
+    /// Clone the [`Arc`] wrapping the underlying [`dom_query::Document`].
+    ///
+    /// Useful when the engine needs to keep one extra refcount on the
+    /// same parse tree (for example, to walk it from Rust *and* hand
+    /// the same tree to a `Class<Document>` JS instance — the Phase 1C
+    /// script pump does this). Both handles share mutations: anything
+    /// JS does via `document.querySelector(...).setAttribute(...)`
+    /// shows up through this `Arc` too, because the underlying tree
+    /// is the *same* `dom_query::Document`, not a clone.
+    pub fn dom_arc(&self) -> Arc<DqDocument> {
+        self.doc.clone()
+    }
 }
 
 #[rquickjs::methods(rename_all = "camelCase")]
@@ -224,6 +237,74 @@ impl Document {
             None => String::new(),
         }
     }
+
+    /// `document.title = value` — set the text content of the existing
+    /// `<title>` element, or create one inside `<head>` if missing.
+    ///
+    /// The HTML spec says assigning to `document.title` mutates the
+    /// first `<title>` element if any; otherwise it inserts a new
+    /// `<title>` at the appropriate place (in `<head>` for an
+    /// HTML document; the document element for SVG; etc.). We
+    /// implement the HTML branch — which covers every page
+    /// `heso eval-dom` and `heso open --js` are likely to touch.
+    ///
+    /// Inline script reaches for this constantly (SSR hydration
+    /// often sets `document.title = ...` to reflect route changes),
+    /// so a Phase 1C `<script>`-execution pass would be obviously
+    /// broken without this setter.
+    #[qjs(set, rename = "title")]
+    fn set_title(&self, value: String) {
+        if let Some(sel) = self.doc.try_select("title") {
+            if let Some(first) = sel.nodes().first() {
+                first.set_text(value.clone());
+                return;
+            }
+        }
+        // No <title> present — create one and attach to <head> (or
+        // documentElement as a fallback).
+        let parent = self.doc.head().or_else(|| self.doc.body()).or_else(|| {
+            // Last resort: the document element.
+            let root = self.doc.tree.root();
+            root.children_it(false).find(|c| c.is_element())
+        });
+        let Some(parent) = parent else { return };
+        // Build the new <title>X</title> via an HTML fragment so the
+        // text is properly escaped + we don't need a low-level
+        // node-construction API.
+        let escaped = html_escape(&value);
+        let fragment = format!("<title>{escaped}</title>");
+        // Append by setting innerHTML on a temporary holder, then
+        // re-parent. dom_query exposes `set_html` on a node, which
+        // replaces children; instead we use the trick of appending to
+        // a detached node. Simpler: just patch the parent's
+        // children — but that loses sibling order. Use the dom_query
+        // primitive that fits: `append_html` if available, otherwise
+        // fall back to set_html-on-a-temp + append_child of the
+        // single child. dom_query 0.28 has `append_html` on NodeRef.
+        parent.append_html(fragment);
+    }
+}
+
+/// Escape `s` so it is safe to embed in HTML text content.
+///
+/// Phase-1C scope: we only need to handle the title-setter path, so
+/// the bare-minimum substitutions (`& < >`) suffice — `<title>` is a
+/// "raw text" element per the HTML spec, meaning the parser ignores
+/// `<` inside it, but we still escape both `&` (which is recognized
+/// as a numeric reference start) and angle brackets for defense in
+/// depth. Quote escapement is unnecessary because we never embed in
+/// an attribute.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// A handle to a single element in a [`Document`]'s tree.
