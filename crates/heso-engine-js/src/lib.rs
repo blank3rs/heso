@@ -20,9 +20,13 @@
 //! inside a sandboxed QuickJS context and return the result as a
 //! [`serde_json::Value`] alongside any captured `console.*` output.
 //! **Phase 1B** (the agent-shaped DOM) is under way — `Document` and
-//! `Element` types backed by `scraper::Html`, the parts of the DOM real
-//! pages actually call. Phase 1C runs `<script>` tags on load so SPA
-//! hydration actually happens. Phase 1D fills out window globals.
+//! `Element` types backed by `dom_query::Document` (a mutable
+//! `html5ever`-backed tree), exposing both the read half
+//! (querySelector / textContent / getAttribute / ...) and the
+//! mutation surface real pages reach for during hydration
+//! (setAttribute / innerHTML setter / appendChild / classList).
+//! Phase 1C runs `<script>` tags on load so SPA hydration actually
+//! happens. Phase 1D fills out window globals.
 //!
 //! ## Why QuickJS
 //!
@@ -50,5 +54,5 @@
 pub mod dom;
 pub mod engine;
 
-pub use dom::{Document, Element};
+pub use dom::{Document, DomTokenList, Element};
 pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};

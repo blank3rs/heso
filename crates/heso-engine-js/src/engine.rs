@@ -22,7 +22,6 @@ use rquickjs::{
     prelude::Rest, CatchResultExt, CaughtError, Class, Context, Ctx, Function, Object, Runtime,
     Value,
 };
-use scraper::Html;
 
 use crate::dom::{self, Document};
 
@@ -168,20 +167,21 @@ impl JsEngine {
 
     /// Evaluate `js` against a parsed HTML page.
     ///
-    /// Parses `html` into a [`scraper::Html`], wraps it in an [`Arc`],
-    /// constructs a [`Document`] instance, installs it as the
-    /// `document` global, and then runs [`Self::eval`]. The Phase 1B
-    /// (read-only) DOM is exposed — JS can call
-    /// `document.querySelector`, `element.textContent`,
-    /// `element.getAttribute`, etc. — but mutations are silently
-    /// ignored (no setters until Phase 1C).
+    /// Parses `html` into a [`dom_query::Document`], wraps it in an
+    /// [`Arc`], constructs a [`Document`] instance, installs it as
+    /// the `document` global, and then runs [`Self::eval`]. JS can
+    /// call the full Phase 1B DOM — `document.querySelector`,
+    /// `element.textContent`, `element.getAttribute`,
+    /// `element.setAttribute`, `element.innerHTML = ...`,
+    /// `element.classList.add(...)`, `element.appendChild(...)`, and
+    /// the rest.
     ///
     /// Errors propagate the same way as [`Self::eval`].
     pub fn eval_with_html(&self, html: &str, js: &str) -> Result<EvalOutcome, EvalError> {
-        let parsed = Arc::new(Html::parse_document(html));
+        let document = Document::from_html(html);
         self.context
             .with(|ctx| -> rquickjs::Result<()> {
-                let doc = Class::instance(ctx.clone(), Document::new(parsed))?;
+                let doc = Class::instance(ctx.clone(), document)?;
                 ctx.globals().set("document", doc)?;
                 Ok(())
             })
@@ -705,5 +705,93 @@ mod tests {
             .expect("eval_with_html ok");
         let s = out.value.as_str().expect("value should be a string");
         assert!(s.contains(r#"<div class="x">"#), "got: {s:?}");
+    }
+
+    // ===== Mutation surface integration tests =====
+
+    #[test]
+    fn js_can_set_attribute_and_read_it_back() {
+        let html = r#"<html><body><a href="/old">go</a></body></html>"#;
+        let out = engine()
+            .eval_with_html(
+                html,
+                r#"
+                const a = document.querySelector('a');
+                a.setAttribute('href', '/new');
+                a.setAttribute('data-source', 'agent');
+                [a.getAttribute('href'), a.getAttribute('data-source')]
+                "#,
+            )
+            .expect("eval_with_html ok");
+        assert_eq!(out.value, serde_json::json!(["/new", "agent"]));
+    }
+
+    #[test]
+    fn js_inner_html_setter_replaces_children() {
+        let html = "<html><body><div id=\"target\"><p>old</p></div></body></html>";
+        let out = engine()
+            .eval_with_html(
+                html,
+                r#"
+                const target = document.getElementById('target');
+                target.innerHTML = '<span class="new">freshly parsed</span>';
+                target.querySelector('.new').textContent
+                "#,
+            )
+            .expect("eval_with_html ok");
+        assert_eq!(out.value, serde_json::json!("freshly parsed"));
+    }
+
+    #[test]
+    fn js_class_list_add_remove_toggle_contains_round_trip() {
+        let html = r#"<html><body><div class="a">x</div></body></html>"#;
+        let out = engine()
+            .eval_with_html(
+                html,
+                r#"
+                const d = document.querySelector('div');
+                d.classList.add('b');
+                d.classList.add('c');
+                d.classList.remove('a');
+                const toggled = d.classList.toggle('highlight');  // adds → true
+                const hasB = d.classList.contains('b');
+                const hasA = d.classList.contains('a');
+                [d.className, toggled, hasB, hasA]
+                "#,
+            )
+            .expect("eval_with_html ok");
+        // Order of tokens reflects insertion order; "a" was removed.
+        assert_eq!(out.value[1], true);
+        assert_eq!(out.value[2], true);
+        assert_eq!(out.value[3], false);
+        let class = out.value[0].as_str().expect("className is string");
+        for token in ["b", "c", "highlight"] {
+            assert!(
+                class.split_ascii_whitespace().any(|t| t == token),
+                "expected token {token} in {class:?}"
+            );
+        }
+        assert!(
+            !class.split_ascii_whitespace().any(|t| t == "a"),
+            "did not expect 'a' in {class:?}"
+        );
+    }
+
+    #[test]
+    fn js_append_child_reparents() {
+        let html = "<html><body><div id=\"src\"><p id=\"item\">x</p></div><div id=\"dst\"></div></body></html>";
+        let out = engine()
+            .eval_with_html(
+                html,
+                r#"
+                const src = document.getElementById('src');
+                const dst = document.getElementById('dst');
+                const item = document.getElementById('item');
+                dst.appendChild(item);
+                [src.children.length, dst.children.length, dst.children[0].id]
+                "#,
+            )
+            .expect("eval_with_html ok");
+        assert_eq!(out.value, serde_json::json!([0, 1, "item"]));
     }
 }
