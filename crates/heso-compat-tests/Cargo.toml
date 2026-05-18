@@ -1,0 +1,26 @@
+[package]
+name = "heso-compat-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Compatibility test harness — pinned-URL inventory + recorded cassettes, replayed against the real heso-engine-fetch via wiremock-rs. Regression net for the agent-relevant half of the web."
+publish = false
+
+[dependencies]
+heso-core = { path = "../heso-core" }
+heso-engine-api = { path = "../heso-engine-api" }
+heso-engine-fetch = { path = "../heso-engine-fetch" }
+reqwest.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+wiremock = "0.6"
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

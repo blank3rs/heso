@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="generator" content="docs.rs 0.0.0 (e50152ed411bb913753b1dfd203f22cb8711f097 2026-05-17 )"><link rel="stylesheet" href="/-/static/vendored.css?0-0-0-e50152ed411bb913753b1dfd203f22cb8711f097-2026-05-17" media="all" />
+        <link rel="stylesheet" href="/-/static/style.css?0-0-0-e50152ed411bb913753b1dfd203f22cb8711f097-2026-05-17" media="all" />
+        <link rel="stylesheet" href="/-/static/font-awesome.css?0-0-0-e50152ed411bb913753b1dfd203f22cb8711f097-2026-05-17" media="all" />
+
+        <link rel="search" href="/-/static/opensearch.xml" type="application/opensearchdescription+xml" title="Docs.rs" />
+
+        <title>Docs.rs</title><script nonce="w6e4rGai5uGIzqbDPqFi2YdfteRwjfpHcB9aZfPwlTIirwPp">(function() {
+    function applyTheme(theme) {
+        if (theme) {
+            document.documentElement.dataset.docsRsTheme = theme;
+        }
+    }
+
+    window.addEventListener("storage", ev => {
+        if (ev.key === "rustdoc-theme") {
+            applyTheme(ev.newValue);
+        }
+    });
+
+    // see ./storage-change-detection.html for details
+    window.addEventListener("message", ev => {
+        if (ev.data && ev.data.storage && ev.data.storage.key === "rustdoc-theme") {
+            applyTheme(ev.data.storage.value);
+        }
+    });
+
+    applyTheme(window.localStorage.getItem("rustdoc-theme"));
+})();</script><script defer type="text/javascript" nonce="w6e4rGai5uGIzqbDPqFi2YdfteRwjfpHcB9aZfPwlTIirwPp" src="/-/static/menu.js?0-0-0-e50152ed411bb913753b1dfd203f22cb8711f097-2026-05-17"></script>
+        <script defer type="text/javascript" nonce="w6e4rGai5uGIzqbDPqFi2YdfteRwjfpHcB9aZfPwlTIirwPp" src="/-/static/index.js?0-0-0-e50152ed411bb913753b1dfd203f22cb8711f097-2026-05-17"></script>
+    </head>
+
+    <body class="centered">
+<div class="nav-container">
+    <div class="container">
+        <div class="pure-menu pure-menu-horizontal" role="navigation" aria-label="Main navigation">
+            <form action="/releases/search"
+                  method="GET"
+                  id="nav-search-form"
+                  class="landing-search-form-nav  ">
+
+                
+                <a href="/" class="pure-menu-heading pure-menu-link docsrs-logo" aria-label="Docs.rs">
+                    <span title="Docs.rs"><span class="fa fa-solid fa-cubes " aria-hidden="true"></span></span>
+                    <span class="title">Docs.rs</span>
+                </a><div class="spacer"></div>
+                
+                
+
+<ul class="pure-menu-list">
+                    <li class="pure-menu-item pure-menu-has-children">
+                        <a href="#" class="pure-menu-link" aria-label="docs.rs">docs.rs</a>
+                        <ul class="pure-menu-children aligned-icons"><li class="pure-menu-item"><a class="pure-menu-link" href="/about"><span class="fa fa-solid fa-circle-info " aria-hidden="true"></span> About docs.rs</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/badges"><span class="fa fa-brands fa-fonticons " aria-hidden="true"></span> Badges</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/builds"><span class="fa fa-solid fa-gears " aria-hidden="true"></span> Builds</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/metadata"><span class="fa fa-solid fa-table " aria-hidden="true"></span> Metadata</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/redirections"><span class="fa fa-solid fa-road " aria-hidden="true"></span> Shorthand URLs</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/download"><span class="fa fa-solid fa-download " aria-hidden="true"></span> Download</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/about/rustdoc-json"><span class="fa fa-solid fa-file-code " aria-hidden="true"></span> Rustdoc JSON</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="/releases/queue"><span class="fa fa-solid fa-gears " aria-hidden="true"></span> Build queue</a></li><li class="pure-menu-item"><a class="pure-menu-link" href="https://foundation.rust-lang.org/policies/privacy-policy/#docs.rs" target="_blank"><span class="fa fa-solid fa-shield-halved " aria-hidden="true"></span> Privacy policy</a></li>
+                        </ul>
+                    </li>
+                </ul>
+                <ul class="pure-menu-list"><li class="pure-menu-item pure-menu-has-children">
+                        <a href="#" class="pure-menu-link" aria-label="Rust">Rust</a>
+                        <ul class="pure-menu-children">
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://www.rust-lang.org/" target="_blank">Rust website</a></li>
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/book/" target="_blank">The Book</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/std/" target="_blank">Standard Library API Reference</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/rust-by-example/" target="_blank">Rust by Example</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/cargo/guide/" target="_blank">The Cargo Guide</a></li>
+
+                            <li class="pure-menu-item"><a class="pure-menu-link" href="https://doc.rust-lang.org/nightly/clippy" target="_blank">Clippy Documentation</a></li>
+                        </ul>
+                    </li>
+                </ul>
+                
+                <div id="search-input-nav">
+                    <label for="nav-search">
+                        <span class="fa fa-solid fa-magnifying-glass " aria-hidden="true"></span>
+                    </label>
+
+                    
+                    
+                    <input id="nav-search" name="query" type="text" aria-label="Find crate by search query" tabindex="-1"
+                        placeholder="Find crate"
+                        >
+                </div>
+            </form>
+        </div>
+    </div>
+</div><div class="container landing">
+        <h1 class="brand"><span class="fa fa-solid fa-cubes " aria-hidden="true"></span> Docs.rs</h1>
+
+        <form action="/releases/search" method="GET" class="landing-search-form">
+            <div>
+                <input class="search-input" id="search" name="query" type="text" aria-label="Find crate by search query"
+                    placeholder="Type 'S' or '/' to search" autofocus>
+            </div>
+
+            <div class="buttons">
+                <button type="submit" class="pure-button pure-button-normal">Search</button>
+                <button type="submit" class="pure-button pure-button-normal" name="i-am-feeling-lucky" value="1">
+                    I'm Feeling Lucky
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <div class="container">
+        <div class="recent-releases-container">
+            <div class="release">
+                <a href="/releases">
+                    <strong>Recent Releases</strong>
+                </a>
+                <a href="/releases/feed" title="Atom feed"><span class="fa fa-solid fa-square-rss " aria-hidden="true"></span></a>
+            </div>
+
+            <ul><li>
+                        <a href="/hypercircuit/0.2.0/hypercircuit/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">hypercircuit-0.2.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">Exact-aware circuit MNA carriers and adapter reports for the Hyper ecosystem</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:17:01Z">2 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/oxc_parser_napi/0.132.0/oxc_parser_napi/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">oxc_parser_napi-0.132.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">A collection of JavaScript tools written in Rust.</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:56Z">7 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/guilder-abstraction/0.1.24/guilder_abstraction/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">guilder-abstraction-0.1.24</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">multi-exchange crypto trading trait</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:55Z">8 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/oxc/0.132.0/oxc/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">oxc-0.132.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">A collection of JavaScript tools written in Rust.</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:49Z">14 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/oxc_minify_napi/0.132.0/oxc_minify_napi/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">oxc_minify_napi-0.132.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">A collection of JavaScript tools written in Rust.</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:44Z">19 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/oxc_transformer_plugins/0.132.0/oxc_transformer_plugins/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">oxc_transformer_plugins-0.132.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">A collection of JavaScript tools written in Rust.</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:38Z">25 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/ffav/4.3.12/ffav/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">ffav-4.3.12</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">Safe FFmpeg wrapper (FFmpeg 4 compatible fork of the ffmpeg-next crate)</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:31Z">32 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/browser-info/1.0.0/browser_info/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">browser-info-1.0.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">Cross-platform(planned) library retrieving active browser URL and detailed information</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:15Z">48 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/crate/kanade-backend/0.18.1"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">kanade-backend-0.18.1</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">axum + SQLite projection backend for the kanade endpoint-management system. Hosts /api/* and the embedded SPA dashboard, projects JetStream streams into SQLite, drives the cron scheduler</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:13Z">50 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/performance-timing/0.1.1/performance_timing/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">performance-timing-0.1.1</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">Performance measurement library. Supports CPU cycle accurate measurement for x86 platforms.
+</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:08Z">55 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/doric/0.1.0/doric/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">doric-0.1.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">A highly simple asynchronous logging lib for Rust.</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:16:05Z">58 seconds ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/chbs_password_checker/0.1.0/chbslib/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">chbs_password_checker-0.1.0</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">Password Strength Checker</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:15:56Z">one minute ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/base65536/1.0.1/base65536/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">base65536-1.0.1</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">A binary encoding optimized for UTF-32/UCS-4 encoded text and Twitter</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:15:52Z">one minute ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/bounded_types/0.2.1/bounded_types/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">bounded_types-0.2.1</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">Provides a type representing bounded integers, implemented using const generics.</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:15:52Z">one minute ago</div></div>
+                        </a>
+                    </li><li>
+                        <a href="/cordic/0.1.5/cordic/"
+                            class="release">
+                            <div class="pure-g">
+                                <div class="pure-u-1 pure-u-sm-6-24 pure-u-md-5-24 name">cordic-0.1.5</div>
+                                <div class="pure-u-1 pure-u-sm-14-24 pure-u-md-16-24 description">Special functions for fixed-point numbers using the CORDIC method.</div><div class="pure-u-1 pure-u-sm-4-24 pure-u-md-3-24 date"
+                                        title="2026-05-18T11:15:49Z">one minute ago</div></div>
+                        </a>
+                    </li></ul>
+        </div>
+    </div><script nonce="w6e4rGai5uGIzqbDPqFi2YdfteRwjfpHcB9aZfPwlTIirwPp" type="text/javascript" src="/-/static/keyboard.js?0-0-0-e50152ed411bb913753b1dfd203f22cb8711f097-2026-05-17"></script></body>
+</html>

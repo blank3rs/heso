@@ -9,6 +9,7 @@ members = [
     "crates/heso-trace",
     "crates/heso-trace-exec",
     "crates/heso-cli",
+    "crates/heso-compat-tests",
 ]
 
 [workspace.package]
