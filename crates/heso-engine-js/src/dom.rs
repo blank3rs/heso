@@ -73,7 +73,16 @@
 use std::sync::Arc;
 
 use dom_query::{Document as DqDocument, NodeId, NodeRef};
-use rquickjs::{class::Trace, Class, Ctx, JsLifetime};
+use rquickjs::{
+    class::Trace,
+    prelude::{Opt, This},
+    Class, Ctx, Error as JsError, Function, JsLifetime, Object, Value,
+};
+
+use crate::events::{
+    self, add_listener_to_instance, dispatch_on_instance, parse_listener_options,
+    remove_listener_from_instance,
+};
 
 /// The `document` global.
 ///
@@ -476,6 +485,128 @@ impl Element {
     fn class_list(&self) -> DomTokenList {
         DomTokenList::new(self.clone())
     }
+
+    /// `element.value` — read the current `value` attribute of a form
+    /// control. Mirrors the standard DOM property for `<input>` /
+    /// `<textarea>` / `<select>`. Returns the empty string when the
+    /// attribute is absent.
+    ///
+    /// Phase 1B simplification: stored entirely as an attribute (so
+    /// `getAttribute('value')` and `.value` agree). Real browsers
+    /// distinguish the *content* attribute from the *IDL* property
+    /// (the typed-in text), but until interactive input + reset wiring
+    /// matters we collapse the two.
+    #[qjs(get)]
+    fn value(&self) -> String {
+        self.node_ref()
+            .and_then(|n| n.attr("value"))
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `element.value = "..."` — set the `value` attribute. Does not
+    /// itself fire `input` / `change` — those are dispatched by the
+    /// caller (e.g. [`crate::JsEngine::set_input_value`]).
+    #[qjs(set, rename = "value")]
+    fn set_value(&self, value: String) {
+        if let Some(n) = self.node_ref() {
+            n.set_attr("value", &value);
+        }
+    }
+
+    /// `element.addEventListener(type, listener, options?)` — register
+    /// a JS callback for `type` events on this element. Mirrors
+    /// [`crate::EventTarget`]; listener storage is JS-side on the
+    /// element instance under the same hidden `__listeners` map shape,
+    /// so dispatch logic (and the no-Persistent footgun avoidance)
+    /// stays unified.
+    fn add_event_listener<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        event_type: String,
+        listener: Function<'js>,
+        options: Opt<Value<'js>>,
+    ) -> rquickjs::Result<()> {
+        let (capture, once, passive) = parse_listener_options(&ctx, options.0)?;
+        let instance: Object<'js> = this
+            .0
+            .into_value()
+            .into_object()
+            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
+        add_listener_to_instance(
+            &ctx,
+            &instance,
+            &event_type,
+            &listener,
+            capture,
+            once,
+            passive,
+        )
+    }
+
+    /// `element.removeEventListener(type, listener, options?)`.
+    fn remove_event_listener<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        event_type: String,
+        listener: Function<'js>,
+        options: Opt<Value<'js>>,
+    ) -> rquickjs::Result<()> {
+        let (capture, _, _) = parse_listener_options(&ctx, options.0)?;
+        let instance: Object<'js> = this
+            .0
+            .into_value()
+            .into_object()
+            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
+        remove_listener_from_instance(&ctx, &instance, &event_type, &listener, capture)
+    }
+
+    /// `element.dispatchEvent(event)` — fire `event` on this element,
+    /// invoking every listener registered for `event.type`. Returns
+    /// `false` iff the event is cancelable and a listener called
+    /// `preventDefault()`. Flat dispatch (no capture/bubble walk) per
+    /// the Phase 1B punts documented in [`crate::events`].
+    fn dispatch_event<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        event: Value<'js>,
+    ) -> rquickjs::Result<bool> {
+        let instance: Object<'js> = this
+            .0
+            .into_value()
+            .into_object()
+            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
+        dispatch_on_instance(&ctx, &instance, event)
+    }
+
+    /// `element.click()` — synthesize and dispatch a cancelable
+    /// `"click"` event on this element. Equivalent to
+    /// `element.dispatchEvent(new Event('click', { bubbles: true,
+    /// cancelable: true }))`, which is what real browsers do for the
+    /// HTMLElement.click() shortcut.
+    ///
+    /// Returns nothing — call sites that want to know whether
+    /// `preventDefault()` was called should use `dispatchEvent`
+    /// directly. (DOM spec says `.click()` is `void` too.)
+    fn click<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<()> {
+        let event = events::Event::new_with_init(
+            "click".to_owned(),
+            Some(events::EventInit {
+                bubbles: true,
+                cancelable: true,
+                composed: false,
+            }),
+        );
+        let event_class = Class::instance(ctx.clone(), event)?;
+        let event_value: Value<'js> = event_class.into_value();
+        let instance: Object<'js> = this
+            .0
+            .into_value()
+            .into_object()
+            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
+        let _ = dispatch_on_instance(&ctx, &instance, event_value)?;
+        Ok(())
+    }
 }
 
 /// `element.classList` — a [DOMTokenList][spec] over the element's
@@ -656,14 +787,16 @@ mod tests {
         let head = d.head().expect("head");
         assert_eq!(body.tag_name(), "BODY");
         assert_eq!(head.tag_name(), "HEAD");
-        assert_eq!(body.query_selector("p".to_owned()).unwrap().text_content(), "x");
+        assert_eq!(
+            body.query_selector("p".to_owned()).unwrap().text_content(),
+            "x"
+        );
     }
 
     #[test]
     fn element_get_attribute_returns_some_and_none() {
-        let d = doc(
-            r#"<html><body><a href="https://example.com" class="btn">go</a></body></html>"#,
-        );
+        let d =
+            doc(r#"<html><body><a href="https://example.com" class="btn">go</a></body></html>"#);
         let a = d.query_selector("a".to_owned()).expect("a");
         assert_eq!(
             a.get_attribute("href".to_owned()),
@@ -873,7 +1006,10 @@ mod tests {
         assert!(cl.contains("c".to_owned()));
         let class = div.class_name();
         // Count of "b" is exactly one.
-        assert_eq!(class.split_ascii_whitespace().filter(|t| *t == "b").count(), 1);
+        assert_eq!(
+            class.split_ascii_whitespace().filter(|t| *t == "b").count(),
+            1
+        );
     }
 
     #[test]

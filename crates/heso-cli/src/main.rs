@@ -77,8 +77,8 @@ use std::process::ExitCode;
 use heso_core::Url;
 use heso_engine_api::{EngineApi, Page};
 use heso_engine_fetch::{
-    linked_pages_to_json, ExploreOptions, FetchEngine, DEFAULT_LINK_CAP,
-    HARD_LINK_CAP,
+    linked_pages_to_json, resolve_action, ElementRef, ExploreOptions, FetchEngine,
+    DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use heso_primitives::{CdInput, CdTarget, PrimitiveOp, Trace};
 use heso_trace::Mode;
@@ -98,16 +98,22 @@ fn print_banner() {
     println!("  heso open  <url>              Fetch once, return {{url,title,description,metadata,tree,actions,plat_hash}} (agent-facing)");
     println!("    [--explore-links N]            Pre-fetch up to --link-cap direct (depth=1) or nested (depth>=2) same-origin links");
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
+    println!("  heso click  <url> <@ref>      Fetch <url>, find element at <@ref> in the action graph, dispatch a click");
+    println!("  heso fill   <url> <@ref> <v>  Fetch <url>, find element at <@ref>, set its .value and fire input+change");
+    println!("  heso submit <url> <@form-ref> Fetch <url>, find form at <@form-ref>, click its first submit control");
     println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
     println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
     println!("  heso eval-js <js>             [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window yet — Phase 1B.");
+    println!("  heso eval-dom <url> <js>      [Phase 1B] Fetch <url>, install document, evaluate <js> against the DOM");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso run   <url> <request>    [STUB] navigates to <url> only; request is ignored. Planner not yet wired.");
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See state.json + decisions/0012-fetch-only-native-engine.md (static engine) and");
-    println!("decisions/0014-bundled-quickjs-agent-dom.md (JS engine, in progress) for the design.");
+    println!(
+        "decisions/0014-bundled-quickjs-agent-dom.md (JS engine, in progress) for the design."
+    );
 }
 
 /// Open a URL with the default `FetchEngine`. Returns the loaded page or an
@@ -299,9 +305,7 @@ async fn cmd_cat(args: &[String]) -> ExitCode {
 ///   everything in `/pricing` and below (e.g. `/pricing/enterprise`).
 async fn cmd_find(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!(
-            "usage: heso find <url> [--role X] [--name SUBSTR] [--section /path]"
-        );
+        eprintln!("usage: heso find <url> [--role X] [--name SUBSTR] [--section /path]");
         return ExitCode::from(2);
     }
     let url_arg = &args[0];
@@ -341,9 +345,7 @@ async fn cmd_find(args: &[String]) -> ExitCode {
             }
             other => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!(
-                    "usage: heso find <url> [--role X] [--name SUBSTR] [--section /path]"
-                );
+                eprintln!("usage: heso find <url> [--role X] [--name SUBSTR] [--section /path]");
                 return ExitCode::from(2);
             }
         }
@@ -450,18 +452,14 @@ async fn cmd_open(args: &[String]) -> ExitCode {
                     }
                 };
                 if link_cap > HARD_LINK_CAP {
-                    eprintln!(
-                        "--link-cap clamped from {link_cap} to hard max {HARD_LINK_CAP}"
-                    );
+                    eprintln!("--link-cap clamped from {link_cap} to hard max {HARD_LINK_CAP}");
                     link_cap = HARD_LINK_CAP;
                 }
                 i += 2;
             }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!(
-                    "usage: heso open [--explore-links N] [--link-cap M] <url>"
-                );
+                eprintln!("usage: heso open [--explore-links N] [--link-cap M] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -530,8 +528,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         if let Some(obj) = body.as_object_mut() {
             obj.insert(
                 "inline_data".to_owned(),
-                serde_json::to_value(&page.inline_data)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(&page.inline_data).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -539,8 +536,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         if let Some(obj) = body.as_object_mut() {
             obj.insert(
                 "data_attrs".to_owned(),
-                serde_json::to_value(&page.data_attrs)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(&page.data_attrs).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -778,6 +774,314 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
     }
 }
 
+/// Build a CSS selector that resolves an action-graph element via
+/// `document.querySelector(...)`.
+///
+/// Strategy, in order of preference:
+///
+/// 1. `attrs["id"]` is present and looks like a plain identifier:
+///    `#<id>`. Plain-identifier means it parses fine in CSS without
+///    escaping — alphanumeric / underscore / hyphen, and doesn't
+///    start with a digit. Almost every real-world id qualifies.
+/// 2. Tag plus discriminating attributes: for `<a>` use
+///    `a[href="..."]`; for form controls use the tag plus
+///    `[type="..."][name="..."]` if both are present, falling back to
+///    either alone. Quoting via `serde_json::to_string` gives us a
+///    CSS-safe attribute literal (the JSON string-literal grammar is
+///    a subset of what CSS accepts inside `[attr="..."]`).
+/// 3. Last-resort fallback: bare tag selector + nth-of-type derived
+///    from the element's position in the document. This is a best-
+///    effort guess and may match the wrong element on a complex page;
+///    when an action ref leaks here, the better fix is to give the
+///    element a name / id upstream.
+///
+/// Returns `None` only if `el` lacks both a tag name AND any of the
+/// fallback attrs — in practice, every action-graph entry has a tag
+/// so this is unreachable.
+fn selector_for_action(el: &ElementRef) -> Option<String> {
+    // (1) prefer a clean id selector.
+    if let Some(id) = el.attrs.get("id") {
+        if !id.is_empty() && is_css_plain_ident(id) {
+            return Some(format!("#{id}"));
+        }
+    }
+
+    let tag = el.tag.as_str();
+    if tag.is_empty() {
+        return None;
+    }
+
+    // (2a) <a> with href.
+    if tag == "a" {
+        if let Some(href) = el.attrs.get("href") {
+            return Some(format!("a[href={}]", css_attr_literal(href)));
+        }
+    }
+
+    // (2b) form controls: combine type + name when present.
+    if matches!(tag, "input" | "textarea" | "select" | "button") {
+        let mut sel = tag.to_owned();
+        if let Some(t) = el.attrs.get("type") {
+            sel.push_str(&format!("[type={}]", css_attr_literal(t)));
+        }
+        if let Some(n) = el.attrs.get("name") {
+            sel.push_str(&format!("[name={}]", css_attr_literal(n)));
+        }
+        // If we added any attribute, return; else fall through to (3).
+        if sel.len() > tag.len() {
+            return Some(sel);
+        }
+    }
+
+    // (2c) <form> with action.
+    if tag == "form" {
+        if let Some(a) = el.attrs.get("action") {
+            return Some(format!("form[action={}]", css_attr_literal(a)));
+        }
+    }
+
+    // (3) bare tag. May be ambiguous on a complex page — caller
+    // should plumb more attrs upstream if this becomes a real issue.
+    Some(tag.to_owned())
+}
+
+/// `true` if `s` parses as a CSS identifier without escaping —
+/// alphanumeric + underscore + hyphen, doesn't start with a digit or
+/// a single `-` followed by a digit. Conservative; rejects valid-but-
+/// fancy ids in favor of falling back to attribute matching.
+fn is_css_plain_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// JSON-encode `value` to produce a CSS-safe `[attr=...]` literal.
+/// Both grammars accept `"..."` with backslash-escaped quotes; using
+/// `serde_json::to_string` handles the escaping uniformly. Returns
+/// `"<empty>"` on the (unreachable) error case so we don't propagate
+/// a String allocation failure here.
+fn css_attr_literal(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+/// Shared body for `heso click` / `heso fill` / `heso submit`. Fetches
+/// `url`, resolves `ref_str` in the action graph, builds a CSS
+/// selector, and hands `(html, selector)` to `op`. `op` is the
+/// engine method to call — `dispatch_click`, `set_input_value`, or
+/// `submit_form`. Prints the unified `{ok, url, value, console}` JSON
+/// the existing eval-* commands use and returns a [`ExitCode`].
+async fn run_dispatch<F>(url_arg: &str, ref_arg: &str, op_name: &str, op: F) -> ExitCode
+where
+    F: FnOnce(
+        &heso_engine_js::JsEngine,
+        &str,
+        &str,
+    ) -> Result<heso_engine_js::EvalOutcome, heso_engine_js::EvalError>,
+{
+    // Normalize the @ref — accept both `@e7` and `e7` for ergonomics.
+    let want = if let Some(stripped) = ref_arg.strip_prefix('@') {
+        format!("@{stripped}")
+    } else {
+        format!("@{ref_arg}")
+    };
+
+    let url = match Url::parse(url_arg) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid URL `{url_arg}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let engine = match FetchEngine::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to build fetch engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // We need BOTH the parsed action graph (to resolve @ref → selector)
+    // AND the raw HTML (to hand to the JS engine). `open()` gives us
+    // the actions; `fetch_text` gives us the HTML. Two round-trips
+    // would be wasteful, so we fetch once via `open_static` (gets the
+    // actions) and re-fetch the text via `fetch_text`. NOTE: this is
+    // two HTTP calls — a follow-up should let `open_static` keep the
+    // raw HTML on the FetchPage so we can re-use it. For PR1 the
+    // duplicate fetch is acceptable: both go through the same client,
+    // and the second one comes from HTTP cache for sane servers.
+    let page = match engine.open(&url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fetch failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let action = match resolve_action(&page.actions, &want) {
+        Some(a) => a,
+        None => {
+            eprintln!("no element at ref `{want}`");
+            return ExitCode::from(2);
+        }
+    };
+    let selector = match selector_for_action(action) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
+                action.tag, action.attrs
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (final_url, html) = match engine.fetch_text(&url).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fetch (html) failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let js_engine = match heso_engine_js::JsEngine::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to create JS engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    match op(&js_engine, &html, &selector) {
+        Ok(outcome) => {
+            let body = serde_json::json!({
+                "ok": true,
+                "op": op_name,
+                "url": final_url.to_string(),
+                "ref": want,
+                "selector": selector,
+                "value": outcome.value,
+                "console": outcome.console,
+            });
+            match serde_json::to_string_pretty(&body) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("failed to serialize result: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let err_body = match &e {
+                heso_engine_js::EvalError::Exception { message, stack } => serde_json::json!({
+                    "kind": "exception",
+                    "message": message,
+                    "stack": stack,
+                }),
+                heso_engine_js::EvalError::ThrownValue { value } => serde_json::json!({
+                    "kind": "thrown_value",
+                    "value": value,
+                }),
+                heso_engine_js::EvalError::Engine(msg) => serde_json::json!({
+                    "kind": "engine",
+                    "message": msg,
+                }),
+            };
+            let body = serde_json::json!({
+                "ok": false,
+                "op": op_name,
+                "url": final_url.to_string(),
+                "ref": want,
+                "selector": selector,
+                "error": err_body,
+            });
+            match serde_json::to_string_pretty(&body) {
+                Ok(s) => println!("{s}"),
+                Err(se) => {
+                    eprintln!("failed to serialize error body: {se}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `heso click <url> <@ref>` — fetch <url>, locate the element with
+/// id `@ref` in the page's action graph, build a CSS selector from
+/// its attributes, and dispatch a cancelable `"click"` event on it
+/// via the QuickJS engine (per [ADR 0014]).
+///
+/// The selector is built in this layer (not in the engine) per the
+/// PR1 plan: `selector_for_action` prefers `#id`, then falls through
+/// to `tag[attr=...]` shapes, then to a bare tag. If the page hosts a
+/// modern SPA, any inline `<script>` that ran during static parse is
+/// NOT yet rerun — phase 1B does not execute `<script>` tags
+/// (handled by PR-A of the next phase plan). For now this fires
+/// click handlers that were attached during the same `eval_with_html`
+/// snippet — useful for click-through behaviors a planner sets up
+/// inline.
+///
+/// Output: `{ok, op, url, ref, selector, value, console}`. `value`
+/// is `true` when the selector matched and the click was dispatched.
+///
+/// Exit codes: 0 on success, 1 on fetch/JS failure, 2 on usage error
+/// or unknown @ref.
+async fn cmd_click(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: heso click <url> <@ref>");
+        return ExitCode::from(2);
+    }
+    run_dispatch(&args[0], &args[1], "click", |eng, html, sel| {
+        eng.dispatch_click(html, sel)
+    })
+    .await
+}
+
+/// `heso fill <url> <@ref> <value>` — fetch <url>, locate the input
+/// at `@ref` in the action graph, set its `value` to `<value>`, and
+/// dispatch first an `"input"` then a `"change"` event (matching
+/// real browser behavior when a user types).
+///
+/// Output shape mirrors `heso click`: `{ok, op, url, ref, selector,
+/// value, console}` where `value: true` indicates the selector
+/// matched. Exit codes match `heso click`.
+async fn cmd_fill(args: &[String]) -> ExitCode {
+    if args.len() < 3 {
+        eprintln!("usage: heso fill <url> <@ref> <value>");
+        return ExitCode::from(2);
+    }
+    let value = args[2].clone();
+    run_dispatch(&args[0], &args[1], "fill", move |eng, html, sel| {
+        eng.set_input_value(html, sel, &value)
+    })
+    .await
+}
+
+/// `heso submit <url> <@form-ref>` — fetch <url>, locate the form at
+/// `@form-ref`, then click its first submit-typed descendant
+/// (`button[type="submit"]` / `input[type="submit"]` / bare-typed
+/// `<button>`). See [`heso_engine_js::JsEngine::submit_form`] for the
+/// Phase 1B limitations (no real HTTP POST; relies on JS handlers).
+///
+/// Output: `{ok, op, url, ref, selector, value, console}`. `value:
+/// true` iff a submit control was found and clicked; `false` if the
+/// form had no submit control. Exit codes match `heso click`.
+async fn cmd_submit(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: heso submit <url> <@form-ref>");
+        return ExitCode::from(2);
+    }
+    run_dispatch(&args[0], &args[1], "submit", |eng, html, sel| {
+        eng.submit_form(html, sel)
+    })
+    .await
+}
+
 async fn cmd_plat_hash(args: &[String]) -> ExitCode {
     if args.is_empty() {
         eprintln!("usage: heso plat-hash <file>");
@@ -934,6 +1238,9 @@ async fn main() -> ExitCode {
         Some("plat-verify") => cmd_plat_verify(&args[1..]).await,
         Some("eval-js") => cmd_eval_js(&args[1..]).await,
         Some("eval-dom") => cmd_eval_dom(&args[1..]).await,
+        Some("click") => cmd_click(&args[1..]).await,
+        Some("fill") => cmd_fill(&args[1..]).await,
+        Some("submit") => cmd_submit(&args[1..]).await,
         Some("serve") => serve::run().await,
         Some("run") => cmd_run(&args[1..]).await,
         Some(other) => {

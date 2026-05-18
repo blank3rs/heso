@@ -98,8 +98,7 @@ use std::rc::Rc;
 use rquickjs::{
     class::Trace,
     prelude::{Opt, This},
-    Array, Class, Context, Ctx, Error as JsError, Exception, Function, JsLifetime, Object,
-    Value,
+    Array, Class, Context, Ctx, Error as JsError, Exception, Function, JsLifetime, Object, Value,
 };
 
 use crate::engine::EvalError;
@@ -539,9 +538,10 @@ impl CustomEvent {
     /// provided at construction.
     #[qjs(get)]
     fn detail<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
-        let obj: Object<'js> = this.0.clone().into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "CustomEvent", "not an object")
-        })?;
+        let obj: Object<'js> =
+            this.0.clone().into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "CustomEvent", "not an object")
+            })?;
         match obj.get::<_, Option<Value<'js>>>(PROP_DETAIL)? {
             Some(v) => Ok(v),
             None => {
@@ -653,10 +653,19 @@ impl EventTarget {
         options: Opt<Value<'js>>,
     ) -> rquickjs::Result<()> {
         let (capture, once, passive) = parse_listener_options(&ctx, options.0)?;
-        let instance: Object<'js> = this.0.into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "EventTarget", "not an object")
-        })?;
-        add_listener_to_instance(&ctx, &instance, &event_type, &listener, capture, once, passive)
+        let instance: Object<'js> =
+            this.0.into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "EventTarget", "not an object")
+            })?;
+        add_listener_to_instance(
+            &ctx,
+            &instance,
+            &event_type,
+            &listener,
+            capture,
+            once,
+            passive,
+        )
     }
 
     /// `target.removeEventListener(type, listener, options?)`.
@@ -668,9 +677,10 @@ impl EventTarget {
         options: Opt<Value<'js>>,
     ) -> rquickjs::Result<()> {
         let (capture, _, _) = parse_listener_options(&ctx, options.0)?;
-        let instance: Object<'js> = this.0.into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "EventTarget", "not an object")
-        })?;
+        let instance: Object<'js> =
+            this.0.into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "EventTarget", "not an object")
+            })?;
         remove_listener_from_instance(&ctx, &instance, &event_type, &listener, capture)
     }
 
@@ -681,9 +691,10 @@ impl EventTarget {
         ctx: Ctx<'js>,
         event: Value<'js>,
     ) -> rquickjs::Result<bool> {
-        let instance: Object<'js> = this.0.into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "EventTarget", "not an object")
-        })?;
+        let instance: Object<'js> =
+            this.0.into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "EventTarget", "not an object")
+            })?;
         dispatch_on_instance(&ctx, &instance, event)
     }
 }
@@ -691,7 +702,7 @@ impl EventTarget {
 /// Read (or lazily create) the listener-map Object hanging off
 /// `instance` under [`PROP_LISTENERS`]. The map's shape is
 /// `{ [eventType]: [{ callback, capture, once, passive }, ...] }`.
-fn get_or_create_listener_map<'js>(
+pub(crate) fn get_or_create_listener_map<'js>(
     ctx: &Ctx<'js>,
     instance: &Object<'js>,
 ) -> rquickjs::Result<Object<'js>> {
@@ -708,7 +719,7 @@ fn get_or_create_listener_map<'js>(
 /// Append a listener record to the per-type list. De-dupes against
 /// existing records that share `(callback, capture)` per the spec
 /// (duplicate addEventListener is a no-op).
-fn add_listener_to_instance<'js>(
+pub(crate) fn add_listener_to_instance<'js>(
     ctx: &Ctx<'js>,
     instance: &Object<'js>,
     event_type: &str,
@@ -755,7 +766,7 @@ fn add_listener_to_instance<'js>(
 }
 
 /// Remove the first listener record matching `(callback, capture)`.
-fn remove_listener_from_instance<'js>(
+pub(crate) fn remove_listener_from_instance<'js>(
     ctx: &Ctx<'js>,
     instance: &Object<'js>,
     event_type: &str,
@@ -777,9 +788,7 @@ fn remove_listener_from_instance<'js>(
         let rec: Option<Object<'js>> = list.get(i)?;
         let Some(rec) = rec else { continue };
         if !removed {
-            let existing_capture: bool = rec
-                .get::<_, Option<bool>>("capture")?
-                .unwrap_or(false);
+            let existing_capture: bool = rec.get::<_, Option<bool>>("capture")?.unwrap_or(false);
             if existing_capture == capture {
                 let existing_cb: Option<Function<'js>> = rec.get("callback")?;
                 if let Some(existing_cb) = existing_cb {
@@ -800,13 +809,16 @@ fn remove_listener_from_instance<'js>(
 /// Run a synchronous flat dispatch of `event` on `instance`. Returns
 /// `false` iff the event is cancelable and a listener called
 /// `preventDefault()`.
-fn dispatch_on_instance<'js>(
+pub(crate) fn dispatch_on_instance<'js>(
     ctx: &Ctx<'js>,
     instance: &Object<'js>,
     event: Value<'js>,
 ) -> rquickjs::Result<bool> {
     let view = view_from_value(&event).ok_or_else(|| {
-        Exception::throw_type(ctx, "dispatchEvent: argument must be an Event or CustomEvent")
+        Exception::throw_type(
+            ctx,
+            "dispatchEvent: argument must be an Event or CustomEvent",
+        )
     })?;
 
     if view.state.dispatching.get() {
@@ -887,7 +899,7 @@ fn functions_strict_equal<'js>(a: &Function<'js>, b: &Function<'js>) -> bool {
 /// `removeEventListener`. A boolean is interpreted as `capture`; an
 /// object may carry `capture` / `once` / `passive` booleans;
 /// undefined/null yields all-false defaults.
-fn parse_listener_options<'js>(
+pub(crate) fn parse_listener_options<'js>(
     _ctx: &Ctx<'js>,
     options: Option<Value<'js>>,
 ) -> rquickjs::Result<(bool, bool, bool)> {
@@ -963,9 +975,10 @@ impl AbortSignal {
     #[qjs(get)]
     fn reason<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
         let aborted = this.0.borrow().aborted.get();
-        let obj: Object<'js> = this.0.clone().into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "AbortSignal", "not an object")
-        })?;
+        let obj: Object<'js> =
+            this.0.clone().into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "AbortSignal", "not an object")
+            })?;
         let ctx = obj.ctx().clone();
         if !aborted {
             return ctx.eval::<Value<'js>, _>("undefined");
@@ -982,9 +995,10 @@ impl AbortSignal {
         if !aborted {
             return Ok(());
         }
-        let obj: Object<'js> = this.0.clone().into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "AbortSignal", "not an object")
-        })?;
+        let obj: Object<'js> =
+            this.0.clone().into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "AbortSignal", "not an object")
+            })?;
         let ctx = obj.ctx().clone();
         let reason = match obj.get::<_, Option<Value<'js>>>(PROP_REASON)? {
             Some(v) => v,
@@ -1002,10 +1016,19 @@ impl AbortSignal {
         options: Opt<Value<'js>>,
     ) -> rquickjs::Result<()> {
         let (capture, once, passive) = parse_listener_options(&ctx, options.0)?;
-        let instance: Object<'js> = this.0.into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "AbortSignal", "not an object")
-        })?;
-        add_listener_to_instance(&ctx, &instance, &event_type, &listener, capture, once, passive)
+        let instance: Object<'js> =
+            this.0.into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "AbortSignal", "not an object")
+            })?;
+        add_listener_to_instance(
+            &ctx,
+            &instance,
+            &event_type,
+            &listener,
+            capture,
+            once,
+            passive,
+        )
     }
 
     /// `signal.removeEventListener(type, listener, options?)`.
@@ -1017,9 +1040,10 @@ impl AbortSignal {
         options: Opt<Value<'js>>,
     ) -> rquickjs::Result<()> {
         let (capture, _, _) = parse_listener_options(&ctx, options.0)?;
-        let instance: Object<'js> = this.0.into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "AbortSignal", "not an object")
-        })?;
+        let instance: Object<'js> =
+            this.0.into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "AbortSignal", "not an object")
+            })?;
         remove_listener_from_instance(&ctx, &instance, &event_type, &listener, capture)
     }
 
@@ -1029,9 +1053,10 @@ impl AbortSignal {
         ctx: Ctx<'js>,
         event: Value<'js>,
     ) -> rquickjs::Result<bool> {
-        let instance: Object<'js> = this.0.into_value().into_object().ok_or_else(|| {
-            JsError::new_from_js_message("this", "AbortSignal", "not an object")
-        })?;
+        let instance: Object<'js> =
+            this.0.into_value().into_object().ok_or_else(|| {
+                JsError::new_from_js_message("this", "AbortSignal", "not an object")
+            })?;
         dispatch_on_instance(&ctx, &instance, event)
     }
 }
@@ -1157,7 +1182,9 @@ impl AbortController {
         let signal_class: Class<'js, AbortSignal> = signal_obj
             .as_class::<AbortSignal>()
             .cloned()
-            .ok_or_else(|| JsError::new_from_js_message("signal", "AbortSignal", "wrong class"))?;
+            .ok_or_else(|| {
+            JsError::new_from_js_message("signal", "AbortSignal", "wrong class")
+        })?;
         let aborted = signal_class.borrow().aborted.clone();
         if aborted.get() {
             return Ok(());

@@ -273,6 +273,131 @@ impl JsEngine {
         self.eval(js)
     }
 
+    /// Load `html`, find the element at `selector`, and dispatch a
+    /// cancelable `"click"` event on it. The existing event-dispatch
+    /// plumbing (per [`crate::events`]) fires any handlers registered
+    /// via `addEventListener('click', …)` in script that ran during
+    /// the same evaluation.
+    ///
+    /// The returned [`EvalOutcome`]'s `value` is `true` when an
+    /// element matched the selector (and was clicked), `false` when no
+    /// element matched — callers can branch on it instead of treating
+    /// "not found" as an error. The `console` field carries everything
+    /// the click handler's body logged.
+    ///
+    /// `selector` must be a valid CSS selector that resolves through
+    /// `document.querySelector` — typically a `#id` or a tag +
+    /// attribute selector built from the action graph entry's
+    /// attributes (see the CLI's `selector_for_action` helper).
+    ///
+    /// Phase 1B: dispatch is **synchronous** and **flat** (no capture
+    /// or bubble walk). Listeners attached directly to the target
+    /// element fire; ancestors are not visited. Tree-aware bubbling
+    /// is a follow-up.
+    pub fn dispatch_click(&self, html: &str, selector: &str) -> Result<EvalOutcome, EvalError> {
+        // `serde_json::to_string` gives us a JS-safe string literal —
+        // it escapes quotes, backslashes, and control chars correctly,
+        // so a selector like `a[href="/path with \"quote\""]` round-
+        // trips without breaking the snippet.
+        let selector_lit = serde_json::to_string(selector)
+            .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        // `script` runs inside `eval_with_html`'s context, where
+        // `document` is already wired. We want the expression-position
+        // value of the script to be the boolean "found and clicked?",
+        // so we wrap the body in an IIFE.
+        let script = format!(
+            r#"
+            (() => {{
+                const el = document.querySelector({selector_lit});
+                if (!el) return false;
+                el.click();
+                return true;
+            }})()
+            "#,
+        );
+        self.eval_with_html(html, &script)
+    }
+
+    /// Load `html`, find the element at `selector`, set its `value`
+    /// to `value`, and dispatch first an `"input"` event then a
+    /// `"change"` event on it. Both events are constructed as
+    /// `bubbles: true, cancelable: true` (matching real browser
+    /// behavior when a user types into an `<input>` / `<textarea>`).
+    ///
+    /// The returned [`EvalOutcome`]'s `value` is `true` when an
+    /// element matched the selector, `false` when no element matched
+    /// — same shape as [`Self::dispatch_click`]. The `console` field
+    /// includes any output from `input` / `change` listeners.
+    pub fn set_input_value(
+        &self,
+        html: &str,
+        selector: &str,
+        value: &str,
+    ) -> Result<EvalOutcome, EvalError> {
+        let selector_lit = serde_json::to_string(selector)
+            .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        let value_lit = serde_json::to_string(value)
+            .map_err(|e| EvalError::Engine(format!("encode value: {e}")))?;
+        let script = format!(
+            r#"
+            (() => {{
+                const el = document.querySelector({selector_lit});
+                if (!el) return false;
+                el.value = {value_lit};
+                el.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
+                return true;
+            }})()
+            "#,
+        );
+        self.eval_with_html(html, &script)
+    }
+
+    /// Load `html`, find the form at `selector`, then find its first
+    /// `<button type="submit">` or `<input type="submit">`
+    /// descendant and dispatch a cancelable `"click"` event on it.
+    /// A form's own `submit` handler — registered via
+    /// `form.addEventListener('submit', …)` in real browsers — is
+    /// **NOT yet wired in Phase 1B**: this primitive intentionally
+    /// only fires the submit-button click, on the assumption that
+    /// most modern forms intercept submission via the click on a
+    /// submit-type control (or via a JS framework's onSubmit wired
+    /// to that control).
+    ///
+    /// Returns `value: true` when a submit-typed descendant was
+    /// found, `value: false` otherwise (form had no submit control,
+    /// or selector didn't match).
+    ///
+    /// Limitation (deferred until [PR2 fetch + form serialize]):
+    ///
+    /// - No HTTP form submission. If the page lacks JS handlers,
+    ///   nothing actually leaves the engine; future work serializes
+    ///   the form fields and POSTs them through `reqwest::Client`.
+    /// - No `submit` event on the `<form>` itself. The `dispatchEvent`
+    ///   plumbing supports it, but most pages observe submit by
+    ///   listening on the submit button click, so we leave the form-
+    ///   level event out until a real page makes us care.
+    pub fn submit_form(&self, html: &str, selector: &str) -> Result<EvalOutcome, EvalError> {
+        let selector_lit = serde_json::to_string(selector)
+            .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        let script = format!(
+            r#"
+            (() => {{
+                const form = document.querySelector({selector_lit});
+                if (!form) return false;
+                const submitter =
+                    form.querySelector('button[type="submit"]') ||
+                    form.querySelector('input[type="submit"]') ||
+                    form.querySelector('button:not([type])'); // <button> defaults to type=submit
+                if (!submitter) return false;
+                submitter.click();
+                return true;
+            }})()
+            "#,
+        );
+        self.eval_with_html(html, &script)
+    }
+
     /// Evaluate `code` as a script.
     ///
     /// Returns the script's completion value as JSON plus all
@@ -292,20 +417,22 @@ impl JsEngine {
             .expect("console buffer poisoned")
             .clear();
 
-        let value = self.context.with(|ctx| -> Result<serde_json::Value, EvalError> {
-            match ctx.eval::<Value, _>(code).catch(&ctx) {
-                Ok(v) => js_value_to_json(&ctx, v),
-                Err(CaughtError::Exception(exc)) => Err(EvalError::Exception {
-                    message: exc.message().unwrap_or_default(),
-                    stack: exc.stack(),
-                }),
-                Err(CaughtError::Value(v)) => {
-                    let repr = js_value_to_json(&ctx, v).unwrap_or(serde_json::Value::Null);
-                    Err(EvalError::ThrownValue { value: repr })
+        let value = self
+            .context
+            .with(|ctx| -> Result<serde_json::Value, EvalError> {
+                match ctx.eval::<Value, _>(code).catch(&ctx) {
+                    Ok(v) => js_value_to_json(&ctx, v),
+                    Err(CaughtError::Exception(exc)) => Err(EvalError::Exception {
+                        message: exc.message().unwrap_or_default(),
+                        stack: exc.stack(),
+                    }),
+                    Err(CaughtError::Value(v)) => {
+                        let repr = js_value_to_json(&ctx, v).unwrap_or(serde_json::Value::Null);
+                        Err(EvalError::ThrownValue { value: repr })
+                    }
+                    Err(CaughtError::Error(e)) => Err(EvalError::Engine(e.to_string())),
                 }
-                Err(CaughtError::Error(e)) => Err(EvalError::Engine(e.to_string())),
-            }
-        })?;
+            })?;
 
         let console = self
             .console_buffer
@@ -319,7 +446,8 @@ impl JsEngine {
 
 impl Default for JsEngine {
     fn default() -> Self {
-        Self::new().expect("rquickjs Runtime + Context construction should never fail on default config")
+        Self::new()
+            .expect("rquickjs Runtime + Context construction should never fail on default config")
     }
 }
 
@@ -404,9 +532,7 @@ fn install_console_method<'js>(
         let mut json_args: Vec<serde_json::Value> = Vec::with_capacity(args.len());
         for arg in args.into_inner() {
             let arg_ctx = arg.ctx().clone();
-            json_args.push(
-                js_value_to_json(&arg_ctx, arg).unwrap_or(serde_json::Value::Null),
-            );
+            json_args.push(js_value_to_json(&arg_ctx, arg).unwrap_or(serde_json::Value::Null));
         }
         if let Ok(mut buf) = buffer.lock() {
             buf.push(ConsoleEntry {
@@ -524,7 +650,9 @@ mod tests {
     #[test]
     fn evaluates_array_literal() {
         let e = engine();
-        let out = e.eval("[1, 'two', null, true, {nested: 9}]").expect("eval ok");
+        let out = e
+            .eval("[1, 'two', null, true, {nested: 9}]")
+            .expect("eval ok");
         assert_eq!(out.value[0], 1);
         assert_eq!(out.value[1], "two");
         assert!(out.value[2].is_null());
@@ -596,14 +724,20 @@ mod tests {
         let e = engine();
         let _ = e.eval("console.log('first')").expect("eval ok");
         let out = e.eval("console.log('second'); 0").expect("eval ok");
-        assert_eq!(out.console.len(), 1, "second eval should not see first eval's logs");
+        assert_eq!(
+            out.console.len(),
+            1,
+            "second eval should not see first eval's logs"
+        );
         assert_eq!(out.console[0].args[0], "second");
     }
 
     #[test]
     fn throw_new_error_returns_exception_variant() {
         let e = engine();
-        let err = e.eval(r#"throw new Error('boom')"#).expect_err("should throw");
+        let err = e
+            .eval(r#"throw new Error('boom')"#)
+            .expect_err("should throw");
         match err {
             EvalError::Exception { message, .. } => {
                 assert_eq!(message, "boom");
