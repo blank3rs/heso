@@ -1,0 +1,17 @@
+[package]
+name = "heso-engine-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The EngineApi trait — the swappable boundary between heso and any underlying browser engine."
+
+[dependencies]
+heso-core = { path = "../heso-core" }
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

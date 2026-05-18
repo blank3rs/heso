@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/heso-core",
+    "crates/heso-engine-api",
+    "crates/heso-engine-fetch",
+    "crates/heso-engine-js",
+    "crates/heso-primitives",
+    "crates/heso-trace",
+    "crates/heso-trace-exec",
+    "crates/heso-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/akku41809/heso"
+homepage = "https://github.com/akku41809/heso"
+authors = ["Akshay and heso contributors"]
+
+[workspace.dependencies]
+# Cross-crate shared deps go here. Pin versions intentionally.
+# Add to crates' Cargo.toml as: foo = { workspace = true }
+thiserror = "2.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = { version = "2", features = ["serde"] }
+tracing = "0.1"
+blake3 = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "http2"] }
+scraper = "0.21"
+ego-tree = "0.9"
+regex = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

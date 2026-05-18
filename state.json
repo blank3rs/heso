@@ -1,0 +1,1141 @@
+{
+  "$schema": "./state.schema.json",
+  "schema_version": "1.0.0",
+  "project": {
+    "name": "heso",
+    "tagline": "headless browser for the agent-relevant half of the web",
+    "category": "agentware",
+    "phase": "M0-skeleton"
+  },
+  "meta": {
+    "updated_at": "2026-05-18T09:30:00Z",
+    "updated_by": "claude-opus-4-7"
+  },
+  "current_focus": {
+    "milestone_id": "M1",
+    "summary": "ADR 0014 Phase 1A landed 2026-05-18: heso-engine-js wraps QuickJS via rquickjs as a sandboxed JS evaluator (no DOM yet) with console capture, per-engine isolation, 16 unit tests, `heso eval-js` CLI subcommand. Workspace now 8 crates (added heso-engine-js); 145 lib tests green; 8.1 MB release binary (up from 5.2 MB pre-QuickJS). Engine layering settled: heso-engine-fetch is the static path (ADR 0012), heso-engine-js is the JS path (ADR 0014). Cartography V0 also live (ADR 0015): `heso open --explore-links` builds same-origin sub-page maps, content-addressed plat_hash (BLAKE3 over canonical JSON), `heso plat-verify` catches tampering. Strategic priorities: (1) ADR 0014 Phase 1B — agent-shaped DOM types as #[rquickjs::class] backed by scraper::Html (Document/Element/Node/NodeList/Text + window/document globals); (2) Phase 1C — run <script> tags during `heso open --js`; (3) round out remaining primitives per ADR 0010; (4) T-022 planner v0; (5) T-023 wire heso.run.",
+    "next_action_id": "T-022"
+  },
+  "milestones": [
+    {
+      "id": "M0",
+      "title": "Skeleton",
+      "status": "in_progress",
+      "target_date": "2026-05-31",
+      "exit_criteria": [
+        "`cargo check --workspace` passes",
+        "AGENTS.md + .agent/ populated and discoverable by any coding agent",
+        "Foundational ADRs (0001–0009) written and accepted",
+        "Research wiki populated: rust-llm-mistakes + browser-engines (rendering, agent-first, conversion, ladybird, determinism) + servo-internals (architecture, embedding-api, spidermonkey, verso). MCP ecosystem + existing-agent-browsers still pending.",
+        "research/INDEX.md exists and indexes every note",
+        ".agent/HOWTO/use-research.md describes the wiki workflow",
+        "docs/the-one-tool.md and skills/heso/SKILL.md drafted (per ADR 0009)",
+        "state.json validates against state.schema.json",
+        "Initial git history + GitHub repo created"
+      ]
+    },
+    {
+      "id": "M1",
+      "title": "Native fetch engine running (per ADR 0012)",
+      "status": "achieved",
+      "target_date": null,
+      "exit_criteria": [
+        "reqwest + scraper + ego-tree added to workspace; chromiumoxide + futures removed",
+        "heso-engine-fetch crate created; implements EngineApi via reqwest::Client + scraper::Html parse + recursive DOM walker that strips script/style/noscript/template",
+        "EngineApi reshaped to async (impl Future + Send) — done in the 0011 → 0012 transition, kept",
+        "FetchPage holds the post-redirect URL + pre-computed visible body text",
+        "`heso fetch <url>` returns {url, text} JSON; `heso run <url> <req>` returns a Receipt with a stable BLAKE3 trace_hash",
+        "Live network test passes (example.com extracts 'Example Domain'); Flue agent end-to-end produces detailed answer about korrd.co from real page content",
+        "Single Rust binary, no Chrome dep, no Node — release build ~30s on cold cache, ~10MB stripped",
+        "Determinism preconditions still pending — but the static-fetch path has no clock/RNG to seed, so deterministic-mode is free for this engine"
+      ]
+    },
+    {
+      "id": "M2",
+      "title": "Primitives + trace runner",
+      "status": "todo",
+      "target_date": null,
+      "exit_criteria": [
+        "Primitives layer (heso-primitives crate) exposes the 15 terminal-shaped internal operations from ADR 0010: pwd, ls, cd, cat, find, grep, echo, rm, click, submit, wget, wait, screenshot, eval, diff. Each is implemented over EngineApi and returns a typed Result. Cookies and Web Storage are addressed via the /env/ virtual hierarchy (cat /env/cookie/<name>, echo val > /env/storage/local/<key>, etc.) — not separate primitives.",
+        "Trace runner (heso-trace-exec crate) takes [PrimitiveOp] + EngineApi + SessionConfig, runs primitives in order, produces Result + Receipt.",
+        "Trace format types (heso-trace crate) defined as JSON-serializable AST — the canonical form for signing and replay.",
+        "Fake clock implementation (Date.now, performance.now, setTimeout, setInterval, requestAnimationFrame) — per ADR 0008",
+        "Seeded RNG implementation (Math.random + crypto.getRandomValues with explicit opt-out) — per ADR 0008",
+        "Network record/replay layer via WebViewDelegate::intercept_web_resource_load — per ADR 0008",
+        "Three operating modes (deterministic / recording / live) wired into session config",
+        "Same-seed determinism smoke test: two runs of the same hand-written trace in deterministic mode produce byte-identical Receipt for at least 5 reference sites"
+      ]
+    },
+    {
+      "id": "M3",
+      "title": "The one tool (planner + heso.run)",
+      "status": "todo",
+      "target_date": null,
+      "exit_criteria": [
+        "Planner v0 (heso-planner crate) takes (start_url, plain-English request, current page state) → [PrimitiveOp]. v0 is pattern-matched, covering 5 request shapes: list extraction, single-item search, form submission, multi-page join, page watch. Returns a Need-Clarification response when the request is too ambiguous.",
+        "heso.run wired as a single MCP tool (heso-mcp crate) exposing the contract from ADR 0009: (start_url, request, options?) → (status, data, receipt, cost).",
+        "skills/heso/SKILL.md + docs/the-one-tool.md polished from real usage. SKILL.md is the only artifact agents read to learn heso.",
+        "End-to-end demo: heso.run works for 5 representative requests against live web pages (HN headline scrape, Wikipedia extract, a search-and-filter, a multi-page join, a form-submission flow). Each call returns expected data + a signed receipt + cost report.",
+        "Planner version is recorded in every receipt; same input + same planner_id + same seed produces byte-identical output."
+      ]
+    },
+    {
+      "id": "M4",
+      "title": "Identity + signed audit log (precondition: M2 determinism + M3 trace runner)",
+      "status": "todo",
+      "target_date": null,
+      "exit_criteria": [
+        "Ed25519 keypair per agent instance, stored in ~/.heso/identity/",
+        "Every heso.run call produces a Receipt signed by the session's identity key",
+        "Append-only audit log on disk, signature-chained (git-style)",
+        "Audit log entries include session seed + network-record hash + planner_id so they verify reproducibility per ADR 0008",
+        "Live mode refuses to sign actions (no determinism guarantee)",
+        "`heso log --verify` CLI command validates the entire log AND replays each trace deterministically"
+      ]
+    },
+    {
+      "id": "M5",
+      "title": "Claude Code plugin published",
+      "status": "todo",
+      "target_date": null,
+      "exit_criteria": [
+        "Plugin bundles: heso MCP server (exposing the one tool heso.run), skills/heso/SKILL.md, a web-researcher subagent that uses heso, PostToolUse hook for receipt verification",
+        "Published to a marketplace (official or own)",
+        "Working end-to-end demo: research a topic across 20 sources in one command",
+        "Landing page + 60-second demo video"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Initialize Cargo workspace + root config (Cargo.toml, rust-toolchain, fmt, clippy, deny)",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [
+          "0001"
+        ],
+        "research": [],
+        "files": [
+          "Cargo.toml",
+          "rust-toolchain.toml",
+          "rustfmt.toml",
+          "clippy.toml",
+          "deny.toml"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": ""
+    },
+    {
+      "id": "T-002",
+      "title": "Write AGENTS.md, CLAUDE.md, README.md, and the .agent/ meta directory",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [
+          "0007"
+        ],
+        "research": [],
+        "files": [
+          "AGENTS.md",
+          "CLAUDE.md",
+          "README.md",
+          ".agent/MAP.md",
+          ".agent/CONVENTIONS.md",
+          ".agent/WORKFLOWS.md",
+          ".agent/PRIORITIES.md",
+          ".agent/GLOSSARY.md"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": ""
+    },
+    {
+      "id": "T-003",
+      "title": "Write foundational ADRs (0001–0009)",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [
+          "0001",
+          "0002",
+          "0003",
+          "0004",
+          "0005",
+          "0006",
+          "0007",
+          "0008",
+          "0009"
+        ],
+        "research": [],
+        "files": [
+          "decisions/"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "ADR 0008 (deterministic execution) added as first-class property. ADR 0009 (heso.run as the single agent-facing tool) locks the public surface — all previously-designed primitives become internals."
+    },
+    {
+      "id": "T-004",
+      "title": "Create heso-core + heso-engine-api + heso-cli crate skeletons",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-001"
+      ],
+      "links": {
+        "adr": [
+          "0001",
+          "0002"
+        ],
+        "research": [],
+        "files": [
+          "crates/heso-core/",
+          "crates/heso-engine-api/",
+          "crates/heso-cli/"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Just enough to compile. Real engine impl comes in M1; primitives + trace runner in M2; planner + heso.run in M3."
+    },
+    {
+      "id": "T-005",
+      "title": "Author state.json + state.schema.json with JSON-Schema validation",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [],
+        "research": [],
+        "files": [
+          "state.json",
+          "state.schema.json",
+          ".agent/HOWTO/update-state.md"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": ""
+    },
+    {
+      "id": "T-006",
+      "title": "Verify `cargo check --workspace` passes",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-001",
+        "T-004"
+      ],
+      "links": {
+        "adr": [],
+        "research": [],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Verified clean on 2026-05-17 with toolchain 1.90. Initial MSRV 1.83 was insufficient — bumped to 1.90 to support `edition2024` deps pulled in transitively by `url` v2.5.8."
+    },
+    {
+      "id": "T-007",
+      "title": "Seed research/mcp-ecosystem/ with the Claude Code surfaces + cross-agent ecosystem survey from this session",
+      "status": "todo",
+      "priority": "P2",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [
+          "0004"
+        ],
+        "research": [
+          "mcp-ecosystem/claude-code-extension-surfaces",
+          "mcp-ecosystem/agent-ecosystem-survey"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Both research reports already gathered in conversation but never written to disk. Convert to markdown files in research/mcp-ecosystem/. Add to research/INDEX.md after. Lower priority now since ADR 0009 makes our MCP surface much simpler (one tool), so this research is reference-level rather than design-driving."
+    },
+    {
+      "id": "T-008",
+      "title": "Seed research/servo-internals/ + research/browser-engines/ with engine notes",
+      "status": "done",
+      "priority": "P1",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [
+          "0003",
+          "0008"
+        ],
+        "research": [
+          "servo-internals/architecture",
+          "servo-internals/embedding-api-v0-1-0",
+          "servo-internals/spidermonkey-integration",
+          "servo-internals/verso-prior-art",
+          "browser-engines/README",
+          "browser-engines/rendering-pipeline",
+          "browser-engines/agent-first-design",
+          "browser-engines/conversion-strategies",
+          "browser-engines/ladybird-architecture",
+          "browser-engines/determinism"
+        ],
+        "files": [
+          "research/servo-internals/",
+          "research/browser-engines/"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Done via parallel subagent research (2026-05-17). Output: 9 browser/servo notes + 1 Rust LLM mistakes note + INDEX.md + use-research HOWTO. Determinism note (browser-engines/determinism.md) added as follow-on to ADR 0008. agent-first-design.md later reframed (per ADR 0009) as internal primitives, not public surface."
+    },
+    {
+      "id": "T-009",
+      "title": "Seed research/existing-agent-browsers/ with Browserbase, Stagehand, Browser Use notes",
+      "status": "todo",
+      "priority": "P2",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [],
+        "research": [
+          "existing-agent-browsers/browserbase",
+          "existing-agent-browsers/stagehand",
+          "existing-agent-browsers/browser-use"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Document what each does, where it falls short, and what we'll do differently. Partial coverage already in browser-engines/conversion-strategies.md but dedicated per-product notes still useful for the planner — Stagehand's natural-language-action heuristics are direct prior art for heso's planner v0."
+    },
+    {
+      "id": "T-010",
+      "title": "Create GitHub repo (public) and push initial commit",
+      "status": "todo",
+      "priority": "P1",
+      "milestone": "M0",
+      "owner": "akshay",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-006"
+      ],
+      "links": {
+        "adr": [
+          "0006"
+        ],
+        "research": [],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Repo URL placeholder in Cargo.toml is github.com/akku41809/heso — update if different."
+    },
+    {
+      "id": "T-011",
+      "title": "Set up CI (cargo check / test / fmt / clippy / deny) on GitHub Actions",
+      "status": "todo",
+      "priority": "P1",
+      "milestone": "M0",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-010"
+      ],
+      "links": {
+        "adr": [],
+        "research": [],
+        "files": [
+          ".github/workflows/ci.yml"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Matrix: stable, beta on Linux + macOS + Windows. Cache cargo registry. Set MOZJS_ARCHIVE on every matrix entry once servo dep lands (avoid 30-60 min SpiderMonkey builds)."
+    },
+    {
+      "id": "T-012",
+      "title": "[CANCELLED per ADR 0011] Add servo crate dependency to heso-engine-servo",
+      "status": "cancelled",
+      "priority": "P0",
+      "milestone": "M1",
+      "owner": "akshay",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-006"
+      ],
+      "links": {
+        "adr": [
+          "0003",
+          "0011"
+        ],
+        "research": [
+          "servo-internals/embedding-api-v0-1-0",
+          "servo-internals/spidermonkey-integration"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Cancelled by ADR 0011. We're shipping Chromium via CDP (heso-engine-cdp + chromiumoxide) as the M1 engine — see T-026. Servo deferred to M4+ as a possible second engine. If/when reactivated, this task is replaced by `Add servo crate, get hello-world ServoEngine compiling` under the heso-engine-servo crate."
+    },
+    {
+      "id": "T-013",
+      "title": "[REFRAMED per ADR 0011] Reshape EngineApi trait for async + CDP backing",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M1",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [],
+      "links": {
+        "adr": [
+          "0002",
+          "0008",
+          "0011"
+        ],
+        "research": [
+          "browser-engines/agent-first-design"
+        ],
+        "files": [
+          "crates/heso-engine-api/src/lib.rs"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Original T-013 was 'design EngineApi from Servo's WebView surface'; reframed by ADR 0011 to 'shape EngineApi for chromiumoxide (async-first)'. Trait still has zero engine-vendor types — chromiumoxide types stop at the heso-engine-cdp boundary. Methods become `async fn` (stable in traits since Rust 1.75). Surfaces needed for the 15 primitives: open(url), text(), accessibility_tree(), query_ax(role, name), evaluate(js), click(node), fill(node, value), submit(form), wait_for(cond, timeout), screenshot(opts), fetch_resource(url|node), cookies_*/storage_* CRUD, snapshot(). Build these incrementally as the primitives need them; M1 only needs open() + text()."
+    },
+    {
+      "id": "T-014",
+      "title": "[REFRAMED per ADR 0011] M2 determinism preconditions on Chromium",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-026"
+      ],
+      "links": {
+        "adr": [
+          "0008",
+          "0011"
+        ],
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "files": [
+          "crates/heso-engine-cdp/"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Original T-014 was Servo-specific (SoftwareRenderingContext + pinned font stack). Reframed for Chromium: (1) Emulation.setDeviceMetricsOverride to pin viewport + DPR — first precondition for byte-identical screenshots; (2) CaptureScreenshotParams { optimize_for_speed: false, from_surface: true, format: Png, clip: viewport } — second precondition; (3) headless mode = new-style headless (Chrome 112+) to avoid the headless-shell rendering drift. Font pinning is harder on Chromium (uses system fonts); deferred to a follow-up if it bites determinism in practice."
+    },
+    {
+      "id": "T-015",
+      "title": "[REFRAMED per ADR 0011] Fake clock via Emulation.setVirtualTimePolicy",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-026"
+      ],
+      "links": {
+        "adr": [
+          "0008",
+          "0011"
+        ],
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Original T-015 patched SpiderMonkey directly. Reframed for Chromium: `Emulation.setVirtualTimePolicy { policy: Pause/Advance/AdvanceAndPause, budget: ms, max_virtual_time_task_starvation_count, wait_for_navigation }`. CDP's canonical hook for synthetic time — replaces real `Date.now`, `performance.now`, `setTimeout`, `setInterval`, `requestAnimationFrame` for every frame in the page. The wait_for_navigation flag bridges to T-017 network replay. Open question Q-006 still applies (agent-controlled advance vs tick-based)."
+    },
+    {
+      "id": "T-016",
+      "title": "[REFRAMED per ADR 0011] Seeded RNG via Page.addScriptToEvaluateOnNewDocument",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-026"
+      ],
+      "links": {
+        "adr": [
+          "0008",
+          "0011"
+        ],
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Original T-016 patched SpiderMonkey directly. Reframed for Chromium: inject a Mulberry32/xorshift32 polyfill via `Page.addScriptToEvaluateOnNewDocument { source: ... }` that overrides `Math.random` (and `crypto.getRandomValues` when the agent opts in to determinism over real entropy). KNOWN LIMITATION: hostile JS that calls `Math.random.toString()` can detect the polyfill — acceptable for the vast majority of agent workflows; the undetectable case waits for a Servo backend (engine-level patch)."
+    },
+    {
+      "id": "T-017",
+      "title": "[REFRAMED per ADR 0011] Network record/replay via Fetch.requestPaused",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-026"
+      ],
+      "links": {
+        "adr": [
+          "0008",
+          "0011"
+        ],
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Original T-017 used Servo's WebViewDelegate::intercept_web_resource_load. Reframed for Chromium: `Fetch.enable { patterns: [{requestStage: Response}] }` then handle `Fetch.requestPaused` events. Recording mode: pass through with `Fetch.continueRequest`, capture response body to JSONL with content-addressed bytes. Replay mode: serve from the JSONL store with `Fetch.fulfillRequest`; hash mismatch on an un-recorded request → error, not a real fetch. Same wire format as the original plan, different binding."
+    },
+    {
+      "id": "T-018",
+      "title": "Three operating modes (deterministic / recording / live) wired into session config",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "akshay",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-015",
+        "T-016",
+        "T-017"
+      ],
+      "links": {
+        "adr": [
+          "0008"
+        ],
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "deterministic = default for agent sessions, default for tests, default for signed-action workflows. recording = real clock/RNG, all inputs logged for replay. live = no guarantees, identity refuses to sign."
+    },
+    {
+      "id": "T-019",
+      "title": "Determinism smoke test: same seed produces byte-identical output for 5 reference sites",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-018"
+      ],
+      "links": {
+        "adr": [
+          "0008"
+        ],
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "files": [],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Reference sites: example.com, en.wikipedia.org, news.ycombinator.com, a JS-heavy SPA (TBD), a form-submission flow (TBD). Compare AX tree + extracted text + screenshot byte-for-byte across two runs."
+    },
+    {
+      "id": "T-020",
+      "title": "Build the primitives layer (heso-primitives crate) — the 15 terminal-shaped ops per ADR 0010",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-013"
+      ],
+      "links": {
+        "adr": [
+          "0010",
+          "0009",
+          "0002"
+        ],
+        "research": [
+          "browser-engines/agent-first-design"
+        ],
+        "files": [
+          "crates/heso-primitives/Cargo.toml",
+          "crates/heso-primitives/src/lib.rs",
+          "Cargo.toml",
+          "decisions/0010-primitives-as-terminal-commands.md"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Operations (per ADR 0010): pwd, ls, cd, cat, find, grep, echo, rm, click, submit, wget, wait, screenshot, eval, diff. Each takes EngineApi + typed inputs, returns typed Result. Cookies + Web Storage are addressed via /env/ virtual paths in ls/cat/echo/rm — not separate primitives. NOT public to agents — consumed only by the trace runner. Initial T-020 shipped 0009's list (fetch/extract/fill/click_link/click_button/submit/wait_for/screenshot/script/cookies/storage/diff); user caught that this didn't match the original design intent in agent-first-design.md and triggered the terminal-shaped redesign in ADR 0010. heso-primitives was rewritten end-to-end and all cross-cutting docs were updated. PrimitiveOp JSON-AST + per-op Input/Output structs + execute() dispatch + Error enum are complete and tested. cd-to-URL delegates to existing EngineApi::open; the other 14 ops return Error::NotImplemented until T-013 grows the engine surface (and T-014/T-015/T-017 land the determinism preconditions for screenshot/wait/wget). Workspace dep change: enabled `serde` feature on `url` crate."
+    },
+    {
+      "id": "T-021",
+      "title": "Build heso-trace + heso-trace-exec crates — JSON AST types and trace runner",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M2",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-020"
+      ],
+      "links": {
+        "adr": [
+          "0009",
+          "0010",
+          "0005",
+          "0008"
+        ],
+        "research": [],
+        "files": [
+          "crates/heso-trace/Cargo.toml",
+          "crates/heso-trace/src/lib.rs",
+          "crates/heso-trace-exec/Cargo.toml",
+          "crates/heso-trace-exec/src/lib.rs",
+          "crates/heso-trace-exec/examples/receipt.rs",
+          "Cargo.toml"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "heso-trace exports: Trace, PrimitiveOp, PrimitiveResult (re-exported from heso-primitives), plus Receipt, Cost, Mode (deterministic/recording/live, default = deterministic), ContentHash, and trace_hash(trace) -> hex BLAKE3 of canonical JSON. Pure data — no engine dep. heso-trace-exec exports SessionConfig + run(engine, trace, config) -> Receipt. Runner walks the trace, dispatches each op via heso_primitives::execute, stops at the first failure and records failed_at + error in the receipt. Workspace gained blake3 = 1 (workspace dep). Tests: heso-trace 9 unit + 2 doctest, heso-trace-exec 7 unit + 1 example; total workspace = 30 unit + 4 doctest. Verified end-to-end via `cargo run --release --example receipt -p heso-trace-exec` — a successful trace produces a stable trace_hash (identical across two runs), a failing trace records failed_at=1 with the gating-task message from the stubbed primitive, and the receipt serializes to clean JSON. Out of scope (later): signing (M4), real cost accounting (engine has to feed back byte/cpu — needs T-013/T-017), pages_seen population (engine has to report content hashes — needs T-013)."
+    },
+    {
+      "id": "T-022",
+      "title": "Build planner v0 (heso-planner crate) — pattern-matched conversion of plain-English requests to traces",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M3",
+      "owner": "akshay",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-021"
+      ],
+      "links": {
+        "adr": [
+          "0009"
+        ],
+        "research": [
+          "browser-engines/agent-first-design",
+          "existing-agent-browsers/stagehand"
+        ],
+        "files": [
+          "crates/heso-planner/"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "v0 is pattern-matched, not LLM-backed. Recognizes 5 request shapes: (1) list extraction ('get all X with fields Y, Z'), (2) single-item search ('find the cheapest X under $N'), (3) form submission ('sign up with email=X, password=Y'), (4) multi-page join ('every page mentioning X, summarize'), (5) page watch ('watch for price change'). Returns Need-Clarification when no pattern matches. Output is a Trace from heso-trace + a planner_id."
+    },
+    {
+      "id": "T-023",
+      "title": "Wire heso.run as the single MCP tool (heso-mcp crate)",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M3",
+      "owner": "akshay",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-022"
+      ],
+      "links": {
+        "adr": [
+          "0009",
+          "0004"
+        ],
+        "research": [],
+        "files": [
+          "crates/heso-mcp/"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "MCP server (stdio + HTTP) exposing exactly one tool: heso.run per the contract in docs/the-one-tool.md. Wires planner → trace runner → engine. Never exposes primitives directly. Status values: ok | need_clarification | failed | partial. See ADR 0009 §Internal architecture for the data flow."
+    },
+    {
+      "id": "T-024",
+      "title": "Polish skills/heso/SKILL.md + docs/the-one-tool.md from real usage",
+      "status": "todo",
+      "priority": "P1",
+      "milestone": "M3",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-023"
+      ],
+      "links": {
+        "adr": [
+          "0009"
+        ],
+        "research": [],
+        "files": [
+          "skills/heso/SKILL.md",
+          "docs/the-one-tool.md"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Initial draft already written during the architectural pivot (2026-05-17). Refine based on real successful and failing heso.run calls during M3 development. Goal: any LLM can use heso correctly with only this one file in context."
+    },
+    {
+      "id": "T-026",
+      "title": "[CANCELLED per ADR 0012] heso-engine-cdp crate (Chromium via chromiumoxide)",
+      "status": "cancelled",
+      "priority": "P0",
+      "milestone": "M1",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-013"
+      ],
+      "links": {
+        "adr": [
+          "0011",
+          "0002"
+        ],
+        "research": [],
+        "files": [
+          "crates/heso-engine-cdp/Cargo.toml",
+          "crates/heso-engine-cdp/src/lib.rs",
+          "crates/heso-cli/src/main.rs"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Built and proven end-to-end (T-026 was completed), then CANCELLED + crate deleted per ADR 0012. The chromiumoxide path required a system Chrome install, breaking the single-binary deployment story. Replaced by T-027 (heso-engine-fetch) which is pure-Rust native and deploys anywhere. The lessons captured in ADR 0011 (engine choice doesn't determine the moat; ~80% of differentiation is above the engine) carried into ADR 0012's reasoning."
+    },
+    {
+      "id": "T-027",
+      "title": "Implement heso-engine-fetch: native HTTP+HTML EngineApi via reqwest + html5ever (M1)",
+      "status": "done",
+      "priority": "P0",
+      "milestone": "M1",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-013"
+      ],
+      "links": {
+        "adr": [
+          "0012",
+          "0002"
+        ],
+        "research": [
+          "browser-engines/agent-first-design"
+        ],
+        "files": [
+          "crates/heso-engine-fetch/Cargo.toml",
+          "crates/heso-engine-fetch/src/lib.rs",
+          "crates/heso-cli/src/main.rs",
+          "Cargo.toml"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "Native single-binary Rust engine. reqwest::Client (rustls TLS, gzip+brotli, HTTP/2, up to 20 redirects) for HTTP; scraper (html5ever under the hood) for HTML parse; recursive DOM walker for visible-text extraction (strips script/style/noscript/template, normalizes whitespace). FetchPage holds the post-redirect final URL + pre-computed body text. heso-cli gained a `heso fetch <url>` subcommand that returns {url, text} JSON directly (the surface external tools like the Flue agent call); `heso run <url> <req>` continues to walk a trace and return a Receipt. Live tests (with real network calls to example.com) pass. End-to-end demo via Flue agent on korrd.co produced detailed answer with content from the actual page. Honest limitations documented in ADR 0012 + the crate's lib.rs doc-comment: no JS, no CSS layout, no JS-validated form submission. For JS-heavy sites the text comes back sparse and the planner should surface a clear error (future work)."
+    },
+    {
+      "id": "T-025",
+      "title": "End-to-end demo: heso.run works for 5 representative requests against live web pages",
+      "status": "todo",
+      "priority": "P0",
+      "milestone": "M3",
+      "owner": "claude",
+      "created_at": "2026-05-17",
+      "updated_at": "2026-05-17",
+      "depends_on": [
+        "T-023"
+      ],
+      "links": {
+        "adr": [
+          "0009"
+        ],
+        "research": [],
+        "files": [
+          "tests/demo/"
+        ],
+        "issues": [],
+        "rfcs": []
+      },
+      "notes": "5 demos: (1) HN headline scrape, (2) Wikipedia article extract, (3) Amazon search-and-filter for cheapest item, (4) docs-site multi-page join (find pages mentioning X), (5) form submission to a test site. Each demo asserts: receipt structure is valid, cost is reported, second run with same seed produces identical Receipt.trace_hash."
+    }
+  ],
+  "open_questions": [
+    {
+      "id": "Q-001",
+      "question": "Which JS engine? Stick with Servo's SpiderMonkey or explore Boa (pure Rust)?",
+      "context": "SpiderMonkey is C++, heavy to build, requires significant build-tooling on each platform. Boa is pure Rust but slower and partial spec coverage. Defer until we have a Servo embed working — we'll know more about the pain. ADR 0003 + servo-internals/spidermonkey-integration.md document the current trade-offs.",
+      "raised_at": "2026-05-17",
+      "blocks": [],
+      "links": {
+        "research": [
+          "servo-internals/spidermonkey-integration"
+        ],
+        "adr": [
+          "0003"
+        ]
+      }
+    },
+    {
+      "id": "Q-002",
+      "question": "Async runtime: tokio (default), smol (lighter), or async-std (less active)?",
+      "context": "Choice affects every crate that does I/O. tokio is the de-facto standard with the richest ecosystem. Default to tokio unless we hit a Servo compat issue. See rust-llm-mistakes/README.md §2 for related anti-patterns.",
+      "raised_at": "2026-05-17",
+      "blocks": [],
+      "links": {
+        "research": [
+          "rust-llm-mistakes/README"
+        ],
+        "adr": []
+      }
+    },
+    {
+      "id": "Q-003",
+      "question": "How do we package and distribute a Servo-based binary across Linux/macOS/Windows?",
+      "context": "Servo links to SpiderMonkey + many native libs. Cross-platform distribution is non-trivial. Need to research Verso's release pipeline and the MOZJS_ARCHIVE story.",
+      "raised_at": "2026-05-17",
+      "blocks": [],
+      "links": {
+        "research": [
+          "servo-internals/verso-prior-art",
+          "servo-internals/spidermonkey-integration"
+        ],
+        "adr": []
+      }
+    },
+    {
+      "id": "Q-004",
+      "question": "Can we eliminate JS event loop microtask ordering nondeterminism without patching SpiderMonkey?",
+      "context": "Microtask ordering is observable. SpiderMonkey may have ordering subtleties around Promise resolution timing that we can't control via prefs. If we must patch SpiderMonkey, the determinism story gets more expensive. Investigate by writing a test that exercises microtask ordering across runs.",
+      "raised_at": "2026-05-17",
+      "blocks": [
+        "T-018"
+      ],
+      "links": {
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "adr": [
+          "0008"
+        ]
+      }
+    },
+    {
+      "id": "Q-005",
+      "question": "Is Stylo's parallel selector matching output-deterministic in practice (only timing varies) or also output-nondeterministic in edge cases?",
+      "context": "Stylo uses rayon for parallel selector matching. CSS spec mandates result ordering, so output should be deterministic. But edge cases (cascade origin priority across stylesheets loaded in parallel, e.g.) may differ. Build a test before declaring determinism complete.",
+      "raised_at": "2026-05-17",
+      "blocks": [
+        "T-019"
+      ],
+      "links": {
+        "research": [
+          "browser-engines/determinism",
+          "servo-internals/architecture"
+        ],
+        "adr": [
+          "0008"
+        ]
+      }
+    },
+    {
+      "id": "Q-006",
+      "question": "What's the right granularity for the fake clock — agent-controlled (explicit advance_clock(ms)), tick-based (auto-advance on next animation frame), or some hybrid?",
+      "context": "Agent-controlled gives full reproducibility but breaks sites that rely on time-based behavior (e.g. polling). Tick-based feels more natural but introduces a coupling between rendering and clock that may be hard to reason about. A hybrid (auto-tick but agent can also explicit-advance) may be best. Site-compat testing needed.",
+      "raised_at": "2026-05-17",
+      "blocks": [
+        "T-015"
+      ],
+      "links": {
+        "research": [
+          "browser-engines/determinism"
+        ],
+        "adr": [
+          "0008"
+        ]
+      }
+    },
+    {
+      "id": "Q-007",
+      "question": "Planner v0 pattern coverage: which 5 request shapes do we hard-code, and how do we handle the 6th?",
+      "context": "Per ADR 0009, planner v0 is pattern-matched, not LLM-backed. We need to commit to a fixed set of recognized request shapes. Current proposal: list extraction, single-item search, form submission, multi-page join, page watch. Sixth requests should return need_clarification with a question that elicits a recognized shape. Alternative: ship a small LLM in v0 (heavier).",
+      "raised_at": "2026-05-17",
+      "blocks": [
+        "T-022"
+      ],
+      "links": {
+        "research": [
+          "browser-engines/agent-first-design"
+        ],
+        "adr": [
+          "0009"
+        ]
+      }
+    },
+    {
+      "id": "Q-008",
+      "question": "Should planner versions be semver-pinned in receipts so old runs replay against their original planner, or do we accept that planner upgrades may produce different traces from the same request?",
+      "context": "If we pin, replay against old receipts is guaranteed to reproduce — but old planner versions accumulate and need maintenance. If we don't pin, agents see behavior changes when heso upgrades. Mid-ground: pin major versions only (planner_v1, planner_v2), allow minor patches.",
+      "raised_at": "2026-05-17",
+      "blocks": [],
+      "links": {
+        "research": [],
+        "adr": [
+          "0009"
+        ]
+      }
+    }
+  ],
+  "blockers": [],
+  "decisions_pending": [
+    {
+      "id": "D-001",
+      "topic": "Async runtime selection",
+      "summary": "Pick tokio vs smol vs async-std before more crates take on I/O dependencies. Default leaning is tokio.",
+      "raised_at": "2026-05-17",
+      "needs_adr": true,
+      "blocks_tasks": [
+        "T-013"
+      ]
+    },
+    {
+      "id": "D-002",
+      "topic": "Identity storage format on disk",
+      "summary": "Where the Ed25519 keypair lives (filesystem layout, permissions, format) and how rotation works.",
+      "raised_at": "2026-05-17",
+      "needs_adr": true,
+      "blocks_tasks": []
+    },
+    {
+      "id": "D-003",
+      "topic": "Planner versioning policy",
+      "summary": "How planner versions are pinned in receipts and how old versions are maintained for replay. See Q-008.",
+      "raised_at": "2026-05-17",
+      "needs_adr": true,
+      "blocks_tasks": [
+        "T-022"
+      ]
+    }
+  ],
+  "log": [
+    {
+      "at": "2026-05-18T09:30:00Z",
+      "by": "claude-opus-4-7",
+      "action": "shipped",
+      "target": "ADR 0014 Phase 1B Day 1 — agent-shaped DOM live, JS reaches into the parse + ADR 0016 positioning reframe",
+      "note": "Two parallel landings: the JS engine grew an agent-shaped DOM, and the public positioning was sharpened into a defensible product category. (1) NEW MODULE `crates/heso-engine-js/src/dom.rs` (~430 LOC, 18 unit tests) implements the read-only half of the DOM as #[rquickjs::class]-backed Rust types. `Document` (wraps `Arc<scraper::Html>`) exposes `querySelector`, `querySelectorAll`, `getElementById`, `documentElement`, `body`, `head`, `title`. `Element` exposes `tagName` (uppercase per spec), `localName`, `id`, `className`, `textContent`, `innerHTML`, `outerHTML`, `getAttribute`, `hasAttribute`, `querySelector`, `querySelectorAll`, `children`, `parentElement`. Lifetime story: each Element stores `(Arc<Html>, ego_tree::NodeId)` — looks up its NodeRef on every access, never borrows across QuickJS calls. JsEngine gained `eval_with_html(html, js) -> EvalOutcome` that parses HTML, constructs a Document, registers Document+Element classes on globals via Class::define, instantiates and sets `document` as a global, then runs the JS. Class constructors are intentionally not exposed — JS can't `new Document()` because we don't define `#[qjs(constructor)]`. Two getters needed explicit `#[qjs(rename = \"innerHTML\")]` / `\"outerHTML\"` because `rename_all = camelCase` produces `innerHtml` not the DOM-spec `innerHTML` (uppercase HTML acronym). 11 DOM-via-JS integration tests in engine.rs prove the wiring: `document.title`, querySelector + textContent chain, Array.from + map over querySelectorAll, getElementById, attribute reads, scoped subtree queries, console.log alongside DOM access, innerHTML / outerHTML round-trips, null-when-no-match. NEW CLI SUBCOMMAND `heso eval-dom <url> <js>` (or `<url> -` for JS from stdin) — fetches the URL via a new `FetchEngine::fetch_text(url) -> (final_url, raw_html)` HTTP-only helper (factored out of `open_static` so callers needing raw HTML for the JS path don't pay metadata+tree+actions extraction cost), constructs a JsEngine, eval_with_html. Prints `{ok, url, value, console}` or `{ok:false, url, error:{kind,message,stack|value}}`. LIVE END-TO-END VERIFIED on three real URLs: `heso eval-dom https://news.ycombinator.com 'document.title'` -> \"Hacker News\"; `heso eval-dom https://news.ycombinator.com 'Array.from(document.querySelectorAll(\".titleline > a\")).slice(0,5).map(a => a.textContent)'` -> 5 actual current HN story titles; `heso eval-dom https://example.com '({h1: document.querySelector(\"h1\").textContent, p: document.querySelector(\"p\").textContent})'` -> structured object with the page content. JS RUNS INSIDE HESO, REACHES INTO THE DOM, RETURNS STRUCTURED DATA — NO CHROMIUM, NO NODE. (2) POSITIONING REFRAMED via subagent: NEW ADR `decisions/0016-positioning-headless-browser-for-agents.md` (Accepted 2026-05-18) is now the canonical statement: \"Headless browser for the agent-relevant half of the web. 30MB single binary, sub-100ms cold start, no Chromium. Handles fetch, parse, JS hydration, forms, clicks, sessions. Returns structured agent-shaped JSON with content-hashed signed receipts.\" Frames the competition: Browser Use, Stagehand, Skyvern, Operator are wrappers around Playwright/Chromium; the Chromium bloat (~70% of 180-240 MB) is the rendering pipeline (Skia, Blink layout, GPU compositor, codec stack) which agents don't need. heso ships the boring half (fetch+parse+JS+DOM+cookies+forms+clicks) and drops the rendering half — that's the bet. Precedent cited: jsdom (~50k LOC JS) + happy-dom (~30k LOC JS) prove a minimal DOM+JS handles the agent half — doing it in Rust against QuickJS is the move nobody has shipped as a product, real gap on the shelf. README rewritten lead with comparison table (8.2 MB stripped today / sub-100ms target / <20MB RAM target VS Chromium-headless ~240MB / 1-2s / 180MB). AGENTS.md \"What heso is\" replaced. All engine crate `//!` docstrings reframed. .agent/MAP.md + PRIORITIES.md + state.json.project.tagline updated. ADR 0015 (cartographer) RETAINED — the plat is what one heso run produces, ADR 0016 is what heso IS as a product category. Two stale claims fixed mid-reframe: heso-engine-fetch/src/lib.rs no longer claims \"the default and only engine for v1\"; heso-cli/src/main.rs no longer says \"the only engine is heso-engine-fetch\". Also flagged-and-fixed: .agent/GLOSSARY.md `engine` entry previously said \"no JS support\" — now describes both engines side by side with ADR refs. TESTS: 129 + 45 + 14 + 9 + 7 = **204 workspace lib tests green** (up from 175: +18 dom unit + +11 dom-via-JS integration). Cargo check clean. Release binary 8.2 MB stripped (was 8.1 MB pre-DOM; +100 KB for the new module + class machinery). HONEST SCOPE: this is Phase 1B DAY 1 only. The DOM is READ-ONLY — no `element.setAttribute`, no `appendChild`/`removeChild`/`replaceChild`, no `textContent =` setter, no `classList.add`. The Phase 1B-rest items: mutations, MutationObserver, event model + dispatchEvent, click() that actually fires handlers, HTMLInputElement.value get/set + InputEvent, HTMLFormElement.submit(), setTimeout/setInterval with fake clock, fetch() backed by reqwest. Plus Phase 1C: `<script>` tag execution on page load (the actual SPA hydration story — anthropic.com still won't render without it). Per ADR 0014's Phase 2-3 budget, that's the weeks-to-months part; Day 1 proved the architecture is sound (rquickjs class lifetimes work via Arc<Html>+NodeId, scraper Arc-sharing works, JS round-trips through serde_json cleanly, the rename-all-camelCase getter gotcha is documented for future contributors). Per ADR 0016 the 6-month total is ~4-5 months focused work + 1 month slack; today consumed roughly a Day 1 worth of the DOM month. NEXT moves: Phase 1B Day 2 (mutation setters: setAttribute, classList, textContent =, innerHTML =) OR Phase 1C (run <script> tags on page load — the SPA hydration unlock) OR compatibility-test harness (pin 100 real URLs as fixtures, assert agent-relevant invariants per ADR 0016 roadmap) OR external validation push (now that there's a working public demo)."
+    },
+    {
+      "at": "2026-05-18T07:30:00Z",
+      "by": "claude-opus-4-7",
+      "action": "shipped",
+      "target": "data_attrs extractor + inline_data fuzz-hardened + doc system slimmed (three parallel work streams)",
+      "note": "Three parallel work streams landed in one session via two subagents + main agent. (1) NEW EXTRACTOR `crates/heso-engine-fetch/src/data_attrs.rs` (~280 LOC, 14 unit tests) recognizes JSON payloads stashed in `data-*` element attributes — the older-React / Vue / Stimulus / Alpine / vanilla widget pattern (`<div data-react-props='{...}'>`, `<button data-modal-config='{...}'>`, `<li data-item='{...}'>`). Wired into FetchPage as `pub data_attrs: BTreeMap<String, Vec<DataAttrValue>>` (keyed by attr name including `data-` prefix; values are document-ordered lists of {tag, json}). Same noise-filter philosophy as inline_data: skip empty `{}`/`[]`, skip primitives (just-a-number / just-a-string), only emit non-empty objects and arrays. Conditionally inserted into `heso open` and `heso serve` open-dispatch payloads (only when non-empty so the empty-page baseline plat shape stays unchanged). LIVE WIN: github.com/rust-lang/rust unlocked **94 hydration objects** via this path — 87 `data-analytics-event` payloads and 7 `data-hydro-click` payloads, each carrying full event_type / payload structures (auth_type, location_in_page, originating_url, repository_id, user_id) that GitHub previously emitted only as opaque HTML attribute strings. Stripe and the inline_data-rich sites already covered (apple/netflix/youtube/nextjs/twitter) carry zero data_attrs — confirming the new path is ADDITIVE (different surface) not duplicative. (2) INLINE_DATA FUZZ-HARDENING: an adversarial subagent ran 10 iterations against `crates/heso-engine-fetch/src/inline_data.rs`, found and fixed THREE real bugs the unit tests had missed. (a) UTF-8 BOM (0xEF 0xBB 0xBF) at start of an `application/json` body — `serde_json::from_str` rejects BOM and `trim()` doesn't strip it, so a real-world BOM'd hydration blob produced nothing; fixed by `strip_prefix('\\u{FEFF}')` before trim. (b) `//`-commented assignments being leaked into output — `// window.foo = {...}` was extracted as if real; fixed by new `strip_js_comments()` helper that runs ahead of the assignment regexes, blanking line+block comments with byte-position-preserving spaces while respecting string literals (so `//` inside URL string values is preserved). (c) `<script type=\"module\">` ES modules were skipped — `is_plain_js_script` only accepted `text/javascript`/`application/javascript`, missing ESM scripts; fixed by adding `\"module\"` to the accepted types. Plus 13 regression tests pinning down already-correct behavior (RSC malformed pushes ignored, byte-for-byte determinism across two extract() calls, unterminated object literals don't crash, 200-segment dotted paths don't blow up the regex, duplicate `id` attributes follow first-wins, `id` whitespace trimmed, `function foo() {}` declarations don't get misidentified). inline_data test count went 32 → 48. Status report in `.agent/edge-case-hunt.md`. (3) DOC SYSTEM SLIMMED: another subagent rewrote CLAUDE.md (removed `@AGENTS.md` / `@.agent/MAP.md` / `@.agent/PRIORITIES.md` auto-imports that pasted hundreds of lines into every conversation; replaced with a 17-row \"Read on-demand\" command table — `cat .agent/MAP.md`, `jq '.current_focus' state.json`, `cat decisions/NNNN-*.md`, etc.) and AGENTS.md (rewrote every reflex/checklist item to reference a specific shell command instead of \"read X file\"; trimmed paraphrased content that lives canonically elsewhere). Synced `.agent/MAP.md` (added heso-engine-js to crates, extended ADR range 0001-0015 with Phase 1A status; fixed stale @-import wording on line 19), `.agent/PRIORITIES.md` (Last updated 2026-05-18, Phase 1A done in north-star section, Phase 1B as next), `README.md` (softened JS-not-real bullet to acknowledge Phase 1A landing + heso eval-js; bumped 5.2MB/83-tests stats to 8.1MB/175-tests). Per-conversation context burn dropped significantly — agents now learn the repo by running the commands, not by reading a giant inlined block every time. TESTS: 129 + 16 + 14 + 9 + 7 = **175 workspace lib tests green** (up from 145: +14 data_attrs, +16 inline_data fuzz + regression). Cargo check clean. Release binary 8.1 MB (unchanged — no new C deps, regex already in tree). FLAGS for user attention: `current_focus.next_action_id` is still `T-022` (planner v0) but Phase 1B (DOM) has no task ID yet — user's call whether to add one or proceed by milestone reference. Three flagged-not-fixed items from the fuzz hunt (`\\NNN` octal escapes, regex-literal-inside-object-body, single-quoted JSON string carriers) are documented intentional misses — fixing them is months of work or requires a full JS parser; current docstrings list exactly which JS-isms get translated. Next strategic moves: ADR 0014 Phase 1B (DOM types backed by scraper::Html, weeks of work) OR external validation (push to GitHub, share demo) OR additional static-extraction passes (microdata, noscript, etc.)."
+    },
+    {
+      "at": "2026-05-18T05:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "shipped",
+      "target": "ADR 0014 Phase 1A — QuickJS engine integrated, JS executes inside heso",
+      "note": "First milestone of the JS-capable engine path. New crate `crates/heso-engine-js/` (~470 LOC, 16 unit tests) wraps `rquickjs = \"0.11\"` (which vendors QuickJS as a C build dep) behind a safe `JsEngine` Rust API. Public surface: `JsEngine::new()` -> single Runtime+Context with 10 MB memory cap + 256 KB stack cap; `JsEngine::eval(js)` -> `EvalOutcome { value: serde_json::Value, console: Vec<ConsoleEntry> }` or `EvalError`. Value conversion uses fast paths for primitives (null/bool/int/float/string/function->null/symbol->null) and falls back to JS-native `JSON.stringify` then `serde_json::from_str` for objects and arrays — same key ordering JS itself produces. `console.log/info/warn/error/debug/trace` are installed as global functions that route into an in-process buffer (cleared per eval), not stdout, so trace receipts stay clean. Error variants: `Exception { message, stack }` for `throw new Error(...)`, `ThrownValue { value }` for `throw <non-Error>`, `Engine(String)` for OOM/stack-overflow/parse-failure. Console + isolation per ADR 0008 prep: each engine instance is its own QuickJS Runtime — globals do not leak across engines (verified by `each_engine_is_isolated` test). 16 unit tests cover: arithmetic, string concat, object literals via JSON.stringify, array literals, undefined -> json null, functions -> json null, console capture (all 6 levels), buffer reset between evals, `throw new Error` -> Exception variant, `throw {custom}` -> ThrownValue, syntax errors, engine reuse across multiple evals, modern ES features (arrow fns, spread, destructuring, optional chaining, template literals, default args), JSON.parse roundtrip, engine isolation. NEW CLI SUBCOMMAND `heso eval-js <js>` (or `heso eval-js - < script.js` from stdin) — prints `{ok, value, console}` or `{ok:false, error:{kind,message,stack|value}}` as pretty JSON; exit 0 on success, 1 on JS error, 2 on usage error. Smoke-tested live: `heso eval-js \"1+2+3\"` -> 6; `heso eval-js \"const xs=[1,2,3]; console.log('squares:', xs.map(x=>x*x)); xs.reduce((a,b)=>a+b,0)\"` -> 6 with `squares: [1,4,9]` in console; `heso eval-js \"throw new Error('demo failure')\"` -> exception with stack trace at line 1 col 10; `heso eval-js \"throw {code:42,what:'custom'}\"` -> ThrownValue with the object preserved. Tests: 99 + 16 + 14 + 9 + 7 = **145 workspace lib tests green** (up from 129: +16 new in heso-engine-js, +0 regressions). Binary size: 8.1 MB release-stripped (was 5.2 MB pre-QuickJS, ADR 0014 estimated ~6 MB — somewhat higher but within range; QuickJS itself is ~600 KB of the delta, rest is the rquickjs bindings + extra metadata). HONEST SCOPE: this is Phase 1A only — `JsEngine` is a sandboxed JS evaluator with NO DOM, NO window globals (except console), NO document, NO <script>-tag execution on page load. It runs the language; it does not yet model the browser. Cannot yet read anthropic.com or any pure SPA — that needs Phase 1B (DOM types as #[rquickjs::class] backed by scraper::Html, window/document globals) and Phase 1C (run <script> tags during open --js). Crate dep on heso-engine-fetch was DEFERRED to Phase 1B since Phase 1A doesn't need the parsed Html. Cargo check + clippy clean. Next: Phase 1B per ADR 0014 — bring up Document / Element / Node / NodeList / Text as Rust types implementing #[rquickjs::class], backed by the existing scraper::Html parse. That's the bulk of the DOM build-out and where months-of-work scope kicks in."
+    },
+    {
+      "at": "2026-05-18T03:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "shipped",
+      "target": "SSR gap closure — RSC streams + generic <path>=JSON pattern + JS escape rewrite",
+      "note": "Cartography V0 now reads every common SSR hydration shape without running a single line of JavaScript — one principled rule per pattern, no per-site code. THREE NEW EXTRACTORS in `crates/heso-engine-fetch/src/inline_data.rs` (now ~1080 LOC, 32 unit tests up from 8). (1) RSC STREAMS: recognizes `self.__next_f.push([N, \"...\"])` flight chunks across all inline scripts, concatenates string payloads in source order, splits on newline, JSON-parses each line's right-hand side (after first `:`); falls back to raw string for `T<size>,\"...\"` text chunks and `I[...]` module refs. Result lives under key `__next_f` as ordered array of `{id, value}`. (2) GENERIC `<path>=JSON` ASSIGNMENTS: one regex matches any identifier path (single ident `__DATA__`, dotted chain `netflix.reactContext`, bracket-indexed `window[\"__INITIAL__\"]`, deep `app.feature.flags`, mixed `a[\"b\"].c`) followed by `= {...}` or `= JSON.parse(\"...\")`. Object-literal RHS is naively brace-matched (respecting string literals) and validated by serde_json; non-JSON-shaped JS (unquoted keys, function refs, regex literals) is rejected. JSON.parse RHS is unescaped via serde_json::from_str::<String> then re-parsed. Keys normalized: leading `window.` stripped, `[\"foo\"]` → `.foo`, whitespace removed. First-write-wins so the more explicit `application/json` and RSC paths take precedence. (3) JS-ONLY ESCAPE REWRITER: when strict-JSON parse fails on a captured object literal, rewrite `\\xNN` → `\\u00NN`, `\\v` → `\\u000b`, `\\0` (non-octal) → `\\u0000`, `\\'` → `'` inside string literals, then retry. Universal mechanical translation; no per-site special-casing. NOISE FILTER: `is_trivially_empty` skips inserting `{}` and `[]` results — common namespace-init pattern from bundled polyfills (`var _nativeErrors = {}; ResizeObserverBoxOptions = {};`). LIVE VERIFICATION: netflix.com/title — empty inline_data before this turn → 317,297-byte `netflix.reactContext` captured (the actual page hydration, including models, headers, server defs, build IDs). The JS-only `\\x20`/`\\x2d` escapes inside netflix's strings now parse cleanly via the rewriter. nextjs.org — 92 RSC flight entries, 93,630 bytes (the entire App Router payload: SVG paths, page sections, footer copy). vercel.com — 283 RSC entries, 282 KB. hashnode.com — 119 KB RSC. apple.com — application/json `__ACGH_DATA__` 36 KB still works PLUS new `tvPlusHpData` 27 KB from a window.X assignment we now catch (bonus from generalization). NOISE REDUCTION: netflix went from 58 inline_data keys (49 of them empty {} from polyfill namespace inits) to 10 meaningful keys after the empty-skip filter. Tests: 99 + 14 + 9 + 7 = **129 workspace lib tests green** (up from 105: +24 inline_data covering RSC line-parsing, chunk-splitting, namespace dotted paths, var/let/const prefix, bracket-indexed paths, function-body rejection, empty-skip, JS-escape rewrite round-trip, UTF-8 preservation in rewriter, first-write-wins, mixed-three-pattern integration). HONEST SCOPE: still doesn't catch (a) computed-expression hydration like `JSON.parse(atob(decodeURI(...)))` — needs JS execution, deferred to ADR 0014 QuickJS; (b) single-quoted JSON string literals — rare, would need full string re-quoting; (c) RSC binary chunks fetched via `_rsc.bin`. The generalization principle: one regex, one rule, applies to any site without per-framework knowledge — Apollo, Next.js, Nuxt, Netflix, Apple, Redux, whatever. Adding a new framework is zero code change. Workspace deps: `regex = \"1\"` added to workspace + heso-engine-fetch. blake3, tokio fs feature still in place from previous turn. Cargo check clean, clippy clean. Next strategic moves: ADR 0014 V1 QuickJS engine for the remaining ~30% of sites needing real JS execution, OR external validation (push to GitHub, plat-hash a public demo set, share with someone who runs an agent-browser project)."
+    },
+    {
+      "at": "2026-05-18T00:30:00Z",
+      "by": "claude-opus-4-7",
+      "action": "shipped",
+      "target": "inline_data extractor — SSR-SPA hydration blobs unlocked",
+      "note": "Cartography V0 now reads server-rendered-SPA pages that LOOK empty but ship their actual content as inline JSON `<script type=\"application/json\">` blobs for client-side hydration. New `crates/heso-engine-fetch/src/inline_data.rs` module (~210 LOC, 8 unit tests) extracts every `application/json` script block (excludes `application/ld+json` which `metadata.rs` already owns), parses as serde_json::Value, keys by the script's `id` attribute (synthetic `unnamed-{N}` for unnamed scripts in document order), skips malformed JSON silently. New `inline_data: BTreeMap<String, serde_json::Value>` field on FetchPage + LinkedPage (so cartographied linked pages also surface their blobs). Wired through `heso open`, `heso serve` dispatch_open, and `linked_pages_to_json`. Agent skill args now carry `cachedInlineData` so the LLM can grep it for product/price/copy content; one-line addition to SKILL.md teaches the LLM to check inline_data after metadata.jsonld when preamble is sparse. LIVE WIN: apple.com/ca went from 0 bytes of accessible content (empty preamble, 1 empty h1, SPA shell) to a 37,417-byte structured `__ACGH_DATA__` payload — nav categories (airpods, ipad, accessories, entertainment), Quick Links / Suggested Searches / locale en_CA, all the data Apple's CMS ships server-side for client-side rendering. Hypothesis confirmed by raw-HTML probe (188 KB HTML → 3.3 KB visible text → 37 KB inline JSON we now capture). HONEST SCOPE: pattern catches legacy Next.js `__NEXT_DATA__`, Apple `__ACGH_DATA__`, Nuxt `__NUXT_DATA__`, Astro islands, generic `<script type=\"application/json\">`. Does NOT yet catch: React Server Components streaming (modern Next.js 14+ App Router uses a custom binary-ish streaming protocol, NOT plain JSON — confirmed empty on nextjs.org and effectively-empty on vercel.com which uses Next 15), or `<script>window.X = {...}</script>` JS-assignment hydration patterns (those need a JS parser; on the roadmap via ADR 0014's QuickJS). Tests: 75 + 14 + 9 + 7 = 105 workspace lib tests green (up from 97: +8 inline_data). TypeScript on the agent clean. apple.com's new plat_hash dd74c00... reflects the richer content; the determinism + tamper-detection from the previous turn still hold (same plat content = same hash, byte-tamper caught). Next strategic moves: extend pattern to cover RSC streams + JS-assignment hydration (still without JS execution — RSC is parseable, just not as JSON), OR jump to ADR 0014 V1 QuickJS for true JS-execution coverage. The 'server-renders mapped like Stripe' goal is now reality for the legacy/Astro/Apple slice; modern RSC sites are the remaining gap."
+    },
+    {
+      "at": "2026-05-17T23:30:00Z",
+      "by": "claude-opus-4-7",
+      "action": "shipped",
+      "target": "plat content-addressing + V0 polish + real-world matrix",
+      "note": "Made the moat sentence real and tightened V0. CONTENT-ADDRESSED PLATS (#2): new `crates/heso-engine-fetch/src/plat.rs` (~280 LOC, 13 unit tests). Canonical-JSON serialization (sorted object keys recursively, compact, standard JSON string escaping) — a subset of RFC 8785 sufficient for engine output shapes. BLAKE3 hash over canonical bytes → 64-char hex `plat_hash`. The `plat_hash` field is RECURSIVELY STRIPPED at every level before hashing (so embedding doesn't poison; supports future V2 Merkle-tree per-LinkedPage hashes). `plat::verify()` re-computes and compares; returns Ok(true)/Ok(false)/Err(MissingHashField|MalformedHashField). Wired into `heso open` (output now ends with `plat_hash`) and `heso serve` `open` method (page_id stripped from hash input since it's server-instance-scoped, not part of portable identity). Two new CLI subcommands: `heso plat-hash <file>` (recompute, print hash) and `heso plat-verify <file>` (exit 0=match, 1=mismatch with both hashes shown, 2=malformed). Workspace deps: blake3 added to heso-engine-fetch; tokio gained `fs` feature in heso-cli. END-TO-END VERIFIED LIVE: `heso open https://docs.rs/` produces plat_hash 2dd297..., `heso plat-hash docs.json` independently recomputes the same 2dd297..., `heso plat-verify docs.json` returns `OK 2dd297...` exit 0. Byte-level tampering (one ASCII character mutation) caught: `plat-verify` returns `MISMATCH embedded=2dd297... recomputed=15492...` exit 1. DETERMINISM CONFIRMED: two `heso open https://example.com/` calls produced identical hash abf42b... — the same plat content anywhere produces the same hash, modulo the page changing on the server. Moat-sentence claim from ADR 0015 is now code not promise. V0 POLISH (#1): tree walker now skips `<nav>` outright and `<header>`/`<footer>` when they are direct children of `<body>` — kills the nav-menu noise that bled into every page's preamble during the rust-lang.org stress test. Per-article `<header>` (inside `<article>`) is preserved (regression test added). Agent's expanded-outline builder now goes 3 levels deep: h1 with 200-char intro_preview, h2 with 150-char intro_preview + h3 list, h3 as heading+summary only. Surfaces content that lives at h3 under empty-intro h2s (the rust-lang.org case where memory-safety content was at h3 under an empty 'Why Rust' h2). REAL-WORLD MATRIX (#1c): cartography V0 + plat_hash on 5 representative sites. Wikipedia article (Web scraping) — 1171ms, 3.3 MB, 483 actions, 1 JSON-LD Article block, content nested under one h1 (outline-deepening pays off here). GitHub README (rust-lang/rust) — 1487ms, 1 MB, 5 h1s, 287 actions, 9 OG keys. danluu.com — surprise finding: old-school HTML uses only h2+, no h1, so the entire page content flattens into 7.9 KB preamble (244ms, agent gets the content but loses tree structure — small honest-scope footnote). stripe.com — 1292ms, 1.3 MB, 2 h1s, Org JSON-LD, 208 actions. apple.com — the expected SPA failure mode: 0-byte preamble, 1 empty h1, but 2 JSON-LD blocks + 7 OG keys still carry the marketing copy. 5 plats produced, 5 unique content hashes, all parseable. Tests: 67 + 14 + 9 + 7 = **97 workspace lib tests green** (up from 83: +13 plat module, +1 nav-skip regression). Cargo check + clippy `-D warnings` clean. The moat sentence ('Theirs is the memory one agent keeps. Ours is the artifact every agent shares.') from ADR 0015 + README is now backed by working code: the plat is a content-addressed deterministic artifact that anyone can verify hasn't been tampered with. Ed25519 signing (who produced it) is a clean follow-on. Next strategic moves: V1 (ADR 0014 QuickJS engine) for SPA support, OR external validation (push to GitHub, share with a Browser Use / Stagehand maintainer)."
+    },
+    {
+      "at": "2026-05-17T21:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "accepted",
+      "target": "ADR-0015 + V0 cartography (plat) + agent rewire",
+      "note": "STRATEGIC PIVOT: heso is no longer 'Chromium for agents.' It's a cartographer — the agent's product is a `plat`, a static text-shaped MAP of every reachable state of a web page, signed and deterministic, that agents READ instead of driving a live browser through act/observe/decide. ADR 0015 anchors the pivot. The reframe was forced by two independent reviewers (user-POV + competitive analyst, both fresh subagents with web access): Lightpanda already owns 'smaller headless browser' (V8 + 17 CDP domains + Playwright drop-in + 11x faster benchmarks); Vercel Labs `agent-browser` already shipped the @e1/@e2 ref vocabulary; the QuickJS+DOM bet is 6-12 months for vanilla onclick, 2+ years for React, never for dashboards — so the 'Chromium replacement' lane is suicide-by-scope and someone else's already. Concurrent research subagent surfaced the prior art (Crawljax 2008+, Mesbah TU Delft — DOM-state crawling for QA test gen) and the closest 2025 contender (WebATLAS arXiv 2510.22732 — private per-agent memory, not shared signed artifact). Naming: 'Plat' (surveyor's deed-grade map, unclaimed; 'Atlas' is burned by ChatGPT Atlas + WebATLAS paper). Moat sentence: 'Theirs is the memory one agent keeps. Ours is the artifact every agent shares.' SHIPPED V0 CARTOGRAPHY (sub-agent build): new `crates/heso-engine-fetch/src/explore.rs` (1166 LOC, 19 unit tests + a MockFetcher via crate-private LinkFetcher trait for deterministic concurrency testing). `linked_pages: Vec<LinkedPage>` sibling field on FetchPage (chose this over tree-nested per ADR 0013 reasoning — linked pages have metadata/tree/actions, not just heading sections). `FetchEngine::open_with_explore(url, ExploreOptions)` composes static path + concurrent JoinSet link fetches with output ordering restored to document order. Filters: same-origin (scheme+host+port), skip mailto/tel/javascript/data/fragment/empty, dedupe by canonical URL, cycle prevention seeded with parent URL. Caps: DEFAULT_LINK_CAP=20, HARD_LINK_CAP=50. Per-link errors collapse to {from_ref, url, error} not whole-call failure. CLI: `heso open --explore-links N --link-cap M <url>`. JSON-RPC: `open` method gains explore_links_depth + link_cap params. Tests: workspace 64→83 (+19 new, all green); cargo clippy --all-targets -D warnings clean; cargo check --workspace --all-targets clean. Punted explicitly: robots.txt, rel=nofollow, content-type sniffing, UA rotation, cross-origin allowlist, depth>=3 convergence guarantees. LIVE DEMO: `heso open --explore-links 1 --link-cap 10 https://docs.rs/` returned in 545ms with root (41 actions) + 10 same-origin linked pages each with real titles (About, Badges, Builds, Metadata, Shorthand URLs, …) and their own action counts (20-43 each). Total payload ~1.25 MB structured JSON. AGENT REWIRED: heso-test-agent/.flue/agents/web-search.ts now calls `runHesoOpen(url, exploreLinksDepth=1, linkCap=15)` so every query gets a plat. New `heso_get_link({from_ref})` tool added (fourth in the agent's toolset, alongside ls/cat/find) — pure in-memory lookup that returns the full body of a pre-fetched linked sub-page from cachedLinkedPages. skillArgs adds `linked_pages: [LinkedPageSummary, ...]` with heavy fields stripped (no inner actions/full tree) — LLM gets title + intro_preview + top_level_slugs + counts, calls heso_get_link if it needs prose. navigate-page SKILL.md rewritten in user-mandated minimal style: frontmatter + brief intro + 4-tool table + tips + output spec only (no recipes-by-query-shape, no four-layer cost diagrams, no hard-rules wall — the user explicitly trimmed me). README rewritten to LEAD with cartography pitch, plat terminology, Crawljax lineage, WebATLAS contrast, and the airline-check-in-as-40-nodes-in-2KB killer demo as the V1 target. Honest 'What works today' / 'What is NOT real yet' split preserved. State of the project after this turn: 5.2MB single binary, ADRs 0001-0015 accepted, 9 CLI subcommands (heso fetch/tree/ls/cat/find/meta/open[--explore-links]/serve/run[STUB]), 83 lib tests, ~5900 LOC across 7 crates, end-to-end demo flowing through Flue agent → gpt-5.4-mini → cartography-shaped answer. Next milestone path: V1 = ADR 0014 (QuickJS engine for JS-handler exploration → real state-graph cartography for SPAs); V2 = ADR 0008+0005 (signed shareable plats, Ed25519 + content-hash artifacts). Open question Q-009 added: should V1's exploration backend be QuickJS (single-binary thesis) or hosted Chromium (cartographies built server-side, consumed everywhere)?"
+    },
+    {
+      "at": "2026-05-17T18:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "accepted",
+      "target": "ADR-0014 + action graph + protocol surface + repositioning",
+      "note": "Major repositioning + shipped infrastructure for it. Two external reviewers (user-POV + competitive analyst, both fresh subagents) hit heso with brutal verdicts: today's heso loses head-to-head with Firecrawl/Jina/Browser Use; the only differentiator that holds is the metadata extractor; `heso run` is overselling a stub. User accepted both verdicts and re-positioned: heso is NOT a competitor to those tools — it's the BROWSER ENGINE THEY DRIVE INSTEAD OF CHROMIUM. 'Chromium for agents, not humans.' STRIPPED OVERSELLING: README rewritten with explicit `What works today` / `What is NOT real yet` sections; CLI banner + main.rs doc + cmd_run doc all mark `heso run` as [STUB] with explanation; `What makes it different` items each labeled shipped/designed honestly. SHIPPED ACTION GRAPH: new `crates/heso-engine-fetch/src/actions.rs` (~480 LOC, 12 tests) extracts every interactive element with stable `@e0/@e1/...` refs, ARIA roles, accessible names, section paths sharing tree.rs's slug algorithm. New crate-public helpers `slugify`/`unique_slug`/`collapse_ws` so actions + tree share path arithmetic. New CLI: `heso find <url> [--role X] [--name SUBSTR] [--section /p]` filters; `heso cat <url> @e7` resolves to ElementRef JSON (polymorphic with tree paths). `heso open` now includes `actions` in payload. SHIPPED PROTOCOL SURFACE: new `crates/heso-cli/src/serve.rs` (~370 LOC). `heso serve` = line-delimited JSON-RPC 2.0 server over stdin/stdout, stateful page cache keyed by page_id (p1, p2, ...). Methods: open/ls/cat/find/close/ping + initial 'ready' notification with method list. Tokio-backed sequential dispatch. Live demo: 5 requests in one process opened stripe.com, found 3 Pricing links, resolved @e5, closed — single child process, no subprocess-per-call. Workspace tokio gained io-std + io-util + sync features. heso-cli gained serde + serde_json. AGENT WIRED: heso-test-agent/.flue/agents/web-search.ts switched to read `actions` from heso open. New `heso_find` tool exposed to LLM with same {role, name_substr, section} semantics. Skill args now carry actions_total + actions_by_role + actions (inlined if ≤200 entries, elided otherwise — LLM falls back to heso_find tool). SKILL.md rewritten as four-layer cost model: metadata → preamble+outline → actions[] → tools. ADR 0013 promoted to installment #1 of `engine as semantic extractor`. ADR 0014 ACCEPTED: bundles `rquickjs` (QuickJS via the rquickjs crate, ~600KB) + builds a deliberately-minimal agent-shaped DOM ourselves. Scope explicit: implement query/manipulate/event/timer/fetch/form-submit (the JS LLM-agents-actually-use). Non-goals explicit: no layout, no paint, no canvas/WebGL, no workers, no IndexedDB, no CSS engine, no accessibility tree (we have action graph). Determinism per ADR 0008 preserved (fake clock + seeded PRNG + recorded network). Binary projection: 5.2MB → ~6MB (vs Chromium 180MB+). Crate plan: new `heso-engine-js` sibling crate; static `heso-engine-fetch` stays default. CLI plan: `heso open --js` opt-in, `heso click @ref` / `heso fill @ref VALUE` / `heso submit @ref` / `heso eval` future commands. Implementation in 4 phases (months not weeks). Tests: 64 lib (12 new for actions) all green; cargo check --workspace --all-targets clean. Slug bug regression test from earlier session still green. Stripe.com smoke test: 208 actions extracted, find by name='pricing' returned 3 with correct section paths, cat @e0 = Stripe homepage link, cat @e5 = /en-ca/pricing. Context7 consulted on rquickjs API + scraper before committing to crate choices. Next: implement Phase 1 of ADR 0014 (heso-engine-js crate, core DOM, hello-world JS exec) OR build the static-link state expansion (bounded-depth <a href> pre-fetch, sub-trees) — the V0 of `every open path becomes a sub-directory` that doesn't need the JS engine."
+    },
+    {
+      "at": "2026-05-17T15:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "accepted",
+      "target": "ADR-0013 + metadata extraction",
+      "note": "Engine became a semantic extractor (ADR 0013). New `crates/heso-engine-fetch/src/metadata.rs` (~330 LOC incl. tests) extracts structured data the page already declared: Schema.org JSON-LD blocks (full serde_json::Value list, document-ordered), OpenGraph (`og:*` without prefix, BTreeMap-sorted), Twitter cards (`twitter:*` without prefix), other `<meta name>` tags, canonical link, icons (icon / apple-touch-icon / shortcut-icon), `<html lang>`. FetchPage gained `pub metadata: PageMetadata`. EngineApi::open refactored to parse Html ONCE and share `&doc` across visible-text + metadata + tree extractors (added build_tree_from_doc + extract_visible_text_from_doc); previously each parsed independently. CLI gained two subcommands: `heso meta <url>` (metadata JSON only) and `heso open <url>` (single-payload `{url, title, description, metadata, tree}` — the agent-facing surface, one subprocess gets everything). Slug bug fixed in tree.rs: heading text was joining adjacent text nodes without separators, so `<h1>Workplace AI<br>Shouldn't Be Hard</h1>` slugified to `workplace-aishouldn-t-be-hard`; switched to `.text().collect::<Vec<_>>().join(\" \")` then collapse_ws, regression test added. heso-test-agent switched from `heso tree` to `heso open` (single subprocess); skill args now carry preamble (root.intro clipped to 600 chars) + expanded outline (level-1 + intro_preview ≤200 + level-2 headings) + the full metadata block. navigate-page SKILL.md rewritten to teach the LLM to check metadata.jsonld + preamble FIRST and only call ls/cat when those don't have the answer — common 'what does this company do / where / what do they sell' questions now answer with 0 tool calls (Schema.org Organization block has it). Workspace dep change: enabled serde_json on heso-engine-fetch. Live verify on suprvisr.ai: `heso meta` returned full Organization + WebSite JSON-LD with areaServed=Canada/Ontario, contact email, knowsAbout list, plus OG/Twitter/meta descriptions; `heso open` confirmed slug fix produces `workplace-ai-shouldn-t-be-hard`. Tests: 22 lib unit (6 new for metadata) + tree tests still green; TypeScript on the agent clean. ADR 0013 lays out the direction (engine transforms HTML → structured agent views) and is explicit that this is installment #1 — forms / tables / action-graph / stable @refs are deferred to future ADRs. Next: T-022 (planner v0)."
+    },
+    {
+      "at": "2026-05-17T00:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "initialized",
+      "target": "state.json",
+      "note": "Initial state created during repo skeleton bootstrap. Five milestones defined (M0–M4), 13 tasks seeded, 3 open questions, 2 decisions pending an ADR."
+    },
+    {
+      "at": "2026-05-17T00:30:00Z",
+      "by": "claude-opus-4-7",
+      "action": "completed",
+      "target": "T-006",
+      "note": "`cargo check --workspace --all-targets` passes after bumping MSRV from 1.83 to 1.90. Updated rust-toolchain.toml, Cargo.toml, clippy.toml, and .agent/CONVENTIONS.md."
+    },
+    {
+      "at": "2026-05-17T01:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "completed",
+      "target": "T-008",
+      "note": "Research wiki seeded via parallel subagent research: rust-llm-mistakes/README.md + 5 browser-engines/ notes + 4 servo-internals/ notes. research/INDEX.md added as wiki nav. .agent/HOWTO/use-research.md added as wiki user manual. AGENTS.md updated to make 'read the wiki' a first-class reflex."
+    },
+    {
+      "at": "2026-05-17T01:30:00Z",
+      "by": "claude-opus-4-7",
+      "action": "accepted",
+      "target": "ADR-0008",
+      "note": "Deterministic execution promoted to first-class project property. ADR 0008 written, research/browser-engines/determinism.md added, agent-first-design.md updated, PRIORITIES.md and AGENTS.md updated. Added T-014–T-019 (determinism implementation tasks across M1+M2), Q-004–Q-006 (open determinism questions). M1, M2, M3 exit criteria updated to make determinism a precondition for each milestone."
+    },
+    {
+      "at": "2026-05-17T02:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "accepted",
+      "target": "ADR-0009",
+      "note": "Architectural pivot: heso.run is the single agent-facing tool (ADR 0009). All previously-designed click/fill/extract surface becomes internal primitives. Restructured milestones: M2 = primitives + trace runner (was: agent-shaped API), M3 NEW = the one tool (planner + heso.run + skill), M4 = identity + signed audit log (was M3), M5 = Claude Code plugin (was M4). Added T-020 (primitives layer), T-021 (trace runner + heso-trace types), T-022 (planner v0 pattern-matched), T-023 (heso.run MCP wiring), T-024 (skill polish), T-025 (end-to-end demo). New open questions Q-007 (planner pattern coverage) and Q-008 (planner versioning). New pending decision D-003 (planner versioning policy). Wrote: decisions/0009-heso-run-single-tool.md, docs/the-one-tool.md, skills/heso/SKILL.md. Reframed: research/browser-engines/agent-first-design.md (now marked as internals), AGENTS.md (added agent-contract section + updated reflexes), .agent/PRIORITIES.md (new order of work), research/INDEX.md (added 0009 entries), decisions/README.md (added 0009 row)."
+    },
+    {
+      "at": "2026-05-17T03:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "completed",
+      "target": "T-020",
+      "note": "heso-primitives crate landed (12 ops: fetch, extract, fill, click_link, click_button, submit, wait_for, screenshot, script, cookies, storage, diff). Surface: PrimitiveOp JSON-AST (internally tagged with `op`), per-op Input/Output structs, PrimitiveResult enum, execute() dispatcher, per-crate Error enum (thiserror). fetch() wired to existing EngineApi::open; the other 11 ops return Error::NotImplemented with messages naming the gating task (T-013 for engine surface, T-014 for software rendering, T-015 for fake clock, T-017 for network record/replay, T-021 for snapshot store). Tests: 14 unit + 2 doctest, all green; clippy clean. Workspace dep change: enabled `serde` feature on `url`. Next: T-021 (trace runner)."
+    },
+    {
+      "at": "2026-05-17T09:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "completed",
+      "target": "tree-shaped page navigation (HtmlTree + heso ls/cat/tree + agent rewrite)",
+      "note": "Page text no longer dumped wholesale into LLM context. Built `HtmlTree` (~470 LOC, new `crates/heso-engine-fetch/src/tree.rs`): walks the parsed HTML by heading level, slugifies h1-h6 into a folder-like path structure (e.g. `/a-sensory-layer-for-your-machine/redefining-the-human-machine-interface/pixel-awareness`), tracks intro text per node, exposes `ls(path)` / `cat(path)` / `pwd()` methods. `FetchPage` now carries a `pub tree: HtmlTree` populated in `FetchEngine::open`. heso-cli gained three subcommands: `heso tree <url>` (full JSON tree), `heso ls <url> [path]` (children at path), `heso cat <url> <path>` (intro text at path). heso-test-agent rewritten: fetches the tree ONCE via subprocess, caches in memory, exposes `heso_ls`/`heso_cat` Flue ToolDefs that walk the cached tree (no further subprocess per tool call) — replaces the previous 'unconditional fetch + summarize' pattern. New skill `navigate-page` at .agents/skills/navigate-page/SKILL.md (replaces answer-from-page); tells the LLM to start from the outline, drill in via ls/cat, cap at 10 tool calls. Live e2e on ixla.ca: agent fetched tree (5957B cached), LLM picked one section, called cat (492B), produced a 148B answer. The LLM saw 492B of selected content out of 5957B total — proves the context-budget win. Workspace dep fix: ego-tree pinned to 0.9 (was 0.10) to match scraper 0.21's transitive — surfaced when the new walker needed ego_tree::NodeRef. Tests: 45 unit + 4 doctest, all green; clippy clean. ~785 LOC across 6 files. Built by orchestrator subagent (general-purpose) coordinating two parallel workers (Rust impl + agent rewrite). Next: planner v0 (T-022) — the planner emits ls/cat traces instead of a single cd."
+    },
+    {
+      "at": "2026-05-17T08:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "accepted",
+      "target": "ADR-0012 + T-027",
+      "note": "Engine direction settled: native single-binary fetch engine, no Chrome dep. ADR 0012 accepted (supersedes 0011, which superseded 0003). heso-engine-cdp crate DELETED; chromiumoxide + futures REMOVED from workspace deps. New heso-engine-fetch crate IMPLEMENTED with reqwest + scraper + ego-tree (added to workspace deps); pure Rust, ~30s release build, ~10MB binary, no system browser required. heso-cli gained `heso fetch <url>` subcommand (returns {url, text} JSON directly) and kept `heso run <url> <req>` (trace + Receipt) — both wired through FetchEngine. heso-test-agent's Flue tool renamed from heso_run to heso_fetch and re-pointed at `heso fetch`. Live end-to-end demo on korrd.co: gpt-5.4-mini received real page text via heso_fetch and produced a detailed answer ('ship video like you ship code', closed-beta, hello@korrd.co — content not in training, came from the actual page). Tests: 30 + 4 unit tests (incl live example.com fetch), all green; clippy clean. STALE FILES DELETED: crates/heso-engine-cdp/ (whole crate), research/servo-internals/ (4 notes — Servo embedding research no longer applicable), research/browser-engines/conversion-strategies.md (Servo conversion plan obsolete). CROSS-DOC SYNC: README.md (rewritten for fetch+deployable pitch), AGENTS.md (architecture diagram + reflexes), .agent/MAP.md (crate list + ADR range), .agent/PRIORITIES.md (order of work + new 'DEFER: JS engine' bullet), .agent/GLOSSARY.md (engine entry), research/INDEX.md (use-case table + by-concept + by-keyword + by-topic all stripped of dead Servo links), research/browser-engines/README.md (rewritten as engine-agnostic background). decisions/0011 marked superseded with header note; decisions/README.md updated; new ADR 0012 added. Next: T-022 (planner v0)."
+    },
+    {
+      "at": "2026-05-17T07:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "completed",
+      "target": "T-026 + ADR-0011",
+      "note": "Engine pivot landed end-to-end. ADR 0011 (Chromium via CDP, supersedes ADR 0003 Servo) accepted; new heso-engine-cdp crate implements EngineApi using chromiumoxide 0.9 against headless Chromium. EngineApi trait reshaped to async (impl Future + Send return types — works with Rust 1.75+ AFIT without explicit boxing). Propagation: heso-primitives::cd and heso-primitives::execute became async; heso-trace-exec::run became async; their tests + examples migrated to #[tokio::test] / #[tokio::main]; heso-cli's main became #[tokio::main] and StubEngine was replaced with ChromiumEngine. Workspace gained deps: chromiumoxide=0.9, futures=0.3. Result: `target/release/heso run https://korrd.co/ ...` launches real Chromium, follows the redirect, and returns a Receipt whose result url is https://www.korrd.co/ (post-redirect, captured from page.url()) with a stable trace_hash. The Flue web-search agent in heso-test-agent/ (built earlier) Just Works without changes — it shells out to the new heso binary and the LLM gets a real receipt. All 30 unit tests + 4 doctests pass; clippy clean. Mooted open questions Q-001 (JS engine — Chromium ships V8, n/a), Q-003 (binary distribution — depend on system Chrome for now), Q-004 (microtask ordering — Chromium handles this). Mooted for the CDP path; re-emerge if we add Servo later. T-012 cancelled; T-013/T-014/T-015/T-016/T-017 reframed for CDP. Next: T-022 (planner v0)."
+    },
+    {
+      "at": "2026-05-17T05:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "completed",
+      "target": "T-021",
+      "note": "heso-trace (types-only, pure data) + heso-trace-exec (runner) landed. heso-trace exports Receipt, Cost, Mode, ContentHash, trace_hash(); re-exports Trace/PrimitiveOp/PrimitiveResult from heso-primitives. heso-trace-exec exports run(engine, trace, config) -> Receipt that walks the trace, dispatches each op via heso_primitives::execute, stops at first failure and records failed_at + error. Trace_hash is BLAKE3 over the canonical JSON of the trace — deterministic across runs, verified by example. Workspace dep added: blake3 = 1. Tests: 30 unit + 4 doctest, all green; clippy clean. End-to-end demo: `cargo run --release --example receipt -p heso-trace-exec`. Successful 2-cd trace produces stable trace_hash 6ac3aec0...026f7b86; failing 3-op trace stops at pwd with the T-013 gating message and records partial results=[cd]. Out of scope here: Ed25519 signing (M4), real cost numbers + pages_seen (need engine — T-013/T-017). Next: T-022 (planner v0)."
+    },
+    {
+      "at": "2026-05-17T04:00:00Z",
+      "by": "claude-opus-4-7",
+      "action": "accepted",
+      "target": "ADR-0010",
+      "note": "Primitive vocabulary redesigned as terminal commands (ADR 0010, supersedes ADR 0009's primitive list). Mental model: the current page is the working directory, elements are files, cookies+Web Storage live under /env/. The 15 primitives are pwd, ls, cd, cat, find, grep, echo, rm, click, submit, wget, wait, screenshot, eval, diff. Net delta vs 0009: +5 new (pwd, ls, find, grep, eval rename), -2 folded (cookies+storage → /env/ paths in ls/cat/echo/rm), with click_link+click_button → cd+click and fill/wait_for/script renamed to echo/wait/eval. Trigger: user caught that the click_link/click_button split shipped by T-020's first pass conflicted with the original design intent in agent-first-design.md, and proposed the terminal model. heso-primitives crate fully rewritten. Cross-cutting doc updates: AGENTS.md (architecture diagram + reflexes + new 'fresh-agent checklist' section so future agents cross-check docs before implementing), CLAUDE.md (new 'cross-check docs before implementing' section with the concrete click_link cautionary tale), .agent/PRIORITIES.md (primitive list + new shell-metaphor north-star check), .agent/GLOSSARY.md (replaced stale 'action' entry that pointed at the never-created heso-act crate; added 'primitive', 'trace', 'working directory', 'env path' entries), .agent/MAP.md (load-bearing files), research/browser-engines/agent-first-design.md (reframing note now covers 0010 + a name-translation cheatsheet), research/INDEX.md (use-case + concept rows), skills/heso/SKILL.md (mentions the terminal mental model so receipt.trace is readable to agents), decisions/0001-cargo-workspace-layout.md (annotated the stale heso-act/heso-extract/heso-session/heso-fetch crate list), decisions/0009-heso-run-single-tool.md (header notes that primitive list is superseded), decisions/README.md (added 0010 row). state.json M2 exit criteria updated. Tests: 14 unit + doctests, all green; cargo ck clean."
+    }
+  ]
+}

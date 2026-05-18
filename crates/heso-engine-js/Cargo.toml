@@ -1,0 +1,37 @@
+[package]
+name = "heso-engine-js"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Optional JavaScript-capable engine path: QuickJS via rquickjs + agent-shaped DOM. Sibling of heso-engine-fetch; the static path remains the default. See ADR 0014."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Phase 1B adds the agent-shaped DOM as #[rquickjs::class]-backed
+# Rust types — needs `classes` (Class<T>, define, instance),
+# `properties` (getters/setters), and `macro` (derive macros).
+rquickjs = { version = "0.11", features = ["classes", "properties", "macro"] }
+# heso-engine-fetch supplies the protocol-level fetch + action graph
+# we'll wire DOM access against once mutations + events land.
+heso-engine-fetch = { path = "../heso-engine-fetch" }
+# dom_query is the load-bearing mutable DOM under the JS-DOM bridge,
+# chosen in research/existing-art/rquickjs-dom-precedents.md. It owns
+# the parse tree (`Document`), exposes a jQuery-like surface
+# (`Selection`, `NodeRef`) with attribute / class / child mutation,
+# and is `html5ever`-backed so it matches the rest of the workspace.
+# The crate has had 27 breaking minor releases — pin to exactly
+# 0.28.0 (the only 0.28.x at time of writing). Bumping is a deliberate
+# act, not an automatic minor lift. See ADR 0014.
+dom_query = "=0.28.0"
+
+[dev-dependencies]
+# No additional dev-deps required for Phase 1A — std tests only.
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

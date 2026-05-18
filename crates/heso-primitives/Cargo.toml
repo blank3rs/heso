@@ -1,0 +1,23 @@
+[package]
+name = "heso-primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Internal primitives layer — the ~12 operations the planner emits and the trace runner executes (ADR 0009)."
+
+[dependencies]
+heso-core = { path = "../heso-core" }
+heso-engine-api = { path = "../heso-engine-api" }
+thiserror.workspace = true
+serde = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

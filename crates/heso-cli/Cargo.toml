@@ -1,0 +1,28 @@
+[package]
+name = "heso-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Command-line interface for heso. Wraps the library crates into the `heso` binary."
+
+[[bin]]
+name = "heso"
+path = "src/main.rs"
+
+[dependencies]
+heso-core = { path = "../heso-core" }
+heso-engine-api = { path = "../heso-engine-api" }
+heso-engine-fetch = { path = "../heso-engine-fetch" }
+heso-engine-js = { path = "../heso-engine-js" }
+heso-primitives = { path = "../heso-primitives" }
+heso-trace = { path = "../heso-trace" }
+heso-trace-exec = { path = "../heso-trace-exec" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "io-std", "sync", "fs"] }
+
+[lints.rust]
+unsafe_code = "forbid"

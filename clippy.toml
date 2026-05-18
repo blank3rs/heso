@@ -1,0 +1,5 @@
+# Clippy configuration for heso workspace.
+# Lint groups are enabled per-crate via #![warn(...)] attributes.
+
+avoid-breaking-exported-api = false
+msrv = "1.90"

@@ -1,0 +1,13 @@
+[alias]
+# Common workflows — see .agent/WORKFLOWS.md
+ck = "check --workspace --all-targets"
+ct = "test --workspace --all-targets"
+cl = "clippy --workspace --all-targets -- -D warnings"
+cf = "fmt --all"
+
+[build]
+# Default to multi-threaded compilation
+incremental = true
+
+[net]
+git-fetch-with-cli = true

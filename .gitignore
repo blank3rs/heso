@@ -1,0 +1,39 @@
+# Rust build artifacts
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+# Cargo.lock is kept (workspace contains binary crates)
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local-only state
+.claude/settings.local.json
+heso-local-data/
+*.local
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Identity material — NEVER commit private keys
+identity/private/
+*.priv
+*.pem

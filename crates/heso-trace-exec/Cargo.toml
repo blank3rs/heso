@@ -1,0 +1,23 @@
+[package]
+name = "heso-trace-exec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Trace runner — executes a Trace against an EngineApi-backed primitives layer and produces a Receipt."
+
+[dependencies]
+heso-core = { path = "../heso-core" }
+heso-engine-api = { path = "../heso-engine-api" }
+heso-primitives = { path = "../heso-primitives" }
+heso-trace = { path = "../heso-trace" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
