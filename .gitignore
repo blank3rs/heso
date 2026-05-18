@@ -46,6 +46,20 @@ heso-local-data/
 # still ship; this root-level `tests/` is workspace scratch space.
 /tests/
 
+# Internal / agent-facing meta — kept locally as the working memory of
+# the project, NOT published. The public repo is product code only.
+# (Files stay on disk; this just keeps them out of git going forward.)
+/.agent/
+/AGENTS.md
+/CLAUDE.md
+/decisions/
+/proposals/
+/research/
+/skills/
+/docs/
+/state.json
+/state.schema.json
+
 # Environment / secrets
 .env
 .env.local
