@@ -10,16 +10,83 @@ Each run produces a **plat** — a content-hashed, deterministic, agent-shaped J
 
 ## The numbers
 
-| | heso (today) | headless Chromium |
-|---|---|---|
-| Binary size (stripped release) | **8.2 MB** | ~240 MB |
-| JS engine | QuickJS via `rquickjs` (~600 KB) | V8 (~30 MB) |
-| Install | `cargo build && ./heso` | `npm install playwright` + Chrome download |
-| Cold start | sub-100ms target (TODO measure) | 1–2 s |
-| Idle RAM | <20 MB target (TODO measure) | 100+ MB |
-| Tests | 219 workspace lib tests green | n/a |
+| Metric | Value |
+|---|---|
+| Binary size (stripped release) | **9.1 MB** |
+| Cold start (banner only, median of 10) | **41 ms** *(min 39, p95 52)* |
+| Cold start + JS engine init (`eval-js '1+1'`, median) | **40 ms** *(min 38, p95 40)* |
+| Full fetch + parse + extract (`fetch https://example.com`, median) | **85 ms** *(min 82, p95 86)* |
+| Full DOM eval over network (`eval-dom news.ycombinator.com`, median of 5) | **396 ms** *(min 379)* |
+| Workspace lib tests | **273 passing** |
 
-8.2 MB is the current measurement. The single-binary deploy holds even after bundling the JS engine.
+For comparison: headless Chromium ships at ~240 MB, cold-starts in 1–2 s, and idles at 100+ MB RAM. The agent-relevant workload heso targets (fetch, parse, JS, DOM) runs in well under those budgets.
+
+## What it looks like
+
+Real bytes off the wire, from a fresh `cargo build --release && ./heso`:
+
+```console
+$ heso eval-dom https://news.ycombinator.com 'document.title'
+{
+  "console": [],
+  "ok": true,
+  "url": "https://news.ycombinator.com/",
+  "value": "Hacker News"
+}
+```
+
+```console
+$ heso eval-dom https://news.ycombinator.com \
+    'Array.from(document.querySelectorAll(".titleline > a")).slice(0,5).map(a => a.textContent)'
+{
+  "console": [],
+  "ok": true,
+  "url": "https://news.ycombinator.com/",
+  "value": [
+    "The foundations of a provably secure operating system (PSOS) (1979) [pdf]",
+    "GenCAD",
+    "Crystals found inside wreckage from the first nuclear bomb test",
+    "It is time to give up the dualism introduced by the debate on consciousness",
+    "I turned a $80 RK3562 Android tablet into a Debian Linux workstation"
+  ]
+}
+```
+
+```console
+$ heso open https://example.com
+{
+  "actions": [
+    {
+      "attrs": { "href": "https://iana.org/domains/example" },
+      "name": "Learn more",
+      "ref": "@e0",
+      "role": "link",
+      "section": "/example-domain",
+      "tag": "a"
+    }
+  ],
+  "description": "This domain is for use in documentation examples without needing permission.",
+  "metadata": { "lang": "en", "meta": { "viewport": "width=device-width, initial-scale=1" } },
+  "plat_hash": "abf42bb66917095eb4cafdd4deb00c0686835102e713a3342b32093578007289",
+  "title": "Example Domain",
+  "tree": {
+    "description": "This domain is for use in documentation examples without needing permission.",
+    "root": {
+      "children": [
+        {
+          "heading": "Example Domain",
+          "intro": "This domain is for use in documentation examples without needing permission. Avoid use in operations. Learn more",
+          "level": 1,
+          "path": "/example-domain",
+          "slug": "example-domain",
+          "summary": "Example Domain — This domain is for use in documentation examples without needing permission..."
+        }
+      ]
+    }
+  },
+  "url": "https://example.com/"
+}
+```
 
 ## What's in (the agent-relevant half)
 
@@ -30,11 +97,11 @@ Each run produces a **plat** — a content-hashed, deterministic, agent-shaped J
 | Sandboxed JS evaluation | done (QuickJS via `rquickjs`) |
 | Read-only DOM (`querySelector`, `textContent`, `getAttribute`…) | done |
 | DOM mutations (`setAttribute`, `innerHTML =`, `appendChild`, `classList`…) | done |
-| Page-load JS hydration (`<script>` on load) | weeks |
-| Events (`addEventListener`, `dispatchEvent`, `AbortController`) | in flight |
-| Timers (`setTimeout`/`setInterval`, virtual clock) | in flight |
-| Form fill + submit | days once events land |
-| Click links / buttons | days once events land |
+| Events (`addEventListener`, `dispatchEvent`, `CustomEvent`, `AbortController`, `DOMException`) | done |
+| Timers (`setTimeout`/`setInterval`, deterministic virtual clock) | done |
+| Page-load JS hydration (`<script>` on load) | next |
+| Form fill + submit | days once `click()` wires to dispatchEvent |
+| Click links / buttons | days once `click()` wires to dispatchEvent |
 | `fetch()` inside JS | 1–2 weeks (proxy `reqwest` into QuickJS) |
 | `localStorage` / `sessionStorage` | days |
 | Multi-page sessions | designed in (`page_id` in `heso serve`) |
