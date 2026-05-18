@@ -103,9 +103,12 @@ fn print_banner() {
     println!("  heso submit <url> <@form-ref> Fetch <url>, find form at <@form-ref>, click its first submit control");
     println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
     println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
-    println!("  heso eval-js <js>             [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
+    println!("  heso eval-js [--seed N] <js>  [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window yet — Phase 1B.");
-    println!("  heso eval-dom <url> <js>      [Phase 1B] Fetch <url>, install document, evaluate <js> against the DOM");
+    println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
+    println!("  heso eval-dom [--seed N] <url> <js>");
+    println!("                                [Phase 1B — ADR 0014] Fetch <url>, install document, evaluate <js>; print value+console as JSON");
+    println!("                                Pass `-` for <js> to read from stdin. --seed N seeds the determinism shims (default 0).");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso run   <url> <request>    [STUB] navigates to <url> only; request is ignored. Planner not yet wired.");
     println!();
@@ -586,11 +589,44 @@ async fn cmd_open(args: &[String]) -> ExitCode {
 /// `window`, no `<script>` on-load execution. Useful for sanity
 /// testing the engine independent of any page context.
 async fn cmd_eval_js(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: heso eval-js <js> | heso eval-js - < script.js");
+    // Walk args once and split flags from positionals so `--seed N`
+    // can appear before or after `<js>`. Consistent with the rest of
+    // heso's CLI (raw arg parsing, no `clap`).
+    let mut seed: u64 = 0;
+    let mut positional: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seed" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--seed needs a value");
+                    return ExitCode::from(2);
+                };
+                seed = match v.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("--seed: invalid u64 `{v}`: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 2;
+            }
+            other if other.starts_with("--") && other != "-" => {
+                eprintln!("unknown flag `{other}`");
+                eprintln!("usage: heso eval-js [--seed N] <js> | heso eval-js [--seed N] - < script.js");
+                return ExitCode::from(2);
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if positional.is_empty() {
+        eprintln!("usage: heso eval-js [--seed N] <js> | heso eval-js [--seed N] - < script.js");
         return ExitCode::from(2);
     }
-    let src: String = if args[0] == "-" {
+    let src: String = if positional[0] == "-" {
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();
         if let Err(e) = tokio::io::stdin().read_to_string(&mut buf).await {
@@ -599,10 +635,10 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
         }
         buf
     } else {
-        args[0].clone()
+        positional[0].clone()
     };
 
-    let engine = match heso_engine_js::JsEngine::new() {
+    let engine = match heso_engine_js::JsEngine::new_with_seed(seed) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("failed to create JS engine: {e}");
@@ -677,12 +713,44 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
 ///
 /// Exit codes: 0 on success, 1 on fetch or JS error, 2 on usage.
 async fn cmd_eval_dom(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("usage: heso eval-dom <url> <js> | heso eval-dom <url> -  < script.js");
+    // Same order-tolerant flag walk as `cmd_eval_js`: `--seed N` can
+    // appear in any position; positionals are `<url> <js>` in order.
+    let mut seed: u64 = 0;
+    let mut positional: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seed" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--seed needs a value");
+                    return ExitCode::from(2);
+                };
+                seed = match v.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("--seed: invalid u64 `{v}`: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 2;
+            }
+            other if other.starts_with("--") && other != "-" => {
+                eprintln!("unknown flag `{other}`");
+                eprintln!("usage: heso eval-dom [--seed N] <url> <js> | heso eval-dom [--seed N] <url> -  < script.js");
+                return ExitCode::from(2);
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if positional.len() < 2 {
+        eprintln!("usage: heso eval-dom [--seed N] <url> <js> | heso eval-dom [--seed N] <url> -  < script.js");
         return ExitCode::from(2);
     }
-    let url_arg = &args[0];
-    let js_src: String = if args[1] == "-" {
+    let url_arg = &positional[0];
+    let js_src: String = if positional[1] == "-" {
         use tokio::io::AsyncReadExt;
         let mut buf = String::new();
         if let Err(e) = tokio::io::stdin().read_to_string(&mut buf).await {
@@ -691,7 +759,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
         buf
     } else {
-        args[1].clone()
+        positional[1].clone()
     };
 
     let url = match Url::parse(url_arg) {
@@ -716,7 +784,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
     };
 
-    let js_engine = match heso_engine_js::JsEngine::new() {
+    let js_engine = match heso_engine_js::JsEngine::new_with_seed(seed) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("failed to create JS engine: {e}");

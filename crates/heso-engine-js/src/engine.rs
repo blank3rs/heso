@@ -19,11 +19,12 @@
 use std::sync::{Arc, Mutex};
 
 use rquickjs::{
-    prelude::Rest, CatchResultExt, CaughtError, Class, Context, Ctx, Function, Object, Runtime,
-    Value,
+    prelude::{Func, Rest},
+    CatchResultExt, CaughtError, Class, Context, Ctx, Function, Object, Runtime, Value,
 };
 
 use crate::dom::{self, Document};
+use crate::rng::SeededRng;
 use crate::timers::{self, TimerScheduler};
 
 /// Memory cap per [`JsEngine`]. 10 MB is enough for typical
@@ -145,16 +146,47 @@ pub struct JsEngine {
     /// `pending_timers` methods. See [`crate::timers`] for the full
     /// design.
     timers: Arc<Mutex<TimerScheduler>>,
+    /// Per-engine seeded PRNG backing `Math.random`,
+    /// `crypto.getRandomValues`, and `crypto.randomUUID`. Constructed
+    /// from the `--seed N` value the host passed to
+    /// [`Self::new_with_seed`] (or `0` for [`Self::new`]). See
+    /// [`crate::rng`] for the design; ADR 0008 for the determinism
+    /// contract.
+    rng: SeededRng,
 }
 
 impl JsEngine {
     /// Create a fresh engine with conservative resource limits
-    /// ([`DEFAULT_MEMORY_LIMIT_BYTES`], [`DEFAULT_MAX_STACK_BYTES`]).
+    /// ([`DEFAULT_MEMORY_LIMIT_BYTES`], [`DEFAULT_MAX_STACK_BYTES`])
+    /// and the default RNG seed (`0`).
     ///
     /// `console.log` / `info` / `warn` / `error` / `debug` / `trace`
     /// are installed as global functions that route into an
     /// in-process buffer instead of stdout, so receipts stay clean.
+    ///
+    /// For seeded determinism (per ADR 0008) use
+    /// [`Self::new_with_seed`].
     pub fn new() -> Result<Self, EvalError> {
+        Self::new_with_seed(0)
+    }
+
+    /// Create a fresh engine with the given PRNG seed. Same seed +
+    /// same script + same `advance_clock` sequence → byte-identical
+    /// observable output (per ADR 0008).
+    ///
+    /// `seed = 0` matches [`Self::new`]'s behavior — a real seed, not
+    /// a "no seed" sentinel, so two unseeded sessions are still
+    /// reproducible against each other.
+    ///
+    /// The seed wires up:
+    ///
+    /// - `Math.random()` — draws uniform `f64` in `[0, 1)` from the
+    ///   seeded ChaCha20 stream.
+    /// - `crypto.getRandomValues(view)` — fills the passed
+    ///   `Uint8Array` from the same stream.
+    /// - `crypto.randomUUID()` — emits a v4-format UUID whose 16
+    ///   underlying bytes come from the same stream.
+    pub fn new_with_seed(seed: u64) -> Result<Self, EvalError> {
         let runtime = Runtime::new().map_err(|e| EvalError::Engine(e.to_string()))?;
         runtime.set_memory_limit(DEFAULT_MEMORY_LIMIT_BYTES);
         runtime.set_max_stack_size(DEFAULT_MAX_STACK_BYTES);
@@ -178,12 +210,30 @@ impl JsEngine {
         timers::install_timers(&context, timers.clone())
             .map_err(|e| EvalError::Engine(format!("install timers: {e}")))?;
 
+        // Determinism shims (ADR 0008): override `Math.random` and
+        // install a `crypto` global with `getRandomValues` and
+        // `randomUUID`. The RNG closures own a [`SeededRng`] clone
+        // (cheap — bumps an Arc refcount), so RNG state lives on the
+        // JS side via the Function objects, not on Rust-held
+        // `Persistent`s. That sidesteps the Runtime-drop ordering trap
+        // that `timers.rs` had to design around.
+        let rng = SeededRng::new(seed);
+        install_rng(&context, rng.clone())?;
+
         Ok(Self {
             _runtime: runtime,
             context,
             console_buffer,
             timers,
+            rng,
         })
+    }
+
+    /// The seed-backed RNG installed into the JS context. Useful for
+    /// tests that want to assert host-side determinism — the same
+    /// `SeededRng` clone observed in JS is reachable here.
+    pub fn rng(&self) -> &SeededRng {
+        &self.rng
     }
 
     /// Advance the deterministic virtual clock by `delta_ms`
@@ -513,6 +563,148 @@ fn install_console(
             Ok(())
         })
         .map_err(|e| EvalError::Engine(e.to_string()))?;
+    Ok(())
+}
+
+/// Install the seeded-RNG determinism shims onto the context's
+/// globals (per ADR 0008):
+///
+/// 1. **`Math.random`** — replaced with a closure that draws the next
+///    `f64` from the engine's [`SeededRng`]. JS code calling
+///    `Math.random()` therefore sees the same sequence on every run
+///    with the same seed.
+/// 2. **`crypto.getRandomValues(view)`** — fills the bytes of the
+///    passed `Uint8Array` (or any typed-array-shaped object with a
+///    `length`) from the same stream. Returns the view, matching the
+///    [WebCrypto spec](https://www.w3.org/TR/WebCryptoAPI/#Crypto-method-getRandomValues).
+///    Implementation note: rather than poking at the underlying
+///    `ArrayBuffer` via raw pointers (the crate forbids
+///    `unsafe_code`), we use indexed `Object::set` — JS engines route
+///    `arr[i] = byte` on a TypedArray to the backing buffer, so this
+///    is observably equivalent without unsafe.
+/// 3. **`crypto.randomUUID()`** — returns a v4-format UUID whose 16
+///    bytes come from the same stream.
+///
+/// `Date.now` is NOT routed here. The current `VirtualClock` lives in
+/// [`crate::timers`] and only backs `setTimeout` / `setInterval` —
+/// `Date.now()` today calls QuickJS's built-in implementation, which
+/// reads the host wall clock. Wiring `Date.now` + the `Date()`
+/// constructor through `VirtualClock` belongs in a later PR; see the
+/// inline TODO below.
+fn install_rng(context: &Context, rng: SeededRng) -> Result<(), EvalError> {
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            let globals = ctx.globals();
+
+            // ---- Math.random ----
+            //
+            // Reach for the existing `Math` object so we don't replace
+            // it (and lose Math.floor, Math.abs, etc.). Overriding the
+            // `random` property leaves the rest of Math intact.
+            let math: Object = globals.get("Math")?;
+            let math_random_rng = rng.clone();
+            let math_random = Func::from(move || math_random_rng.next_f64());
+            math.set("random", math_random)?;
+
+            // ---- crypto ----
+            //
+            // We unconditionally install a fresh `crypto` object.
+            // QuickJS doesn't ship one by default, and even if a host
+            // ever pre-populates it the determinism contract requires
+            // ours to win.
+            let crypto = Object::new(ctx.clone())?;
+
+            // crypto.getRandomValues(view: Uint8Array) -> view
+            //
+            // We accept the view as a generic [`Object`] (which is
+            // what a Uint8Array is at the JS level) so we don't need
+            // an rquickjs `TypedArray<u8>` import; we read its
+            // `length` and write each byte via indexed `Object::set`.
+            // QuickJS routes indexed writes on a TypedArray to its
+            // backing buffer, so `view[i]` on the JS side sees the
+            // filled bytes.
+            // crypto.getRandomValues(view) — fills the buffer in-place
+            // and returns the view, per the WebCrypto spec. We return
+            // `()` from the Rust side because returning the same
+            // `Object<'js>` we received trips an
+            // independent-lifetime mismatch in rquickjs's `Func::from`
+            // HRTB inference (the closure's input and return lifetimes
+            // don't unify with `Object` being invariant). Side-effects
+            // (the fill) are the load-bearing part; we re-attach the
+            // "return the view" half from JS by wrapping the binding in
+            // a tiny preamble below so `crypto.getRandomValues(v)`
+            // still produces `v`.
+            let gv_rng = rng.clone();
+            let get_random_values_raw = Func::from(move |view: Object<'_>| {
+                let len: usize = match view.get::<_, usize>("length") {
+                    Ok(n) => n,
+                    // No `length` property → silently no-op (matches
+                    // "throw on bad arg" being more disruptive than
+                    // the spec strictly requires for a determinism
+                    // shim).
+                    Err(_) => return,
+                };
+                if len == 0 {
+                    return;
+                }
+                // Cap at a sane size to avoid a runaway allocator on
+                // huge requests. The WebCrypto spec caps at 65536; we
+                // honor that.
+                const MAX_LEN: usize = 65_536;
+                let effective = len.min(MAX_LEN);
+                let mut buf = vec![0u8; effective];
+                gv_rng.fill_bytes(&mut buf);
+                for (i, byte) in buf.iter().enumerate() {
+                    // Best-effort: if a particular index set fails
+                    // (e.g. the view is read-only), we skip it rather
+                    // than abort the fill. `effective <= 65_536` so
+                    // the cast to u32 is loss-free.
+                    let _ = view.set(i as u32, *byte);
+                }
+            });
+            // Install the raw fill function on the crypto object
+            // under a private name; the JS-side wrap below renames it
+            // to the spec-shape `getRandomValues` that returns the
+            // view.
+            crypto.set("__getRandomValuesRaw", get_random_values_raw)?;
+
+            // crypto.randomUUID() -> string
+            let uuid_rng = rng.clone();
+            let random_uuid = Func::from(move || uuid_rng.random_uuid());
+            crypto.set("randomUUID", random_uuid)?;
+
+            // Publish the crypto global before running the wrap script
+            // so the script can reach it.
+            globals.set("crypto", crypto)?;
+
+            // Wrap the raw fill function so the spec-shape
+            // `crypto.getRandomValues(view)` returns `view`. The Rust
+            // side returns `()` because rquickjs's `Func::from` HRTB
+            // can't unify the input and return Object lifetimes when
+            // both are anonymous; the JS wrapper re-attaches the
+            // "return the view" half cheaply.
+            let wrap_src = r#"
+                (function() {
+                    const raw = globalThis.crypto.__getRandomValuesRaw;
+                    globalThis.crypto.getRandomValues = function(view) {
+                        raw(view);
+                        return view;
+                    };
+                    delete globalThis.crypto.__getRandomValuesRaw;
+                })()
+            "#;
+            ctx.eval::<(), _>(wrap_src)?;
+
+            // TODO(determinism): route Date.now() and the `new Date()`
+            // constructor through VirtualClock so wall-clock reads
+            // become reproducible. Today they pass through to QuickJS's
+            // host-clock implementation; the virtual clock only backs
+            // setTimeout / setInterval. Tracked alongside Phase 2
+            // timer integration.
+
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install rng: {e}")))?;
     Ok(())
 }
 
@@ -1328,5 +1520,104 @@ mod tests {
         assert_eq!(out.value[1], "NotFoundError");
         assert_eq!(out.value[2], 8);
         assert_eq!(out.value[3], "DOMException: not here");
+    }
+
+    // ===== Phase 2 determinism: seeded Math.random / crypto =====
+    //
+    // ADR 0008: same seed + same script must produce byte-identical
+    // observable output. These four tests assert the JS surface honors
+    // the contract end-to-end, with two fresh engines per pair so we
+    // cover construction-time wiring (not just intra-engine repeat
+    // calls, which would just re-prove the RNG itself is deterministic).
+
+    #[test]
+    fn seeded_math_random_same_seed_same_sequence() {
+        let e1 = JsEngine::new_with_seed(42).expect("engine seed 42");
+        let e2 = JsEngine::new_with_seed(42).expect("engine seed 42");
+        let a = e1
+            .eval("Array.from({length: 5}, Math.random)")
+            .expect("eval ok");
+        let b = e2
+            .eval("Array.from({length: 5}, Math.random)")
+            .expect("eval ok");
+        assert_eq!(
+            a.value, b.value,
+            "two fresh engines with seed=42 must yield identical Math.random sequences"
+        );
+        // And the values are real numbers in the contract range.
+        let arr = a.value.as_array().expect("value is array");
+        assert_eq!(arr.len(), 5);
+        for v in arr {
+            let n = v.as_f64().expect("array element is a number");
+            assert!((0.0..1.0).contains(&n), "Math.random should yield [0,1): got {n}");
+        }
+    }
+
+    #[test]
+    fn seeded_math_random_different_seed_different_sequence() {
+        let e1 = JsEngine::new_with_seed(1).expect("engine seed 1");
+        let e2 = JsEngine::new_with_seed(2).expect("engine seed 2");
+        let a = e1
+            .eval("Array.from({length: 5}, Math.random)")
+            .expect("eval ok");
+        let b = e2
+            .eval("Array.from({length: 5}, Math.random)")
+            .expect("eval ok");
+        assert_ne!(
+            a.value, b.value,
+            "different seeds should produce different Math.random sequences"
+        );
+    }
+
+    #[test]
+    fn seeded_crypto_random_uuid_same_seed_same_string() {
+        let e1 = JsEngine::new_with_seed(123).expect("engine seed 123");
+        let e2 = JsEngine::new_with_seed(123).expect("engine seed 123");
+        let a = e1.eval("crypto.randomUUID()").expect("eval ok");
+        let b = e2.eval("crypto.randomUUID()").expect("eval ok");
+        assert_eq!(a.value, b.value, "same seed → same randomUUID");
+        // Sanity-check v4 shape on the value we got back.
+        let s = a.value.as_str().expect("randomUUID returns a string");
+        assert_eq!(s.len(), 36, "UUID len; got {s:?}");
+        assert_eq!(&s[14..15], "4", "version nibble = 4 in {s:?}");
+        let variant = &s[19..20];
+        assert!(
+            matches!(variant, "8" | "9" | "a" | "b"),
+            "variant nibble in {{8,9,a,b}} in {s:?}"
+        );
+    }
+
+    #[test]
+    fn seeded_crypto_get_random_values_same_seed_same_bytes() {
+        let e1 = JsEngine::new_with_seed(99).expect("engine seed 99");
+        let e2 = JsEngine::new_with_seed(99).expect("engine seed 99");
+        // Allocate a fresh Uint8Array(16), fill via getRandomValues,
+        // dump as a plain array of numbers so two engines' outputs
+        // can be compared as JSON values.
+        let js = r#"
+            const buf = new Uint8Array(16);
+            crypto.getRandomValues(buf);
+            Array.from(buf)
+        "#;
+        let a = e1.eval(js).expect("eval ok");
+        let b = e2.eval(js).expect("eval ok");
+        assert_eq!(
+            a.value, b.value,
+            "same seed → identical getRandomValues output"
+        );
+        // 16 bytes of u8 → 16 numeric entries, each in 0..=255.
+        let arr = a.value.as_array().expect("value is array");
+        assert_eq!(arr.len(), 16);
+        for v in arr {
+            let n = v.as_u64().expect("byte is a non-negative integer");
+            assert!(n <= 255, "byte out of range: {n}");
+        }
+        // Sanity: a different seed produces different bytes.
+        let e3 = JsEngine::new_with_seed(100).expect("engine seed 100");
+        let c = e3.eval(js).expect("eval ok");
+        assert_ne!(
+            a.value, c.value,
+            "different seed should produce different bytes"
+        );
     }
 }

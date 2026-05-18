@@ -28,6 +28,15 @@ heso-engine-fetch = { path = "../heso-engine-fetch" }
 # 0.28.0 (the only 0.28.x at time of writing). Bumping is a deliberate
 # act, not an automatic minor lift. See ADR 0014.
 dom_query = "=0.28.0"
+# Phase 2 determinism shims (per ADR 0008): seed a single ChaCha20 PRNG
+# from the session's `--seed N` value and route `Math.random`,
+# `crypto.getRandomValues`, and `crypto.randomUUID` through it so two
+# runs of the same script with the same seed produce byte-identical
+# observable output. `rand_chacha::ChaCha20Rng` is portable across
+# platforms and library versions (unlike `StdRng`), which is the
+# property we actually need. See `src/rng.rs`.
+rand = "0.8"
+rand_chacha = "0.3"
 
 [dev-dependencies]
 # No additional dev-deps required for Phase 1A — std tests only.
