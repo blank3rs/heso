@@ -21,9 +21,30 @@ Thumbs.db
 desktop.ini
 
 # Local-only state
-.claude/settings.local.json
 heso-local-data/
 *.local
+
+# AI coding agents — local state directories (auth tokens, worktrees,
+# conversation history, scratch). Project-level instructions like
+# CLAUDE.md and AGENTS.md are shared docs and DO ship.
+.claude/
+.cursor/
+.cursorignore
+.cursorrules
+.zed/
+.windsurf/
+.windsurfrules
+.aider*
+.continue/
+.codium*
+.qodo/
+.tabnine*
+.github/copilot-chat-history.md
+
+# Local test scratch — fixtures, recorded traces, ad-hoc captures the
+# agents drop here. Per-crate integration tests under `crates/*/tests/`
+# still ship; this root-level `tests/` is workspace scratch space.
+/tests/
 
 # Environment / secrets
 .env
