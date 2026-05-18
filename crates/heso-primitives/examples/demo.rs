@@ -12,8 +12,8 @@
 use heso_core::{Result as HesoResult, Url};
 use heso_engine_api::{EngineApi, Page};
 use heso_primitives::{
-    execute, CatInput, CatTarget, CdInput, CdTarget, EnvPath, FindInput, FindPredicate,
-    LsInput, LsTarget, PrimitiveOp, PwdInput, ScreenshotInput, WaitCondition, WaitInput,
+    execute, CatInput, CatTarget, CdInput, CdTarget, EnvPath, FindInput, FindPredicate, LsInput,
+    LsTarget, PrimitiveOp, PwdInput, ScreenshotInput, WaitCondition, WaitInput,
 };
 
 /// Stand-in for the real Servo engine that's coming in M1. Just records what
@@ -55,12 +55,20 @@ async fn main() {
             target: CdTarget::Url { url: url.clone() },
         }),
         PrimitiveOp::Pwd(PwdInput::default()),
-        PrimitiveOp::Ls(LsInput { target: LsTarget::Page }),
+        PrimitiveOp::Ls(LsInput {
+            target: LsTarget::Page,
+        }),
         PrimitiveOp::Find(FindInput {
-            predicate: FindPredicate::Role { role: String::from("link") },
+            predicate: FindPredicate::Role {
+                role: String::from("link"),
+            },
         }),
         PrimitiveOp::Cat(CatInput {
-            target: CatTarget::Env { path: EnvPath::Cookie { name: String::from("sid") } },
+            target: CatTarget::Env {
+                path: EnvPath::Cookie {
+                    name: String::from("sid"),
+                },
+            },
         }),
         PrimitiveOp::Wait(WaitInput {
             condition: WaitCondition::Sleep { ms: 50 },

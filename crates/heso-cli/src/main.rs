@@ -123,7 +123,9 @@ fn print_banner() {
     println!("                                [Phase 1C — ADR 0014] Fetch <url>, run every <script> in document order, then eval <js>");
     println!("                                against the post-hydration DOM. Pass `-` for <js> to read from stdin.");
     println!("                                --seed N seeds the determinism shims (default 0). Default skips <script src=...>;");
-    println!("                                pass --js-fetch to surface a structured error (real subresource fetch is PR C).");
+    println!("                                pass --js-fetch to install the JS `fetch()` global and honor <script src=...>");
+    println!("                                via the same `reqwest::Client` used for the page load (cookies + receipts coherent).");
+    println!("                                Under --seed N + --js-fetch, fetch() rejects with a clear cassette error (ADR 0008).");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso run   <url> <request>    [STUB] navigates to <url> only; request is ignored. Planner not yet wired.");
     println!();
@@ -628,7 +630,9 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
             }
             other if other.starts_with("--") && other != "-" => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso eval-js [--seed N] <js> | heso eval-js [--seed N] - < script.js");
+                eprintln!(
+                    "usage: heso eval-js [--seed N] <js> | heso eval-js [--seed N] - < script.js"
+                );
                 return ExitCode::from(2);
             }
             _ => {
@@ -821,7 +825,29 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
     };
 
-    let js_engine = match heso_engine_js::JsEngine::new_with_seed(seed) {
+    // Build the JS engine. When `--js-fetch` is set we install a
+    // live `fetch()` global routed through the same `reqwest::Client`
+    // the static path used to load the page (so cookies, TLS,
+    // User-Agent stay coherent — per `next-phase-plan.md` item C and
+    // the ADR 0014 Phase 2 row).
+    //
+    // When `--seed N` is set without a recording cassette (item M is
+    // not landed yet), the in-JS `fetch()` rejects every call with a
+    // clear "not in cassette" error per ADR 0008's determinism gate.
+    // Seed = 0 is treated as "no seed" for this purpose (it's the
+    // default for unseeded runs and shouldn't lock out live fetch).
+    let js_engine_result = if js_fetch {
+        let client = fetch_engine.client();
+        let rt_handle = tokio::runtime::Handle::current();
+        if seed != 0 {
+            heso_engine_js::JsEngine::new_with_seed_and_fetch(seed, client, rt_handle)
+        } else {
+            heso_engine_js::JsEngine::new_with_fetch(client, rt_handle)
+        }
+    } else {
+        heso_engine_js::JsEngine::new_with_seed(seed)
+    };
+    let js_engine = match js_engine_result {
         Ok(e) => e,
         Err(e) => {
             eprintln!("failed to create JS engine: {e}");
@@ -830,7 +856,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
     };
 
     let policy = if js_fetch {
-        heso_engine_js::ScriptFetchPolicy::Error
+        heso_engine_js::ScriptFetchPolicy::Fetch
     } else {
         heso_engine_js::ScriptFetchPolicy::Skip
     };

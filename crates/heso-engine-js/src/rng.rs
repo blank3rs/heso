@@ -117,11 +117,22 @@ impl SeededRng {
              {:02x}{:02x}-\
              {:02x}{:02x}-\
              {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5],
-            bytes[6], bytes[7],
-            bytes[8], bytes[9],
-            bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+            bytes[0],
+            bytes[1],
+            bytes[2],
+            bytes[3],
+            bytes[4],
+            bytes[5],
+            bytes[6],
+            bytes[7],
+            bytes[8],
+            bytes[9],
+            bytes[10],
+            bytes[11],
+            bytes[12],
+            bytes[13],
+            bytes[14],
+            bytes[15],
         )
     }
 }
@@ -138,10 +149,16 @@ mod tests {
         let b = SeededRng::new(42);
         let seq_a: Vec<f64> = (0..5).map(|_| a.next_f64()).collect();
         let seq_b: Vec<f64> = (0..5).map(|_| b.next_f64()).collect();
-        assert_eq!(seq_a, seq_b, "same seed must produce identical f64 sequence");
+        assert_eq!(
+            seq_a, seq_b,
+            "same seed must produce identical f64 sequence"
+        );
         // And the values are in the Math.random contract range.
         for v in &seq_a {
-            assert!((0.0..1.0).contains(v), "next_f64 should yield [0,1): got {v}");
+            assert!(
+                (0.0..1.0).contains(v),
+                "next_f64 should yield [0,1): got {v}"
+            );
         }
     }
 
@@ -167,7 +184,11 @@ mod tests {
         let rng = SeededRng::new(0);
         for _ in 0..32 {
             let s = rng.random_uuid();
-            assert_eq!(s.len(), 36, "UUID has 36 chars (32 hex + 4 dashes); got {s:?}");
+            assert_eq!(
+                s.len(),
+                36,
+                "UUID has 36 chars (32 hex + 4 dashes); got {s:?}"
+            );
             let bytes = s.as_bytes();
             assert_eq!(bytes[8], b'-', "dash at idx 8 missing in {s:?}");
             assert_eq!(bytes[13], b'-', "dash at idx 13 missing in {s:?}");

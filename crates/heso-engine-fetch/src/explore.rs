@@ -171,12 +171,8 @@ pub struct LinkedPage {
     /// linked page (Next.js / Apple `__ACGH_DATA__` / Nuxt / Astro /
     /// generic Remix hydration payloads). Empty when the page has none
     /// or the fetch failed. See [`crate::inline_data`].
-    #[serde(
-        default,
-        skip_serializing_if = "std::collections::BTreeMap::is_empty"
-    )]
-    pub inline_data:
-        std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub inline_data: std::collections::BTreeMap<String, serde_json::Value>,
     /// Recursive children (this page's own linked pages). Always
     /// present, may be empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -297,7 +293,10 @@ pub(crate) fn should_follow(base: &Url, candidate: &Url) -> bool {
 fn canonical_key(u: &Url) -> String {
     let scheme = u.scheme().to_ascii_lowercase();
     let host = u.host_str().unwrap_or("").to_ascii_lowercase();
-    let port = u.port_or_known_default().map(|p| p.to_string()).unwrap_or_default();
+    let port = u
+        .port_or_known_default()
+        .map(|p| p.to_string())
+        .unwrap_or_default();
     let path = u.path();
     let query = u.query().unwrap_or("");
     if query.is_empty() {
@@ -335,8 +334,8 @@ impl LinkFetcher for FetchEngine {
             .await
             .map_err(|e| format!("http: {e}"))?;
         let final_url_str = resp.url().as_str().to_owned();
-        let final_url = Url::parse(&final_url_str)
-            .map_err(|e| format!("bad redirected url: {e}"))?;
+        let final_url =
+            Url::parse(&final_url_str).map_err(|e| format!("bad redirected url: {e}"))?;
         let text = resp.text().await.map_err(|e| format!("body: {e}"))?;
         Ok((final_url, text))
     }
@@ -345,8 +344,7 @@ impl LinkFetcher for FetchEngine {
 /// Boxed `Send` future alias — recursive `async fn`s need indirection
 /// (`Box::pin`) and we need the result to satisfy [`JoinSet::spawn`]'s
 /// `Send + 'static` bound.
-type ExploreFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Vec<LinkedPage>> + Send>>;
+type ExploreFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<LinkedPage>> + Send>>;
 
 /// Internal entry point. Returns the [`LinkedPage`] vector in document
 /// order. `parent_actions` and `parent_url` are owned so the spawned
@@ -393,8 +391,7 @@ pub(crate) fn explore<E: LinkFetcher>(
             let visited_clone = visited.clone();
             let opts_child = options.child();
             joinset.spawn(async move {
-                let page =
-                    fetch_one(engine_clone, target, opts_child, visited_clone).await;
+                let page = fetch_one(engine_clone, target, opts_child, visited_clone).await;
                 (idx, page)
             });
         }
@@ -509,9 +506,7 @@ async fn fetch_one<E: LinkFetcher>(
 /// Render a [`LinkedPage`] vector into the JSON shape we expose via
 /// `heso open` and `heso serve`. Centralized so the two surfaces stay
 /// in sync without one drifting from the other.
-pub fn linked_pages_to_json(
-    linked_pages: &[LinkedPage],
-) -> serde_json::Value {
+pub fn linked_pages_to_json(linked_pages: &[LinkedPage]) -> serde_json::Value {
     // We could just `serde_json::to_value(linked_pages)`, but doing it
     // ourselves means the field order on the wire is documented here
     // (helpful when the LLM is reading the JSON cold).
@@ -519,14 +514,14 @@ pub fn linked_pages_to_json(
         .iter()
         .map(|p| {
             let mut obj: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            obj.insert("from_ref".into(), serde_json::Value::String(p.from_ref.clone()));
+            obj.insert(
+                "from_ref".into(),
+                serde_json::Value::String(p.from_ref.clone()),
+            );
             obj.insert("url".into(), serde_json::Value::String(p.url.clone()));
             obj.insert("title".into(), serde_json::Value::String(p.title.clone()));
             if let Some(d) = &p.description {
-                obj.insert(
-                    "description".into(),
-                    serde_json::Value::String(d.clone()),
-                );
+                obj.insert("description".into(), serde_json::Value::String(d.clone()));
             }
             if let Some(t) = &p.tree {
                 obj.insert(
@@ -549,8 +544,7 @@ pub fn linked_pages_to_json(
             if !p.inline_data.is_empty() {
                 obj.insert(
                     "inline_data".into(),
-                    serde_json::to_value(&p.inline_data)
-                        .unwrap_or(serde_json::Value::Null),
+                    serde_json::to_value(&p.inline_data).unwrap_or(serde_json::Value::Null),
                 );
             }
             if !p.linked_pages.is_empty() {
@@ -800,12 +794,7 @@ mod tests {
         let html = r#"<html><body><a href="/page1">go</a></body></html>"#;
         let actions = extract_actions(&parse(html));
         let parent = u("https://example.com/");
-        let pages = explore_blocking(
-            &engine,
-            &actions,
-            &parent,
-            ExploreOptions::with_depth(0),
-        );
+        let pages = explore_blocking(&engine, &actions, &parent, ExploreOptions::with_depth(0));
         assert!(pages.is_empty());
     }
 
@@ -878,8 +867,7 @@ mod tests {
                </body></html>"#,
         );
 
-        let parent_html =
-            r#"<html><body><a href="/about">about</a></body></html>"#;
+        let parent_html = r#"<html><body><a href="/about">about</a></body></html>"#;
         let actions = extract_actions(&parse(parent_html));
         let parent_url = u("https://example.com/");
         let pages = explore_blocking(
@@ -899,10 +887,7 @@ mod tests {
             .collect();
         assert_eq!(
             nested_urls,
-            vec![
-                "https://example.com/team",
-                "https://example.com/history"
-            ]
+            vec!["https://example.com/team", "https://example.com/history"]
         );
         // Depth-2 leaf pages don't recurse further.
         for nested in &pages[0].linked_pages {
@@ -1049,8 +1034,7 @@ mod tests {
                  <a href="/page1">back-to-1</a>
                </body></html>"#,
         );
-        let parent_html =
-            r#"<html><body><a href="/page1">go</a></body></html>"#;
+        let parent_html = r#"<html><body><a href="/page1">go</a></body></html>"#;
         let actions = extract_actions(&parse(parent_html));
         let parent_url = u("https://example.com/");
         let pages = explore_blocking(
@@ -1065,12 +1049,11 @@ mod tests {
         // page1 again — that'd be the cycle. With our visited set, page2's
         // own linked_pages list is empty.
         assert_eq!(pages[0].linked_pages.len(), 1);
-        assert_eq!(
-            pages[0].linked_pages[0].url,
-            "https://example.com/page2"
+        assert_eq!(pages[0].linked_pages[0].url, "https://example.com/page2");
+        assert!(
+            pages[0].linked_pages[0].linked_pages.is_empty(),
+            "page2 must not have re-followed page1 (cycle prevention)"
         );
-        assert!(pages[0].linked_pages[0].linked_pages.is_empty(),
-            "page2 must not have re-followed page1 (cycle prevention)");
     }
 
     #[test]
@@ -1139,8 +1122,7 @@ mod tests {
         );
         let first_json = serialize(&first);
         // URLs come out p0, p1, p2, ..., p7 — document order.
-        let urls: Vec<&str> =
-            first.iter().map(|p| p.url.as_str()).collect();
+        let urls: Vec<&str> = first.iter().map(|p| p.url.as_str()).collect();
         assert_eq!(
             urls,
             (0..8)

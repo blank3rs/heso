@@ -399,7 +399,9 @@ pub async fn cd<E: EngineApi>(engine: &E, input: &CdInput) -> Result<CdOutput> {
     match &input.target {
         CdTarget::Url { url } => {
             let page = engine.open(url).await?;
-            Ok(CdOutput { url: page.url().clone() })
+            Ok(CdOutput {
+                url: page.url().clone(),
+            })
         }
         CdTarget::Element { .. } => Err(Error::NotImplemented(
             "cd @element — pending engine click+navigation surface (T-013)",
@@ -803,10 +805,7 @@ pub struct ScreenshotOutput {
 /// Determinism: this primitive depends on the software-rendering and pinned-
 /// font preconditions tracked in T-014. The bytes returned by two runs of the
 /// same trace with the same seed will be byte-identical once T-014 lands.
-pub fn screenshot<E: EngineApi>(
-    _engine: &E,
-    _input: &ScreenshotInput,
-) -> Result<ScreenshotOutput> {
+pub fn screenshot<E: EngineApi>(_engine: &E, _input: &ScreenshotInput) -> Result<ScreenshotOutput> {
     Err(Error::NotImplemented(
         "screenshot — pending engine render surface (T-013, T-014)",
     ))
@@ -941,7 +940,9 @@ mod tests {
     #[test]
     fn cd_url_serializes_with_op_tag_and_nested_target_kind() {
         let op = PrimitiveOp::Cd(CdInput {
-            target: CdTarget::Url { url: u("https://example.com/") },
+            target: CdTarget::Url {
+                url: u("https://example.com/"),
+            },
         });
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(json["op"], "cd");
@@ -952,7 +953,9 @@ mod tests {
     #[test]
     fn cd_special_targets_roundtrip() {
         for target in [CdTarget::Back, CdTarget::Previous] {
-            let op = PrimitiveOp::Cd(CdInput { target: target.clone() });
+            let op = PrimitiveOp::Cd(CdInput {
+                target: target.clone(),
+            });
             match rt(&op) {
                 PrimitiveOp::Cd(CdInput { target: round }) => assert_eq!(round, target),
                 other => panic!("wrong variant: {other:?}"),
@@ -964,7 +967,9 @@ mod tests {
     fn echo_with_env_path_serializes_cleanly() {
         let op = PrimitiveOp::Echo(EchoInput {
             value: "abc".into(),
-            target: EchoTarget::Env { path: EnvPath::Cookie { name: "sid".into() } },
+            target: EchoTarget::Env {
+                path: EnvPath::Cookie { name: "sid".into() },
+            },
             append: false,
         });
         let json = serde_json::to_value(&op).unwrap();
@@ -980,8 +985,14 @@ mod tests {
     fn all_fifteen_op_variants_roundtrip() {
         let ops: Vec<PrimitiveOp> = vec![
             PrimitiveOp::Pwd(PwdInput {}),
-            PrimitiveOp::Ls(LsInput { target: LsTarget::Page }),
-            PrimitiveOp::Cd(CdInput { target: CdTarget::Url { url: u("https://example.com/") } }),
+            PrimitiveOp::Ls(LsInput {
+                target: LsTarget::Page,
+            }),
+            PrimitiveOp::Cd(CdInput {
+                target: CdTarget::Url {
+                    url: u("https://example.com/"),
+                },
+            }),
             PrimitiveOp::Cat(CatInput {
                 target: CatTarget::Element {
                     element: ElementRef::new("@e1"),
@@ -989,7 +1000,9 @@ mod tests {
                 },
             }),
             PrimitiveOp::Find(FindInput {
-                predicate: FindPredicate::Role { role: "link".into() },
+                predicate: FindPredicate::Role {
+                    role: "link".into(),
+                },
             }),
             PrimitiveOp::Grep(GrepInput {
                 pattern: "rust".into(),
@@ -998,27 +1011,45 @@ mod tests {
             }),
             PrimitiveOp::Echo(EchoInput {
                 value: "v".into(),
-                target: EchoTarget::Field { element: ElementRef::new("@e2") },
+                target: EchoTarget::Field {
+                    element: ElementRef::new("@e2"),
+                },
                 append: false,
             }),
             PrimitiveOp::Rm(RmInput {
-                target: RmTarget::EnvScope { scope: EnvScope::Cookie },
+                target: RmTarget::EnvScope {
+                    scope: EnvScope::Cookie,
+                },
             }),
-            PrimitiveOp::Click(ClickInput { element: ElementRef::new("@e3") }),
-            PrimitiveOp::Submit(SubmitInput { form: ElementRef::new("@e4") }),
-            PrimitiveOp::Wget(WgetInput { target: WgetTarget::Url { url: u("https://example.com/x.png") } }),
+            PrimitiveOp::Click(ClickInput {
+                element: ElementRef::new("@e3"),
+            }),
+            PrimitiveOp::Submit(SubmitInput {
+                form: ElementRef::new("@e4"),
+            }),
+            PrimitiveOp::Wget(WgetInput {
+                target: WgetTarget::Url {
+                    url: u("https://example.com/x.png"),
+                },
+            }),
             PrimitiveOp::Wait(WaitInput {
                 condition: WaitCondition::Sleep { ms: 100 },
                 timeout_ms: 1000,
             }),
             PrimitiveOp::Screenshot(ScreenshotInput { element: None }),
-            PrimitiveOp::Eval(EvalInput { source: "1+1".into() }),
+            PrimitiveOp::Eval(EvalInput {
+                source: "1+1".into(),
+            }),
             PrimitiveOp::Diff(DiffInput {
                 before: SnapshotId::new("@s1"),
                 after: SnapshotId::new("@s2"),
             }),
         ];
-        assert_eq!(ops.len(), 15, "exactly fifteen terminal primitives per ADR 0010");
+        assert_eq!(
+            ops.len(),
+            15,
+            "exactly fifteen terminal primitives per ADR 0010"
+        );
 
         for op in &ops {
             assert_eq!(&rt(op), op);
@@ -1031,40 +1062,79 @@ mod tests {
         // name. Verify every variant.
         let pairs = [
             (PrimitiveOp::Pwd(PwdInput {}), "pwd"),
-            (PrimitiveOp::Ls(LsInput { target: LsTarget::Page }), "ls"),
-            (PrimitiveOp::Cd(CdInput { target: CdTarget::Back }), "cd"),
+            (
+                PrimitiveOp::Ls(LsInput {
+                    target: LsTarget::Page,
+                }),
+                "ls",
+            ),
+            (
+                PrimitiveOp::Cd(CdInput {
+                    target: CdTarget::Back,
+                }),
+                "cd",
+            ),
             (
                 PrimitiveOp::Cat(CatInput {
-                    target: CatTarget::Element { element: ElementRef::new("@e1"), attr: "text".into() },
+                    target: CatTarget::Element {
+                        element: ElementRef::new("@e1"),
+                        attr: "text".into(),
+                    },
                 }),
                 "cat",
             ),
             (
-                PrimitiveOp::Find(FindInput { predicate: FindPredicate::Role { role: "link".into() } }),
+                PrimitiveOp::Find(FindInput {
+                    predicate: FindPredicate::Role {
+                        role: "link".into(),
+                    },
+                }),
                 "find",
             ),
             (
-                PrimitiveOp::Grep(GrepInput { pattern: "x".into(), ignore_case: false, within: None }),
+                PrimitiveOp::Grep(GrepInput {
+                    pattern: "x".into(),
+                    ignore_case: false,
+                    within: None,
+                }),
                 "grep",
             ),
             (
                 PrimitiveOp::Echo(EchoInput {
                     value: "v".into(),
-                    target: EchoTarget::Field { element: ElementRef::new("@e1") },
+                    target: EchoTarget::Field {
+                        element: ElementRef::new("@e1"),
+                    },
                     append: false,
                 }),
                 "echo",
             ),
             (
                 PrimitiveOp::Rm(RmInput {
-                    target: RmTarget::Field { element: ElementRef::new("@e1") },
+                    target: RmTarget::Field {
+                        element: ElementRef::new("@e1"),
+                    },
                 }),
                 "rm",
             ),
-            (PrimitiveOp::Click(ClickInput { element: ElementRef::new("@e1") }), "click"),
-            (PrimitiveOp::Submit(SubmitInput { form: ElementRef::new("@e1") }), "submit"),
             (
-                PrimitiveOp::Wget(WgetInput { target: WgetTarget::Url { url: u("https://example.com/") } }),
+                PrimitiveOp::Click(ClickInput {
+                    element: ElementRef::new("@e1"),
+                }),
+                "click",
+            ),
+            (
+                PrimitiveOp::Submit(SubmitInput {
+                    form: ElementRef::new("@e1"),
+                }),
+                "submit",
+            ),
+            (
+                PrimitiveOp::Wget(WgetInput {
+                    target: WgetTarget::Url {
+                        url: u("https://example.com/"),
+                    },
+                }),
                 "wget",
             ),
             (
@@ -1074,7 +1144,10 @@ mod tests {
                 }),
                 "wait",
             ),
-            (PrimitiveOp::Screenshot(ScreenshotInput { element: None }), "screenshot"),
+            (
+                PrimitiveOp::Screenshot(ScreenshotInput { element: None }),
+                "screenshot",
+            ),
             (PrimitiveOp::Eval(EvalInput { source: "1".into() }), "eval"),
             (
                 PrimitiveOp::Diff(DiffInput {
@@ -1094,8 +1167,14 @@ mod tests {
     fn trace_serializes_as_json_array() {
         let trace: Trace = vec![
             PrimitiveOp::Pwd(PwdInput {}),
-            PrimitiveOp::Cd(CdInput { target: CdTarget::Url { url: u("https://example.com/") } }),
-            PrimitiveOp::Ls(LsInput { target: LsTarget::Page }),
+            PrimitiveOp::Cd(CdInput {
+                target: CdTarget::Url {
+                    url: u("https://example.com/"),
+                },
+            }),
+            PrimitiveOp::Ls(LsInput {
+                target: LsTarget::Page,
+            }),
         ];
         let json = serde_json::to_value(&trace).unwrap();
         assert!(json.is_array());
@@ -1118,7 +1197,9 @@ mod tests {
 
     #[test]
     fn primitive_result_uses_same_op_tag_as_op() {
-        let res = PrimitiveResult::Cd(CdOutput { url: u("https://example.com/") });
+        let res = PrimitiveResult::Cd(CdOutput {
+            url: u("https://example.com/"),
+        });
         let json = serde_json::to_value(&res).unwrap();
         assert_eq!(json["op"], "cd");
         assert_eq!(json["url"], "https://example.com/");
@@ -1161,7 +1242,11 @@ mod tests {
     async fn cd_url_delegates_to_engine_open() {
         let out = cd(
             &DummyEngine,
-            &CdInput { target: CdTarget::Url { url: u("https://example.com/foo") } },
+            &CdInput {
+                target: CdTarget::Url {
+                    url: u("https://example.com/foo"),
+                },
+            },
         )
         .await
         .unwrap();
@@ -1171,7 +1256,9 @@ mod tests {
     #[tokio::test]
     async fn execute_dispatches_cd_to_engine() {
         let op = PrimitiveOp::Cd(CdInput {
-            target: CdTarget::Url { url: u("https://example.com/bar") },
+            target: CdTarget::Url {
+                url: u("https://example.com/bar"),
+            },
         });
         match execute(&DummyEngine, &op).await.unwrap() {
             PrimitiveResult::Cd(out) => assert_eq!(out.url.as_str(), "https://example.com/bar"),
@@ -1182,7 +1269,9 @@ mod tests {
     #[tokio::test]
     async fn cd_element_back_previous_all_return_not_implemented() {
         for target in [
-            CdTarget::Element { element: ElementRef::new("@e1") },
+            CdTarget::Element {
+                element: ElementRef::new("@e1"),
+            },
             CdTarget::Back,
             CdTarget::Previous,
         ] {
@@ -1196,23 +1285,48 @@ mod tests {
         let e = DummyEngine;
         let ops = [
             PrimitiveOp::Pwd(PwdInput {}),
-            PrimitiveOp::Ls(LsInput { target: LsTarget::Page }),
-            PrimitiveOp::Cat(CatInput {
-                target: CatTarget::Element { element: ElementRef::new("@e1"), attr: "text".into() },
+            PrimitiveOp::Ls(LsInput {
+                target: LsTarget::Page,
             }),
-            PrimitiveOp::Find(FindInput { predicate: FindPredicate::Role { role: "link".into() } }),
-            PrimitiveOp::Grep(GrepInput { pattern: "x".into(), ignore_case: false, within: None }),
+            PrimitiveOp::Cat(CatInput {
+                target: CatTarget::Element {
+                    element: ElementRef::new("@e1"),
+                    attr: "text".into(),
+                },
+            }),
+            PrimitiveOp::Find(FindInput {
+                predicate: FindPredicate::Role {
+                    role: "link".into(),
+                },
+            }),
+            PrimitiveOp::Grep(GrepInput {
+                pattern: "x".into(),
+                ignore_case: false,
+                within: None,
+            }),
             PrimitiveOp::Echo(EchoInput {
                 value: "v".into(),
-                target: EchoTarget::Field { element: ElementRef::new("@e1") },
+                target: EchoTarget::Field {
+                    element: ElementRef::new("@e1"),
+                },
                 append: false,
             }),
             PrimitiveOp::Rm(RmInput {
-                target: RmTarget::Field { element: ElementRef::new("@e1") },
+                target: RmTarget::Field {
+                    element: ElementRef::new("@e1"),
+                },
             }),
-            PrimitiveOp::Click(ClickInput { element: ElementRef::new("@e1") }),
-            PrimitiveOp::Submit(SubmitInput { form: ElementRef::new("@e1") }),
-            PrimitiveOp::Wget(WgetInput { target: WgetTarget::Url { url: u("https://example.com/") } }),
+            PrimitiveOp::Click(ClickInput {
+                element: ElementRef::new("@e1"),
+            }),
+            PrimitiveOp::Submit(SubmitInput {
+                form: ElementRef::new("@e1"),
+            }),
+            PrimitiveOp::Wget(WgetInput {
+                target: WgetTarget::Url {
+                    url: u("https://example.com/"),
+                },
+            }),
             PrimitiveOp::Wait(WaitInput {
                 condition: WaitCondition::Sleep { ms: 1 },
                 timeout_ms: 10,

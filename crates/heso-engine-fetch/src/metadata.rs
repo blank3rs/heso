@@ -125,8 +125,8 @@ pub fn extract(doc: &Html) -> PageMetadata {
 // ============================================================================
 
 fn extract_jsonld(doc: &Html) -> Vec<serde_json::Value> {
-    let selector = Selector::parse(r#"script[type="application/ld+json"]"#)
-        .expect("valid selector");
+    let selector =
+        Selector::parse(r#"script[type="application/ld+json"]"#).expect("valid selector");
     doc.select(&selector)
         .filter_map(|s| {
             let raw: String = s.text().collect();
@@ -143,11 +143,7 @@ fn extract_jsonld(doc: &Html) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn extract_meta_prefixed(
-    doc: &Html,
-    attr: &str,
-    prefix: &str,
-) -> BTreeMap<String, String> {
+fn extract_meta_prefixed(doc: &Html, attr: &str, prefix: &str) -> BTreeMap<String, String> {
     let selector = Selector::parse("meta").expect("valid selector");
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for el in doc.select(&selector) {
@@ -196,8 +192,7 @@ fn extract_meta_unprefixed(doc: &Html) -> BTreeMap<String, String> {
 }
 
 fn extract_canonical(doc: &Html) -> Option<String> {
-    let selector =
-        Selector::parse(r#"link[rel="canonical"]"#).expect("valid selector");
+    let selector = Selector::parse(r#"link[rel="canonical"]"#).expect("valid selector");
     doc.select(&selector)
         .next()
         .and_then(|el| el.value().attr("href"))
@@ -215,9 +210,9 @@ fn extract_icons(doc: &Html) -> Vec<String> {
             Some(r) => r,
             None => continue,
         };
-        let is_icon = rel.split_ascii_whitespace().any(|t| {
-            matches!(t, "icon" | "apple-touch-icon" | "shortcut-icon")
-        });
+        let is_icon = rel
+            .split_ascii_whitespace()
+            .any(|t| matches!(t, "icon" | "apple-touch-icon" | "shortcut-icon"));
         if !is_icon {
             continue;
         }

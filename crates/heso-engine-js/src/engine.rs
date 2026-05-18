@@ -24,6 +24,7 @@ use rquickjs::{
 };
 
 use crate::dom::{self, Document};
+use crate::fetch::{self, FetchMode, FetchQueue};
 use crate::rng::SeededRng;
 use crate::scripts::{self, ScriptFetchPolicy, ScriptOutcome};
 use crate::timers::{self, TimerScheduler};
@@ -154,6 +155,22 @@ pub struct JsEngine {
     /// [`crate::rng`] for the design; ADR 0008 for the determinism
     /// contract.
     rng: SeededRng,
+    /// Per-engine pending-fetch queue + fetch mode.
+    ///
+    /// Populated only when the host called [`Self::new_with_fetch`]
+    /// or [`Self::new_with_seed_and_fetch`]; otherwise `None` and the
+    /// `fetch` global is not installed in the JS context.
+    ///
+    /// `RefCell` (not `Mutex`) because [`Self`] is single-threaded by
+    /// construction — the QuickJS runtime is `!Send`, so the engine
+    /// never crosses a thread boundary.
+    fetch_state: Option<FetchState>,
+}
+
+/// Bundles a per-engine fetch queue with the mode that drives it.
+pub(crate) struct FetchState {
+    pub(crate) queue: Arc<FetchQueue>,
+    pub(crate) mode: FetchMode,
 }
 
 impl JsEngine {
@@ -188,6 +205,71 @@ impl JsEngine {
     /// - `crypto.randomUUID()` — emits a v4-format UUID whose 16
     ///   underlying bytes come from the same stream.
     pub fn new_with_seed(seed: u64) -> Result<Self, EvalError> {
+        Self::new_inner(seed, None)
+    }
+
+    /// Create a fresh engine with the default seed (`0`) and the
+    /// `fetch` global wired to the supplied [`reqwest::Client`].
+    ///
+    /// Use this when constructing an engine for a session that should
+    /// be able to issue HTTP requests from JS — typically `heso
+    /// eval-dom --js-fetch` or `heso open --js`. Pass the same
+    /// [`Arc<reqwest::Client>`] you use for the static path
+    /// ([`heso_engine_fetch::FetchEngine::client`]) so cookies, TLS
+    /// state, and (when item M lands) recorded-network playback stay
+    /// coherent across the two paths.
+    ///
+    /// `rt_handle` is the host's [`tokio::runtime::Handle`] — the
+    /// engine uses it to drive `reqwest::Client::send` from inside
+    /// the synchronous JS context. The host MUST call this from a
+    /// context where `Handle::try_current()` succeeds (e.g. inside
+    /// a `#[tokio::main]` function or a `tokio::task::spawn_blocking`
+    /// pool), otherwise constructing the engine still works but
+    /// every `fetch()` rejects with an executor error.
+    pub fn new_with_fetch(
+        client: Arc<reqwest::Client>,
+        rt_handle: tokio::runtime::Handle,
+    ) -> Result<Self, EvalError> {
+        Self::new_inner(0, Some(FetchMode::Live { client, rt_handle }))
+    }
+
+    /// Like [`Self::new_with_fetch`] but also seeds the PRNG. When
+    /// `seed` is non-zero this is `--seed N` mode WITHOUT a recording
+    /// cassette and — per ADR 0008's "determinism gate" — `fetch()`
+    /// is installed in the `DeterministicNoCassette` variant that
+    /// rejects every call with a clear error pointing the user at
+    /// `heso run --record`.
+    ///
+    /// Use [`Self::new_with_seed_and_live_fetch`] if you have a
+    /// recording cassette and want live fetch under a seed.
+    pub fn new_with_seed_and_fetch(
+        seed: u64,
+        _client: Arc<reqwest::Client>,
+        _rt_handle: tokio::runtime::Handle,
+    ) -> Result<Self, EvalError> {
+        // Currently every seeded run lands in `DeterministicNoCassette`
+        // because item M (record/replay) hasn't shipped yet. When it
+        // does, the cassette decides whether we route to the live
+        // client or replay from disk; the public surface stays the
+        // same.
+        Self::new_inner(seed, Some(FetchMode::DeterministicNoCassette))
+    }
+
+    /// Escape hatch: seeded PRNG + live fetch. Used by tests that
+    /// pin both at once and by future code that has a cassette and
+    /// wants to route through it. Most callers want
+    /// [`Self::new_with_seed_and_fetch`] instead.
+    pub fn new_with_seed_and_live_fetch(
+        seed: u64,
+        client: Arc<reqwest::Client>,
+        rt_handle: tokio::runtime::Handle,
+    ) -> Result<Self, EvalError> {
+        Self::new_inner(seed, Some(FetchMode::Live { client, rt_handle }))
+    }
+
+    /// Internal constructor — the single place that wires up all
+    /// globals so the public `new_*` variants don't drift.
+    fn new_inner(seed: u64, fetch_mode: Option<FetchMode>) -> Result<Self, EvalError> {
         let runtime = Runtime::new().map_err(|e| EvalError::Engine(e.to_string()))?;
         runtime.set_memory_limit(DEFAULT_MEMORY_LIMIT_BYTES);
         runtime.set_max_stack_size(DEFAULT_MAX_STACK_BYTES);
@@ -221,12 +303,23 @@ impl JsEngine {
         let rng = SeededRng::new(seed);
         install_rng(&context, rng.clone())?;
 
+        // Optional: install the `fetch` global.
+        let fetch_state = if let Some(mode) = fetch_mode {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let queue = Arc::new(FetchQueue::new());
+            fetch::install_fetch(&context, mode.clone(), queue.clone())?;
+            Some(FetchState { queue, mode })
+        } else {
+            None
+        };
+
         Ok(Self {
             _runtime: runtime,
             context,
             console_buffer,
             timers,
             rng,
+            fetch_state,
         })
     }
 
@@ -288,6 +381,87 @@ impl JsEngine {
             .lock()
             .expect("timer scheduler poisoned")
             .pending_count()
+    }
+
+    /// Drain every pending `fetch()` call: dispatch the HTTP request
+    /// through the engine's shared `reqwest::Client`, resolve (or
+    /// reject) the Promise that `fetch()` returned, then loop until
+    /// QuickJS reports no more pending microtask jobs.
+    ///
+    /// A single pass works for the simple `.then(...)` shape because
+    /// resolving a Promise immediately enqueues its `.then` callbacks
+    /// as microtasks, which QuickJS runs in `Runtime::execute_pending_job`.
+    ///
+    /// **Limitation:** top-level `await fetch(...)` in `eval` does
+    /// not yet work — that requires the [`rquickjs::AsyncRuntime`]
+    /// path (item K, microtask pump). For now, callers should use
+    /// `.then(...)` chains and observe the result via either
+    /// [`Self::drain_console`] or a side-effect they capture in JS.
+    ///
+    /// Returns the number of fetches drained. `0` is the steady
+    /// state — every call after the first that introduces no new
+    /// pending fetches returns `0`. Idempotent on an engine that has
+    /// no fetch state installed.
+    pub fn run_pending_jobs(&self) -> Result<usize, EvalError> {
+        let Some(fs) = self.fetch_state.as_ref() else {
+            return Ok(0);
+        };
+        let mut total = 0;
+        // Loop: a `.then` callback can call `fetch()` again, which
+        // re-fills the queue. Drain repeatedly until empty.
+        loop {
+            let drained = fetch::drain_pending(&self.context, &fs.queue, &fs.mode)?;
+            if drained == 0 {
+                break;
+            }
+            total += drained;
+            // Drive any microtasks queued by the resolve() calls.
+            self.execute_pending_jobs_until_idle()?;
+        }
+        // One final pump for microtasks queued by the last drain.
+        self.execute_pending_jobs_until_idle()?;
+        Ok(total)
+    }
+
+    /// Number of pending fetches not yet drained — observable only
+    /// between an `eval` that called `fetch()` and the matching
+    /// [`Self::run_pending_jobs`] call.
+    pub fn pending_fetches(&self) -> usize {
+        self.fetch_state
+            .as_ref()
+            .map(|fs| fs.queue.len())
+            .unwrap_or(0)
+    }
+
+    /// Run QuickJS's microtask queue until it reports idle.
+    /// Internal helper; the public surface is
+    /// [`Self::run_pending_jobs`] (which also drives fetches).
+    fn execute_pending_jobs_until_idle(&self) -> Result<(), EvalError> {
+        // Loop guard so a pathological microtask that re-enqueues
+        // itself doesn't spin forever. 10_000 is well above what any
+        // page-hydration pass should produce.
+        const MAX_PUMP: usize = 10_000;
+        for _ in 0..MAX_PUMP {
+            // `Runtime::execute_pending_job` returns Ok(true) if a job
+            // ran, Ok(false) if the queue is empty, Err(e) if a job
+            // threw. We treat the thrown case as a captured `console.error`
+            // — same containment rule as `timers::advance_clock`.
+            match self._runtime.execute_pending_job() {
+                Ok(true) => continue,
+                Ok(false) => return Ok(()),
+                Err(e) => {
+                    if let Ok(mut buf) = self.console_buffer.lock() {
+                        buf.push(ConsoleEntry {
+                            level: ConsoleLevel::Error,
+                            args: vec![serde_json::Value::String(format!("microtask: {e}"))],
+                        });
+                    }
+                }
+            }
+        }
+        Err(EvalError::Engine(format!(
+            "microtask pump exceeded {MAX_PUMP} iterations - possible infinite loop"
+        )))
     }
 
     /// Drain and return the console buffer. Useful between calls to
@@ -394,10 +568,37 @@ impl JsEngine {
         // land on the same `Arc<dom_query::Document>` the JS-side
         // `document` global wraps, so by the time we eval `js` below,
         // the DOM reflects post-hydration state.
-        let script_outcome =
-            scripts::run_scripts(&self.context, &dom, policy, &self.console_buffer)?;
+        //
+        // External `<script src>` references are honored when policy
+        // is `Fetch` *and* the engine was built with a fetch client.
+        // The fetch shim borrows the same `reqwest::Client` we use
+        // for the rest of the page — see `crate::fetch` for the
+        // determinism-gate rules.
+        let script_fetch_client = self.fetch_state.as_ref().and_then(|fs| match &fs.mode {
+            FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
+            FetchMode::DeterministicNoCassette => None,
+        });
+        let script_outcome = scripts::run_scripts(
+            &self.context,
+            &dom,
+            policy,
+            &self.console_buffer,
+            script_fetch_client.as_ref(),
+        )?;
+
+        // Drive any fetches the page scripts queued before running
+        // user JS — agent code expects `globalThis.window.__DATA = await fetch(...)`
+        // patterns to have completed by the time the user's `js`
+        // argument runs.
+        self.run_pending_jobs()?;
 
         let user_outcome = self.eval_no_clear(js)?;
+
+        // Drive any fetches the user JS queued. This is how
+        // `fetch(...).then(r => r.text()).then(t => globalThis.X = t)`
+        // becomes observable as `globalThis.X` from a subsequent
+        // [`Self::eval`] in the same engine.
+        self.run_pending_jobs()?;
         Ok((user_outcome, script_outcome))
     }
 
@@ -430,6 +631,13 @@ impl JsEngine {
                     }
                 })?
         };
+
+        // Drain pending fetches + microtasks before snapshotting the
+        // console — `fetch(url).then(r => r.text()).then(t =>
+        // console.log(t))` queues a pending fetch synchronously, and
+        // its resolve path eventually pushes a `console.log` entry.
+        // Snapshot order matters: pump first, then snapshot.
+        self.run_pending_jobs()?;
 
         let console = self
             .console_buffer
@@ -601,6 +809,12 @@ impl JsEngine {
                 }
             })?;
 
+        // If the script queued any `fetch()` calls, drain them now so
+        // `.then(...)` callbacks fire before we return. Side effects
+        // observable via `globalThis.X = ...` will be visible to the
+        // next `eval` on this engine.
+        self.run_pending_jobs()?;
+
         let console = self
             .console_buffer
             .lock()
@@ -634,9 +848,18 @@ impl Drop for JsEngine {
         // inside `ctx.with` and the QuickJS engine can free their
         // bound objects synchronously.
         let timers = self.timers.clone();
+        let fetch_queue = self.fetch_state.as_ref().map(|fs| fs.queue.clone());
         self.context.with(|_ctx| {
             if let Ok(mut s) = timers.lock() {
                 s.clear_all();
+            }
+            // Drop every queued fetch's Persistent<Function> handles
+            // while the runtime is still alive. Same trap that
+            // `timers.clear_all` is solving: a Persistent dropped
+            // after the parent Runtime aborts the process via
+            // QuickJS's `list_empty(&rt->gc_obj_list)` debug assert.
+            if let Some(q) = fetch_queue {
+                let _drained = q.take_all();
             }
         });
     }
@@ -1666,7 +1889,10 @@ mod tests {
         assert_eq!(arr.len(), 5);
         for v in arr {
             let n = v.as_f64().expect("array element is a number");
-            assert!((0.0..1.0).contains(&n), "Math.random should yield [0,1): got {n}");
+            assert!(
+                (0.0..1.0).contains(&n),
+                "Math.random should yield [0,1): got {n}"
+            );
         }
     }
 
@@ -1848,9 +2074,9 @@ mod tests {
                     && c.args
                         .first()
                         .and_then(|v| v.as_str())
-                        .map(|s| s.contains("bundle.js") && s.contains("PR C"))
+                        .map(|s| s.contains("bundle.js"))
                         .unwrap_or(false)),
-            "expected an error naming bundle.js + PR C, got: {:?}",
+            "expected an error naming bundle.js, got: {:?}",
             out.console
         );
     }

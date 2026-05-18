@@ -137,9 +137,7 @@ pub fn filter<'a>(
             if let Some(want_section) = section {
                 let want_section = want_section.trim_end_matches('/');
                 let want_with_slash = format!("{want_section}/");
-                if r.section != want_section
-                    && !r.section.starts_with(&want_with_slash)
-                {
+                if r.section != want_section && !r.section.starts_with(&want_with_slash) {
                     return false;
                 }
             }
@@ -176,8 +174,7 @@ fn walk(node: ego_tree::NodeRef<'_, Node>, state: &mut WalkState) {
     // interactive descendants get attributed to the new section.
     if let Some(level) = heading_level(tag) {
         if let Some(elem) = ScraperElementRef::wrap(node) {
-            let heading_text =
-                collapse_ws(&elem.text().collect::<Vec<_>>().join(" "));
+            let heading_text = collapse_ws(&elem.text().collect::<Vec<_>>().join(" "));
             if !heading_text.is_empty() {
                 open_section(state, level, &heading_text);
             }
@@ -189,7 +186,9 @@ fn walk(node: ego_tree::NodeRef<'_, Node>, state: &mut WalkState) {
         if let Some(role) = compute_role(&elem) {
             let ref_id = format!("@e{}", state.counter);
             state.counter += 1;
-            state.refs.push(build_element_ref(&elem, role, ref_id, state));
+            state
+                .refs
+                .push(build_element_ref(&elem, role, ref_id, state));
         }
     }
 
@@ -282,9 +281,7 @@ fn compute_role(el: &ScraperElementRef) -> Option<&'static str> {
                 .unwrap_or_else(|| "text".to_owned());
             match t.as_str() {
                 "hidden" => None, // not actionable
-                "submit" | "button" | "reset" | "image" | "file" => {
-                    Some("button")
-                }
+                "submit" | "button" | "reset" | "image" | "file" => Some("button"),
                 "checkbox" => Some("checkbox"),
                 "radio" => Some("radio"),
                 // Everything else (text, email, search, tel, url, password,
@@ -352,10 +349,7 @@ fn compute_name(el: &ScraperElementRef) -> Option<String> {
             }
         }
         // Submit/button: value is the visible label.
-        if matches!(
-            el.value().attr("type"),
-            Some("submit" | "button" | "reset")
-        ) {
+        if matches!(el.value().attr("type"), Some("submit" | "button" | "reset")) {
             if let Some(v) = el.value().attr("value") {
                 let t = collapse_ws(v);
                 if !t.is_empty() {
@@ -475,7 +469,10 @@ mod tests {
         assert_eq!(refs[0].tag, "a");
         assert_eq!(refs[0].name.as_deref(), Some("Pricing"));
         assert_eq!(refs[0].section, "/welcome");
-        assert_eq!(refs[0].attrs.get("href").map(String::as_str), Some("/pricing"));
+        assert_eq!(
+            refs[0].attrs.get("href").map(String::as_str),
+            Some("/pricing")
+        );
 
         assert_eq!(refs[1].ref_id, "@e1");
         assert_eq!(refs[1].role, "button");
@@ -517,15 +514,16 @@ mod tests {
         assert_eq!(
             roles,
             vec![
-                "textbox", "textbox", "textbox", "checkbox", "radio",
-                "button", "button", "button", "button", "button",
+                "textbox", "textbox", "textbox", "checkbox", "radio", "button", "button", "button",
+                "button", "button",
                 // type="hidden" skipped
-                "textbox", // <input> with no type → text → textbox
-                "textbox", // <textarea>
+                "textbox",  // <input> with no type → text → textbox
+                "textbox",  // <textarea>
                 "combobox", // <select>
             ]
         );
-        assert!(refs.iter().all(|r| !r.attrs.contains_key("type") || r.attrs.get("type").map(String::as_str) != Some("hidden")));
+        assert!(refs.iter().all(|r| !r.attrs.contains_key("type")
+            || r.attrs.get("type").map(String::as_str) != Some("hidden")));
     }
 
     #[test]
@@ -591,7 +589,10 @@ mod tests {
         // form, input, button — three refs.
         assert_eq!(refs.len(), 3);
         assert_eq!(refs[0].role, "form");
-        assert_eq!(refs[0].attrs.get("action").map(String::as_str), Some("/search"));
+        assert_eq!(
+            refs[0].attrs.get("action").map(String::as_str),
+            Some("/search")
+        );
         assert_eq!(refs[0].attrs.get("method").map(String::as_str), Some("get"));
         assert_eq!(refs[1].role, "textbox");
         assert_eq!(refs[2].role, "button");
@@ -633,15 +634,13 @@ mod tests {
         let pricing = filter(&refs, None, None, Some("/pricing"));
         // /pricing AND /pricing/enterprise both match the prefix.
         assert_eq!(pricing.len(), 2);
-        let enterprise =
-            filter(&refs, None, None, Some("/pricing/enterprise"));
+        let enterprise = filter(&refs, None, None, Some("/pricing/enterprise"));
         assert_eq!(enterprise.len(), 1);
     }
 
     #[test]
     fn resolve_finds_by_ref_id() {
-        let html =
-            r#"<html><body><a href="/x">X</a><a href="/y">Y</a></body></html>"#;
+        let html = r#"<html><body><a href="/x">X</a><a href="/y">Y</a></body></html>"#;
         let refs = extract(&parse(html));
         let e1 = resolve(&refs, "@e1").expect("should find @e1");
         assert_eq!(e1.attrs.get("href").map(String::as_str), Some("/y"));
@@ -670,8 +669,14 @@ mod tests {
             </body></html>
         "#;
         let refs = extract(&parse(html));
-        assert_eq!(refs[0].attrs.get("aria-expanded").map(String::as_str), Some("true"));
-        assert_eq!(refs[0].attrs.get("aria-pressed").map(String::as_str), Some("false"));
+        assert_eq!(
+            refs[0].attrs.get("aria-expanded").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            refs[0].attrs.get("aria-pressed").map(String::as_str),
+            Some("false")
+        );
     }
 
     #[test]

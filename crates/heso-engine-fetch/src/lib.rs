@@ -70,19 +70,17 @@ pub mod plat;
 pub mod tree;
 
 pub use actions::{
-    extract as extract_actions, filter as filter_actions,
-    resolve as resolve_action, ElementRef,
+    extract as extract_actions, filter as filter_actions, resolve as resolve_action, ElementRef,
 };
 pub use data_attrs::{extract as extract_data_attrs, DataAttrValue};
 pub use explore::{
-    linked_pages_to_json, ExploreOptions, LinkedPage, DEFAULT_LINK_CAP,
-    HARD_LINK_CAP,
+    linked_pages_to_json, ExploreOptions, LinkedPage, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 pub use inline_data::extract as extract_inline_data;
 pub use metadata::{extract as extract_metadata, PageMetadata};
 pub use plat::{
-    canonical_json as plat_canonical_json, hash as plat_hash,
-    verify as plat_verify, VerifyError as PlatVerifyError,
+    canonical_json as plat_canonical_json, hash as plat_hash, verify as plat_verify,
+    VerifyError as PlatVerifyError,
 };
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
 
@@ -148,6 +146,22 @@ impl FetchEngine {
     /// directly.
     pub(crate) fn client_ref(&self) -> &Client {
         &self.client
+    }
+
+    /// A public, clone-cheap handle to the underlying [`reqwest::Client`].
+    ///
+    /// Threaded into [`heso_engine_js::JsEngine::new_with_fetch`] so
+    /// the JS-side `fetch()` global shares cookies, TLS state, the
+    /// `heso/<version>` User-Agent, and (when item M lands) the
+    /// recorded-network playback layer with the rest of the
+    /// workspace.
+    ///
+    /// `reqwest::Client` is internally an `Arc` — wrapping in another
+    /// `Arc` here is for API hygiene (so callers can hold an
+    /// `Arc<Client>` directly without an extra clone in their
+    /// signatures), not for cheaper cloning.
+    pub fn client(&self) -> Arc<reqwest::Client> {
+        Arc::new(self.client.clone())
     }
 
     /// Open a URL with optional link-graph cartography per

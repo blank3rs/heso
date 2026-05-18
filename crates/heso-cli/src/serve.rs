@@ -69,8 +69,7 @@ use std::sync::Arc;
 use heso_core::Url;
 use heso_engine_api::Page;
 use heso_engine_fetch::{
-    linked_pages_to_json, ExploreOptions, FetchEngine, FetchPage, DEFAULT_LINK_CAP,
-    HARD_LINK_CAP,
+    linked_pages_to_json, ExploreOptions, FetchEngine, FetchPage, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -208,10 +207,7 @@ pub async fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn write_line(
-    out: &mut tokio::io::Stdout,
-    v: &serde_json::Value,
-) -> std::io::Result<()> {
+async fn write_line(out: &mut tokio::io::Stdout, v: &serde_json::Value) -> std::io::Result<()> {
     let mut s = serde_json::to_string(v)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     s.push('\n');
@@ -235,11 +231,7 @@ async fn handle(state: Arc<ServerState>, line: &str) -> Response {
         }
     };
     if req.jsonrpc != "2.0" {
-        return error_response(
-            req.id,
-            INVALID_REQUEST,
-            "`jsonrpc` must be \"2.0\"".into(),
-        );
+        return error_response(req.id, INVALID_REQUEST, "`jsonrpc` must be \"2.0\"".into());
     }
     let id = req.id.clone();
     let result = match req.method.as_str() {
@@ -250,11 +242,7 @@ async fn handle(state: Arc<ServerState>, line: &str) -> Response {
         "close" => dispatch_close(state.clone(), req.params).await,
         "ping" => Ok(serde_json::json!("pong")),
         m => {
-            return error_response(
-                id,
-                METHOD_NOT_FOUND,
-                format!("unknown method `{m}`"),
-            );
+            return error_response(id, METHOD_NOT_FOUND, format!("unknown method `{m}`"));
         }
     };
     match result {
@@ -304,8 +292,7 @@ async fn dispatch_open(
     state: Arc<ServerState>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let p: OpenParams =
-        serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let p: OpenParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let url = Url::parse(&p.url).map_err(|e| format!("invalid URL: {e}"))?;
     let opts = ExploreOptions {
         depth: p.explore_links_depth,
@@ -330,8 +317,7 @@ async fn dispatch_open(
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
                 "inline_data".to_owned(),
-                serde_json::to_value(&page.inline_data)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(&page.inline_data).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -339,8 +325,7 @@ async fn dispatch_open(
         if let Some(obj) = payload.as_object_mut() {
             obj.insert(
                 "data_attrs".to_owned(),
-                serde_json::to_value(&page.data_attrs)
-                    .unwrap_or(serde_json::Value::Null),
+                serde_json::to_value(&page.data_attrs).unwrap_or(serde_json::Value::Null),
             );
         }
     }
@@ -384,8 +369,7 @@ async fn dispatch_ls(
     state: Arc<ServerState>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let p: LsParams =
-        serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let p: LsParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let pages = state.pages.lock().await;
     let page = pages
         .get(&p.page_id)
@@ -404,8 +388,7 @@ async fn dispatch_cat(
     state: Arc<ServerState>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let p: CatParams =
-        serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let p: CatParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let pages = state.pages.lock().await;
     let page = pages
         .get(&p.page_id)
@@ -437,8 +420,7 @@ async fn dispatch_find(
     state: Arc<ServerState>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let p: FindParams =
-        serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let p: FindParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let pages = state.pages.lock().await;
     let page = pages
         .get(&p.page_id)
@@ -461,8 +443,7 @@ async fn dispatch_close(
     state: Arc<ServerState>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let p: CloseParams =
-        serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let p: CloseParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let mut pages = state.pages.lock().await;
     let removed = pages.remove(&p.page_id);
     Ok(serde_json::json!({ "closed": removed.is_some() }))

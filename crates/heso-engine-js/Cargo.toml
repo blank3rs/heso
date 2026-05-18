@@ -37,9 +37,19 @@ dom_query = "=0.28.0"
 # property we actually need. See `src/rng.rs`.
 rand = "0.8"
 rand_chacha = "0.3"
+# Phase 1C item C: `fetch()` inside JS. Shares the workspace
+# `reqwest::Client` (same TLS, gzip/brotli, HTTP/2 settings as the
+# static `heso-engine-fetch` path) so cookies and (when item M
+# lands) recorded-network playback stay coherent. See `src/fetch.rs`
+# and `decisions/0014` (Phase 2 stdlib subset row).
+reqwest = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-# No additional dev-deps required for Phase 1A — std tests only.
+# wiremock-rs: localhost mock server for the in-JS fetch tests.
+# Apache-2.0, mocking-only (recording is item M).
+wiremock = "0.6"
+tokio = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

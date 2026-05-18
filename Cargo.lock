@@ -697,10 +697,13 @@ dependencies = [
  "heso-engine-fetch",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
+ "reqwest",
  "rquickjs",
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]

@@ -1,0 +1,424 @@
+//! Integration tests for the PR2 / item-C surface: `fetch()` inside
+//! JS, routed through the shared `reqwest::Client`. Per
+//! `next-phase-plan.md` item C and ADR 0008's determinism gate.
+//!
+//! These tests use [`wiremock::MockServer`] for localhost HTTP
+//! exchanges so the workspace `cargo test` stays hermetic, plus one
+//! `data:` URL test that needs no server at all.
+//!
+//! Limitation pinned by these tests: `await fetch(...)` at top-level
+//! does **not** yet work because the microtask pump (next-phase item
+//! K) hasn't been wired with [`rquickjs::AsyncRuntime`]. The
+//! `.then(...)` shape is the one PR2 supports; we test that shape
+//! exclusively and document the await-doesn't-work limitation in the
+//! `await_top_level_returns_pending_promise` test below.
+
+use std::sync::Arc;
+
+use heso_engine_js::{FetchMode, JsEngine, ScriptFetchPolicy};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+/// Build a fresh [`reqwest::Client`] matching the rest of the
+/// workspace's shape (rustls, gzip+brotli, HTTP/2, identifying as
+/// `heso-engine-js-tests`).
+fn shared_client() -> Arc<reqwest::Client> {
+    Arc::new(
+        reqwest::Client::builder()
+            .user_agent("heso-engine-js-tests/0.0.1")
+            .build()
+            .expect("client builds"),
+    )
+}
+
+/// Build a JS engine in `FetchMode::Live` with the supplied tokio
+/// handle.
+fn engine_with_fetch() -> JsEngine {
+    let client = shared_client();
+    let rt = tokio::runtime::Handle::current();
+    JsEngine::new_with_fetch(client, rt).expect("engine builds")
+}
+
+// ===== data: URL — works without a server =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_data_url_resolves_to_body_via_then() {
+    let engine = engine_with_fetch();
+    // Use .then to stash the body into globalThis so we can observe
+    // it after the engine drains its pending-fetch queue.
+    let _ = engine
+        .eval(
+            r#"
+            fetch("data:text/plain,hello").then(r => r.text()).then(t => {
+                globalThis.__body = t;
+            });
+            "#,
+        )
+        .expect("schedule fetch");
+    // Engine's `eval` already drained pending fetches before returning.
+    let out = engine.eval("globalThis.__body").expect("observe");
+    assert_eq!(out.value, serde_json::json!("hello"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_data_url_exposes_status_200_and_ok_true() {
+    let engine = engine_with_fetch();
+    let _ = engine
+        .eval(
+            r#"
+            fetch("data:text/plain,xyz").then(r => {
+                globalThis.__status = r.status;
+                globalThis.__ok = r.ok;
+                globalThis.__url = r.url;
+            });
+            "#,
+        )
+        .expect("schedule");
+    let out = engine
+        .eval("[globalThis.__status, globalThis.__ok, globalThis.__url]")
+        .expect("observe");
+    assert_eq!(out.value[0], 200);
+    assert_eq!(out.value[1], true);
+    assert_eq!(out.value[2], "data:text/plain,xyz");
+}
+
+// ===== HTTP GET via wiremock-rs =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_http_get_returns_status_and_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/greet"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hello, agent"))
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/greet", server.uri());
+    let _ = engine
+        .eval(&format!(
+            r#"
+            fetch({url:?}).then(r => {{
+                globalThis.__status = r.status;
+                return r.text();
+            }}).then(t => {{
+                globalThis.__body = t;
+            }});
+            "#,
+            url = url,
+        ))
+        .expect("schedule");
+    let out = engine
+        .eval("[globalThis.__status, globalThis.__body]")
+        .expect("observe");
+    assert_eq!(out.value[0], 200);
+    assert_eq!(out.value[1], "hello, agent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_http_post_with_body_sends_body_and_decodes_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(|req: &Request| {
+            let body = String::from_utf8_lossy(&req.body).into_owned();
+            ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "received": body,
+                "len": body.len(),
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/echo", server.uri());
+    let _ = engine
+        .eval(&format!(
+            r#"
+            fetch({url:?}, {{ method: "POST", body: "x" }}).then(r => {{
+                globalThis.__status = r.status;
+                return r.json();
+            }}).then(j => {{
+                globalThis.__body = j;
+            }});
+            "#,
+            url = url,
+        ))
+        .expect("schedule");
+    let out = engine
+        .eval("[globalThis.__status, globalThis.__body]")
+        .expect("observe");
+    assert_eq!(out.value[0], 201);
+    assert_eq!(out.value[1]["received"], "x");
+    assert_eq!(out.value[1]["len"], 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_post_with_json_body_sets_content_type_automatically() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .respond_with(|req: &Request| {
+            let ct = req
+                .headers
+                .get("content-type")
+                .map(|v| v.to_str().unwrap_or("").to_owned())
+                .unwrap_or_default();
+            let body = String::from_utf8_lossy(&req.body).into_owned();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content_type": ct,
+                "body": body,
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/api", server.uri());
+    let _ = engine
+        .eval(&format!(
+            r#"
+            fetch({url:?}, {{
+                method: "POST",
+                body: {{ name: "alice", count: 3 }}
+            }}).then(r => r.json()).then(j => {{
+                globalThis.__got = j;
+            }});
+            "#,
+            url = url,
+        ))
+        .expect("schedule");
+    let out = engine.eval("globalThis.__got").expect("observe");
+    assert_eq!(out.value["content_type"], "application/json");
+    let body: serde_json::Value =
+        serde_json::from_str(out.value["body"].as_str().expect("body str")).expect("body is json");
+    assert_eq!(body["name"], "alice");
+    assert_eq!(body["count"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_http_404_resolves_with_ok_false() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/exists"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/nope", server.uri());
+    let _ = engine
+        .eval(&format!(
+            r#"
+            fetch({url:?}).then(r => {{
+                globalThis.__status = r.status;
+                globalThis.__ok = r.ok;
+            }});
+            "#,
+            url = url,
+        ))
+        .expect("schedule");
+    // WHATWG: 4xx/5xx still resolve the promise; `ok` reflects 2xx-ness.
+    let out = engine
+        .eval("[globalThis.__status, globalThis.__ok]")
+        .expect("observe");
+    assert_eq!(out.value[0], 404);
+    assert_eq!(out.value[1], false);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fetch_response_headers_get_is_case_insensitive() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/hdr"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-Custom", "agent-shaped")
+                .set_body_string("ok"),
+        )
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/hdr", server.uri());
+    let _ = engine
+        .eval(&format!(
+            r#"
+            fetch({url:?}).then(r => {{
+                globalThis.__lower = r.headers.get("x-custom");
+                globalThis.__upper = r.headers.get("X-CUSTOM");
+                globalThis.__missing = r.headers.get("missing");
+                globalThis.__has_lower = r.headers.has("x-custom");
+                globalThis.__has_missing = r.headers.has("nope");
+            }});
+            "#,
+            url = url,
+        ))
+        .expect("schedule");
+    let out = engine
+        .eval("[globalThis.__lower, globalThis.__upper, globalThis.__missing, globalThis.__has_lower, globalThis.__has_missing]")
+        .expect("observe");
+    assert_eq!(out.value[0], "agent-shaped");
+    assert_eq!(out.value[1], "agent-shaped");
+    assert!(out.value[2].is_null());
+    assert_eq!(out.value[3], true);
+    assert_eq!(out.value[4], false);
+}
+
+// ===== Determinism gate: --seed N + no cassette =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn seed_without_cassette_rejects_fetch_with_clear_error() {
+    let client = shared_client();
+    let rt = tokio::runtime::Handle::current();
+    // `new_with_seed_and_fetch(seed != 0, ...)` lands in
+    // `DeterministicNoCassette` per ADR 0008.
+    let engine = JsEngine::new_with_seed_and_fetch(42, client, rt).expect("engine builds");
+    let _ = engine
+        .eval(
+            r#"
+            fetch("https://example.com").then(
+                _ => { globalThis.__outcome = "resolved"; },
+                e => { globalThis.__outcome = "rejected"; globalThis.__msg = String(e); }
+            );
+            "#,
+        )
+        .expect("schedule");
+    let out = engine
+        .eval("[globalThis.__outcome, globalThis.__msg]")
+        .expect("observe");
+    assert_eq!(out.value[0], "rejected");
+    let msg = out.value[1].as_str().expect("msg is string");
+    assert!(msg.contains("not in cassette"), "msg = {msg:?}");
+    assert!(msg.contains("--record"), "msg = {msg:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn seed_zero_with_fetch_uses_live_path() {
+    // seed = 0 is the unseeded sentinel — the CLI takes Live path for
+    // it. Direct constructor call mirrors that contract.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ok"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("live"))
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/ok", server.uri());
+    let _ = engine
+        .eval(&format!(
+            r#"
+            fetch({url:?}).then(r => r.text()).then(t => {{
+                globalThis.__body = t;
+            }});
+            "#,
+            url = url,
+        ))
+        .expect("schedule");
+    let out = engine.eval("globalThis.__body").expect("observe");
+    assert_eq!(out.value, "live");
+}
+
+// ===== --js-fetch absent (default): no `fetch` global installed =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn engine_without_fetch_has_no_fetch_global() {
+    let engine = JsEngine::new().expect("engine new");
+    let out = engine.eval("typeof fetch").expect("eval");
+    assert_eq!(out.value, "undefined");
+}
+
+// ===== await top-level limitation (documented; expected to NOT resolve eagerly) =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_top_level_returns_pending_promise() {
+    // Documents the PR2 limitation: top-level `await fetch(...)` does
+    // not resolve eagerly under the sync `Runtime + Context` pair we
+    // use today. The promise the script returns is observable on
+    // `EvalOutcome::value`, but it shows up as an empty object
+    // because [`crate::engine::js_value_to_json`] doesn't unwrap
+    // pending Promises — and the host needs `.then(...)` to get the
+    // real body, until item K (microtask pump via AsyncRuntime) lands.
+    let engine = engine_with_fetch();
+    let out = engine
+        .eval(
+            r#"
+            (async () => {
+                const r = await fetch("data:text/plain,async-not-pumped");
+                return r.text();
+            })()
+            "#,
+        )
+        .expect("schedule");
+    // Should NOT contain "async-not-pumped" — the body isn't unwrapped
+    // by the current pump. `.then` is the working shape (covered
+    // above).
+    if let Some(s) = out.value.as_str() {
+        assert!(
+            !s.contains("async-not-pumped"),
+            "top-level await unexpectedly worked, microtask pump may already be wired: {s}"
+        );
+    }
+}
+
+// ===== Page-script integration: <script src=> honored under Fetch policy =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_script_src_fetched_under_fetch_policy() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/inline.js"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/javascript")
+                .set_body_string("globalThis.__hydrated = 'yes';"),
+        )
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let script_url = format!("{}/inline.js", server.uri());
+    let html = format!(r#"<html><body><script src="{script_url}"></script></body></html>"#);
+    let out = engine
+        .eval_with_html_policy(&html, "globalThis.__hydrated", ScriptFetchPolicy::Fetch)
+        .expect("eval");
+    assert_eq!(out.value, "yes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_script_src_failed_fetch_writes_console_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/missing.js"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let script_url = format!("{}/missing.js", server.uri());
+    let html = format!(r#"<html><body><script src="{script_url}"></script></body></html>"#);
+    let out = engine
+        .eval_with_html_policy(&html, "1+1", ScriptFetchPolicy::Fetch)
+        .expect("eval");
+    assert_eq!(out.value, 2);
+    assert!(
+        out.console.iter().any(|c| c
+            .args
+            .first()
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("missing.js") && s.contains("HTTP 404"))
+            .unwrap_or(false)),
+        "expected an HTTP 404 console error, got: {:?}",
+        out.console
+    );
+}
+
+// ===== FetchMode is exported =====
+
+#[test]
+fn fetch_mode_is_exported() {
+    // Compile-time check that FetchMode is reachable as a public
+    // type for downstream callers. The `_` binding is enough.
+    let _: Option<FetchMode> = None;
+}

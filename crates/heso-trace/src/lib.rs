@@ -178,7 +178,10 @@ mod tests {
 
     #[test]
     fn mode_serializes_lowercase() {
-        assert_eq!(serde_json::to_value(Mode::Deterministic).unwrap(), "deterministic");
+        assert_eq!(
+            serde_json::to_value(Mode::Deterministic).unwrap(),
+            "deterministic"
+        );
         assert_eq!(serde_json::to_value(Mode::Recording).unwrap(), "recording");
         assert_eq!(serde_json::to_value(Mode::Live).unwrap(), "live");
     }
@@ -189,7 +192,10 @@ mod tests {
         let b = ContentHash::of(b"some bytes");
         assert_eq!(a, b);
         assert_eq!(a.0.len(), 64);
-        assert!(a.0.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .0
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]

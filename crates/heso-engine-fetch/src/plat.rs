@@ -112,8 +112,7 @@ fn write_canonical(v: &Value, out: &mut String) {
         Value::String(s) => {
             // Delegate to serde_json for JSON-string escaping — it handles
             // \", \\, \n, \t, \uXXXX, etc. correctly.
-            let escaped =
-                serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
+            let escaped = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
             out.push_str(&escaped);
         }
         Value::Array(arr) => {
@@ -137,8 +136,7 @@ fn write_canonical(v: &Value, out: &mut String) {
                 if i > 0 {
                     out.push(',');
                 }
-                let escaped = serde_json::to_string(key)
-                    .unwrap_or_else(|_| "\"\"".to_owned());
+                let escaped = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
                 out.push_str(&escaped);
                 out.push(':');
                 // SAFETY: `keys` came from `map.keys()`, so the lookup
@@ -176,8 +174,7 @@ mod tests {
         });
         let canon = canonical_json(&v);
         // Outer keys sorted: a comes before b. Inner keys sorted.
-        let expected =
-            r#"{"outer_a":{"w":{"i":true,"j":null},"z":[3,4]},"outer_b":{"x":2,"y":1}}"#;
+        let expected = r#"{"outer_a":{"w":{"i":true,"j":null},"z":[3,4]},"outer_b":{"x":2,"y":1}}"#;
         assert_eq!(canon, expected);
     }
 
@@ -230,10 +227,8 @@ mod tests {
         // be hashing the hash). Adding or changing it must not change the
         // computed hash.
         let v_no_hash = json!({"data": [1, 2, 3]});
-        let v_with_hash =
-            json!({"data": [1, 2, 3], "plat_hash": "deadbeef"});
-        let v_with_diff_hash =
-            json!({"data": [1, 2, 3], "plat_hash": "cafef00d"});
+        let v_with_hash = json!({"data": [1, 2, 3], "plat_hash": "deadbeef"});
+        let v_with_diff_hash = json!({"data": [1, 2, 3], "plat_hash": "cafef00d"});
         assert_eq!(hash(&v_no_hash), hash(&v_with_hash));
         assert_eq!(hash(&v_no_hash), hash(&v_with_diff_hash));
     }

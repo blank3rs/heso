@@ -113,9 +113,7 @@ mod tests {
     use super::*;
     use heso_core::{Result as HesoResult, Url};
     use heso_engine_api::Page;
-    use heso_primitives::{
-        CdInput, CdTarget, PrimitiveOp, PwdInput, ScreenshotInput,
-    };
+    use heso_primitives::{CdInput, CdTarget, PrimitiveOp, PwdInput, ScreenshotInput};
 
     struct DummyEngine;
     struct DummyPage(Url);
@@ -141,7 +139,9 @@ mod tests {
     }
 
     fn cd(url: &str) -> PrimitiveOp {
-        PrimitiveOp::Cd(CdInput { target: CdTarget::Url { url: u(url) } })
+        PrimitiveOp::Cd(CdInput {
+            target: CdTarget::Url { url: u(url) },
+        })
     }
 
     #[tokio::test]
@@ -187,8 +187,18 @@ mod tests {
 
     #[tokio::test]
     async fn trace_hash_in_receipt_differs_for_different_traces() {
-        let r1 = run(&DummyEngine, &vec![cd("https://example.com/")], &SessionConfig::default()).await;
-        let r2 = run(&DummyEngine, &vec![cd("https://example.org/")], &SessionConfig::default()).await;
+        let r1 = run(
+            &DummyEngine,
+            &vec![cd("https://example.com/")],
+            &SessionConfig::default(),
+        )
+        .await;
+        let r2 = run(
+            &DummyEngine,
+            &vec![cd("https://example.org/")],
+            &SessionConfig::default(),
+        )
+        .await;
         assert_ne!(r1.trace_hash, r2.trace_hash);
     }
 

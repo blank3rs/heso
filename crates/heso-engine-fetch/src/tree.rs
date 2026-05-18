@@ -253,8 +253,7 @@ fn extract_title(doc: &Html) -> String {
 }
 
 fn extract_description(doc: &Html) -> Option<String> {
-    let meta_selector =
-        Selector::parse(r#"meta[name="description"]"#).expect("valid selector");
+    let meta_selector = Selector::parse(r#"meta[name="description"]"#).expect("valid selector");
     if let Some(meta) = doc.select(&meta_selector).next() {
         if let Some(content) = meta.value().attr("content") {
             let trimmed = collapse_ws(content);
@@ -431,8 +430,7 @@ fn walk_node(node: ego_tree::NodeRef<'_, Node>, builder: &mut TreeBuilder) {
                     // (`<br>`, `<span>`, `<em>`, ...) don't smash adjacent
                     // words together. `collapse_ws` then squashes any
                     // resulting whitespace runs.
-                    let heading =
-                        collapse_ws(&elem.text().collect::<Vec<_>>().join(" "));
+                    let heading = collapse_ws(&elem.text().collect::<Vec<_>>().join(" "));
                     if !heading.is_empty() {
                         builder.open_section(level, heading);
                         return;

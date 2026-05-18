@@ -10,9 +10,7 @@
 
 use heso_core::{Result as HesoResult, Url};
 use heso_engine_api::{EngineApi, Page};
-use heso_primitives::{
-    CdInput, CdTarget, PrimitiveOp, PwdInput, ScreenshotInput,
-};
+use heso_primitives::{CdInput, CdTarget, PrimitiveOp, PwdInput, ScreenshotInput};
 use heso_trace::{Mode, Receipt};
 use heso_trace_exec::{run, SessionConfig};
 
@@ -38,10 +36,7 @@ impl EngineApi for DemoEngine {
 
 fn summarize(label: &str, r: &Receipt) {
     println!("== {label} ==");
-    println!(
-        "  status:     {}",
-        if r.is_ok() { "ok" } else { "failed" }
-    );
+    println!("  status:     {}", if r.is_ok() { "ok" } else { "failed" });
     println!("  trace len:  {}", r.trace.len());
     println!("  results:    {}", r.results.len());
     println!("  trace_hash: {}", r.trace_hash);

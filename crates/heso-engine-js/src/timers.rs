@@ -301,15 +301,10 @@ impl TimerScheduler {
             // stale insertion_seq + fire_at_ms pair pointing into
             // entries that no longer match. Match on both.
             if let Some(entry) = self.entries.get(&top.id) {
-                if entry.fire_at_ms == top.fire_at_ms
-                    && entry.insertion_seq == top.insertion_seq
-                {
+                if entry.fire_at_ms == top.fire_at_ms && entry.insertion_seq == top.insertion_seq {
                     // Take the entry out — caller will decide whether
                     // to re-insert (interval) or drop (one-shot).
-                    let entry = self
-                        .entries
-                        .remove(&top.id)
-                        .expect("just verified present");
+                    let entry = self.entries.remove(&top.id).expect("just verified present");
                     return Some((top.id, entry));
                 }
             }
@@ -899,9 +894,7 @@ mod tests {
         assert_eq!(mid.value, serde_json::json!(2)); // fires at 50, 100.
 
         // Now clear and confirm no more fires.
-        let _ = e
-            .eval("clearInterval(globalThis.id)")
-            .expect("clear ok");
+        let _ = e.eval("clearInterval(globalThis.id)").expect("clear ok");
         assert_eq!(e.pending_timers(), 0);
         e.advance_clock(10_000).expect("advance ok");
         let after = e.eval("globalThis.count").expect("eval ok");
@@ -1024,9 +1017,7 @@ mod tests {
         assert_eq!(e.pending_timers(), 3);
 
         // Clear one timeout.
-        let _ = e
-            .eval("clearTimeout(globalThis.ids[0])")
-            .expect("clear ok");
+        let _ = e.eval("clearTimeout(globalThis.ids[0])").expect("clear ok");
         assert_eq!(e.pending_timers(), 2);
 
         // Fire the remaining timeout.

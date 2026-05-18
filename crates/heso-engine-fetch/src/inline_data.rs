@@ -98,8 +98,7 @@ pub fn extract(doc: &Html) -> BTreeMap<String, serde_json::Value> {
 /// `unnamed-{n}` synthetic keys in document order. Malformed JSON
 /// is skipped silently.
 fn extract_application_json(doc: &Html, out: &mut BTreeMap<String, serde_json::Value>) {
-    let selector = Selector::parse(r#"script[type="application/json"]"#)
-        .expect("valid selector");
+    let selector = Selector::parse(r#"script[type="application/json"]"#).expect("valid selector");
     let mut unnamed_counter: usize = 0;
     for s in doc.select(&selector) {
         let raw: String = s.text().collect();
@@ -146,10 +145,8 @@ fn extract_rsc(doc: &Html, out: &mut BTreeMap<String, serde_json::Value>) {
         // The string body is captured WITH its surrounding quotes so we
         // can hand the whole literal to serde_json::from_str::<String>
         // for unescaping.
-        Regex::new(
-            r#"self\.__next_f\.push\(\s*\[\s*\d+\s*,\s*("(?:[^"\\]|\\.)*")\s*\]\s*\)"#,
-        )
-        .expect("valid push regex")
+        Regex::new(r#"self\.__next_f\.push\(\s*\[\s*\d+\s*,\s*("(?:[^"\\]|\\.)*")\s*\]\s*\)"#)
+            .expect("valid push regex")
     });
 
     let script_selector = Selector::parse("script").expect("valid selector");
@@ -227,14 +224,12 @@ fn extract_rsc(doc: &Html, out: &mut BTreeMap<String, serde_json::Value>) {
 fn extract_js_data_assigns(doc: &Html, out: &mut BTreeMap<String, serde_json::Value>) {
     static JSON_PARSE_RE: OnceLock<Regex> = OnceLock::new();
     let json_parse_re = JSON_PARSE_RE.get_or_init(|| {
-        Regex::new(IDENT_PATH_LHS_PATTERN_JSON_PARSE)
-            .expect("valid JSON.parse regex")
+        Regex::new(IDENT_PATH_LHS_PATTERN_JSON_PARSE).expect("valid JSON.parse regex")
     });
 
     static OBJECT_LITERAL_RE: OnceLock<Regex> = OnceLock::new();
     let object_literal_re = OBJECT_LITERAL_RE.get_or_init(|| {
-        Regex::new(IDENT_PATH_LHS_PATTERN_OBJECT_LITERAL)
-            .expect("valid object literal regex")
+        Regex::new(IDENT_PATH_LHS_PATTERN_OBJECT_LITERAL).expect("valid object literal regex")
     });
 
     let script_selector = Selector::parse("script").expect("valid selector");
@@ -293,10 +288,12 @@ fn extract_js_data_assigns(doc: &Html, out: &mut BTreeMap<String, serde_json::Va
             // injects JS-style escapes in otherwise-JSON-shaped
             // values. The rewriter is a mechanical, universal
             // translation; no per-site special-casing.
-            let parsed = serde_json::from_str::<serde_json::Value>(candidate).ok().or_else(|| {
-                let rewritten = rewrite_js_only_escapes(candidate);
-                serde_json::from_str::<serde_json::Value>(&rewritten).ok()
-            });
+            let parsed = serde_json::from_str::<serde_json::Value>(candidate)
+                .ok()
+                .or_else(|| {
+                    let rewritten = rewrite_js_only_escapes(candidate);
+                    serde_json::from_str::<serde_json::Value>(&rewritten).ok()
+                });
             if let Some(v) = parsed {
                 if !is_trivially_empty(&v) {
                     out.insert(key, v);
@@ -530,10 +527,7 @@ fn is_plain_js_script(type_attr: Option<&str>) -> bool {
         None => true,
         Some(t) => {
             let t = t.trim().to_ascii_lowercase();
-            t.is_empty()
-                || t == "text/javascript"
-                || t == "application/javascript"
-                || t == "module"
+            t.is_empty() || t == "text/javascript" || t == "application/javascript" || t == "module"
         }
     }
 }
@@ -695,9 +689,7 @@ mod tests {
         "#;
         let data = extract(&parse(html));
         assert_eq!(data.len(), 1);
-        let v = data
-            .get("__NEXT_DATA__")
-            .expect("named __NEXT_DATA__ key");
+        let v = data.get("__NEXT_DATA__").expect("named __NEXT_DATA__ key");
         assert_eq!(v["page"], "/");
         assert_eq!(v["props"]["pageProps"]["title"], "Hello");
     }
@@ -1149,7 +1141,8 @@ mod tests {
         // Don't double-rewrite `\n`, `\t`, `\uXXXX`, `\"`, `\\` —
         // those are already valid JSON. Output should match input
         // verbatim when no JS-only escapes are present.
-        let input = r#"{"a":"line1\nline2","b":"tab\there","c":"é","d":"quote\"inside","e":"slash\\here"}"#;
+        let input =
+            r#"{"a":"line1\nline2","b":"tab\there","c":"é","d":"quote\"inside","e":"slash\\here"}"#;
         let out = rewrite_js_only_escapes(input);
         assert_eq!(out, input);
     }
@@ -1321,7 +1314,10 @@ mod tests {
         let d2 = extract(&parse(html));
         let s1 = serde_json::to_string(&d1).expect("serialize d1");
         let s2 = serde_json::to_string(&d2).expect("serialize d2");
-        assert_eq!(s1, s2, "two parses of the same input must serialize identically");
+        assert_eq!(
+            s1, s2,
+            "two parses of the same input must serialize identically"
+        );
     }
 
     #[test]
@@ -1447,7 +1443,10 @@ mod tests {
         "#;
         let data = extract(&parse(html));
         let v = data.get("dupe").expect("dupe key present");
-        assert_eq!(v["who"], "first", "first script in document order should win");
+        assert_eq!(
+            v["who"], "first",
+            "first script in document order should win"
+        );
     }
 
     #[test]
@@ -1461,7 +1460,11 @@ mod tests {
             </head><body></body></html>
         "#;
         let data = extract(&parse(html));
-        assert!(data.contains_key("myid"), "id should be trimmed; keys: {:?}", data.keys().collect::<Vec<_>>());
+        assert!(
+            data.contains_key("myid"),
+            "id should be trimmed; keys: {:?}",
+            data.keys().collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1478,7 +1481,11 @@ mod tests {
             </body></html>
         "##;
         let data = extract(&parse(html));
-        assert!(!data.contains_key("loaded"), "function name leaked: {:?}", data.keys().collect::<Vec<_>>());
+        assert!(
+            !data.contains_key("loaded"),
+            "function name leaked: {:?}",
+            data.keys().collect::<Vec<_>>()
+        );
         assert!(!data.contains_key("foo"), "stray identifier leaked");
         assert_eq!(data["__REAL__"]["ok"], true);
     }

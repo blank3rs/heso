@@ -45,8 +45,5 @@ pub trait EngineApi: Send + Sync {
     /// automatically).
     ///
     /// [ADR 0011]: ../../decisions/0011-chromium-cdp-first-engine.md
-    fn open(
-        &self,
-        url: &Url,
-    ) -> impl std::future::Future<Output = Result<Self::Page>> + Send;
+    fn open(&self, url: &Url) -> impl std::future::Future<Output = Result<Self::Page>> + Send;
 }

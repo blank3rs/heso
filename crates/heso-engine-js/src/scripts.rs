@@ -75,11 +75,9 @@ use crate::engine::{ConsoleEntry, ConsoleLevel, EvalError};
 ///
 /// The synchronous-blocking fetch jsdom defaults to is the
 /// correct-by-spec behavior but introduces network traffic on what an
-/// agent expects to be a "parse + eval" command. Until [`llrt_fetch`]
-/// lands (next-phase plan item C), the safe default is to skip and
-/// warn — gated behind `--js-fetch` on the CLI.
-///
-/// [`llrt_fetch`]: https://github.com/awslabs/llrt/tree/main/llrt_modules
+/// agent expects to be a "parse + eval" command. The default is to
+/// skip + warn; opt-in via `--js-fetch` on the CLI flips to
+/// [`Self::Fetch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScriptFetchPolicy {
     /// External scripts are silently skipped (a `console.warn` entry is
@@ -91,9 +89,24 @@ pub enum ScriptFetchPolicy {
     /// explaining that subresource fetch isn't wired yet. The script
     /// is not executed (no `Error::NotReady` style abort — same
     /// containment rule as a throwing inline script). Reserved for
-    /// `--js-fetch` once the user opts in but before PR C lands the
-    /// actual fetch path.
+    /// historical callers; new code should use [`Self::Fetch`] when
+    /// fetch is wired and [`Self::Skip`] otherwise.
     Error,
+    /// External scripts are fetched synchronously via the engine's
+    /// shared `reqwest::Client` (the same client the rest of the
+    /// workspace uses, threaded in via [`crate::JsEngine::new_with_fetch`]).
+    /// Per jsdom's basic mode: each `<script src=...>` blocks the
+    /// pump until its body returns, then executes inline. Failures
+    /// (HTTP error, body decode error, timeout) are captured as
+    /// [`ConsoleLevel::Error`] entries; the pump continues to the
+    /// next script — same containment rule as a throwing inline
+    /// script.
+    ///
+    /// If the engine has no fetch client (no
+    /// [`crate::JsEngine::new_with_fetch`] call), [`Self::Fetch`]
+    /// degrades to [`Self::Error`] semantics: a clear message
+    /// explaining the engine wasn't built with a fetch backend.
+    Fetch,
 }
 
 /// Outcome of [`run_scripts`] — useful for receipts and tests.
@@ -148,6 +161,7 @@ pub fn run_scripts(
     document: &dom_query::Document,
     policy: ScriptFetchPolicy,
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+    fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
 ) -> Result<ScriptOutcome, EvalError> {
     let scripts = collect_scripts(document);
     let mut outcome = ScriptOutcome::default();
@@ -165,22 +179,61 @@ pub fn run_scripts(
             },
             ScriptKind::External { src } => {
                 outcome.external_handled += 1;
-                match policy {
-                    ScriptFetchPolicy::Skip => {
+                match (policy, fetch_client) {
+                    (ScriptFetchPolicy::Skip, _) => {
                         push_console(
                             console_buffer,
                             ConsoleLevel::Warn,
                             format!(
-                                "heso: skipped external script <script src=\"{src}\"> (pass --js-fetch to opt in once PR C lands)"
+                                "heso: skipped external script <script src=\"{src}\"> (pass --js-fetch to enable subresource fetch)"
                             ),
                         );
                     }
-                    ScriptFetchPolicy::Error => {
+                    (ScriptFetchPolicy::Error, _) => {
                         push_console(
                             console_buffer,
                             ConsoleLevel::Error,
                             format!(
-                                "heso: external script fetch not wired yet (PR C — llrt_fetch). Wanted <script src=\"{src}\">"
+                                "heso: external script fetch disabled. Wanted <script src=\"{src}\">"
+                            ),
+                        );
+                    }
+                    (ScriptFetchPolicy::Fetch, Some((client, rt))) => {
+                        // Synchronous-blocking fetch + execute, matching
+                        // jsdom's basic mode. Failures land on the
+                        // console buffer; the pump continues.
+                        match fetch_script_source(client, rt, &src) {
+                            Ok(source) => match eval_one(context, &source)? {
+                                Some(err_msg) => {
+                                    outcome.executed_with_error += 1;
+                                    push_console(
+                                        console_buffer,
+                                        ConsoleLevel::Error,
+                                        format!("<script src=\"{src}\"> threw: {err_msg}"),
+                                    );
+                                }
+                                None => {
+                                    outcome.executed += 1;
+                                }
+                            },
+                            Err(e) => {
+                                push_console(
+                                    console_buffer,
+                                    ConsoleLevel::Error,
+                                    format!("heso: <script src=\"{src}\"> fetch failed: {e}"),
+                                );
+                            }
+                        }
+                    }
+                    (ScriptFetchPolicy::Fetch, None) => {
+                        // Caller asked for Fetch policy but the engine
+                        // doesn't have a client — surface a clear
+                        // diagnostic so the agent can fix its config.
+                        push_console(
+                            console_buffer,
+                            ConsoleLevel::Error,
+                            format!(
+                                "heso: <script src=\"{src}\"> wanted Fetch policy but engine has no fetch client (build with JsEngine::new_with_fetch)"
                             ),
                         );
                     }
@@ -193,6 +246,39 @@ pub fn run_scripts(
     }
 
     Ok(outcome)
+}
+
+/// Synchronously fetch `src` via the shared `reqwest::Client`. Used
+/// by [`ScriptFetchPolicy::Fetch`] to honor `<script src=...>` refs
+/// during page hydration.
+///
+/// `src` is expected to be an absolute URL (or anything `reqwest`
+/// can parse as one); relative URLs are not yet resolved against the
+/// page's base URL — that's a documented limitation of the Phase 1C
+/// pump. Callers that need relative-URL support should pre-resolve
+/// against `final_url` before passing the HTML to the engine.
+fn fetch_script_source(
+    client: &reqwest::Client,
+    rt: &tokio::runtime::Handle,
+    src: &str,
+) -> Result<String, String> {
+    // `block_in_place` lets the CLI's `#[tokio::main]` flow run this
+    // synchronously without tripping the "runtime from within a
+    // runtime" panic — same trick as `crate::fetch::perform_request`.
+    tokio::task::block_in_place(|| {
+        rt.block_on(async {
+            let resp = client
+                .get(src)
+                .send()
+                .await
+                .map_err(|e| format!("send: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("HTTP {}", status.as_u16()));
+            }
+            resp.text().await.map_err(|e| format!("read body: {e}"))
+        })
+    })
 }
 
 /// Internal: one script element after classification.
