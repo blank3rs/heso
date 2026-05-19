@@ -547,6 +547,237 @@ async fn external_script_src_failed_fetch_writes_console_error() {
     );
 }
 
+// ===== AGENT_FINDINGS_V3 silent-null regression =====
+//
+// `await heso.flush()` (or any `await Promise.resolve()` / `await <non-thenable>`)
+// followed by `await fetch(...)` used to return `null` instead of the fetched
+// JSON. Root cause: [`JsEngine::run_pending_jobs`] drained the fetch queue
+// BEFORE pumping microtasks, so when the user's async function was suspended
+// at the first `await` (and no fetch was queued yet at the synchronous
+// entry point), the loop observed `drained == 0` on the first iteration and
+// broke. The final microtask pump then ran the user's async resumption,
+// which called `fetch(...)` and queued it — but the queue was never drained
+// again. The Promise nobody settled stayed pending; the engine's eval
+// returned `Ok(serde_json::Value::Null)` via the
+// `Thenable registered but never settled` branch — a silent failure.
+//
+// Fix: pump microtasks FIRST in each loop iteration of `run_pending_jobs`,
+// so the user's `await`-suspended async function gets to enqueue its fetch
+// BEFORE the drain step. The tests below exercise the three problematic
+// shapes V3 flagged plus a couple of generalized variants.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_heso_flush_then_await_fetch_resolves_to_real_response() {
+    // The exact shape AGENT_FINDINGS_V3.md flagged as "silent null":
+    //
+    //     (async () => {
+    //         await heso.flush();
+    //         const v = await fetch(URL).then(r => r.json());
+    //         return JSON.stringify({url: v.url});
+    //     })()
+    //
+    // Pre-fix: `value: null, error: null, console: []`.
+    // Post-fix: returns the JSON payload's `url` field.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/get"))
+        .respond_with(|req: &Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": req.url.to_string(),
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/get?after=submit", server.uri());
+    let out = engine
+        .eval(&format!(
+            r#"
+            (async () => {{
+                await heso.flush();
+                const verify = await fetch({url:?}).then(r => r.json());
+                return JSON.stringify({{url: verify.url}});
+            }})()
+            "#,
+            url = url,
+        ))
+        .expect("eval");
+    // The core regression: BEFORE the fix this returned
+    // `serde_json::Value::Null` silently with no console output.
+    // After the fix, the IIFE's `.return JSON.stringify(...)` produces
+    // a JSON string containing the request URL the mock saw.
+    assert!(
+        !out.value.is_null(),
+        "regression: heso.flush() + await fetch returned null silently"
+    );
+    let s = out.value.as_str().expect("string return");
+    let parsed: serde_json::Value = serde_json::from_str(s).expect("inner JSON");
+    // wiremock normalizes the host to `localhost` but echoes the path;
+    // pin the path + query rather than the full URL.
+    assert!(
+        parsed["url"].as_str().is_some_and(|u| u.ends_with("/get?after=submit")),
+        "expected URL ending with /get?after=submit, got {parsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_promise_resolve_then_await_fetch_resolves() {
+    // Generalized: `heso.flush()` is just `Promise.resolve()` under the
+    // hood, so the same trap fires for any `await Promise.resolve()`
+    // followed by a fetch. Pre-fix: silent null. Post-fix: real body.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/probe"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok-after-resolve"))
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/probe", server.uri());
+    let out = engine
+        .eval(&format!(
+            r#"
+            (async () => {{
+                await Promise.resolve();
+                const r = await fetch({url:?});
+                return r.text();
+            }})()
+            "#,
+            url = url,
+        ))
+        .expect("eval");
+    assert_eq!(out.value, "ok-after-resolve");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_non_thenable_then_await_fetch_resolves() {
+    // Even more reduced: `await <number>` suspends the async function
+    // the same way as `await Promise.resolve()`, so any later
+    // `await fetch(...)` triggered the same trap. Pre-fix: silent null.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/n"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("non-thenable-ok"))
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/n", server.uri());
+    let out = engine
+        .eval(&format!(
+            r#"
+            (async () => {{
+                let x = 1;
+                await x;
+                const r = await fetch({url:?});
+                return r.text();
+            }})()
+            "#,
+            url = url,
+        ))
+        .expect("eval");
+    assert_eq!(out.value, "non-thenable-ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_side_effect_then_flush_then_fetch_resolves() {
+    // The full AGENT_FINDINGS_V3 reproducer chain: a synchronous DOM
+    // mutation + form.submit() (which itself block_on's an HTTP call
+    // via __hesoFormSubmitNow), then `await heso.flush()`, then
+    // `await fetch(...)`. The `f.submit()` makes the chain match the
+    // verbatim repro; the silent-null is caused by `heso.flush()`,
+    // not by `f.submit()`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/anything"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(""))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/get"))
+        .respond_with(|req: &Request| {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "url": req.url.to_string(),
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let form_action = format!("{}/anything", server.uri());
+    let verify_url = format!("{}/get?after=submit", server.uri());
+
+    // Set a base URL so __hesoFormSubmitNow can resolve relative refs;
+    // the form's `action` is absolute so this is belt-and-braces.
+    engine.set_base_url(Some(url::Url::parse("https://example.com/").unwrap()));
+
+    let html = "<html><body></body></html>";
+    let out = engine
+        .eval_with_html(
+            html,
+            &format!(
+                r#"
+                (async () => {{
+                    document.body.innerHTML = '<form action="{form}" method="post" id="f"><input name="marker" value="v3-test"></form>';
+                    const f = document.getElementById('f');
+                    f.submit();
+                    await heso.flush();
+                    const verify = await fetch({verify:?}).then(r => r.json());
+                    return JSON.stringify({{url: verify.url}});
+                }})()
+                "#,
+                form = form_action,
+                verify = verify_url,
+            ),
+        )
+        .expect("eval");
+    // The verbatim AGENT_FINDINGS_V3 reproducer: before the fix this
+    // silently returned `null`. After the fix it returns the JSON
+    // body the mock served.
+    assert!(
+        !out.value.is_null(),
+        "regression: form.submit() + heso.flush() + await fetch returned null silently"
+    );
+    let s = out.value.as_str().expect("string return");
+    let parsed: serde_json::Value = serde_json::from_str(s).expect("inner JSON");
+    assert!(
+        parsed["url"].as_str().is_some_and(|u| u.ends_with("/get?after=submit")),
+        "expected URL ending with /get?after=submit, got {parsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn await_fetch_after_then_chain_still_resolves() {
+    // Composite: a `.then` chain produces a value, an `await` suspends
+    // on that chain, then a later `await fetch(...)` runs. Same trap as
+    // the simple `await Promise.resolve()` shape because the suspension
+    // happens on a microtask boundary in both cases.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/chained"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("chain-ok"))
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/chained", server.uri());
+    let out = engine
+        .eval(&format!(
+            r#"
+            (async () => {{
+                const pre = await Promise.resolve("seed").then(s => s.toUpperCase());
+                const r = await fetch({url:?});
+                const body = await r.text();
+                return pre + "/" + body;
+            }})()
+            "#,
+            url = url,
+        ))
+        .expect("eval");
+    assert_eq!(out.value, "SEED/chain-ok");
+}
+
 // ===== FetchMode is exported =====
 
 #[test]

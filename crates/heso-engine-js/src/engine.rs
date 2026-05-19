@@ -561,20 +561,65 @@ impl JsEngine {
             return Ok(0);
         };
         let mut total = 0;
-        // Loop: a `.then` callback can call `fetch()` again, which
-        // re-fills the queue. Drain repeatedly until empty.
-        loop {
+        // Pump microtasks FIRST, then drain fetches, then loop. The
+        // pump-first order is load-bearing: in shapes like
+        //
+        //     (async () => {
+        //         await Promise.resolve();   // suspends here
+        //         const r = await fetch(...); // fetch queued from microtask
+        //         return r;
+        //     })()
+        //
+        // the synchronous evaluation of the IIFE produces a Promise
+        // and *suspends* at the first `await` — no `fetch` has been
+        // called yet. The synchronous prefix returns control to us
+        // with the pending-fetch queue empty. We must pump microtasks
+        // (which is what advances the async function past the
+        // `await Promise.resolve()` and lets it actually call
+        // `fetch(...)`) before we look at the queue, or we will
+        // observe `drained == 0` and exit while a Promise nobody
+        // settles still waits on the queued-but-undrained fetch.
+        //
+        // After AGENT_FINDINGS_V3.md flagged this as silent-null:
+        // `await heso.flush()` + later `await fetch(...)` returned
+        // `null` because `heso.flush()` is `Promise.resolve()`, and
+        // every subsequent `await fetch(...)` lands in this same
+        // microtask-after-pump trap. The fix is symmetric — pump
+        // first, then drain, then loop until both report idle.
+        //
+        // We track whether each iteration did work; the loop only
+        // exits when an iteration produced zero drained fetches AND
+        // the post-drain microtask pump found nothing to do — i.e.
+        // when the system is truly quiescent.
+        const MAX_PUMP_ROUNDS: usize = 1_000;
+        for _ in 0..MAX_PUMP_ROUNDS {
+            // 1. Pump microtasks. A user `await`-suspended async
+            //    function resumes here; its `fetch(...)` call queues
+            //    a pending request into `fs.queue`.
+            self.execute_pending_jobs_until_idle()?;
+            // 2. Drain any fetches that microtasks just queued.
+            //    Each fetch's resolve()/reject() schedules its own
+            //    `.then` callbacks as new microtasks, which the next
+            //    iteration's pump will drain.
             let drained = fetch::drain_pending(&self.context, &fs.queue, &fs.mode)?;
             if drained == 0 {
-                break;
+                // No fetches queued during this round. One more
+                // pump for microtasks the previous drain's resolves
+                // may have scheduled, then we're done.
+                self.execute_pending_jobs_until_idle()?;
+                // Belt-and-braces: a `.then` on a just-resolved
+                // fetch could in principle queue another fetch.
+                // If so, loop. Otherwise we're idle.
+                if fs.queue.len() == 0 {
+                    return Ok(total);
+                }
+                continue;
             }
             total += drained;
-            // Drive any microtasks queued by the resolve() calls.
-            self.execute_pending_jobs_until_idle()?;
         }
-        // One final pump for microtasks queued by the last drain.
-        self.execute_pending_jobs_until_idle()?;
-        Ok(total)
+        Err(EvalError::Engine(format!(
+            "pending-jobs pump exceeded {MAX_PUMP_ROUNDS} rounds - possible infinite fetch loop"
+        )))
     }
 
     /// Number of pending fetches not yet drained — observable only
