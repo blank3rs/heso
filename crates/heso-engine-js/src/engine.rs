@@ -187,11 +187,17 @@ pub struct JsEngine {
     /// never crosses a thread boundary.
     fetch_state: Option<FetchState>,
     /// Per-engine "current page URL" — used to resolve relative
-    /// `<script src="...">` references during inline-script execution.
+    /// `<script src="...">` references during inline-script execution
+    /// and as the referrer for dynamic `import(...)` calls.
     /// `None` for engines created without an associated page (e.g.
     /// bare `heso eval-js`); set by [`Self::set_base_url`] or by
     /// [`crate::JsSession`] at open/navigate time.
-    base_url: Mutex<Option<Url>>,
+    ///
+    /// `Arc` (not bare [`Mutex`]) because the dynamic-import shim
+    /// closure ([`install_dynamic_import`]) holds a long-lived
+    /// reference into it — every `import()` reads the current page
+    /// URL to use as the resolver's referrer argument.
+    base_url: Arc<Mutex<Option<Url>>>,
     /// Per-engine ES-module source cache (item M-A). Pre-seeded by
     /// the [`crate::scripts`] pump for each inline `<script
     /// type="module">` body and for each external module's
@@ -199,7 +205,44 @@ pub struct JsEngine {
     /// [`HttpLoader`] when QuickJS's module evaluator asks for a
     /// dependency. See [`crate::modules`].
     module_cache: ModuleCache,
+    /// Per-engine module resolver used by the `globalThis.import(...)`
+    /// shim (WHATWG HTML §8.1.3.7 "Import calls"). `None` until the
+    /// host installs one via [`Self::install_module_resolver`]; while
+    /// `None`, every dynamic `import()` rejects with a clear error.
+    ///
+    /// The resolver is a `Fn(specifier, referrer) -> Result<(absolute_url,
+    /// source), error_message>`; it is the seam M-A (the static module
+    /// loader) wires into when it lands. M-C ships only the shim plus
+    /// the seam — the engine itself ships no real resolver, because
+    /// "what counts as a module" (file resolver? import map? bundler?)
+    /// is M-A's call. See AGENT_FINDINGS (M-C task).
+    ///
+    /// `Arc<Mutex<…>>` (not just `Mutex<…>`) because the JS-side shim
+    /// holds an `Arc` clone for as long as the engine is alive —
+    /// otherwise we'd have to keep the resolver itself inside the
+    /// closure and lose the ability to re-install at runtime.
+    module_resolver: Arc<Mutex<Option<ModuleResolveFn>>>,
 }
+
+/// Signature of the module resolver installed via
+/// [`JsEngine::install_module_resolver`].
+///
+/// The first argument is the raw specifier as it appeared inside the
+/// `import('…')` call (e.g. `"./foo.js"`, `"https://example.com/m.js"`,
+/// `"lodash-es"`). The second is the referrer URL — typically the
+/// engine's current page URL set via [`JsEngine::set_base_url`],
+/// falling back to `about:blank` when no page is associated.
+///
+/// On success, the resolver returns `(absolute_url, source)` — the
+/// absolute URL is used as the module's name inside QuickJS (so
+/// stack traces and `import.meta.url` reflect a stable identity), and
+/// the source is the ES Module source text that QuickJS parses and
+/// evaluates.
+///
+/// On failure, the resolver returns a human-readable error message
+/// that surfaces as a `TypeError` on the rejected `import()` promise.
+pub type ModuleResolveFn =
+    Box<dyn Fn(&str, &Url) -> Result<(Url, String), String> + Send + Sync>;
 
 /// Bundles a per-engine fetch queue with the mode that drives it.
 pub(crate) struct FetchState {
@@ -453,6 +496,24 @@ impl JsEngine {
         // don't accidentally rewrite their internal shape.
         install_deep_resolve(&context)?;
 
+        // Install `globalThis.import` — the dynamic `import(...)` shim
+        // (WHATWG HTML §8.1.3.7). Today QuickJS only exposes the
+        // `import()` syntax inside module scripts; a classic `<script>`
+        // (or `JsEngine::eval` body) that writes `await import('./x.js')`
+        // gets a syntax error. The shim makes the *callable* form
+        // available everywhere — `globalThis.import('./x.js')` returns
+        // a Promise that resolves to the module namespace, just like
+        // the spec's HostImportModuleDynamically callback.
+        //
+        // The resolver hangs off `Arc<Mutex<Option<…>>>` so the host
+        // can swap it in after construction (M-A wires its module
+        // loader here). Without a resolver, every `import()` rejects
+        // with a clear "no module loader installed" message.
+        let module_resolver: Arc<Mutex<Option<ModuleResolveFn>>> =
+            Arc::new(Mutex::new(None));
+        let base_url: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
+        install_dynamic_import(&context, module_resolver.clone(), base_url.clone())?;
+
         Ok(Self {
             _runtime: runtime,
             context,
@@ -460,8 +521,9 @@ impl JsEngine {
             timers,
             rng,
             fetch_state,
-            base_url: Mutex::new(None),
+            base_url,
             module_cache,
+            module_resolver,
         })
     }
 
@@ -497,6 +559,28 @@ impl JsEngine {
     /// Current page URL, if any. See [`Self::set_base_url`].
     pub fn base_url(&self) -> Option<Url> {
         self.base_url.lock().expect("base_url poisoned").clone()
+    }
+
+    /// Install (or replace) the module resolver used by the
+    /// `globalThis.import(...)` shim.
+    ///
+    /// This is the integration seam for M-A (the static module loader):
+    /// M-A's loader will call this at engine setup to register a
+    /// resolver that knows how to fetch `./foo.js`, `https://…`, and
+    /// bare-specifier modules from an import map. M-C (this slice)
+    /// ships only the shim and the seam — without a resolver
+    /// installed, every dynamic `import()` rejects with a clear "no
+    /// module loader installed" message.
+    ///
+    /// Replacing an already-installed resolver is supported and takes
+    /// effect immediately for the next `import(...)` call; in-flight
+    /// imports keep using the resolver that was active when they
+    /// started.
+    pub fn install_module_resolver(&self, resolver: ModuleResolveFn) {
+        *self
+            .module_resolver
+            .lock()
+            .expect("module resolver poisoned") = Some(resolver);
     }
 
     /// The seed-backed RNG installed into the JS context. Useful for
@@ -1533,6 +1617,368 @@ fn install_deep_resolve(context: &Context) -> Result<(), EvalError> {
         })
         .map_err(|e| EvalError::Engine(format!("install __hesoDeepResolve: {e}")))?;
     Ok(())
+}
+
+/// Install `globalThis.import` — the callable form of WHATWG HTML
+/// §8.1.3.7 "Import calls".
+///
+/// In a real browser, the `import(specifier)` *expression* is the
+/// host hook the spec calls `HostImportModuleDynamically`. It works
+/// inside both classic scripts and module scripts and always returns
+/// a Promise resolving to the module namespace object.
+///
+/// QuickJS supports `import(...)` natively inside module scripts only
+/// (`JS_EVAL_TYPE_MODULE`), which leaves a gap for the way `heso`
+/// currently runs page JS: every inline `<script>` and every
+/// [`JsEngine::eval`] body is parsed as a classic script (it has to
+/// be — top-level `return`, `function`-declarations-as-statements,
+/// and the legacy `arguments` shape all require classic mode). In
+/// classic mode `import(...)` is a syntax error.
+///
+/// The shim closes the gap by installing the *callable* form on the
+/// global object: `globalThis.import(specifier)` returns a Promise
+/// that walks the same path as the spec callback. It is the
+/// agent-visible entry point even when M-A's static module loader
+/// has fully landed — `<script type="module">` will still use the
+/// native `import(...)` expression, but `await import('./foo.js')`
+/// from a classic script (or from an `eval`'d agent expression)
+/// routes through this shim.
+///
+/// ## Flow
+///
+/// 1. `globalThis.import(specifier)` calls a Rust closure.
+/// 2. The closure locks the engine's `module_resolver` slot.
+///    - If `None`, rejects with a `TypeError` mentioning "no module
+///      loader installed" — same shape an agent gets when the host
+///      forgot to wire M-A's resolver.
+///    - If `Some(resolve_fn)`, calls `resolve_fn(specifier,
+///      base_url_or_about_blank)` → `(absolute_url, source)`.
+/// 3. Hands the source to [`rquickjs::Module::declare`] (compile-only)
+///    and then `.eval()` (which runs top-level code and returns
+///    `(Module<Evaluated>, eval_promise)`). QuickJS's own loader
+///    handles any nested static `import` statements inside the
+///    module — when M-A wires `rt.set_loader(...)`, those just work.
+/// 4. The shim grabs `module.namespace()` synchronously (the
+///    namespace object is materialized the moment evaluation begins
+///    — see QuickJS's `JS_GetModuleNamespace`) and chains `.then`
+///    on the eval-promise to forward fulfillment / rejection.
+///    Top-level-await modules suspend at eval-time; the chain
+///    settles the outer promise only when the inner finishes.
+///
+/// ## Why we capture the namespace early
+///
+/// `rquickjs::Persistent` is not implemented for `Module<'js, _>` —
+/// modules are atom-pinned and can't escape their `Ctx`. The
+/// namespace is just an `Object`, which `Persistent` handles cleanly.
+/// We snapshot it the moment we have it; the `.then` callback only
+/// needs to hand the *already-snapshotted* namespace to the outer
+/// resolver, so the module itself can drop at the end of this
+/// closure body.
+///
+/// ## Lineage
+///
+/// Conceptual shape mirrors:
+/// - **boa_engine**'s `Context::host_import_module_dynamically` —
+///   same `(specifier, referrer) → Promise<ModuleNamespace>` flow.
+/// - **deno_core**'s `ModuleLoader::load` / dynamic-import path —
+///   same "resolve → fetch source → compile → eval → namespace"
+///   pipeline, but deno's version is async-by-default; ours is
+///   synchronous-on-the-resolve-side because rquickjs gives us a
+///   sync-evaluation path that's already enough for `heso`'s
+///   eval-and-flush mental model.
+/// - **rquickjs**'s built-in `Module::evaluate` — the underlying
+///   primitive we lean on. The 3-step `declare → eval → namespace`
+///   sequence comes straight from rquickjs's own test suite.
+fn install_dynamic_import(
+    context: &Context,
+    resolver: Arc<Mutex<Option<ModuleResolveFn>>>,
+    base_url: Arc<Mutex<Option<Url>>>,
+) -> Result<(), EvalError> {
+    use rquickjs::{Module, Persistent, Promise};
+
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            let globals = ctx.globals();
+            let resolver_clone = resolver.clone();
+            let base_url_clone = base_url.clone();
+
+            // The dynamic-import shim. Returns a Promise — a
+            // `Persistent<Promise<'static>>` because rquickjs's closure
+            // lifetime model prefers Persistents over `'js`-bound
+            // returns. Same pattern as fetch.rs's `make_fetch_live`.
+            let import_fn = Function::new(
+                ctx.clone(),
+                move |args: Rest<Value<'_>>| -> rquickjs::Result<Persistent<Promise<'static>>> {
+                    let args_inner = args.into_inner();
+                    let ctx = match args_inner.first() {
+                        Some(v) => v.ctx().clone(),
+                        None => {
+                            // Called with no args — return a rejected
+                            // Promise rather than throwing
+                            // synchronously, to match the spec shape
+                            // (every `import()` produces a Promise,
+                            // settled-or-pending).
+                            return Err(rquickjs::Error::new_from_js(
+                                "undefined",
+                                "import: specifier required",
+                            ));
+                        }
+                    };
+
+                    // Extract the specifier as a String. Any non-string
+                    // first argument is coerced via `String(v)` — the
+                    // spec calls `ToString` on the argument before
+                    // resolving.
+                    let specifier: String = match args_inner.first() {
+                        Some(v) if v.is_string() => v
+                            .as_string()
+                            .expect("is_string just checked")
+                            .to_string()?,
+                        Some(v) => {
+                            // Best-effort `ToString` via JS. Avoids a
+                            // separate Rust-side coercion ladder.
+                            let to_string_fn: Function = ctx.eval("String")?;
+                            to_string_fn.call::<_, String>((v.clone(),))?
+                        }
+                        None => unreachable!("first arg was Some above"),
+                    };
+
+                    // Build the outer Promise we'll return to JS. From
+                    // here on, every failure path goes through
+                    // `reject.call(...)` instead of `Err(...)` — we
+                    // already returned the promise, so a thrown error
+                    // would surface as an *uncaught* throw, not a
+                    // promise rejection.
+                    let (promise, resolve, reject) = Promise::new(&ctx)?;
+
+                    // Pull the resolver out. Lock-fail (poison) → reject.
+                    let resolver_guard = match resolver_clone.lock() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            let err = build_type_error(
+                                &ctx,
+                                "module resolver lock poisoned",
+                            )?;
+                            reject.call::<_, ()>((err,))?;
+                            return Ok(Persistent::save(&ctx, promise));
+                        }
+                    };
+                    let Some(resolve_fn) = resolver_guard.as_ref() else {
+                        // The "M-A hasn't wired its loader yet" path.
+                        // Phrasing intentionally mentions both the
+                        // load-bearing words from the M-C contract
+                        // ("no module loader installed") and the seam
+                        // hint ("install_module_resolver") so an agent
+                        // who hits this knows exactly which API to
+                        // call.
+                        let err = build_type_error(
+                            &ctx,
+                            &format!(
+                                "no module loader installed - dynamic import('{specifier}') \
+                                 requires JsEngine::install_module_resolver to be called \
+                                 first (see WHATWG HTML §8.1.3.7)"
+                            ),
+                        )?;
+                        reject.call::<_, ()>((err,))?;
+                        return Ok(Persistent::save(&ctx, promise));
+                    };
+
+                    // Determine the referrer URL. Default to
+                    // `about:blank` when the engine has no associated
+                    // page — same convention as `set_base_url(None)`.
+                    let referrer: Url = match base_url_clone.lock() {
+                        Ok(g) => g
+                            .clone()
+                            .unwrap_or_else(|| {
+                                Url::parse("about:blank")
+                                    .expect("about:blank parses")
+                            }),
+                        Err(_) => {
+                            let err = build_type_error(
+                                &ctx,
+                                "base_url lock poisoned",
+                            )?;
+                            reject.call::<_, ()>((err,))?;
+                            return Ok(Persistent::save(&ctx, promise));
+                        }
+                    };
+
+                    // Resolver runs synchronously — it's pure
+                    // string-massaging plus (when M-A wires it) a
+                    // cache lookup against pre-fetched module sources.
+                    // A blocking network fetch here would surprise
+                    // agents (`import()` is supposed to be async);
+                    // M-A's contract is that the resolver returns
+                    // already-fetched bytes.
+                    let (resolved_url, source) = match resolve_fn(&specifier, &referrer) {
+                        Ok(pair) => pair,
+                        Err(msg) => {
+                            let err = build_type_error(
+                                &ctx,
+                                &format!("failed to resolve module '{specifier}': {msg}"),
+                            )?;
+                            reject.call::<_, ()>((err,))?;
+                            return Ok(Persistent::save(&ctx, promise));
+                        }
+                    };
+
+                    // We drop the guard before any further work so a
+                    // re-entrant `import()` from inside the freshly
+                    // compiled module doesn't deadlock on its own
+                    // mutex.
+                    drop(resolver_guard);
+
+                    // Compile + evaluate. QuickJS's loader (set via
+                    // `rt.set_loader`, which M-A will wire) handles
+                    // any nested static `import` statements inside
+                    // `source`. If `Module::declare` itself fails
+                    // (parse error in the resolved source), surface
+                    // it as a rejection — same shape the spec calls
+                    // for when "fetch a module script tree" fails.
+                    let module_name = resolved_url.as_str();
+                    let declared = match Module::declare(ctx.clone(), module_name, source) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let err = build_type_error(
+                                &ctx,
+                                &format!(
+                                    "failed to compile module '{specifier}' \
+                                     (resolved to '{module_name}'): {e}"
+                                ),
+                            )?;
+                            reject.call::<_, ()>((err,))?;
+                            return Ok(Persistent::save(&ctx, promise));
+                        }
+                    };
+                    let (evaluated, eval_promise) = match declared.eval() {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            let err = build_type_error(
+                                &ctx,
+                                &format!(
+                                    "failed to evaluate module '{specifier}' \
+                                     (resolved to '{module_name}'): {e}"
+                                ),
+                            )?;
+                            reject.call::<_, ()>((err,))?;
+                            return Ok(Persistent::save(&ctx, promise));
+                        }
+                    };
+
+                    // Snapshot the namespace synchronously. The
+                    // namespace object exists as soon as `eval()`
+                    // returns; only its *binding values* are populated
+                    // when the eval-promise resolves.
+                    let namespace = match evaluated.namespace() {
+                        Ok(ns) => ns,
+                        Err(e) => {
+                            let err = build_type_error(
+                                &ctx,
+                                &format!(
+                                    "failed to get namespace of module '{specifier}': {e}"
+                                ),
+                            )?;
+                            reject.call::<_, ()>((err,))?;
+                            return Ok(Persistent::save(&ctx, promise));
+                        }
+                    };
+
+                    // Persistent-save the namespace so the resolve
+                    // callback we register on the eval-promise can
+                    // hand it back out into the outer Promise.
+                    let namespace_p: Persistent<Object<'static>> =
+                        Persistent::save(&ctx, namespace);
+
+                    // Persistent-save the outer resolver/rejecter so
+                    // they survive the closure-lifetime boundary into
+                    // the `.then` callbacks. Same trick fetch.rs uses
+                    // for its queued resolves.
+                    let resolve_p: Persistent<Function<'static>> =
+                        Persistent::save(&ctx, resolve);
+                    let reject_p: Persistent<Function<'static>> =
+                        Persistent::save(&ctx, reject);
+                    let reject_p_for_reject: Persistent<Function<'static>> =
+                        reject_p.clone();
+
+                    // Chain `.then(onFulfilled, onRejected)` on the
+                    // eval-promise. `then()` is the rquickjs accessor
+                    // for `Promise.prototype.then`.
+                    let then_fn = eval_promise.then()?;
+
+                    let on_fulfilled = Function::new(
+                        ctx.clone(),
+                        move |args: Rest<Value<'_>>| -> rquickjs::Result<()> {
+                            let args_inner = args.into_inner();
+                            // The eval-promise resolves to `undefined`;
+                            // we ignore its value and resolve the
+                            // outer promise with the namespace.
+                            let ctx = match args_inner.first() {
+                                Some(v) => v.ctx().clone(),
+                                None => return Ok(()),
+                            };
+                            let ns = namespace_p.clone().restore(&ctx)?;
+                            let resolver = resolve_p.clone().restore(&ctx)?;
+                            resolver.call::<_, ()>((ns,))?;
+                            Ok(())
+                        },
+                    )?;
+
+                    let on_rejected = Function::new(
+                        ctx.clone(),
+                        move |args: Rest<Value<'_>>| -> rquickjs::Result<()> {
+                            let args_inner = args.into_inner();
+                            let (ctx, err) = match args_inner.into_iter().next() {
+                                Some(v) => (v.ctx().clone(), v),
+                                None => return Ok(()),
+                            };
+                            let rejector = reject_p_for_reject.clone().restore(&ctx)?;
+                            rejector.call::<_, ()>((err,))?;
+                            Ok(())
+                        },
+                    )?;
+
+                    then_fn.call::<_, ()>((
+                        This(eval_promise.clone()),
+                        on_fulfilled,
+                        on_rejected,
+                    ))?;
+
+                    Ok(Persistent::save(&ctx, promise))
+                },
+            )?;
+
+            // Install on `globalThis.import`. We use `defineProperty`
+            // via `Object.defineProperty` to mark the property as
+            // non-enumerable — matches the way real browsers expose
+            // host hooks (they don't show up in `Object.keys(window)`).
+            // We mark it `writable: true` so tests / debuggers can
+            // monkey-patch it if they need to; production code never
+            // touches it after install.
+            //
+            // We can't just do `globals.set("import", import_fn)`
+            // because that creates an enumerable own property.
+            let define = ctx
+                .eval::<Function, _>(
+                    "(function(target, key, fn) { \
+                        Object.defineProperty(target, key, { \
+                            value: fn, writable: true, configurable: true, enumerable: false \
+                        }); \
+                    })",
+                )?;
+            define.call::<_, ()>((globals.clone(), "import", import_fn))?;
+
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install dynamic import shim: {e}")))?;
+    Ok(())
+}
+
+/// Build a `TypeError` JS value with the given message — convenience
+/// for the dynamic-import shim's reject paths.
+fn build_type_error<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Result<Value<'js>> {
+    let escaped = serde_json::to_string(message)
+        .unwrap_or_else(|_| "\"<unprintable error message>\"".to_owned());
+    ctx.eval::<Value, _>(format!("new TypeError({escaped})"))
 }
 
 /// Install the JS-side `__hesoFormSubmitNow(form)` helper used by
@@ -4133,5 +4579,215 @@ mod tests {
             .eval("[typeof Date.now, Date.now()]")
             .expect("eval ok");
         assert_eq!(out.value, serde_json::json!(["function", 42]));
+    }
+
+    // -------------------------------------------------------------
+    // M-C: dynamic import() shim
+    //
+    // Tests that exercise the `globalThis.import(...)` shim installed
+    // by `install_dynamic_import`. This is the agent-visible callable
+    // form of WHATWG HTML §8.1.3.7's `import(...)` expression — see
+    // the doc comment on `install_dynamic_import` for the full spec
+    // reference and the lineage of the design.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn dynamic_import_is_installed_as_a_function_on_global_this() {
+        // The bootstrap path installs `globalThis.import` even when no
+        // resolver has been wired. M-A's loader plugs into the same
+        // shim later; what we ship in M-C is the function itself and
+        // the seam.
+        let e = engine();
+        let out = e
+            .eval("typeof globalThis.import")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!("function"));
+    }
+
+    #[test]
+    fn dynamic_import_is_not_enumerable_on_globals() {
+        // Real browsers expose host hooks as non-enumerable own
+        // properties so they don't show up in `Object.keys(window)`.
+        // Page code that iterates globals shouldn't trip over our
+        // shim. We use `Object.getOwnPropertyDescriptor` because a
+        // plain `'import' in globalThis` check passes for both
+        // enumerable and non-enumerable own properties.
+        let e = engine();
+        let out = e
+            .eval(
+                "Object.getOwnPropertyDescriptor(globalThis, 'import').enumerable",
+            )
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(false));
+    }
+
+    #[test]
+    fn dynamic_import_without_resolver_rejects_with_specific_error() {
+        // Until `install_module_resolver` is called, every dynamic
+        // `import()` must reject. The error message must mention "no
+        // module loader installed" — that exact phrase is the
+        // contract M-A's docs point agents at when they get a missing
+        // module, so a paraphrase here would silently break that
+        // cross-doc reference.
+        let e = engine();
+        let out = e
+            .eval(
+                r#"
+                globalThis.import('./foo.js').then(
+                    () => ({ ok: true, msg: null, name: null }),
+                    (err) => ({
+                        ok: false,
+                        msg: String((err && err.message) || err),
+                        name: err && err.name,
+                    }),
+                )
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value["ok"], false);
+        let msg = out.value["msg"]
+            .as_str()
+            .expect("msg is a string");
+        assert!(
+            msg.contains("no module loader installed"),
+            "rejection message did not mention 'no module loader installed': {msg}",
+        );
+        // Should also surface as a TypeError — same shape the spec
+        // uses for module resolution failures.
+        assert_eq!(out.value["name"], "TypeError");
+    }
+
+    #[test]
+    fn dynamic_import_with_stub_resolver_resolves_to_namespace() {
+        // Wire a tiny resolver that returns `export const x = 42;`
+        // for any specifier. The shim should compile + evaluate that
+        // module and resolve the import promise with its namespace
+        // object — so `(await import('./x.js')).x === 42` round-trips.
+        //
+        // We give the engine a real base URL first; otherwise the
+        // referrer falls back to `about:blank` (a cannot-be-a-base
+        // URL) and `Url::join` rejects the relative specifier
+        // before it ever reaches the shim. Real hosts always set
+        // a base URL before page JS runs — `JsSession::open` does
+        // it via `set_base_url`.
+        let e = engine();
+        e.set_base_url(Some(
+            Url::parse("https://example.com/page").expect("base parses"),
+        ));
+        e.install_module_resolver(Box::new(|specifier, referrer| {
+            let resolved = referrer
+                .join(specifier)
+                .map_err(|err| format!("join {specifier} onto {referrer}: {err}"))?;
+            Ok((resolved, "export const x = 42;".to_owned()))
+        }));
+        let out = e
+            .eval(
+                r#"
+                globalThis.import('./x.js').then(
+                    (ns) => ({ ok: true, x: ns.x }),
+                    (err) => ({ ok: false, msg: String((err && err.message) || err) }),
+                )
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(
+            out.value["ok"], true,
+            "import failed: {:?}",
+            out.value,
+        );
+        assert_eq!(out.value["x"], 42);
+    }
+
+    #[test]
+    fn dynamic_import_uses_engine_base_url_as_referrer() {
+        // The shim must pass the engine's current `base_url` as the
+        // referrer to the resolver. This is how relative specifiers
+        // (`./foo.js`) become absolute URLs — without it, a resolver
+        // can't tell `./a.js` on `https://x/page` from `./a.js` on
+        // `https://y/other`.
+        let e = engine();
+        e.set_base_url(Some(
+            Url::parse("https://example.com/app/index.html")
+                .expect("base parses"),
+        ));
+        // The resolver records the (specifier, referrer) pair it
+        // received via a side channel — an `Arc<Mutex<Vec<...>>>`
+        // we keep on the Rust side.
+        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        e.install_module_resolver(Box::new(move |specifier, referrer| {
+            seen_clone
+                .lock()
+                .expect("seen poisoned")
+                .push((specifier.to_owned(), referrer.to_string()));
+            let resolved = referrer
+                .join(specifier)
+                .map_err(|err| format!("join: {err}"))?;
+            Ok((resolved, "export const ok = true;".to_owned()))
+        }));
+        let _ = e
+            .eval("globalThis.import('./sibling.js')")
+            .expect("eval ok");
+        let recorded = seen.lock().expect("seen lock").clone();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "./sibling.js");
+        assert_eq!(recorded[0].1, "https://example.com/app/index.html");
+    }
+
+    #[test]
+    fn dynamic_import_resolver_error_surfaces_as_rejection() {
+        // A resolver that returns `Err(msg)` must turn into a rejected
+        // promise whose error message includes the resolver's text.
+        // That's how M-A surfaces bare-specifier failures
+        // ("not in import map") and 404s without crashing the eval.
+        let e = engine();
+        e.install_module_resolver(Box::new(|_specifier, _referrer| {
+            Err("not in import map (resolver-test)".to_owned())
+        }));
+        let out = e
+            .eval(
+                r#"
+                globalThis.import('lodash-es').then(
+                    () => ({ ok: true, msg: null }),
+                    (err) => ({ ok: false, msg: String(err && err.message) }),
+                )
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value["ok"], false);
+        let msg = out.value["msg"]
+            .as_str()
+            .expect("msg is a string");
+        assert!(
+            msg.contains("not in import map (resolver-test)"),
+            "rejection did not include resolver error text: {msg}",
+        );
+    }
+
+    #[test]
+    fn dynamic_import_module_with_top_level_await_resolves_eventually() {
+        // A module that does `await Promise.resolve(...)` at top level
+        // suspends evaluation at the await; the shim must chain
+        // correctly so the outer `import()` promise resolves only
+        // once the inner top-level-await finishes.
+        let e = engine();
+        e.install_module_resolver(Box::new(|_specifier, _referrer| {
+            Ok((
+                Url::parse("https://example.com/m.js").expect("url parses"),
+                "export const x = await Promise.resolve(99);".to_owned(),
+            ))
+        }));
+        let out = e
+            .eval(
+                r#"
+                globalThis.import('./m.js').then(
+                    (ns) => ({ ok: true, x: ns.x }),
+                    (err) => ({ ok: false, msg: String(err && err.message) }),
+                )
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value["ok"], true);
+        assert_eq!(out.value["x"], 99);
     }
 }
