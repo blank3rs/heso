@@ -216,10 +216,12 @@ Not for: scraping data behind canvas, video, computed CSS layout, WebGL, or serv
 | Content-hashed plats (BLAKE3) | ✅ |
 | Ed25519 signed receipts | ✅ |
 | **TodoMVC Preact renders end-to-end** through `heso eval-dom --js-fetch` | ✅ |
-| **572 workspace tests, 2 ignored** (TypeError-throw guards pending Ctx-bound merge with IDL paths) | ✅ |
+| **`MutationObserver` / `IntersectionObserver` / `ResizeObserver` / `PerformanceObserver`** — noop ctors with spec method surface; unblocks SPAs that init observers in hydration | ✅ |
+| **WHATWG `URLSearchParams`** — `get`/`getAll`/`set`/`append`/`delete`/`has`/`sort`/`size`/iteration, with parent-URL reflection back into `url.toString()` | ✅ |
+| **`history.pushState` / `replaceState` / `back` / `forward` / `go`** with synchronous `popstate` dispatch, cached `location` reference identity preserved | ✅ |
+| **641 workspace tests, 2 ignored** (TypeError-throw guards pending Ctx-bound merge with IDL paths) | ✅ |
 | Recorded-network playback (cassettes) for byte-identical replay | 🚧 designed |
-| `MutationObserver` / `IntersectionObserver` / `ResizeObserver` (noop stubs) | 🚧 next |
-| SVG namespace tracking, full WHATWG URL mutation (`searchParams`), `history.pushState` → `popstate` | 🚧 next |
+| SVG namespace tracking + `tagName` casing | 🚧 next |
 | React 19 full interaction round-trip — `KeyboardEvent` / `InputEvent` / `MouseEvent` ctors, focus tracker | 🚧 weeks |
 | Real `document.cookie` jar (shared with `reqwest`) | 🚧 weeks |
 
