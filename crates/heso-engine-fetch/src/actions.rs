@@ -633,6 +633,81 @@ mod tests {
         assert_eq!(about_links[0].name.as_deref(), Some("About"));
     }
 
+    /// Regression test for AGENT_FINDINGS_V3.md "NEW MINOR BUG — `heso find
+    /// --name <regex>` is not substring-matching". The V3 agent reported
+    /// that `heso find --role link --name "comment"` on news.ycombinator.com
+    /// returned `count: 0` even though 29 anchors with names like
+    /// `"35 comments"` / `"31 comments"` were present in the unfiltered set.
+    ///
+    /// Empirically the bug did not reproduce against the current binary
+    /// (`heso find --role link --name comment` returns 30 matches against a
+    /// live HN snapshot — the same `contains`-based logic shipped from the
+    /// initial commit). This test locks in the substring semantics so the
+    /// `--name` filter cannot silently regress to a stricter (anchored or
+    /// regex-full-string) match in a future refactor.
+    ///
+    /// Four required cases:
+    ///   1. Substring match in the middle of the field
+    ///   2. Substring match at the start of the field
+    ///   3. Substring match at the end of the field
+    ///   4. Needle with regex-special chars treated as a literal substring
+    #[test]
+    fn filter_name_is_substring_not_full_string_anchor() {
+        let html = r#"
+            <html><body>
+              <a href="/c1">35 comments</a>
+              <a href="/c2">31 comments</a>
+              <a href="/start">comment thread on widgets</a>
+              <a href="/end">unsubscribe from comment</a>
+              <a href="/punct">v1.0.0 release notes</a>
+              <a href="/punct2">go to v1.0.0 page</a>
+              <a href="/plus">a+b weighting (literal)</a>
+              <a href="/unrelated">About</a>
+            </body></html>
+        "#;
+        let refs = extract(&parse(html));
+
+        // Case 1: substring in the middle of the field. "comment" appears
+        // between leading digits and the trailing "s" in "35 comments" /
+        // "31 comments". Also matches the start/end variants below — total 4.
+        let mid = filter(&refs, None, Some("comment"), None);
+        assert_eq!(
+            mid.len(),
+            4,
+            "needle 'comment' should match all four `*comment*` anchors as a substring; got {:?}",
+            mid.iter().map(|r| r.name.as_deref().unwrap_or("")).collect::<Vec<_>>()
+        );
+
+        // Case 2: substring at the START of the field. "35" is a prefix of
+        // "35 comments" — nothing else has it.
+        let start = filter(&refs, None, Some("35"), None);
+        assert_eq!(start.len(), 1);
+        assert_eq!(start[0].name.as_deref(), Some("35 comments"));
+
+        // Case 3: substring at the END of the field. "thread on widgets"
+        // closes out exactly one anchor.
+        let end = filter(&refs, None, Some("thread on widgets"), None);
+        assert_eq!(end.len(), 1);
+        assert_eq!(end[0].name.as_deref(), Some("comment thread on widgets"));
+
+        // Case 4: needle contains regex-special characters (`.`, `+`). The
+        // current implementation matches as a literal substring — `.` is a
+        // literal period, NOT "any character" — so `v1.0.0` matches only the
+        // two anchors that literally contain the dotted string, and `a+b`
+        // matches the one anchor that literally contains `a+b`. This pins
+        // the "no implicit regex interpretation" contract: a future switch
+        // to a `Regex::new(needle)` path would have to opt in explicitly.
+        let dots = filter(&refs, None, Some("v1.0.0"), None);
+        assert_eq!(dots.len(), 2, "literal `.` must match a `.`, not any char");
+        let plus = filter(&refs, None, Some("a+b"), None);
+        assert_eq!(plus.len(), 1, "literal `+` must match a `+`, not one-or-more");
+        // And the negative side of (4): a needle containing `.` should NOT
+        // match an anchor that lacks that literal period — i.e. the dot is
+        // not behaving as the regex any-char metacharacter.
+        let dot_negative = filter(&refs, None, Some("v1.0.x"), None);
+        assert_eq!(dot_negative.len(), 0);
+    }
+
     #[test]
     fn filter_by_section_is_path_prefix() {
         let html = r#"
