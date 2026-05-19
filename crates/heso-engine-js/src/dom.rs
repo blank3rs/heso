@@ -290,6 +290,47 @@ pub(crate) fn element_listener_map_opt<'js>(
     registry.get::<_, Option<Object<'js>>>(key.as_str())
 }
 
+/// Document-level listener map. Keyed off the same
+/// `__nodeListeners` registry as elements, under the fixed
+/// sentinel `"document"` (a [`NodeId`] could never produce this
+/// stringification, so collisions are impossible).
+fn document_listener_map<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+    let globals = ctx.globals();
+    let document: Object<'js> = globals.get("document")?;
+    let registry: Object<'js> = match document.get::<_, Option<Object<'js>>>(PROP_NODE_LISTENERS)? {
+        Some(r) => r,
+        None => {
+            let r = Object::new(ctx.clone())?;
+            document.set(PROP_NODE_LISTENERS, r.clone())?;
+            r
+        }
+    };
+    match registry.get::<_, Option<Object<'js>>>("document")? {
+        Some(m) => Ok(m),
+        None => {
+            let m = Object::new(ctx.clone())?;
+            registry.set("document", m.clone())?;
+            Ok(m)
+        }
+    }
+}
+
+/// Read-only variant of [`document_listener_map`]: `None` if no
+/// document listeners have been registered yet.
+fn document_listener_map_opt<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<Object<'js>>> {
+    let globals = ctx.globals();
+    let document: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("document")?;
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let registry: Option<Object<'js>> =
+        document.get::<_, Option<Object<'js>>>(PROP_NODE_LISTENERS)?;
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    registry.get::<_, Option<Object<'js>>>("document")
+}
+
 /// The `document` global.
 ///
 /// Wraps a parsed [`dom_query::Document`]. Construction is from Rust
@@ -691,6 +732,54 @@ impl Document {
         }
         false
     }
+
+    /// `document.addEventListener(type, listener, options?)` —
+    /// register a JS callback for document-level events.
+    /// Listener storage is JS-side under the same
+    /// `__nodeListeners` registry shape used by Element, keyed
+    /// off the fixed sentinel `"document"`. The element-rooted
+    /// dispatch path prepends the document so these listeners
+    /// fire for bubbling events that started on a descendant
+    /// element.
+    fn add_event_listener<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        event_type: String,
+        listener: Function<'js>,
+        options: Opt<Value<'js>>,
+    ) -> rquickjs::Result<()> {
+        let (capture, once, passive) = parse_listener_options(&ctx, options.0)?;
+        let map = document_listener_map(&ctx)?;
+        add_listener_to_map(&ctx, &map, &event_type, &listener, capture, once, passive)
+    }
+
+    /// `document.removeEventListener(type, listener, options?)`.
+    fn remove_event_listener<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        event_type: String,
+        listener: Function<'js>,
+        options: Opt<Value<'js>>,
+    ) -> rquickjs::Result<()> {
+        let (capture, _, _) = parse_listener_options(&ctx, options.0)?;
+        if let Some(map) = document_listener_map_opt(&ctx)? {
+            remove_listener_from_map(&ctx, &map, &event_type, &listener, capture)?;
+        }
+        Ok(())
+    }
+
+    /// `document.dispatchEvent(event)` — fire `event` against
+    /// document-level listeners only. No tree walk (the document is
+    /// the root). Returns `false` iff a listener called
+    /// `preventDefault()` and the event is cancelable.
+    fn dispatch_event<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        event: Value<'js>,
+    ) -> rquickjs::Result<bool> {
+        let map = document_listener_map_opt(&ctx)?;
+        let doc_value: Value<'js> = ctx.globals().get("document")?;
+        events::dispatch_with_map(&ctx, map.as_ref(), Some(doc_value), event)    }
 }
 
 /// Escape `s` so it is safe to embed in HTML text content.
@@ -1688,9 +1777,21 @@ impl Element {
 ///
 /// The walk follows [`Element::parent_element`] semantics: skip non-
 /// element parents (text/comment nodes are not in the dispatch path
-/// per the DOM spec). Termination is the first node with no element
-/// parent (i.e. the document element or an orphan node still being
-/// constructed by `createElement`).
+/// per the DOM spec). Termination of the element walk is the first
+/// node with no element parent (i.e. the document element or an
+/// orphan node still being constructed by `createElement`).
+///
+/// The [`Document`] is prepended at index 0 so that document-level
+/// listeners fire **first** in the capture phase and **last** in
+/// the bubble phase. React 19's synthetic-event system (and a great
+/// deal of non-React inline JS) attaches its single global click
+/// handler with `document.addEventListener`; without the document
+/// in the path, none of those handlers would ever observe element-
+/// rooted dispatches.
+///
+/// `event.target` is set by [`dispatch_with_node_path`] from the
+/// last entry of the path, so prepending the document keeps the
+/// target the element — which is what the spec requires.
 fn build_dispatch_path<'js>(
     ctx: &Ctx<'js>,
     target: &Element,
@@ -1711,7 +1812,14 @@ fn build_dispatch_path<'js>(
     // `dispatch_with_node_path`'s expected ordering).
     ids.reverse();
 
-    let mut path: Vec<(Option<Object<'js>>, Value<'js>)> = Vec::with_capacity(ids.len());
+    let mut path: Vec<(Option<Object<'js>>, Value<'js>)> =
+        Vec::with_capacity(ids.len() + 1);
+    // Document sits at the root of the path. `fire_listeners_on_node`
+    // skips when the map is `None`, so a session that has never
+    // attached a document-level listener pays only one lookup.
+    let doc_map = document_listener_map_opt(ctx)?;
+    let doc_value: Value<'js> = ctx.globals().get("document")?;
+    path.push((doc_map, doc_value));
     for id in ids {
         let map = element_listener_map_opt(ctx, id)?;
         let wrapper = Class::instance(ctx.clone(), Element::from_id(target.doc.clone(), id))?;

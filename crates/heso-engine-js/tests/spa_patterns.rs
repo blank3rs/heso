@@ -1148,3 +1148,63 @@ fn text_node_text_content_still_works() {
     let out = sess.eval("document.createTextNode('hi').textContent").unwrap();
     assert_eq!(out.value, serde_json::json!("hi"));
 }
+
+// =====================================================================
+// Document is in the element-dispatch path
+//
+// React 19 (and most pre-React inline JS) delegates clicks via
+// `document.addEventListener('click', root)`. Element-rooted
+// dispatches must reach those listeners — both in capture (where the
+// document is the outermost ancestor) and in bubble (where it is the
+// final stop).
+// =====================================================================
+
+#[test]
+fn document_listener_fires_on_element_click_bubble() {
+    let html = "<!doctype html><html><body><button id='b'>x</button></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("globalThis.log = []; document.addEventListener('click', e => globalThis.log.push('doc:' + e.target.id));").unwrap();
+    sess.click("#b").unwrap();
+    let out = sess.eval("globalThis.log").unwrap();
+    assert_eq!(out.value, serde_json::json!(["doc:b"]));
+}
+
+#[test]
+fn document_capture_fires_before_target() {
+    let html = "<!doctype html><html><body><button id='b'>x</button></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("globalThis.log = []; document.addEventListener('click', () => globalThis.log.push('doc-cap'), { capture: true }); document.querySelector('#b').addEventListener('click', () => globalThis.log.push('target'));").unwrap();
+    sess.click("#b").unwrap();
+    let out = sess.eval("globalThis.log").unwrap();
+    assert_eq!(out.value, serde_json::json!(["doc-cap", "target"]));
+}
+
+#[test]
+fn document_bubble_fires_after_target() {
+    let html = "<!doctype html><html><body><button id='b'>x</button></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("globalThis.log = []; document.querySelector('#b').addEventListener('click', () => globalThis.log.push('target')); document.addEventListener('click', () => globalThis.log.push('doc-bub'));").unwrap();
+    sess.click("#b").unwrap();
+    let out = sess.eval("globalThis.log").unwrap();
+    assert_eq!(out.value, serde_json::json!(["target", "doc-bub"]));
+}
+
+#[test]
+fn document_stop_propagation_in_capture_halts_path() {
+    let html = "<!doctype html><html><body><div id='outer'><button id='b'>x</button></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("globalThis.log = []; document.addEventListener('click', e => { globalThis.log.push('doc-cap'); e.stopPropagation(); }, { capture: true }); document.querySelector('#outer').addEventListener('click', () => globalThis.log.push('outer')); document.querySelector('#b').addEventListener('click', () => globalThis.log.push('target'));").unwrap();
+    sess.click("#b").unwrap();
+    let out = sess.eval("globalThis.log").unwrap();
+    assert_eq!(out.value, serde_json::json!(["doc-cap"]));
+}
+
+#[test]
+fn document_listener_event_target_is_the_element() {
+    let html = "<!doctype html><html><body><button id='b'>x</button></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("globalThis.targets = []; document.addEventListener('click', e => globalThis.targets.push(e.target.id));").unwrap();
+    sess.click("#b").unwrap();
+    let out = sess.eval("globalThis.targets").unwrap();
+    assert_eq!(out.value, serde_json::json!(["b"]));
+}
