@@ -1,0 +1,45 @@
+{
+  "_comment": "Source-of-truth target list for compatibility benchmarks. Mirrors the TARGETS array in crates/heso-compat-suite/src/main.rs so both the Rust suite and the Playwright sidecar exercise the same workload. Keep this in sync with the Rust array; when adding a target, update both. The Rust suite does NOT currently read this file (it has its own const), but the Playwright sidecar does — see ../playwright/README.md.",
+  "targets": [
+    {
+      "name": "example.com",
+      "url": "https://example.com",
+      "category": "smoke"
+    },
+    {
+      "name": "news.ycombinator.com",
+      "url": "https://news.ycombinator.com",
+      "category": "server-rendered"
+    },
+    {
+      "name": "news.ycombinator.com (count)",
+      "url": "https://news.ycombinator.com",
+      "category": "server-rendered"
+    },
+    {
+      "name": "wikipedia.org",
+      "url": "https://www.wikipedia.org/",
+      "category": "server-rendered"
+    },
+    {
+      "name": "httpbin.org/html",
+      "url": "https://httpbin.org/html",
+      "category": "static"
+    },
+    {
+      "name": "developer.mozilla.org div",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/HTML/Element/div",
+      "category": "docs"
+    },
+    {
+      "name": "rust-lang.org",
+      "url": "https://www.rust-lang.org/",
+      "category": "marketing"
+    },
+    {
+      "name": "docs.rs",
+      "url": "https://docs.rs/serde/latest/serde/",
+      "category": "docs"
+    }
+  ]
+}
