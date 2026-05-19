@@ -892,6 +892,10 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         heso_engine_js::ScriptFetchPolicy::Skip
     };
 
+    // Set the page URL so the inline-script pump can resolve
+    // relative `<script src="...">` refs against it.
+    js_engine.set_base_url(Some(final_url.clone()));
+
     match js_engine.eval_with_html_capture(&html, &js_src, policy) {
         Ok((outcome, script_outcome)) => {
             let body = serde_json::json!({

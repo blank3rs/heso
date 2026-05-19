@@ -23,6 +23,8 @@ use rquickjs::{
     CatchResultExt, CaughtError, Class, Context, Ctx, Function, Object, Runtime, Value,
 };
 
+use url::Url;
+
 use crate::dom::{self, Document};
 use crate::fetch::{self, FetchMode, FetchQueue};
 use crate::rng::SeededRng;
@@ -165,6 +167,12 @@ pub struct JsEngine {
     /// construction — the QuickJS runtime is `!Send`, so the engine
     /// never crosses a thread boundary.
     fetch_state: Option<FetchState>,
+    /// Per-engine "current page URL" — used to resolve relative
+    /// `<script src="...">` references during inline-script execution.
+    /// `None` for engines created without an associated page (e.g.
+    /// bare `heso eval-js`); set by [`Self::set_base_url`] or by
+    /// [`crate::JsSession`] at open/navigate time.
+    base_url: Mutex<Option<Url>>,
 }
 
 /// Bundles a per-engine fetch queue with the mode that drives it.
@@ -328,7 +336,25 @@ impl JsEngine {
             timers,
             rng,
             fetch_state,
+            base_url: Mutex::new(None),
         })
+    }
+
+    /// Set or clear the page URL used to resolve relative
+    /// `<script src="...">` references when [`Self::install_document`]
+    /// or [`Self::eval_with_html`] runs the inline-script pump.
+    ///
+    /// Without this, the script pump treats `src="base.js"` as a
+    /// literal URL and `reqwest` rejects it — see the relative-URL
+    /// path in [`crate::scripts::fetch_script_source`]. With it set,
+    /// the pump resolves via [`Url::join`] before issuing the fetch.
+    pub fn set_base_url(&self, url: Option<Url>) {
+        *self.base_url.lock().expect("base_url poisoned") = url;
+    }
+
+    /// Current page URL, if any. See [`Self::set_base_url`].
+    pub fn base_url(&self) -> Option<Url> {
+        self.base_url.lock().expect("base_url poisoned").clone()
     }
 
     /// The seed-backed RNG installed into the JS context. Useful for
@@ -520,12 +546,14 @@ impl JsEngine {
             FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
             FetchMode::DeterministicNoCassette => None,
         });
+        let base_url = self.base_url();
         let script_outcome = scripts::run_scripts(
             &self.context,
             &dom,
             policy,
             &self.console_buffer,
             script_fetch_client.as_ref(),
+            base_url.as_ref(),
         )?;
 
         self.run_pending_jobs()?;
@@ -636,12 +664,14 @@ impl JsEngine {
             FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
             FetchMode::DeterministicNoCassette => None,
         });
+        let base_url = self.base_url();
         let script_outcome = scripts::run_scripts(
             &self.context,
             &dom,
             policy,
             &self.console_buffer,
             script_fetch_client.as_ref(),
+            base_url.as_ref(),
         )?;
 
         // Drive any fetches the page scripts queued before running

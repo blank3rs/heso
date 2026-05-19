@@ -628,3 +628,67 @@ fn aria_expanded_toggles_each_click_via_getattribute() {
         .unwrap();
     assert_eq!(a2.value, serde_json::json!("false"));
 }
+
+// =====================================================================
+// Relative <script src> resolution against the page base URL.
+// Bundled apps (Vite/webpack/rollup outputs, TodoMVC examples, the
+// long tail of "load app.js" pages) ALL use relative script paths.
+// Without base-URL resolution, the script pump feeds reqwest a
+// literal path like "app.js" which fails with "send: builder error".
+// =====================================================================
+
+#[test]
+fn relative_script_src_does_not_panic_without_base_url() {
+    // Engine with no base URL set: external script fetch fails, but
+    // gracefully — the pump continues, no panic, no abort.
+    let html = r#"<!doctype html><html><body>
+        <div id="out">no-script</div>
+        <script src="app.js"></script>
+    </body></html>"#;
+    let engine = JsEngine::new().unwrap();
+    let outcome = engine.eval_with_html_policy(
+        html,
+        "document.querySelector('#out').textContent",
+        heso_engine_js::ScriptFetchPolicy::Fetch,
+    );
+    // We get an outcome (not a panic), and the external_handled count
+    // is bumped because we tried to fetch.
+    assert!(outcome.is_ok());
+}
+
+#[test]
+fn set_base_url_is_observable_via_getter() {
+    let engine = JsEngine::new().unwrap();
+    assert!(engine.base_url().is_none());
+    let u = Url::parse("https://example.com/path/index.html").unwrap();
+    engine.set_base_url(Some(u.clone()));
+    assert_eq!(engine.base_url().as_ref(), Some(&u));
+    engine.set_base_url(None);
+    assert!(engine.base_url().is_none());
+}
+
+#[test]
+fn jssession_open_sets_base_url_automatically() {
+    // After JsSession::open, the engine's base URL is the page URL —
+    // so a subsequent re-install (e.g. via the engine API directly)
+    // would see it. This is the contract `open_on_engine` provides.
+    let html = "<!doctype html><html><body></body></html>";
+    let target = Url::parse("https://example.com/foo/bar/").unwrap();
+    let (sess, _) = JsSession::open(html, target.clone()).unwrap();
+    assert_eq!(sess.engine().base_url().as_ref(), Some(&target));
+}
+
+#[test]
+fn navigate_updates_base_url_so_relative_src_resolves_against_new_page() {
+    // Open on page A, navigate to page B — the engine's base URL
+    // must reflect B, not A. This is the property that lets
+    // relative <script src> on the new page resolve correctly.
+    let html_a = "<!doctype html><html><body><span id='x'>a</span></body></html>";
+    let html_b = "<!doctype html><html><body><span id='x'>b</span></body></html>";
+    let url_a = Url::parse("https://a.example.com/index.html").unwrap();
+    let url_b = Url::parse("https://b.example.com/sub/page.html").unwrap();
+    let (mut sess, _) = JsSession::open(html_a, url_a.clone()).unwrap();
+    assert_eq!(sess.engine().base_url().as_ref(), Some(&url_a));
+    sess.navigate(html_b, url_b.clone()).unwrap();
+    assert_eq!(sess.engine().base_url().as_ref(), Some(&url_b));
+}

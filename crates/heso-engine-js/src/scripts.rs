@@ -162,6 +162,7 @@ pub fn run_scripts(
     policy: ScriptFetchPolicy,
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
     fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
+    base_url: Option<&url::Url>,
 ) -> Result<ScriptOutcome, EvalError> {
     let scripts = collect_scripts(document);
     let mut outcome = ScriptOutcome::default();
@@ -202,7 +203,7 @@ pub fn run_scripts(
                         // Synchronous-blocking fetch + execute, matching
                         // jsdom's basic mode. Failures land on the
                         // console buffer; the pump continues.
-                        match fetch_script_source(client, rt, &src) {
+                        match fetch_script_source(client, rt, &src, base_url) {
                             Ok(source) => match eval_one(context, &source)? {
                                 Some(err_msg) => {
                                     outcome.executed_with_error += 1;
@@ -252,23 +253,37 @@ pub fn run_scripts(
 /// by [`ScriptFetchPolicy::Fetch`] to honor `<script src=...>` refs
 /// during page hydration.
 ///
-/// `src` is expected to be an absolute URL (or anything `reqwest`
-/// can parse as one); relative URLs are not yet resolved against the
-/// page's base URL — that's a documented limitation of the Phase 1C
-/// pump. Callers that need relative-URL support should pre-resolve
-/// against `final_url` before passing the HTML to the engine.
+/// `src` may be absolute (`https://...`) or relative (`base.js`,
+/// `../foo/bar.js`). Relative refs are resolved against `base_url`
+/// via [`url::Url::join`]. Without a base URL, `src` is sent to
+/// `reqwest` as-is — which works for absolute URLs and fails with
+/// "send: builder error" for relative ones (caller is responsible
+/// for setting the engine's base URL via
+/// [`crate::JsEngine::set_base_url`]).
 fn fetch_script_source(
     client: &reqwest::Client,
     rt: &tokio::runtime::Handle,
     src: &str,
+    base_url: Option<&url::Url>,
 ) -> Result<String, String> {
+    // Resolve relative src against base. `Url::join` handles both
+    // absolute src (returns src) and relative (joins). If parsing
+    // fails outright, fall back to the raw src so reqwest can produce
+    // a clear error.
+    let resolved: String = match base_url {
+        Some(base) => match base.join(src) {
+            Ok(u) => u.to_string(),
+            Err(_) => src.to_owned(),
+        },
+        None => src.to_owned(),
+    };
     // `block_in_place` lets the CLI's `#[tokio::main]` flow run this
     // synchronously without tripping the "runtime from within a
     // runtime" panic — same trick as `crate::fetch::perform_request`.
     tokio::task::block_in_place(|| {
         rt.block_on(async {
             let resp = client
-                .get(src)
+                .get(&resolved)
                 .send()
                 .await
                 .map_err(|e| format!("send: {e}"))?;

@@ -114,6 +114,9 @@ impl JsSession {
         url: Url,
         policy: ScriptFetchPolicy,
     ) -> Result<(Self, ScriptOutcome), EvalError> {
+        // Set the base URL before installing so the inline-script
+        // pump can resolve relative `<script src="...">` references.
+        engine.set_base_url(Some(url.clone()));
         let document = Document::from_html(html);
         let outcome = engine.install_document(document.clone(), policy)?;
         Ok((
@@ -142,6 +145,9 @@ impl JsSession {
         url: Url,
         policy: ScriptFetchPolicy,
     ) -> Result<ScriptOutcome, EvalError> {
+        // Re-point base URL before installing so relative
+        // `<script src>` refs resolve against the NEW page.
+        self.engine.set_base_url(Some(url.clone()));
         let document = Document::from_html(html);
         let outcome = self.engine.install_document(document.clone(), policy)?;
         self.document = document;
