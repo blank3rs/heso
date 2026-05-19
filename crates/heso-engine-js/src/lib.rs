@@ -64,11 +64,22 @@
 //!   `heso eval-js` and `heso eval-dom`); same seed, byte-identical
 //!   output across runs and machines.
 //!
-//! `Date.now` and `new Date()` still hit the host clock — clock-seeding
-//! lands in Phase 1C alongside `<script>`-on-load. `fetch()` /
-//! `XMLHttpRequest` are not installed yet and will arrive as recorded-
-//! network shims so the determinism guarantees from ADR 0008 carry over
-//! to JS-issued network calls too.
+//! - `Date.now()` and zero-arg `new Date()` route through the same
+//!   [`VirtualClock`] — `Date.now()` reads `clock.now_ms()` as an
+//!   `f64`, and `new Date()` (the zero-arg construction form, where
+//!   the spec reads the host clock) is monkey-patched to
+//!   `new Date(Date.now())`. Explicit-input forms
+//!   (`new Date(ms)`, `new Date(str)`, `new Date(y, m, d, ...)`,
+//!   `Date.parse`, `Date.UTC`) are pure functions of their inputs
+//!   and stay on the QuickJS built-in. A fresh engine starts at
+//!   virtual epoch `0` (= midnight 1970-01-01 UTC); the host advances
+//!   it via [`JsEngine::advance_clock`], the same control surface as
+//!   timers.
+//!
+//! `fetch()` / `XMLHttpRequest` are not fully deterministic yet — `fetch`
+//! is installed but currently lives in `DeterministicNoCassette` mode
+//! under `--seed N` until record/replay (ADR 0008 item M) lands and the
+//! recorded-network shim makes JS-issued HTTP calls reproducible too.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -303,6 +303,14 @@ impl JsEngine {
         let rng = SeededRng::new(seed);
         install_rng(&context, rng.clone())?;
 
+        // Determinism shim for the host wall clock: route `Date.now()`
+        // and zero-arg `new Date()` through the same `VirtualClock`
+        // that backs `setTimeout` / `setInterval`. Explicit-input forms
+        // (`new Date(ms)`, `new Date(str)`, `new Date(y,m,d,...)`,
+        // `Date.parse`, `Date.UTC`) are pure functions of their inputs
+        // and stay on the QuickJS built-in. See [`install_date`].
+        install_date(&context, timers.clone())?;
+
         // Optional: install the `fetch` global.
         let fetch_state = if let Some(mode) = fetch_mode {
             #[allow(clippy::arc_with_non_send_sync)]
@@ -973,12 +981,12 @@ fn install_console(
 /// 3. **`crypto.randomUUID()`** — returns a v4-format UUID whose 16
 ///    bytes come from the same stream.
 ///
-/// `Date.now` is NOT routed here. The current `VirtualClock` lives in
-/// [`crate::timers`] and only backs `setTimeout` / `setInterval` —
-/// `Date.now()` today calls QuickJS's built-in implementation, which
-/// reads the host wall clock. Wiring `Date.now` + the `Date()`
-/// constructor through `VirtualClock` belongs in a later PR; see the
-/// inline TODO below.
+/// `Date.now` and zero-arg `new Date()` are routed separately by
+/// [`install_date`], which shares the [`VirtualClock`](crate::timers)
+/// backing `setTimeout` / `setInterval`. Explicit-input `Date` forms
+/// (`new Date(ms)`, `new Date(str)`, `new Date(y,m,d,...)`,
+/// `Date.parse`, `Date.UTC`) are pure functions of their inputs and
+/// stay on the QuickJS built-in.
 fn install_rng(context: &Context, rng: SeededRng) -> Result<(), EvalError> {
     context
         .with(|ctx| -> rquickjs::Result<()> {
@@ -1083,16 +1091,150 @@ fn install_rng(context: &Context, rng: SeededRng) -> Result<(), EvalError> {
             "#;
             ctx.eval::<(), _>(wrap_src)?;
 
-            // TODO(determinism): route Date.now() and the `new Date()`
-            // constructor through VirtualClock so wall-clock reads
-            // become reproducible. Today they pass through to QuickJS's
-            // host-clock implementation; the virtual clock only backs
-            // setTimeout / setInterval. Tracked alongside Phase 2
-            // timer integration.
-
             Ok(())
         })
         .map_err(|e| EvalError::Engine(format!("install rng: {e}")))?;
+    Ok(())
+}
+
+/// Install the deterministic `Date` shim onto the context's globals
+/// (per [ADR 0008]).
+///
+/// Two surfaces are intercepted; everything else stays on QuickJS's
+/// built-in `Date`:
+///
+/// 1. **`Date.now()`** — returns the current
+///    [`VirtualClock`](crate::timers) reading as an `f64`, matching
+///    the spec's "milliseconds since the Unix epoch" shape. Because
+///    the clock starts at zero on a fresh engine, `Date.now()` on a
+///    just-constructed engine is `0` — i.e. midnight 1970-01-01 UTC.
+///    The host can shift this by either calling
+///    [`JsEngine::advance_clock`] (the same control surface as timers)
+///    or by setting an initial epoch via a future
+///    `new_with_seed_and_epoch_ms` constructor — both are valid; both
+///    keep determinism.
+///
+/// 2. **`new Date()`** (zero-arg construction) — pins the constructed
+///    `Date` instance to the same virtual time. All explicit-input
+///    forms (`new Date(ms)`, `new Date(str)`, `new Date(y, m, d, ...)`)
+///    are *pure functions of their inputs* and pass through to the
+///    QuickJS built-in unchanged.
+///
+/// ## Why this shape (monkey-patch over JS)
+///
+/// QuickJS's `Date` is implemented in C and built into the runtime;
+/// there's no clean rquickjs API to swap out the constructor's
+/// host-time-reading code path. The idiomatic move (matching
+/// `sinon.useFakeTimers` and `happy-dom`'s fake clock) is to leave
+/// the original `Date` intact and replace `globalThis.Date` with a
+/// thin JS wrapper that forwards every form except the zero-arg
+/// constructor to the original, and the zero-arg constructor to
+/// `new OriginalDate(Date.now())`. `Date.prototype` and the static
+/// surface (`Date.parse`, `Date.UTC`, `Date.now`) are copied across
+/// so `instanceof Date`, `Date.parse('...')`, etc. still work.
+///
+/// We rebind `Date.now` first (Rust closure → `VirtualClock.now_ms`)
+/// then run a tiny JS bootstrap that builds the wrapper using the
+/// rebound `Date.now`. The wrapper itself is JS so it stays inside
+/// the QuickJS sandbox — no Rust callback per construction.
+///
+/// [ADR 0008]: ../../decisions/0008-deterministic-execution.md
+fn install_date(
+    context: &Context,
+    timers: Arc<Mutex<TimerScheduler>>,
+) -> Result<(), EvalError> {
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            let globals = ctx.globals();
+
+            // Step 1: replace `Date.now` on the *original* Date with a
+            // closure that reads the shared VirtualClock. The wrapper
+            // built in step 2 then copies this Date.now onto itself.
+            //
+            // The clock is read under the scheduler lock; on a poisoned
+            // mutex (effectively unreachable — single-threaded engine)
+            // we fall back to `0.0` rather than panic.
+            let now_timers = timers.clone();
+            let date_now = Func::from(move || -> f64 {
+                match now_timers.lock() {
+                    Ok(s) => s.now_ms() as f64,
+                    Err(_) => 0.0,
+                }
+            });
+            let date_obj: Object = globals.get("Date")?;
+            date_obj.set("now", date_now)?;
+
+            // Step 2: build the JS-side wrapper around the original
+            // Date. The wrapper:
+            //
+            //   - intercepts zero-arg `new Date()` → returns
+            //     `new OriginalDate(Date.now())` (which now reads the
+            //     virtual clock).
+            //   - forwards every other construction form unchanged.
+            //   - forwards calls without `new` (`Date()` returns a
+            //     string in the spec) to the original.
+            //   - preserves `Date.prototype` so `instanceof Date` keeps
+            //     working for both zero-arg and explicit-input
+            //     instances.
+            //   - copies the static surface (`now`, `parse`, `UTC`)
+            //     across so `Date.parse` / `Date.UTC` / `Date.now`
+            //     still resolve.
+            //
+            // Note: we copy *all* own properties of the original Date
+            // (rather than hardcoding {now, parse, UTC}) so any future
+            // QuickJS-side additions ride along automatically.
+            let bootstrap = r#"
+                (function() {
+                    const OriginalDate = globalThis.Date;
+                    function WrappedDate(...args) {
+                        // Called without `new` — per the spec,
+                        // `Date(...)` returns a string representation
+                        // of the current time, ignoring its arguments.
+                        // Defer to the original so we keep that
+                        // behavior; the original will route through
+                        // our patched `Date.now` via its own
+                        // construction path on most engines, but
+                        // QuickJS reads the host clock here, so we
+                        // pin it explicitly using the virtual clock.
+                        if (!(this instanceof WrappedDate)) {
+                            return new OriginalDate(OriginalDate.now()).toString();
+                        }
+                        // Zero-arg construction: pin to virtual clock.
+                        if (args.length === 0) {
+                            return new OriginalDate(OriginalDate.now());
+                        }
+                        // Explicit-input forms — pass through.
+                        // Spread to preserve `new Date(y, m, d, ...)`
+                        // multi-arg shape.
+                        return new OriginalDate(...args);
+                    }
+                    // Preserve prototype identity so
+                    // `instanceof Date` works for instances created
+                    // by both the wrapper and the original (the
+                    // wrapper returns instances constructed by the
+                    // original, so they're `instanceof OriginalDate`
+                    // already; by aliasing prototypes we also satisfy
+                    // `instanceof WrappedDate`).
+                    WrappedDate.prototype = OriginalDate.prototype;
+                    // Copy the static surface (now, parse, UTC, and
+                    // any future additions) onto the wrapper.
+                    for (const key of Object.getOwnPropertyNames(OriginalDate)) {
+                        if (key === 'length' || key === 'name' || key === 'prototype') {
+                            continue;
+                        }
+                        const desc = Object.getOwnPropertyDescriptor(OriginalDate, key);
+                        if (desc) {
+                            Object.defineProperty(WrappedDate, key, desc);
+                        }
+                    }
+                    globalThis.Date = WrappedDate;
+                })()
+            "#;
+            ctx.eval::<(), _>(bootstrap)?;
+
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install date: {e}")))?;
     Ok(())
 }
 
@@ -2244,5 +2386,123 @@ mod tests {
         assert_eq!(script_outcome.executed_with_error, 1);
         assert_eq!(script_outcome.external_handled, 1);
         assert_eq!(script_outcome.skipped_non_script_type, 1);
+    }
+
+    // ===== Date virtualization (ADR 0008 determinism shim) =====
+    //
+    // The contract: `Date.now()` and zero-arg `new Date()` route
+    // through the engine's VirtualClock, while every explicit-input
+    // form (`new Date(ms)`, `new Date(str)`, `new Date(y, m, d, ...)`,
+    // `Date.parse`, `Date.UTC`) stays pure-of-input on the QuickJS
+    // built-in.
+
+    #[test]
+    fn date_now_starts_at_zero_on_fresh_engine() {
+        let e = engine();
+        let out = e.eval("Date.now()").expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(0));
+    }
+
+    #[test]
+    fn date_now_advances_by_exactly_advance_clock_delta() {
+        let e = engine();
+        e.advance_clock(1234).expect("advance ok");
+        let out = e.eval("Date.now()").expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(1234));
+        e.advance_clock(766).expect("advance ok");
+        let out = e.eval("Date.now()").expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(2000));
+    }
+
+    #[test]
+    fn date_now_is_byte_identical_across_engines_with_same_advance_sequence() {
+        // Two fresh engines, same advance sequence → byte-identical
+        // Date.now() readings at every step.
+        fn run() -> Vec<serde_json::Value> {
+            let e = engine();
+            let mut out = Vec::new();
+            for delta in [0u64, 10, 25, 100, 50] {
+                e.advance_clock(delta).expect("advance ok");
+                out.push(e.eval("Date.now()").expect("eval ok").value);
+            }
+            out
+        }
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn zero_arg_new_date_matches_date_now() {
+        let e = engine();
+        e.advance_clock(500_000).expect("advance ok");
+        let out = e
+            .eval("[new Date().getTime(), Date.now()]")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!([500_000, 500_000]));
+    }
+
+    #[test]
+    fn explicit_input_date_forms_are_untouched() {
+        // The whole point of the wrapper is that explicit-input forms
+        // remain pure of input. Advance the clock to a nonzero virtual
+        // time first to prove the explicit constructors don't pick it
+        // up.
+        let e = engine();
+        e.advance_clock(9_999_999).expect("advance ok");
+
+        // new Date(ms). Large integers come back as JSON floats —
+        // compare the f64 value, not the JSON variant.
+        let out = e
+            .eval("new Date(1234567890000).getTime()")
+            .expect("eval ok");
+        assert_eq!(out.value.as_f64(), Some(1234567890000.0));
+
+        // Date.parse(str) is pure of input.
+        // 2024-01-01T00:00:00Z = 1704067200000 ms since epoch.
+        let out = e
+            .eval("Date.parse('2024-01-01T00:00:00Z')")
+            .expect("eval ok");
+        assert_eq!(out.value.as_f64(), Some(1704067200000.0));
+
+        // Date.UTC(...) is pure of input.
+        let out = e.eval("Date.UTC(2024, 0, 1, 0, 0, 0)").expect("eval ok");
+        assert_eq!(out.value.as_f64(), Some(1704067200000.0));
+
+        // new Date(y, m, d, ...) — month is 0-indexed; we use UTC
+        // accessors to avoid timezone variance in test environments.
+        let out = e
+            .eval("new Date(Date.UTC(2024, 0, 1)).getUTCFullYear()")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(2024));
+    }
+
+    #[test]
+    fn date_instanceof_still_works_for_both_construction_paths() {
+        // Both the zero-arg wrapper path and the explicit-input
+        // passthrough path must produce instances that pass
+        // `instanceof Date`.
+        let e = engine();
+        let out = e
+            .eval(
+                r#"[
+                    new Date() instanceof Date,
+                    new Date(0) instanceof Date,
+                    new Date(2024, 0, 1) instanceof Date,
+                ]"#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!([true, true, true]));
+    }
+
+    #[test]
+    fn date_now_is_a_function_on_the_global_date() {
+        // Regression guard: the wrapper must carry `Date.now` across so
+        // libraries that read `Date.now` directly (not through `new
+        // Date()`) get the virtual clock.
+        let e = engine();
+        e.advance_clock(42).expect("advance ok");
+        let out = e
+            .eval("[typeof Date.now, Date.now()]")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(["function", 42]));
     }
 }
