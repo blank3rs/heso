@@ -169,22 +169,38 @@ Not for: scraping data behind canvas, video, computed CSS layout, WebGL, or serv
 | HTTP/HTTPS, cookies, redirects | ✅ |
 | HTML parse (html5ever) | ✅ |
 | Sandboxed JS (QuickJS) | ✅ |
-| DOM read + mutate, `createElement` | ✅ |
+| DOM read + mutate, `createElement` / `createTextNode` / `createElementNS` | ✅ |
 | Events with W3C capture/bubble walk, timers, `AbortController` | ✅ |
+| **Document in dispatch path** — React 19 synthetic events delegate cleanly | ✅ |
+| Node traversal — `childNodes`, `firstChild`/`lastChild`, `nextSibling`/`previousSibling`, `firstElementChild`/`lastElementChild`, `*ElementSibling`, `childElementCount`, `hasChildNodes`, `contains`, `isConnected`, `cloneNode(deep)`, `remove()` | ✅ |
+| `nodeType`, `nodeName`, `parentNode`, `ownerDocument`, `getElementsByTagName`, `insertBefore` | ✅ |
+| `element.className` setter, `classList`, `setAttribute` (bool/number/null coerced per spec) | ✅ |
+| **HTMLInputElement IDL split** — `.value` / `.checked` separate from content attrs; `defaultValue` / `defaultChecked`; `disabled`/`readOnly`/`required` reflected; `.type` / `.name` / `.placeholder` IDL | ✅ |
+| `Element.style` as `CSSStyleDeclaration`-shaped Proxy with real CSS-property allow-list (~500 props + custom `--*`) | ✅ |
+| **Text/comment node wrapper safety** — element-only ops return empty default or throw `TypeError` | ✅ |
 | `click` / `fill` / `submit` through `dispatchEvent` (returns `defaultPrevented`) | ✅ |
-| `<script>`-on-load (SPA inline-script hydration) | ✅ |
+| `<script>`-on-load (SPA inline-script hydration), relative `<script src>` resolved against page URL | ✅ |
 | `fetch()` inside JS (shared `reqwest::Client`) | ✅ |
 | **Stateful `JsSession`** — one engine, one document, listeners persist across calls | ✅ |
 | **Stateful replay** (`heso replay trace.json`) — anchor preventDefault, navigation tracking, `--seed N` | ✅ |
 | **Trace fingerprints** — keyless, algorithm-derived BLAKE3 Merkle chain | ✅ |
 | Seeded RNG (`--seed N`) — `Math.random`, `crypto.*` | ✅ |
+| `Date.now` / zero-arg `new Date()` routed through VirtualClock | ✅ |
+| `window`, `window.location`, `window.history`, lazy DOM-ctor stubs via prototype Proxy | ✅ |
+| WHATWG-shaped `URL` global (`new URL(href, base)`, `.canParse`) | ✅ |
+| `navigator` (`.userAgent`/`.language`/`.webdriver=false`), `queueMicrotask`, `requestAnimationFrame`/`cancelAnimationFrame`, `performance.now()` | ✅ |
+| `atob` / `btoa`, `matchMedia`, in-memory `localStorage` / `sessionStorage` | ✅ |
+| `document.readyState='complete'`, `document.activeElement`, `document.cookie` (stub), `document.contains` | ✅ |
+| Element layout zero-stubs — `getBoundingClientRect`, `getClientRects`, `client*`/`offset*`/`scroll*` dims, `focus`/`blur`/`scrollIntoView` | ✅ |
 | Content-hashed plats (BLAKE3) | ✅ |
 | Ed25519 signed receipts | ✅ |
-| **464 workspace tests, 0 ignored** (including 31 SPA-pattern integration tests) | ✅ |
-| `Date.now` seeding / virtual `new Date()` | 🚧 next |
+| **TodoMVC Preact renders end-to-end** through `heso eval-dom --js-fetch` | ✅ |
+| **565 workspace tests, 2 ignored** (TypeError-throw guards pending Ctx-bound merge with IDL paths) | ✅ |
 | Recorded-network playback (cassettes) for byte-identical replay | 🚧 designed |
-| `MutationObserver`, `requestAnimationFrame`, layout APIs | 🚧 weeks |
-| React / Vue compat harness — live bundle hydration | 📅 month 3 |
+| `MutationObserver` / `IntersectionObserver` / `ResizeObserver` (noop stubs) | 🚧 next |
+| SVG namespace tracking, full WHATWG URL mutation (`searchParams`), `history.pushState` → `popstate` | 🚧 next |
+| React 19 full interaction round-trip — `KeyboardEvent` / `InputEvent` / `MouseEvent` ctors, focus tracker | 🚧 weeks |
+| Real `document.cookie` jar (shared with `reqwest`) | 🚧 weeks |
 
 Honest about scope. Honest about gaps. No vapor.
 
