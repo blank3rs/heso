@@ -172,6 +172,62 @@ heso serve     # JSON-RPC 2.0 over stdin/stdout, stateful page sessions
 
 Point Browser Use, Stagehand, or your own loop at the stdio transport. Swap Chromium out, leave the agent code alone.
 
+## Drop into Claude Code (or any agent harness) as a skill
+
+heso is built to be **a tool an LLM agent calls**, not a library a human drives. The shape that fits cleanest is the "skill" / "tool" pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses all support: a markdown file that tells the model when to reach for the tool and which verbs to invoke.
+
+Drop this into `.claude/skills/heso/SKILL.md` (or your harness's equivalent) and your agent gets a 7.65 MB headless browser:
+
+```markdown
+---
+name: heso
+description: Use the heso headless browser (one 7.65 MB Rust binary, no Chromium, no Node) for any task that needs to fetch a real web page, parse it, run its JavaScript, extract content, navigate, fill forms, or click links. Default to this over WebFetch + WebSearch when the workflow needs a DOM, stateful clicks, or framework-rendered content. Output is structured JSON.
+---
+
+# heso — agent-native browser
+
+## When to invoke me
+
+- "Get the content / title / metadata of <URL>"
+- "Extract <thing> from <page>" — table data, links, prices, dates, anything in the DOM
+- "Fill out this form and submit" — `find` then `fill` then `submit`
+- "Search this site for X and follow the first result"
+- "Run this JavaScript against <page> and tell me what it returns"
+- "Click the @e0 / @e1 / … action and tell me what changes"
+- Any task where Playwright would be overkill or where determinism matters
+
+## Verbs (each prints JSON to stdout — pipe through `jq` if needed)
+
+- `heso open <url>` — full page summary: `title`, `metadata`, `actions: [{ref: "@eN", role, name}]`, content-hashed `plat_hash`
+- `heso meta <url>` — just the metadata block (OpenGraph, JSON-LD)
+- `heso find <url> [--role link|button|input|form] [--name "regex"]` — locate an actionable element, returns its `@eN` ref
+- `heso click <url> @e<N>` — dispatch click on action @eN
+- `heso fill <url> @e<N> "value"` — type into input @eN (fires `input` + `change`)
+- `heso submit <url> @e<N>` — submit form @eN (walks the form, fires `submit`)
+- `heso eval-dom [--js-fetch] [--seed N] <url> "<js>"` — fetch URL, parse, run inline `<script>`s, then eval your JS. Pass `-` to read JS from stdin. `--js-fetch` enables in-JS `fetch()`. Inline JS can `await heso.flush()` to yield to framework re-render microtasks.
+- `heso tree <url>` / `heso ls <url> <path>` / `heso cat <url> <path>` — navigate the page as a directory of heading-defined sections
+- `heso eval-js [--seed N] "<js>"` — sandboxed JS only, no DOM
+- `heso serve` — JSON-RPC 2.0 over stdin/stdout for multi-step sessions where state must persist across calls
+
+## Recipes
+
+**Read a page:** `heso open https://example.com | jq '.title, .description'`
+
+**Extract structured data:** `heso eval-dom https://news.ycombinator.com 'Array.from(document.querySelectorAll(".titleline > a")).slice(0,5).map(a => ({title: a.textContent, url: a.href}))'`
+
+**Drive a framework:** `heso eval-dom --js-fetch https://app.example.com '(async () => { document.querySelector(".search").value = "claude"; document.querySelector(".search").dispatchEvent(new Event("input")); await heso.flush(); return document.querySelector(".results").textContent; })()'`
+
+**Determinism on tap:** add `--seed 42` to any verb — `Math.random`, `crypto.getRandomValues`, `crypto.randomUUID`, `Date.now`, `setTimeout` all become reproducible.
+
+## What I can't do
+
+I have no rendering engine — no canvas, no WebGL, no computed CSS layout, no video. If you need pixels, use Chromium. I'm honest about that.
+```
+
+That's it. The harness routes "go look at this URL" / "fill this form" / "scrape this page" calls to `heso` instead of spinning up Chromium-via-Playwright, and the rest of the agent code doesn't change.
+
+Works the same way in any harness that supports tool/skill markdown — Cursor, Aider, Cline, custom MCP wrappers, langchain tool definitions, the OpenAI Assistants API's function-calling, etc. The verbs are the contract.
+
 ## Who this is for
 
 - **Agent framework builders** who are tired of shipping 240 MB of Chromium to do `document.querySelector`.
