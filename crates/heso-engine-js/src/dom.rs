@@ -78,6 +78,7 @@ use rquickjs::{
     prelude::{Opt, This},
     Class, Ctx, Function, JsLifetime, Object, Value,
 };
+use url::Url;
 
 use crate::events::{
     self, add_listener_to_map, dispatch_with_node_path, parse_listener_options,
@@ -337,6 +338,140 @@ fn document_listener_map_opt<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<Obj
         return Ok(None);
     };
     registry.get::<_, Option<Object<'js>>>("document")
+}
+
+/// Read `globalThis.location.href` and parse it as a [`Url`]. Returns
+/// `None` when `location` is missing, its `href` field is not a
+/// string, or the value isn't an absolute URL (e.g. `"about:blank"`
+/// parses fine; an empty string does not).
+///
+/// Used by the [`HTMLHyperlinkElementUtils`] mixin on
+/// [`Element`] (`href`, `protocol`, `host`, `hostname`, `port`,
+/// `pathname`, `search`, `hash`, `origin`, `username`, `password` on
+/// `<a>` / `<area>`) to resolve the element's `href` content attribute
+/// against the document base URL per WHATWG HTML §4.6.6.
+///
+/// The base URL "lives" on `globalThis.location.href` rather than on
+/// the [`Document`] struct because the engine already routes the
+/// page URL through `install_location` on every navigation — see
+/// [`crate::engine::install_location`]. Reading from `location` keeps
+/// us coherent with `history.pushState` / `history.replaceState`
+/// without threading an extra base-URL field through every Element.
+///
+/// [`HTMLHyperlinkElementUtils`]: https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinkelementutils
+fn document_base_url<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Option<Url>> {
+    let globals = ctx.globals();
+    let location: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("location")?;
+    let Some(location) = location else {
+        return Ok(None);
+    };
+    let href: Option<String> = location.get::<_, Option<String>>("href")?;
+    let Some(href) = href else {
+        return Ok(None);
+    };
+    Ok(Url::parse(&href).ok())
+}
+
+/// Resolve an anchor / area element's `href` content attribute
+/// against the document's base URL. Returns:
+///
+/// - `Ok(None)` when the element has no `href` attribute. Per spec
+///   this maps to `""` from the `href` getter and the empty-string
+///   defaults for every decomposition property.
+/// - `Ok(Some(url))` when the `href` attribute parsed successfully
+///   (either as an absolute URL, or relative to the document base).
+/// - `Err(raw)` when the attribute is present but `url::Url::parse`
+///   plus `base.join` both rejected it. Per WHATWG HTML §4.6.6 the
+///   `href` getter falls back to returning the raw attribute text in
+///   this case; decomposition properties return `""`.
+///
+/// `node` is borrowed for the read; we resolve once per IDL property
+/// access. `url::Url::parse` is sub-microsecond, and matching the
+/// "lazy reinitialize" model the spec describes avoids us having to
+/// invalidate a cached `Url` on every `setAttribute('href', …)`.
+fn resolve_anchor_url<'js>(
+    ctx: &Ctx<'js>,
+    node: &NodeRef<'_>,
+) -> rquickjs::Result<Result<Option<Url>, String>> {
+    let Some(raw) = node.attr("href") else {
+        return Ok(Ok(None));
+    };
+    let raw = raw.to_string();
+    // Try as absolute first — `Url::parse` handles `javascript:`,
+    // `mailto:`, `data:` and anything else with a scheme without
+    // needing a base. Only fall through to `base.join` for relative
+    // refs, so we match WHATWG behavior for "URLs with non-relative
+    // flag set" (mycustomprotocol:abc → protocol = "mycustomprotocol:").
+    if let Ok(u) = Url::parse(&raw) {
+        return Ok(Ok(Some(u)));
+    }
+    // Relative — try resolving against the document base URL.
+    if let Some(base) = document_base_url(ctx)? {
+        if let Ok(u) = base.join(&raw) {
+            return Ok(Ok(Some(u)));
+        }
+    }
+    Ok(Err(raw))
+}
+
+/// True iff `name` is an element tag that the WHATWG
+/// `HTMLHyperlinkElementUtils` mixin applies to (`<a>` with an `href`
+/// attribute and `<area>` with an `href` attribute, per HTML §4.6.6).
+/// The `href` content attribute itself is checked elsewhere; this
+/// gate only blocks the IDL properties on, say, `<link>` or `<base>`
+/// (which reflect `href` as a plain string attribute, not the
+/// decomposition mixin).
+fn is_hyperlink_tag(name: &str) -> bool {
+    name.eq_ignore_ascii_case("a") || name.eq_ignore_ascii_case("area")
+}
+
+/// Higher-level wrapper used by every `HTMLHyperlinkElementUtils`
+/// getter on [`Element`]. Returns `Some(url)` when the element is an
+/// `<a>` or `<area>` with a successfully-resolved `href`, and `None`
+/// otherwise (non-hyperlink tag, missing attribute, or parse failure).
+///
+/// Decomposition getters (`protocol`, `host`, `pathname`, etc.) all
+/// return `""` on `None`. The `href` getter is the one exception — it
+/// surfaces the raw attribute on parse failure, so it bypasses this
+/// helper and calls [`resolve_anchor_url`] directly.
+fn anchor_url<'js>(
+    this: &This<Class<'js, Element>>,
+    ctx: &Ctx<'js>,
+) -> rquickjs::Result<Option<Url>> {
+    let (doc, node_id) = {
+        let borrowed = this.0.borrow();
+        (borrowed.doc.clone(), borrowed.node_id)
+    };
+    let Some(node) = doc.tree.get(&node_id) else {
+        return Ok(None);
+    };
+    let is_hyperlink = node
+        .node_name()
+        .map(|n| is_hyperlink_tag(n.as_ref()))
+        .unwrap_or(false);
+    if !is_hyperlink {
+        return Ok(None);
+    }
+    match resolve_anchor_url(ctx, &node)? {
+        Ok(opt) => Ok(opt),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Persist the (possibly-mutated) parsed URL back into the element's
+/// `href` content attribute as the serialized absolute URL. Used by
+/// every `HTMLHyperlinkElementUtils` setter (`protocol`, `host`,
+/// `pathname`, `search`, …) so a read-then-write round-trip via
+/// `anchor.protocol = "https"` is observable through both
+/// `anchor.href` and `anchor.getAttribute('href')`.
+fn write_anchor_href<'js>(this: &This<Class<'js, Element>>, url: &Url) {
+    let (doc, node_id) = {
+        let borrowed = this.0.borrow();
+        (borrowed.doc.clone(), borrowed.node_id)
+    };
+    if let Some(node) = doc.tree.get(&node_id) {
+        node.set_attr("href", url.as_str());
+    }
 }
 
 /// The `document` global.
@@ -1912,6 +2047,345 @@ impl Element {
         if let Some(n) = self.node_ref() {
             n.set_attr("placeholder", &value.0);
         }
+    }
+
+    // ===== HTMLHyperlinkElementUtils mixin (`<a>` + `<area>`) ================
+    //
+    // WHATWG HTML §4.6.6 — `href`, `protocol`, `host`, `hostname`,
+    // `port`, `pathname`, `search`, `hash`, `origin`, `username`,
+    // `password`. The getter on each property re-resolves the
+    // element's `href` content attribute against `globalThis.location`
+    // on every read (see [`resolve_anchor_url`]) so navigation via
+    // `history.pushState` / `set_base_url` is reflected without an
+    // explicit invalidation step.
+    //
+    // The mixin only applies to `<a>` and `<area>` per the spec; on
+    // any other tag every property returns `""`. This matches the
+    // existing per-tag-specific IDL gating we already do for
+    // `<input>` (`value`, `checked`) — Element is one shared Rust
+    // type and the tag check sorts out which behaviors apply.
+    //
+    // Bug-of-record: prior to this getter, `anchor.href` returned
+    // `undefined`, forcing every Playwright migration to fall back to
+    // `anchor.getAttribute('href')` (which, unlike `.href`, does NOT
+    // resolve relative URLs). See `AGENT_FINDINGS.md` (commit
+    // `2cebf12`) for the original bug report.
+    //
+    // Spec: <https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinkelementutils>.
+
+    /// `anchor.href` IDL getter per WHATWG HTML §4.6.6.
+    ///
+    /// Algorithm:
+    /// 1. If this is not an `<a>` or `<area>`, return `""`.
+    /// 2. If there's no `href` content attribute, return `""`.
+    /// 3. Otherwise, "reinitialize url": parse the attribute against
+    ///    `globalThis.location.href`. Return the serialized absolute
+    ///    URL.
+    /// 4. If parsing fails, fall back to the raw attribute value (the
+    ///    spec's behavior when the URL record is unset).
+    ///
+    /// **The reason this method exists:** the agent-driven HN
+    /// extraction test (May 2026) discovered `a.href` returned a
+    /// falsy value where it should have returned the resolved URL,
+    /// breaking every Playwright snippet that assumes `a.href` is the
+    /// canonical absolute string. `getAttribute('href')` was the
+    /// workaround; the real fix is here.
+    #[qjs(get)]
+    fn href<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        let (doc, node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        let Some(node) = doc.tree.get(&node_id) else {
+            return Ok(String::new());
+        };
+        if !node
+            .node_name()
+            .map(|n| is_hyperlink_tag(n.as_ref()))
+            .unwrap_or(false)
+        {
+            return Ok(String::new());
+        }
+        match resolve_anchor_url(&ctx, &node)? {
+            Ok(Some(u)) => Ok(u.as_str().to_owned()),
+            // Spec: when the URL record fails to parse, the IDL
+            // getter returns the raw attribute value as-is.
+            Err(raw) => Ok(raw),
+            // No `href` content attribute — empty string per spec.
+            Ok(None) => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.href = "…"` IDL setter — writes the `href` content
+    /// attribute verbatim. Per spec the setter is "set the `href`
+    /// content attribute to the given value"; URL re-parse happens
+    /// lazily on the next getter call.
+    #[qjs(set, rename = "href")]
+    fn set_href(&self, value: rquickjs::Coerced<String>) {
+        if let Some(n) = self.node_ref() {
+            n.set_attr("href", &value.0);
+        }
+    }
+
+    /// `anchor.protocol` — `scheme + ":"` of the resolved URL.
+    /// Returns `""` on non-hyperlink tags, missing href, or parse
+    /// failure.
+    #[qjs(get)]
+    fn protocol<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(format!("{}:", u.scheme())),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.protocol = "https"` setter. Tolerates a trailing `":"`.
+    /// Silently no-ops on illegal transitions (e.g. `http` → `mailto`)
+    /// per the WHATWG "any setter that would produce an invalid URL
+    /// leaves the URL unchanged" rule.
+    ///
+    /// Mutations write back into the `href` content attribute as the
+    /// serialized absolute URL — that's the storage canonical per
+    /// spec.
+    #[qjs(set, rename = "protocol")]
+    fn set_protocol<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            let trimmed = value.0.trim_end_matches(':');
+            if u.set_scheme(trimmed).is_ok() {
+                write_anchor_href(&this, &u);
+            }
+        }
+        Ok(())
+    }
+
+    /// `anchor.host` — `hostname[:port]` of the resolved URL.
+    #[qjs(get)]
+    fn host<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        let Some(u) = anchor_url(&this, &ctx)? else {
+            return Ok(String::new());
+        };
+        Ok(match (u.host_str(), u.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_owned(),
+            _ => String::new(),
+        })
+    }
+
+    /// `anchor.host = "example.com:8080"` setter.
+    #[qjs(set, rename = "host")]
+    fn set_host<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            if u.set_host(Some(&value.0)).is_ok() {
+                write_anchor_href(&this, &u);
+            }
+        }
+        Ok(())
+    }
+
+    /// `anchor.hostname` — host without port.
+    #[qjs(get)]
+    fn hostname<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.host_str().unwrap_or("").to_owned()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.hostname = "…"` setter.
+    #[qjs(set, rename = "hostname")]
+    fn set_hostname<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            if u.set_host(Some(&value.0)).is_ok() {
+                write_anchor_href(&this, &u);
+            }
+        }
+        Ok(())
+    }
+
+    /// `anchor.port` — empty string when no port is set, otherwise the
+    /// port as a decimal string.
+    #[qjs(get)]
+    fn port<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.port().map(|p| p.to_string()).unwrap_or_default()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.port = "8080"` setter. Empty string clears the port.
+    #[qjs(set, rename = "port")]
+    fn set_port<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            let port = if value.0.is_empty() {
+                None
+            } else {
+                value.0.parse::<u16>().ok()
+            };
+            if u.set_port(port).is_ok() {
+                write_anchor_href(&this, &u);
+            }
+        }
+        Ok(())
+    }
+
+    /// `anchor.pathname` — path portion of the resolved URL, starting
+    /// with `/` for hierarchical URLs. Empty string on parse failure.
+    #[qjs(get)]
+    fn pathname<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.path().to_owned()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.pathname = "/foo"` setter.
+    #[qjs(set, rename = "pathname")]
+    fn set_pathname<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            u.set_path(&value.0);
+            write_anchor_href(&this, &u);
+        }
+        Ok(())
+    }
+
+    /// `anchor.search` — query portion with leading `?`. Empty when no
+    /// query.
+    #[qjs(get)]
+    fn search<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.query().map(|q| format!("?{q}")).unwrap_or_default()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.search = "?a=1"` setter. Tolerates a leading `?`.
+    #[qjs(set, rename = "search")]
+    fn set_search<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            let v = value.0.strip_prefix('?').unwrap_or(&value.0);
+            if v.is_empty() {
+                u.set_query(None);
+            } else {
+                u.set_query(Some(v));
+            }
+            write_anchor_href(&this, &u);
+        }
+        Ok(())
+    }
+
+    /// `anchor.hash` — fragment portion with leading `#`. Empty when
+    /// no fragment.
+    #[qjs(get)]
+    fn hash<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.fragment().map(|f| format!("#{f}")).unwrap_or_default()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.hash = "#frag"` setter. Tolerates a leading `#`.
+    #[qjs(set, rename = "hash")]
+    fn set_hash<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            let v = value.0.strip_prefix('#').unwrap_or(&value.0);
+            if v.is_empty() {
+                u.set_fragment(None);
+            } else {
+                u.set_fragment(Some(v));
+            }
+            write_anchor_href(&this, &u);
+        }
+        Ok(())
+    }
+
+    /// `anchor.origin` — `scheme://host[:port]` for hierarchical
+    /// schemes, `"null"` otherwise. Read-only per spec.
+    #[qjs(get)]
+    fn origin<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.origin().ascii_serialization()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.username` — percent-encoded username, or empty.
+    #[qjs(get)]
+    fn username<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.username().to_owned()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.username = "…"` setter.
+    #[qjs(set, rename = "username")]
+    fn set_username<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            if u.set_username(&value.0).is_ok() {
+                write_anchor_href(&this, &u);
+            }
+        }
+        Ok(())
+    }
+
+    /// `anchor.password` — percent-encoded password, or empty.
+    #[qjs(get)]
+    fn password<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        match anchor_url(&this, &ctx)? {
+            Some(u) => Ok(u.password().unwrap_or("").to_owned()),
+            None => Ok(String::new()),
+        }
+    }
+
+    /// `anchor.password = "…"` setter.
+    #[qjs(set, rename = "password")]
+    fn set_password<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        if let Some(mut u) = anchor_url(&this, &ctx)? {
+            let pw = if value.0.is_empty() {
+                None
+            } else {
+                Some(value.0.as_str())
+            };
+            if u.set_password(pw).is_ok() {
+                write_anchor_href(&this, &u);
+            }
+        }
+        Ok(())
     }
 
     /// `element.addEventListener(type, listener, options?)` — register
