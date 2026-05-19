@@ -226,6 +226,45 @@ const TARGETS: &[Target] = &[
             needle: "serde",
         },
     },
+    // TodoMVC framework targets — JS-rendered SPAs that ship a static
+    // <title>TodoMVC: <Framework></title> in the HTML, so the probe is
+    // robust whether or not JS hydration completes. `js_fetch: true` lets
+    // the in-JS `fetch()` global resolve external <script> tags so the
+    // framework code actually executes.
+    //
+    // TODO: follow-up — once we trust JS hydration end-to-end, add a
+    // second probe per framework that asserts on the hydrated `.new-todo`
+    // input or the framework's mounted DOM nodes.
+    Target {
+        name: "TodoMVC Preact",
+        category: "spa",
+        url: "https://todomvc.com/examples/preact/dist/",
+        js_fetch: true,
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "TodoMVC",
+        },
+    },
+    Target {
+        name: "TodoMVC React",
+        category: "spa",
+        url: "https://todomvc.com/examples/react/dist/",
+        js_fetch: true,
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "TodoMVC",
+        },
+    },
+    Target {
+        name: "TodoMVC Vue",
+        category: "spa",
+        url: "https://todomvc.com/examples/vue/dist/",
+        js_fetch: true,
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "TodoMVC",
+        },
+    },
 ];
 
 // ============================================================================
