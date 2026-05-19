@@ -95,6 +95,38 @@ use crate::events::{
 /// state hung off it lives as long as the session does.
 const PROP_NODE_LISTENERS: &str = "__nodeListeners";
 
+/// Name of the hidden registry on `globalThis.document` whose value is
+/// an object mapping per-element IDL state, keyed by a stable
+/// stringification of [`dom_query::NodeId`]. Holds the "dirty value
+/// flag" + "API value" pair that separates `HTMLInputElement.value`
+/// (the typed-in text) from the `value` content attribute (=
+/// `defaultValue`), plus the analogous bits for `checked`.
+///
+/// Why a document-side registry instead of own-props on the Element
+/// JS instance: every `document.querySelector(...)` produces a **new**
+/// Element wrapper, so own-props on the wrapper don't survive across
+/// `el = document.querySelector(...)` calls. The listener registry
+/// solves the same problem the same way — see [`PROP_NODE_LISTENERS`].
+///
+/// IDL state for input form controls per the HTML spec:
+/// <https://html.spec.whatwg.org/multipage/input.html#the-input-element>.
+const PROP_NODE_IDL_STATE: &str = "__nodeIdlState";
+
+/// Key under [`PROP_NODE_IDL_STATE`]`[node_key]` holding the IDL
+/// value (string). Present only after the JS-side setter has fired.
+const IDL_VALUE: &str = "value";
+/// Key holding the "dirty value flag" — `true` once `.value` has been
+/// set programmatically. The getter falls back to the `value` content
+/// attribute (= `defaultValue`) until this flips to `true`.
+const IDL_VALUE_DIRTY: &str = "valueDirty";
+/// Key holding the IDL `checked` flag (bool). Present only after the
+/// JS-side setter has fired.
+const IDL_CHECKED: &str = "checked";
+/// Key holding the "dirty checkedness flag" — `true` once `.checked`
+/// has been set programmatically. The getter falls back to
+/// `hasAttribute('checked')` (= `defaultChecked`) until this flips.
+const IDL_CHECKED_DIRTY: &str = "checkedDirty";
+
 /// Stringify a [`NodeId`] for use as a JS-object key in the
 /// node-keyed listener registry. Debug-formatting is fine here —
 /// `NodeId` derives `Debug`, the format is stable for the lifetime
@@ -149,6 +181,83 @@ pub(crate) fn clear_listeners_for_nodes<'js>(
     };
     let registry: Option<Object<'js>> =
         document.get::<_, Option<Object<'js>>>(PROP_NODE_LISTENERS)?;
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    for id in ids {
+        let key = node_key(*id);
+        let _ = registry.remove(key.as_str());
+    }
+    Ok(())
+}
+
+/// Look up (or lazily create) the per-element IDL state map for
+/// `node_id` on the long-lived `globalThis.document.__nodeIdlState`
+/// registry. Returns the inner map object whose keys are
+/// [`IDL_VALUE`] / [`IDL_VALUE_DIRTY`] / [`IDL_CHECKED`] /
+/// [`IDL_CHECKED_DIRTY`].
+fn element_idl_state<'js>(
+    ctx: &Ctx<'js>,
+    node_id: NodeId,
+) -> rquickjs::Result<Object<'js>> {
+    let globals = ctx.globals();
+    let document: Object<'js> = globals.get("document")?;
+    let registry: Object<'js> = match document.get::<_, Option<Object<'js>>>(PROP_NODE_IDL_STATE)? {
+        Some(r) => r,
+        None => {
+            let r = Object::new(ctx.clone())?;
+            document.set(PROP_NODE_IDL_STATE, r.clone())?;
+            r
+        }
+    };
+    let key = node_key(node_id);
+    match registry.get::<_, Option<Object<'js>>>(key.as_str())? {
+        Some(m) => Ok(m),
+        None => {
+            let m = Object::new(ctx.clone())?;
+            registry.set(key.as_str(), m.clone())?;
+            Ok(m)
+        }
+    }
+}
+
+/// Read-only variant of [`element_idl_state`] — returns `None` if no
+/// IDL writes have happened for this node yet. Used by getters so a
+/// read of `.value` / `.checked` on a never-mutated input doesn't
+/// litter the registry with empty maps.
+fn element_idl_state_opt<'js>(
+    ctx: &Ctx<'js>,
+    node_id: NodeId,
+) -> rquickjs::Result<Option<Object<'js>>> {
+    let globals = ctx.globals();
+    let document: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("document")?;
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let registry: Option<Object<'js>> =
+        document.get::<_, Option<Object<'js>>>(PROP_NODE_IDL_STATE)?;
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let key = node_key(node_id);
+    registry.get::<_, Option<Object<'js>>>(key.as_str())
+}
+
+/// Delete the IDL-state entries for every NodeId in `ids` from the
+/// document-side registry. Mirrors [`clear_listeners_for_nodes`] so a
+/// detached subtree doesn't leave stale IDL state behind (and so a
+/// recycled NodeId can't pick up the previous occupant's `value`).
+pub(crate) fn clear_idl_state_for_nodes<'js>(
+    ctx: &Ctx<'js>,
+    ids: &[NodeId],
+) -> rquickjs::Result<()> {
+    let globals = ctx.globals();
+    let document: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("document")?;
+    let Some(document) = document else {
+        return Ok(());
+    };
+    let registry: Option<Object<'js>> =
+        document.get::<_, Option<Object<'js>>>(PROP_NODE_IDL_STATE)?;
     let Some(registry) = registry else {
         return Ok(());
     };
@@ -884,6 +993,7 @@ impl Element {
         // cheap and protects against that becoming load-bearing.)
         if !to_clear.is_empty() {
             clear_listeners_for_nodes(&ctx, &to_clear)?;
+            clear_idl_state_for_nodes(&ctx, &to_clear)?;
         }
         Ok(child)
     }
@@ -901,31 +1011,288 @@ impl Element {
         DomTokenList::new(self.clone())
     }
 
-    /// `element.value` — read the current `value` attribute of a form
-    /// control. Mirrors the standard DOM property for `<input>` /
-    /// `<textarea>` / `<select>`. Returns the empty string when the
-    /// attribute is absent.
+    /// `element.value` — IDL value getter for form controls per the
+    /// HTML spec. Returns the *current* value (the typed-in text once
+    /// `.value = ...` has fired), falling back to the `value` content
+    /// attribute (= [`Self::default_value`]) when the IDL setter has
+    /// not yet run on this node.
     ///
-    /// Phase 1B simplification: stored entirely as an attribute (so
-    /// `getAttribute('value')` and `.value` agree). Real browsers
-    /// distinguish the *content* attribute from the *IDL* property
-    /// (the typed-in text), but until interactive input + reset wiring
-    /// matters we collapse the two.
+    /// The split matters for every controlled-input library: React
+    /// Hook Form, Formik, and React's own controlled-input pattern
+    /// detect dirty state by comparing `.value` against
+    /// `getAttribute('value')` / `.defaultValue`. Collapsing the two
+    /// (the Phase-1B shortcut) made every controlled `<input>` in
+    /// React / Vue / Solid look pristine after a write.
+    ///
+    /// IDL state lives in the document-side
+    /// [`PROP_NODE_IDL_STATE`] registry, keyed by [`NodeId`]; see the
+    /// module-level helpers for the storage shape.
+    ///
+    /// Spec: <https://html.spec.whatwg.org/multipage/input.html#dom-input-value>.
     #[qjs(get)]
-    fn value(&self) -> String {
+    fn value<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        let (node_id, doc) = {
+            let borrowed = this.0.borrow();
+            (borrowed.node_id, borrowed.doc.clone())
+        };
+        // If the IDL setter has fired on this node, prefer the IDL
+        // value. Otherwise fall back to the content attribute.
+        if let Some(state) = element_idl_state_opt(&ctx, node_id)? {
+            let dirty: bool = state.get::<_, Option<bool>>(IDL_VALUE_DIRTY)?.unwrap_or(false);
+            if dirty {
+                let v: Option<String> = state.get::<_, Option<String>>(IDL_VALUE)?;
+                return Ok(v.unwrap_or_default());
+            }
+        }
+        Ok(doc
+            .tree
+            .get(&node_id)
+            .and_then(|n| n.attr("value"))
+            .map(|t| t.to_string())
+            .unwrap_or_default())
+    }
+
+    /// `element.value = "..."` — IDL value setter. Stores the new
+    /// value in the per-node IDL state map and marks the dirty bit;
+    /// **does not** touch the `value` content attribute (= the spec's
+    /// `defaultValue`), so `getAttribute('value')` keeps returning the
+    /// original HTML.
+    ///
+    /// Does not itself fire `input` / `change` — those are dispatched
+    /// by the caller (e.g. [`crate::JsEngine::set_input_value`]).
+    #[qjs(set, rename = "value")]
+    fn set_value<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<String>,
+    ) -> rquickjs::Result<()> {
+        let node_id = this.0.borrow().node_id;
+        let state = element_idl_state(&ctx, node_id)?;
+        state.set(IDL_VALUE, value.0)?;
+        state.set(IDL_VALUE_DIRTY, true)?;
+        Ok(())
+    }
+
+    /// `element.defaultValue` — the `value` content attribute,
+    /// reflecting the HTML-authored default. Empty string when the
+    /// attribute is absent. The IDL [`Self::value`] property may
+    /// diverge after a JS-side write; this stays pinned to the
+    /// attribute. Spec:
+    /// <https://html.spec.whatwg.org/multipage/input.html#dom-input-defaultvalue>.
+    #[qjs(get, rename = "defaultValue")]
+    fn default_value(&self) -> String {
         self.node_ref()
             .and_then(|n| n.attr("value"))
             .map(|t| t.to_string())
             .unwrap_or_default()
     }
 
-    /// `element.value = "..."` — set the `value` attribute. Does not
-    /// itself fire `input` / `change` — those are dispatched by the
-    /// caller (e.g. [`crate::JsEngine::set_input_value`]).
-    #[qjs(set, rename = "value")]
-    fn set_value(&self, value: String) {
+    /// `element.defaultValue = "..."` — write the `value` content
+    /// attribute. Per spec, this is the IDL reflection of the
+    /// attribute, so assigning here calls `setAttribute('value', v)`.
+    #[qjs(set, rename = "defaultValue")]
+    fn set_default_value(&self, value: rquickjs::Coerced<String>) {
         if let Some(n) = self.node_ref() {
-            n.set_attr("value", &value);
+            n.set_attr("value", &value.0);
+        }
+    }
+
+    /// `element.checked` — IDL checkedness getter. Mirrors `.value`:
+    /// returns the in-memory bit once the JS setter has fired, falls
+    /// back to `hasAttribute('checked')` (= [`Self::default_checked`])
+    /// until then.
+    ///
+    /// Spec:
+    /// <https://html.spec.whatwg.org/multipage/input.html#dom-input-checked>.
+    #[qjs(get)]
+    fn checked<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<bool> {
+        let (node_id, doc) = {
+            let borrowed = this.0.borrow();
+            (borrowed.node_id, borrowed.doc.clone())
+        };
+        if let Some(state) = element_idl_state_opt(&ctx, node_id)? {
+            let dirty: bool = state
+                .get::<_, Option<bool>>(IDL_CHECKED_DIRTY)?
+                .unwrap_or(false);
+            if dirty {
+                let v: Option<bool> = state.get::<_, Option<bool>>(IDL_CHECKED)?;
+                return Ok(v.unwrap_or(false));
+            }
+        }
+        Ok(doc
+            .tree
+            .get(&node_id)
+            .map(|n| n.has_attr("checked"))
+            .unwrap_or(false))
+    }
+
+    /// `element.checked = bool` — IDL checkedness setter. Stores the
+    /// new bit and marks the dirty flag; does not touch the `checked`
+    /// content attribute (= `defaultChecked`).
+    #[qjs(set, rename = "checked")]
+    fn set_checked<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        value: rquickjs::Coerced<bool>,
+    ) -> rquickjs::Result<()> {
+        let node_id = this.0.borrow().node_id;
+        let state = element_idl_state(&ctx, node_id)?;
+        state.set(IDL_CHECKED, value.0)?;
+        state.set(IDL_CHECKED_DIRTY, true)?;
+        Ok(())
+    }
+
+    /// `element.defaultChecked` — reflects `hasAttribute('checked')`.
+    /// Pinned to the parsed HTML even after the IDL setter has
+    /// diverged.
+    #[qjs(get, rename = "defaultChecked")]
+    fn default_checked(&self) -> bool {
+        self.node_ref()
+            .map(|n| n.has_attr("checked"))
+            .unwrap_or(false)
+    }
+
+    /// `element.defaultChecked = bool` — reflects writing the
+    /// `checked` content attribute. `true` → `setAttribute('checked',
+    /// '')`; `false` → `removeAttribute('checked')`. Per spec the
+    /// attribute's *presence* (regardless of value) means checked.
+    #[qjs(set, rename = "defaultChecked")]
+    fn set_default_checked(&self, value: rquickjs::Coerced<bool>) {
+        if let Some(n) = self.node_ref() {
+            if value.0 {
+                n.set_attr("checked", "");
+            } else {
+                n.remove_attr("checked");
+            }
+        }
+    }
+
+    /// `element.disabled` — IDL boolean *reflected* attribute. The
+    /// HTML spec says the IDL property is true iff the content
+    /// attribute is present, regardless of the attribute's value. No
+    /// IDL/content split here (unlike `.value` / `.checked`), so the
+    /// getter just probes `hasAttribute`.
+    #[qjs(get)]
+    fn disabled(&self) -> bool {
+        self.node_ref()
+            .map(|n| n.has_attr("disabled"))
+            .unwrap_or(false)
+    }
+
+    /// `element.disabled = bool` — toggle the `disabled` content
+    /// attribute. `true` → `setAttribute('disabled', '')`; `false` →
+    /// `removeAttribute('disabled')`.
+    #[qjs(set, rename = "disabled")]
+    fn set_disabled(&self, value: rquickjs::Coerced<bool>) {
+        if let Some(n) = self.node_ref() {
+            if value.0 {
+                n.set_attr("disabled", "");
+            } else {
+                n.remove_attr("disabled");
+            }
+        }
+    }
+
+    /// `element.readOnly` — IDL boolean reflected attribute for
+    /// `readonly`. JavaScript name is `readOnly` (camelCase); HTML
+    /// attribute is `readonly`.
+    #[qjs(get, rename = "readOnly")]
+    fn read_only(&self) -> bool {
+        self.node_ref()
+            .map(|n| n.has_attr("readonly"))
+            .unwrap_or(false)
+    }
+
+    /// `element.readOnly = bool` — toggle the `readonly` content
+    /// attribute.
+    #[qjs(set, rename = "readOnly")]
+    fn set_read_only(&self, value: rquickjs::Coerced<bool>) {
+        if let Some(n) = self.node_ref() {
+            if value.0 {
+                n.set_attr("readonly", "");
+            } else {
+                n.remove_attr("readonly");
+            }
+        }
+    }
+
+    /// `element.required` — IDL boolean reflected attribute.
+    #[qjs(get)]
+    fn required(&self) -> bool {
+        self.node_ref()
+            .map(|n| n.has_attr("required"))
+            .unwrap_or(false)
+    }
+
+    /// `element.required = bool` — toggle the `required` content
+    /// attribute.
+    #[qjs(set, rename = "required")]
+    fn set_required(&self, value: rquickjs::Coerced<bool>) {
+        if let Some(n) = self.node_ref() {
+            if value.0 {
+                n.set_attr("required", "");
+            } else {
+                n.remove_attr("required");
+            }
+        }
+    }
+
+    /// `element.type` — IDL string reflected attribute. Per spec the
+    /// default value is `"text"` when the `type` attribute is
+    /// missing on an `<input>`; non-input elements (button, link)
+    /// have their own defaults, but every framework boots on
+    /// `<input>` first, so the simple text default covers the
+    /// failure mode this fixes.
+    #[qjs(get, rename = "type")]
+    fn input_type(&self) -> String {
+        self.node_ref()
+            .and_then(|n| n.attr("type"))
+            .map(|t| t.to_string())
+            .unwrap_or_else(|| "text".to_owned())
+    }
+
+    /// `element.type = "..."` — write the `type` content attribute.
+    #[qjs(set, rename = "type")]
+    fn set_input_type(&self, value: rquickjs::Coerced<String>) {
+        if let Some(n) = self.node_ref() {
+            n.set_attr("type", &value.0);
+        }
+    }
+
+    /// `element.name` — IDL string reflected attribute. Empty string
+    /// when absent.
+    #[qjs(get)]
+    fn name(&self) -> String {
+        self.node_ref()
+            .and_then(|n| n.attr("name"))
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `element.name = "..."` — write the `name` content attribute.
+    #[qjs(set, rename = "name")]
+    fn set_name(&self, value: rquickjs::Coerced<String>) {
+        if let Some(n) = self.node_ref() {
+            n.set_attr("name", &value.0);
+        }
+    }
+
+    /// `element.placeholder` — IDL string reflected attribute. Empty
+    /// string when absent.
+    #[qjs(get)]
+    fn placeholder(&self) -> String {
+        self.node_ref()
+            .and_then(|n| n.attr("placeholder"))
+            .map(|t| t.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `element.placeholder = "..."` — write the `placeholder`
+    /// content attribute.
+    #[qjs(set, rename = "placeholder")]
+    fn set_placeholder(&self, value: rquickjs::Coerced<String>) {
+        if let Some(n) = self.node_ref() {
+            n.set_attr("placeholder", &value.0);
         }
     }
 

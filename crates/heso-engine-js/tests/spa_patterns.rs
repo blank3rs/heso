@@ -906,3 +906,60 @@ fn class_name_setter_and_classlist_stay_in_sync() {
     let out = sess.eval("document.getElementById('d').className").unwrap();
     assert_eq!(out.value, serde_json::json!("a b c"));
 }
+
+// HTMLInputElement IDL vs content attribute split
+// (React Hook Form / Formik / React controlled-input "dirty" detection)
+// =====================================================================
+
+#[test]
+fn input_value_idl_does_not_modify_value_attribute() {
+    let html = "<!doctype html><html><body><input id='i' value='initial'></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('i').value = 'typed';").unwrap();
+    let out = sess.eval("JSON.stringify({idl: document.getElementById('i').value, attr: document.getElementById('i').getAttribute('value'), def: document.getElementById('i').defaultValue})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["idl"], "typed");
+    assert_eq!(parsed["attr"], "initial");
+    assert_eq!(parsed["def"], "initial");
+}
+
+#[test]
+fn input_value_idl_falls_back_to_attribute_when_not_dirty() {
+    let html = "<!doctype html><html><body><input id='i' value='from-attr'></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("document.getElementById('i').value").unwrap();
+    assert_eq!(out.value, serde_json::json!("from-attr"));
+}
+
+#[test]
+fn input_checked_idl_separate_from_checked_attribute() {
+    let html = "<!doctype html><html><body><input id='c' type='checkbox' checked></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('c').checked = false;").unwrap();
+    let out = sess.eval("JSON.stringify({idl: document.getElementById('c').checked, def: document.getElementById('c').defaultChecked})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["idl"], false);
+    assert_eq!(parsed["def"], true);
+}
+
+#[test]
+fn input_disabled_setter_toggles_attribute_presence() {
+    let html = "<!doctype html><html><body><input id='i'></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('i').disabled = true;").unwrap();
+    let out1 = sess.eval("document.getElementById('i').hasAttribute('disabled')").unwrap();
+    assert_eq!(out1.value, serde_json::json!(true));
+    sess.eval("document.getElementById('i').disabled = false;").unwrap();
+    let out2 = sess.eval("document.getElementById('i').hasAttribute('disabled')").unwrap();
+    assert_eq!(out2.value, serde_json::json!(false));
+}
+
+#[test]
+fn input_type_defaults_to_text_and_reflects() {
+    let html = "<!doctype html><html><body><input id='a'><input id='b' type='email'></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({a: document.getElementById('a').type, b: document.getElementById('b').type})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["a"], "text");
+    assert_eq!(parsed["b"], "email");
+}
