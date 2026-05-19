@@ -1,0 +1,108 @@
+{
+  "tool": "playwright",
+  "browser": "chromium",
+  "playwright_version": "1.60.0",
+  "results": [
+    {
+      "name": "example.com",
+      "category": "smoke",
+      "url": "https://example.com",
+      "status": "ok",
+      "ms_total": 104,
+      "ms_fetch": 53,
+      "ms_eval": 8,
+      "http_status": 200,
+      "value": "Example Domain",
+      "error": null
+    },
+    {
+      "name": "news.ycombinator.com",
+      "category": "server-rendered",
+      "url": "https://news.ycombinator.com",
+      "status": "ok",
+      "ms_total": 472,
+      "ms_fetch": 441,
+      "ms_eval": 2,
+      "http_status": 200,
+      "value": "Hacker News",
+      "error": null
+    },
+    {
+      "name": "news.ycombinator.com (count)",
+      "category": "server-rendered",
+      "url": "https://news.ycombinator.com",
+      "status": "ok",
+      "ms_total": 468,
+      "ms_fetch": 432,
+      "ms_eval": 2,
+      "http_status": 200,
+      "value": "Hacker News",
+      "error": null
+    },
+    {
+      "name": "wikipedia.org",
+      "category": "server-rendered",
+      "url": "https://www.wikipedia.org/",
+      "status": "ok",
+      "ms_total": 478,
+      "ms_fetch": 449,
+      "ms_eval": 2,
+      "http_status": 200,
+      "value": "Wikipedia",
+      "error": null
+    },
+    {
+      "name": "httpbin.org/html",
+      "category": "static",
+      "url": "https://httpbin.org/html",
+      "status": "ok",
+      "ms_total": 144,
+      "ms_fetch": 105,
+      "ms_eval": 10,
+      "http_status": 200,
+      "value": "",
+      "error": null
+    },
+    {
+      "name": "developer.mozilla.org div",
+      "category": "docs",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/HTML/Element/div",
+      "status": "ok",
+      "ms_total": 450,
+      "ms_fetch": 404,
+      "ms_eval": 16,
+      "http_status": 200,
+      "value": "<div> HTML content division element - HTML | MDN",
+      "error": null
+    },
+    {
+      "name": "rust-lang.org",
+      "category": "marketing",
+      "url": "https://www.rust-lang.org/",
+      "status": "ok",
+      "ms_total": 291,
+      "ms_fetch": 248,
+      "ms_eval": 15,
+      "http_status": 200,
+      "value": "Rust Programming Language",
+      "error": null
+    },
+    {
+      "name": "docs.rs",
+      "category": "docs",
+      "url": "https://docs.rs/serde/latest/serde/",
+      "status": "ok",
+      "ms_total": 279,
+      "ms_fetch": 249,
+      "ms_eval": 2,
+      "http_status": 200,
+      "value": "serde - Rust",
+      "error": null
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 8,
+    "failed": 0
+  }
+}

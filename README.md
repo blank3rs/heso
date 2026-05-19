@@ -4,7 +4,7 @@
 
 **A browser for agents, not for humans.**
 
-One ~7.8 MB Rust binary. No Chromium. No Node. No `npm install playwright`.
+One 7.65 MB Rust binary. No Chromium. No Node. No `npm install playwright`.
 Fetches, parses, runs JS, holds a stateful page session across clicks, hands back content-hashed JSON you can sign, diff, and **replay byte-for-byte**.
 
 </div>
@@ -47,7 +47,7 @@ $ heso eval-dom https://news.ycombinator.com \
 }
 ```
 
-Five real story titles, off the live wire, fetched + parsed + JS-evaluated, in **under 400 ms**, from a **~7.8 MB single binary**.
+Five real story titles, off the live wire, fetched + parsed + JS-evaluated, in **under 400 ms**, from a **7.65 MB single binary**.
 
 No Chromium. No Node. No browser download. Just `cargo build && ./heso`.
 
@@ -55,17 +55,18 @@ No Chromium. No Node. No browser download. Just `cargo build && ./heso`.
 
 |  | heso | Playwright + Chromium |
 |---|---|---|
-| Install size | **~7.8 MB** | ~240 MB + Node + browser bundle |
-| Cold start | **40 ms** | 1–2 seconds |
-| Idle RAM | tiny | 100+ MB per browser |
+| Install size | **7.65 MB** (measured) | ~240 MB + Node + browser bundle |
+| Cold start (`--help`) | **15 ms** (measured) | 1–2 seconds |
+| Per-target wall-clock (mean of 8 real URLs) | **125 ms** (measured) | **336 ms** (measured) |
+| Peak RSS after extracting from 14 sites | **17 MB** (measured) | 100+ MB per browser |
 | Deploy unit | one static binary | runtime + browser + driver |
 | Reproducibility | content-hashed, seeded RNG, virtual clock | non-deterministic |
 | Audit trail | every fetch → signable receipt | nothing |
 | Rendering pixels | ✗ — that's the point | ✓ |
 
-See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the live compatibility scorecard across real-world sites — currently **14 / 14 passing** (example.com, HN, Wikipedia, httpbin, MDN, rust-lang.org, docs.rs, TodoMVC Preact/React/Vue, github.com, stripe.com, vercel.com). Reproduce with `cargo run -p heso-compat-suite -- --markdown COMPATIBILITY.md`. Eval cost is **1–95 ms** per page (sub-3 ms for static HTML extraction, 80–95 ms for JS-rendered SPAs that need framework script execution). Peak RSS climbs from **13 MB → 17 MB** across all 14 targets — heso holds onto a tiny working set even after running through that whole battery.
+**Measured head-to-head: heso is 2.69× faster** than Playwright on the same 8 URLs (same machine, same network, same probe). Biggest wins on docs sites — MDN 7.63×, docs.rs 5.07× — where Chromium's startup cost dominates total wall-clock. Reproduce in [`bench/playwright/RESULTS.md`](bench/playwright/RESULTS.md).
 
-Side-by-side comparison vs Playwright on the same URLs is in [`bench/playwright/`](bench/playwright/) — Node + Playwright sidecar that emits column-compatible JSON.
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the live compatibility scorecard — currently **14 / 14 passing** (example.com, HN, Wikipedia, httpbin, MDN, rust-lang.org, docs.rs, TodoMVC Preact/React/Vue, github.com, stripe.com, vercel.com). Reproduce with `cargo run -p heso-compat-suite -- --markdown COMPATIBILITY.md`. Eval cost is **1–95 ms** per page (sub-3 ms for static HTML extraction, 80–95 ms for JS-rendered SPAs that need framework script execution). Peak RSS climbs from **13 MB → 17 MB** across all 14 targets — heso holds onto a tiny working set even after running through that whole battery.
 
 If your agent needs to *look* at a canvas, a video, or a CSS animation: use Chromium. heso is honest about that.
 
