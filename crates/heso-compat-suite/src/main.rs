@@ -265,6 +265,54 @@ const TARGETS: &[Target] = &[
             needle: "TodoMVC",
         },
     },
+    // ---- Heavier SPA / marketing targets ----
+    //
+    // These three sites ship a lot of client-side JS but each also
+    // server-renders a useful `<title>`. We probe the title because it
+    // is the cheapest stable signal: no hydration required, no JS
+    // execution needed against the SPA bundle itself. Once we wire
+    // `js_fetch: true` and a proper script pump for these, we can add
+    // post-hydration probes (e.g. a known link or heading rendered by
+    // React/Next).
+    Target {
+        name: "github.com (microsoft/playwright)",
+        category: "spa",
+        url: "https://github.com/microsoft/playwright",
+        js_fetch: false,
+        // Public repo page; title is a stable
+        // `GitHub - microsoft/playwright: ...`. The slug is a
+        // tighter needle than the brand alone — guards against the
+        // page accidentally redirecting to a generic login wall.
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "microsoft/playwright",
+        },
+    },
+    Target {
+        name: "stripe.com/pricing",
+        category: "spa",
+        url: "https://stripe.com/pricing",
+        js_fetch: false,
+        // Stripe's pricing page title is literally `Pricing & Fees`
+        // (the brand is *not* in the `<title>`). Needle has to be
+        // `Pricing` — confirmed by curl against the live page with
+        // our default `heso/<version>` UA.
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "Pricing",
+        },
+    },
+    Target {
+        name: "vercel.com",
+        category: "spa",
+        url: "https://vercel.com",
+        js_fetch: false,
+        // Next.js marketing site; title contains the brand directly.
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "Vercel",
+        },
+    },
 ];
 
 // ============================================================================
