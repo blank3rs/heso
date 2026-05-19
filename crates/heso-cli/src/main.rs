@@ -33,11 +33,16 @@
 //!   `<@ref>`, set its `.value`, and fire both `input` and `change` events
 //!   (matches real browser typing behavior). Returns the same shape as
 //!   `click` with `op: "fill"`.
-//! - `heso submit <url> <@form-ref>` — Fetch `<url>`, find the form at
-//!   `<@form-ref>`, click its first `button[type=submit]` /
-//!   `input[type=submit]` descendant. Real `reqwest::post` of the
-//!   serialized form lands with sessions; today this drives only the JS
-//!   side of submission.
+//! - `heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]`
+//!   — Fetch `<url>`, find the form at `<@form-ref>`, optionally pre-fill
+//!   its named inputs from `--field` / `--data`, dispatch the submit
+//!   event, serialize per `enctype`, POST through the shared
+//!   `reqwest::Client`, follow redirects, and return the response
+//!   (`responseStatus`, `responseUrl`, `responseBody` ≤ 64 KB,
+//!   `responseContentType`, and `responseJson` when the server sent
+//!   `application/json`). One-shot: fetch + fill + submit + observe in
+//!   a single CLI invocation, fixing the stateless-fill gap that
+//!   `AGENT_FINDINGS_V2.md` filed.
 //! - `heso meta <url>` — Fetch + extract structured metadata (JSON-LD,
 //!   OpenGraph, Twitter cards, SEO meta, canonical, icons, lang). Returns
 //!   the [`PageMetadata`] as JSON.
@@ -127,7 +132,12 @@ fn print_banner() {
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
     println!("  heso click  <url> <@ref>      Fetch <url>, find element at <@ref> in the action graph, dispatch a click");
     println!("  heso fill   <url> <@ref> <v>  Fetch <url>, find element at <@ref>, set its .value and fire input+change");
-    println!("  heso submit <url> <@form-ref> Fetch <url>, find form at <@form-ref>, click its first submit control");
+    println!("  heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]");
+    println!("                                Fetch <url>, locate form at <@form-ref>, optionally pre-fill named inputs,");
+    println!("                                dispatch submit, POST per enctype, return response body + status + parsed JSON.");
+    println!("                                --field name=value     repeatable; matched by input `name` attribute.");
+    println!("                                --data '{{\"k\":\"v\"}}'    JSON dict alternative; --field wins on the same name.");
+    println!("                                File inputs are skipped (PR-X4 will ship FormData/Blob/File globals).");
     println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
     println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
     println!("  heso eval-js [--seed N] <js>  [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
@@ -1277,18 +1287,43 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
     .await
 }
 
-/// `heso submit <url> <@form-ref>` — fetch <url>, locate the form at
-/// `@form-ref`, and submit it per [WHATWG HTML §4.10.22] — dispatch
-/// the `submit` event, serialize the entry list per `enctype`, issue a
-/// real HTTP request through the engine's shared `reqwest::Client`,
-/// follow redirects, and report the post-redirect URL + status.
+/// `heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]`
+/// — fetch <url>, locate the form at `@form-ref`, optionally pre-fill
+/// its named inputs with the supplied values, and submit it per
+/// [WHATWG HTML §4.10.22] — dispatch the `submit` event, serialize
+/// the entry list per `enctype`, issue a real HTTP request through the
+/// engine's shared `reqwest::Client`, follow redirects, and report the
+/// post-redirect URL + status + response body.
 ///
 /// Pre-PR-1 behavior dispatched a click on the submit button without
 /// issuing any HTTP traffic — filed as the top write-side gap in
-/// `AGENT_FINDINGS.md`. PR-1 closes that gap.
+/// `AGENT_FINDINGS.md`. PR-1 closed that. PR-X1 (this revision) closes
+/// the next layer of the same gap that `AGENT_FINDINGS_V2.md` filed:
+/// in V2 every CLI invocation was a fresh process, so `heso fill`'s
+/// typed-in value never reached the next `heso submit` invocation. The
+/// `--field NAME=VALUE` / `--data JSON` flags make submit a one-shot:
+/// fetch + fill + submit + return-response in one process.
 ///
-/// Output: `{ok, op, url, ref, selector, value, console}`. `value` is
-/// the structured submission result:
+/// Flag shape:
+///
+/// - `--field name=value` — repeatable. Sets the form's input(s) with
+///   `name="name"` to `value` before dispatching the submit event.
+///   The first `=` splits name from value; the value can contain `=`
+///   characters and arbitrary unicode (the shell escapes them as
+///   usual). Inputs are matched by `name` attribute, not by `@eN` ref
+///   — that's the WHATWG "successful control" key.
+/// - `--data '{"k1":"v1","k2":"v2"}'` — JSON dict alternative when
+///   the form has many fields. Each `(k, v)` is applied the same way
+///   as a single `--field`. Values must be strings (numbers/booleans
+///   are auto-stringified for ergonomics — `{"age": 32}` works).
+/// - Both can be combined. When the same name appears in `--data` and
+///   `--field`, the explicit `--field` wins (CLI flags override JSON).
+/// - **File inputs are skipped** silently (with a `fieldsSkipped`
+///   entry in the output). Full file upload is filed for a follow-up
+///   PR that ships `FormData` / `Blob` / `File` globals.
+///
+/// Output: `{ok, op, url, ref, selector, value, console, postUrl}`.
+/// `value` is the structured submission result:
 ///
 /// - `{matched: false, submitted: false, reason: "no_form"}` —
 ///   selector didn't match.
@@ -1296,9 +1331,16 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
 ///   reason: "default_prevented"}` — a listener called
 ///   `event.preventDefault()`.
 /// - `{matched: true, submitted: true, method, enctype, action,
-///   responseStatus, responseUrl}` — the request went out, the
-///   response replaced the session document, and we landed at
-///   `responseUrl`.
+///   responseStatus, responseUrl, responseBody, responseBodyTruncated,
+///   responseContentType, responseJson?, fieldsApplied,
+///   fieldsSkipped}` — the request went out, the response replaced
+///   the session document, and we landed at `responseUrl`. The body
+///   is truncated to 64 KB (with `responseBodyTruncated: true` when
+///   so). `responseJson` is the parsed body when the server declared
+///   `Content-Type: application/json` (or a `+json` suffix); omitted
+///   otherwise. `fieldsApplied` lists names actually set;
+///   `fieldsSkipped` lists name + reason (`"no_match"` or
+///   `"file_input"`).
 /// - `{matched: true, submitted: false, reason: "http_error", error}`
 ///   — the request failed (DNS, TLS, timeout, 5xx-then-redirect-cap,
 ///   etc.). The `error` field is the underlying reqwest message.
@@ -1307,20 +1349,149 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
 /// outcome — `preventDefault` is legitimate) or succeeded; 1 on HTTP
 /// failure, 2 on usage error.
 async fn cmd_submit(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("usage: heso submit <url> <@form-ref>");
+    // Order-tolerant walk: split `--field name=value` (repeatable) and
+    // `--data <json>` flags from the two positionals `<url> <@ref>`.
+    let mut fields_cli: Vec<(String, String)> = Vec::new();
+    let mut data_json: Option<String> = None;
+    let mut positional: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--field" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--field needs a value of the form NAME=VALUE");
+                    return ExitCode::from(2);
+                };
+                match v.split_once('=') {
+                    Some((name, val)) => {
+                        if name.is_empty() {
+                            eprintln!("--field: empty name in `{v}`");
+                            return ExitCode::from(2);
+                        }
+                        fields_cli.push((name.to_owned(), val.to_owned()));
+                    }
+                    None => {
+                        eprintln!("--field: expected NAME=VALUE, got `{v}`");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            "--data" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--data needs a JSON dict value");
+                    return ExitCode::from(2);
+                };
+                data_json = Some(v.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                eprintln!(
+                    "usage: heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]"
+                );
+                return ExitCode::from(2);
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    if positional.len() < 2 {
+        eprintln!(
+            "usage: heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]"
+        );
         return ExitCode::from(2);
     }
-    cmd_submit_inner(&args[0], &args[1]).await
+
+    // Parse the optional `--data` JSON dict into an ordered map. We
+    // keep a Vec<(String,String)> so the apply order is deterministic
+    // (matches the JSON key order, then `--field` flags in CLI order
+    // override). Reject non-object roots and non-scalar values.
+    let data_fields: Vec<(String, String)> = match data_json.as_deref() {
+        None => Vec::new(),
+        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Object(map)) => {
+                let mut out = Vec::with_capacity(map.len());
+                for (k, v) in map {
+                    // Stringify scalars; reject arrays/objects for now
+                    // (multi-valued field flags is a separate ergonomic
+                    // call; the form-submit spec keys by `name` and
+                    // each `name` is one string per successful control
+                    // unless it's a `<select multiple>` — that case
+                    // needs repeated `--field` flags today).
+                    let s = match v {
+                        serde_json::Value::String(s) => s,
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::Bool(b) => b.to_string(),
+                        serde_json::Value::Null => String::new(),
+                        other => {
+                            eprintln!(
+                                "--data: value for `{k}` must be a string/number/bool/null, got {}",
+                                other
+                            );
+                            return ExitCode::from(2);
+                        }
+                    };
+                    out.push((k, s));
+                }
+                out
+            }
+            Ok(_) => {
+                eprintln!("--data: expected a JSON object at the top level");
+                return ExitCode::from(2);
+            }
+            Err(e) => {
+                eprintln!("--data: invalid JSON: {e}");
+                return ExitCode::from(2);
+            }
+        },
+    };
+
+    let merged = merge_submit_fields(&data_fields, &fields_cli);
+
+    cmd_submit_inner(&positional[0], &positional[1], &merged).await
+}
+
+/// Merge `--data` JSON fields with `--field NAME=VALUE` CLI flags so
+/// the final apply list has `--field` winning on conflicts. Order:
+/// `--data` keys first (in original JSON order, minus anything also
+/// supplied via `--field`), then all `--field` flags in CLI order.
+/// Last-write-wins still holds inside the JS-side apply, but pruning
+/// the overridden `--data` entry keeps `fieldsApplied` clean.
+fn merge_submit_fields(
+    data_fields: &[(String, String)],
+    fields_cli: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = Vec::with_capacity(data_fields.len() + fields_cli.len());
+    let cli_names: std::collections::HashSet<&str> =
+        fields_cli.iter().map(|(n, _)| n.as_str()).collect();
+    for (n, v) in data_fields {
+        if cli_names.contains(n.as_str()) {
+            continue;
+        }
+        merged.push((n.clone(), v.clone()));
+    }
+    for (n, v) in fields_cli {
+        merged.push((n.clone(), v.clone()));
+    }
+    merged
 }
 
 /// Body of [`cmd_submit`] split out so the dispatch / fetch /
 /// selector-build / session-open / submit sequence is readable
 /// top-to-bottom. The shape mirrors [`run_dispatch`] but takes a
 /// stateful path (open a [`JsSession`], call its
-/// [`heso_engine_js::JsSession::submit`]) so the HTTP response can
-/// flow back into the document.
-async fn cmd_submit_inner(url_arg: &str, ref_arg: &str) -> ExitCode {
+/// [`heso_engine_js::JsSession::submit_with_fields`]) so the HTTP
+/// response can flow back into the document AND the agent's supplied
+/// `(name, value)` overrides are pre-installed on the form before the
+/// submit event fires.
+async fn cmd_submit_inner(
+    url_arg: &str,
+    ref_arg: &str,
+    fields: &[(String, String)],
+) -> ExitCode {
     let want = if let Some(stripped) = ref_arg.strip_prefix('@') {
         format!("@{stripped}")
     } else {
@@ -1407,7 +1578,7 @@ async fn cmd_submit_inner(url_arg: &str, ref_arg: &str) -> ExitCode {
         }
     };
 
-    let outcome = match session.submit(&selector) {
+    let outcome = match session.submit_with_fields(&selector, fields) {
         Ok(o) => o,
         Err(e) => {
             let err_body = match &e {
@@ -2413,5 +2584,63 @@ async fn main() -> ExitCode {
             print_banner();
             ExitCode::SUCCESS
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair(n: &str, v: &str) -> (String, String) {
+        (n.to_owned(), v.to_owned())
+    }
+
+    #[test]
+    fn merge_submit_fields_data_only_keeps_order() {
+        let data = vec![pair("a", "1"), pair("b", "2")];
+        let merged = merge_submit_fields(&data, &[]);
+        assert_eq!(merged, vec![pair("a", "1"), pair("b", "2")]);
+    }
+
+    #[test]
+    fn merge_submit_fields_field_only_keeps_order() {
+        let cli = vec![pair("x", "10"), pair("y", "20")];
+        let merged = merge_submit_fields(&[], &cli);
+        assert_eq!(merged, vec![pair("x", "10"), pair("y", "20")]);
+    }
+
+    #[test]
+    fn merge_submit_fields_field_wins_over_data_on_same_name() {
+        // Both supply `custname`; --field must win, and the leftover
+        // --data entry should NOT appear in the merged output.
+        let data = vec![pair("custname", "FROM-DATA"), pair("email", "from-data@x")];
+        let cli = vec![pair("custname", "FROM-FIELD")];
+        let merged = merge_submit_fields(&data, &cli);
+        // `email` from data stays (no override); `custname` from data
+        // is dropped; `custname` from CLI appears at the end.
+        assert_eq!(
+            merged,
+            vec![
+                pair("email", "from-data@x"),
+                pair("custname", "FROM-FIELD"),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_submit_fields_data_keys_unique_to_data_survive() {
+        let data = vec![pair("a", "1"), pair("b", "2"), pair("c", "3")];
+        let cli = vec![pair("b", "TWO")];
+        let merged = merge_submit_fields(&data, &cli);
+        // `a` and `c` survive in their original order; `b` from data
+        // is dropped; `b=TWO` from CLI lands at the end.
+        assert_eq!(
+            merged,
+            vec![
+                pair("a", "1"),
+                pair("c", "3"),
+                pair("b", "TWO"),
+            ]
+        );
     }
 }

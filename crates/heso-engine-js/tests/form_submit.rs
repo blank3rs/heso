@@ -705,3 +705,425 @@ async fn submit_unmatched_selector_reports_no_form() {
     assert_eq!(outcome.value["reason"], serde_json::json!("no_form"));
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+// =====================================================================
+// PR-X1: --field NAME=VALUE one-shot — `submit_with_fields` sets named
+// inputs before serializing, response body is in the outcome, parsed
+// JSON exposed when content-type is `application/json`, file inputs
+// are silently skipped. Mirrors the AGENT_FINDINGS_V2.md Task R2 / F2
+// failure modes.
+// =====================================================================
+
+/// Helper: build `(name, value)` overrides from `&[(name, value)]`
+/// string-literal pairs without all the `.to_owned()` noise at the
+/// call site.
+fn fields(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(n, v)| ((*n).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_with_fields_overrides_default_input_value() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    // The form's default value for `custname` is "DEFAULT" — the
+    // override should replace it before the entry list is serialized.
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="custname" value="DEFAULT">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let overrides = fields(&[("custname", "Jane Doe")]);
+    let outcome = sess
+        .submit_with_fields("#f", &overrides)
+        .expect("submit ok");
+
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["fieldsApplied"],
+        serde_json::json!(["custname"])
+    );
+
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    // The override won — body contains the supplied value, not the
+    // DOM default.
+    assert!(
+        body.contains("custname=Jane+Doe"),
+        "body should carry override, got: {body}"
+    );
+    assert!(
+        !body.contains("DEFAULT"),
+        "DEFAULT should be gone, got: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_with_fields_handles_multiple_overrides() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="custname" value="">
+            <input type="text" name="custemail" value="">
+            <textarea name="comments"></textarea>
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let overrides = fields(&[
+        ("custname", "Jane Doe"),
+        ("custemail", "j@x.com"),
+        ("comments", "hello world"),
+    ]);
+    let outcome = sess
+        .submit_with_fields("#f", &overrides)
+        .expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let applied = outcome.value["fieldsApplied"]
+        .as_array()
+        .expect("fieldsApplied is an array");
+    assert_eq!(applied.len(), 3, "fieldsApplied: {applied:?}");
+
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    assert!(body.contains("custname=Jane+Doe"), "{body}");
+    assert!(body.contains("custemail=j%40x.com"), "{body}");
+    assert!(body.contains("comments=hello+world"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_with_fields_skips_missing_names_silently() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="real" value="">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let overrides = fields(&[("real", "hi"), ("ghost", "nope")]);
+    let outcome = sess
+        .submit_with_fields("#f", &overrides)
+        .expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    // `real` was applied; `ghost` is in skipped with reason=no_match.
+    assert_eq!(
+        outcome.value["fieldsApplied"],
+        serde_json::json!(["real"])
+    );
+    let skipped = outcome.value["fieldsSkipped"]
+        .as_array()
+        .expect("fieldsSkipped");
+    assert_eq!(skipped.len(), 1, "skipped: {skipped:?}");
+    assert_eq!(skipped[0]["name"], serde_json::json!("ghost"));
+    assert_eq!(skipped[0]["reason"], serde_json::json!("no_match"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_with_fields_file_input_is_skipped() {
+    // PR-X4 territory: file inputs can't have their value set via a
+    // string today. We record them in `fieldsSkipped` with reason
+    // `"file_input"` so an agent / CLI can warn the user.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/upload", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}" enctype="multipart/form-data">
+            <input type="text" name="title" value="">
+            <input type="file" name="upload">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let overrides = fields(&[("title", "agent-x1"), ("upload", "/etc/passwd")]);
+    let outcome = sess
+        .submit_with_fields("#f", &overrides)
+        .expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["fieldsApplied"],
+        serde_json::json!(["title"])
+    );
+    let skipped = outcome.value["fieldsSkipped"]
+        .as_array()
+        .expect("fieldsSkipped");
+    assert_eq!(skipped.len(), 1, "skipped: {skipped:?}");
+    assert_eq!(skipped[0]["name"], serde_json::json!("upload"));
+    assert_eq!(skipped[0]["reason"], serde_json::json!("file_input"));
+
+    let reqs = server.received_requests().await.unwrap();
+    // The upload field is part of the multipart body but carries no
+    // bytes (PR-1's existing limit) — we just verify that the
+    // override didn't leak `/etc/passwd` into the upload value.
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    assert!(body.contains(r#"name="title""#), "{body}");
+    assert!(body.contains("agent-x1"), "{body}");
+    assert!(!body.contains("/etc/passwd"), "must not leak: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_with_fields_overrides_radio_and_checkbox() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="radio" name="color" value="red">
+            <input type="radio" name="color" value="green" checked>
+            <input type="radio" name="color" value="blue">
+            <input type="checkbox" name="agree" value="yes">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    // Switch color from `green` (default-checked) to `blue`; also
+    // check the `agree` checkbox.
+    let overrides = fields(&[("color", "blue"), ("agree", "yes")]);
+    let outcome = sess
+        .submit_with_fields("#f", &overrides)
+        .expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    assert!(body.contains("color=blue"), "body: {body}");
+    assert!(!body.contains("color=green"), "body: {body}");
+    assert!(body.contains("agree=yes"), "body: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_response_body_is_in_outcome_for_urlencoded_post() {
+    // The submit outcome now carries `responseBody` and
+    // `responseContentType` so an agent can observe what the server
+    // echoed back — matches AGENT_FINDINGS_V2.md task R2's second
+    // gap ("no body field, no echo").
+    //
+    // We use `set_body_raw(body, mime)` (not `set_body_string` then
+    // `insert_header`) so wiremock writes our exact content-type
+    // instead of the default `text/plain` it picks for string bodies.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("you sent: k=v", "text/plain; charset=utf-8"),
+        )
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="k" value="v">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["responseBody"],
+        serde_json::json!("you sent: k=v")
+    );
+    assert_eq!(
+        outcome.value["responseContentType"],
+        serde_json::json!("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        outcome.value["responseBodyTruncated"],
+        serde_json::json!(false)
+    );
+    // Not JSON → no responseJson field.
+    assert!(outcome.value.get("responseJson").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_response_json_is_parsed_when_content_type_is_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(
+                r#"{"ok": true, "id": 42, "echo": {"k": "v"}}"#,
+                "application/json",
+            ),
+        )
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/api", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="k" value="v">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    // responseJson is the parsed value — agent can drill into it
+    // without an extra JSON.parse round-trip.
+    assert_eq!(outcome.value["responseJson"]["ok"], serde_json::json!(true));
+    assert_eq!(outcome.value["responseJson"]["id"], serde_json::json!(42));
+    assert_eq!(
+        outcome.value["responseJson"]["echo"]["k"],
+        serde_json::json!("v")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_response_json_handles_vendor_plus_json_suffix() {
+    // `application/vnd.api+json` is a "structured syntax suffix" —
+    // per IANA, the trailing `+json` declares the payload as JSON.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/jsonapi"))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_raw(
+                r#"{"data": {"id": "1", "type": "agents"}}"#,
+                "application/vnd.api+json",
+            ),
+        )
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/jsonapi", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["responseJson"]["data"]["type"],
+        serde_json::json!("agents")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_response_json_omitted_when_body_is_not_valid_json() {
+    // Server lies in its content-type — JSON parse should fail and
+    // the field should be omitted rather than erroring.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/lie"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw("this is definitely not json", "application/json"),
+        )
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/lie", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["responseBody"],
+        serde_json::json!("this is definitely not json")
+    );
+    // The body was unparseable — responseJson is absent (not null,
+    // not an error — just missing). Agents that test for the field
+    // can fall back to responseBody.
+    assert!(
+        outcome.value.get("responseJson").is_none(),
+        "responseJson should be absent on parse failure, got: {:?}",
+        outcome.value
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_response_body_is_truncated_above_64_kib() {
+    // Build a response body larger than the 64 KiB cap; the outcome
+    // should carry a truncated copy + the truncated flag.
+    let big_payload = "X".repeat(70 * 1024); // 71680 bytes > 65536
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/big"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(big_payload.clone(), "text/plain"))
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/big", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["responseBodyTruncated"],
+        serde_json::json!(true)
+    );
+    let body_field = outcome.value["responseBody"]
+        .as_str()
+        .expect("responseBody is a string");
+    assert!(
+        body_field.len() <= 64 * 1024,
+        "truncated body should be ≤ 64 KiB, got {} bytes",
+        body_field.len()
+    );
+    assert!(
+        body_field.len() >= 64 * 1024 - 4,
+        "truncated body should be very close to the cap, got {} bytes",
+        body_field.len()
+    );
+}

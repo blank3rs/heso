@@ -50,9 +50,18 @@ use url::Url;
 use crate::dom::Document;
 use crate::engine::{EvalError, EvalOutcome, JsEngine};
 use crate::form_submit::{
-    build_snapshot_js, issue_request, live_fetch_handle, FormSnapshot, SubmitResponse, SubmitSkip,
+    build_apply_fields_js, build_snapshot_js, issue_request, live_fetch_handle, FormSnapshot,
+    SubmitResponse, SubmitSkip,
 };
 use crate::scripts::{ScriptFetchPolicy, ScriptOutcome};
+
+/// Cap on `responseBody` size returned inside `submit`'s outcome value.
+/// Keeps the JSON payload manageable when an agent submits a form
+/// against a server that responds with a full HTML page. When the
+/// response exceeds this, `responseBody` is truncated to the cap and
+/// `responseBodyTruncated` is set to `true` so callers know to expect a
+/// follow-up `eval-dom` if they need the full content.
+const RESPONSE_BODY_TRUNCATE_BYTES: usize = 64 * 1024;
 
 /// JS snippet that binds `submitter` (in the enclosing scope) to the
 /// first submit-typed descendant of `form`, or `null` if none. Shared
@@ -273,9 +282,13 @@ impl JsSession {
     ///   [`EvalError`] only when the JS-side snapshot itself fails.
     /// - **Success** → issues the request through the shared client,
     ///   navigates this session to the response URL (cookies preserved
-    ///   on the underlying engine), and returns
-    ///   `{matched: true, submitted: true, requestUrl, responseStatus,
-    ///   responseUrl, enctype, method}`.
+    ///   on the underlying engine), and returns the full outcome
+    ///   including `responseStatus`, `responseUrl`, `responseBody`
+    ///   (truncated to 64 KB with `responseBodyTruncated: true` when
+    ///   larger), `responseContentType` (verbatim header), and — when
+    ///   the response declares `application/json` — `responseJson`
+    ///   (the parsed body so agents don't have to `JSON.parse`
+    ///   themselves).
     ///
     /// Enctypes supported: `application/x-www-form-urlencoded`,
     /// `multipart/form-data`, `text/plain`. File inputs in multipart
@@ -289,6 +302,77 @@ impl JsSession {
     ///
     /// [spec]: https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm
     pub fn submit(&mut self, selector: &str) -> Result<EvalOutcome, EvalError> {
+        self.submit_inner(selector, &[])
+    }
+
+    /// Apply `(name, value)` field overrides to the form at `selector`,
+    /// then submit. Combines `fill`-by-name with `submit` into one
+    /// in-process call — fixes the agent UX gap filed as `R2`/`F2` in
+    /// `AGENT_FINDINGS_V2.md` ("fill doesn't persist across verbs, so
+    /// the typed value never reaches submit"). Field overrides are keyed
+    /// by the input's `name` attribute (the WHATWG "successful control"
+    /// key), not by `@eN` action-graph ref.
+    ///
+    /// File inputs are skipped (they can't have their value set from a
+    /// string — full file upload lands with `FormData`/`Blob` plumbing,
+    /// the next pass).
+    ///
+    /// Returns the same outcome shape as [`Self::submit`] with an
+    /// additional `fieldsApplied` array (names that were actually
+    /// touched) and a `fieldsSkipped` array (each entry
+    /// `{name, reason}` where reason is `"no_match"` or `"file_input"`).
+    pub fn submit_with_fields(
+        &mut self,
+        selector: &str,
+        fields: &[(String, String)],
+    ) -> Result<EvalOutcome, EvalError> {
+        self.submit_inner(selector, fields)
+    }
+
+    /// Core implementation shared by [`Self::submit`] and
+    /// [`Self::submit_with_fields`]. When `fields` is non-empty, runs
+    /// the apply-fields pass first; the result is stitched into the
+    /// final outcome as `fieldsApplied` / `fieldsSkipped`. When empty,
+    /// the pre-fill step is skipped entirely (no JS round-trip cost
+    /// for the legacy callers).
+    fn submit_inner(
+        &mut self,
+        selector: &str,
+        fields: &[(String, String)],
+    ) -> Result<EvalOutcome, EvalError> {
+        // Phase 0: apply field overrides (when any). Done before the
+        // snapshot so the `submit` event fires against the post-fill
+        // DOM — listeners that read input.value see the agent's
+        // supplied data. Note: the apply pass dispatches `input` /
+        // `change` events the same way `JsSession::fill` does, so any
+        // validation listener that runs on those is honored.
+        let (fields_applied, fields_skipped, fields_matched_form) = if fields.is_empty() {
+            (
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                true, // no overrides → don't second-guess the snapshot
+            )
+        } else {
+            let apply_js = build_apply_fields_js(selector, fields);
+            let apply_outcome = self.engine.eval(&apply_js)?;
+            let applied = apply_outcome
+                .value
+                .get("applied")
+                .cloned()
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            let skipped = apply_outcome
+                .value
+                .get("skipped")
+                .cloned()
+                .unwrap_or(serde_json::Value::Array(vec![]));
+            let matched = apply_outcome
+                .value
+                .get("matched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            (applied, skipped, matched)
+        };
+
         // Phase 1: extract the snapshot (dispatches the submit event
         // as a side effect, which is the spec-mandated checkpoint).
         let snapshot_js = build_snapshot_js(selector);
@@ -303,7 +387,7 @@ impl JsSession {
                 // Snapshot wasn't well-shaped (selector miss without
                 // the right field, or a typo in the JS template).
                 // Return the raw outcome with an explanatory field.
-                let value = serde_json::json!({
+                let mut value = serde_json::json!({
                     "matched": false,
                     "defaultPrevented": false,
                     "submitted": false,
@@ -311,6 +395,7 @@ impl JsSession {
                     "error": e.to_string(),
                     "raw": snapshot_value,
                 });
+                attach_field_diagnostics(&mut value, &fields_applied, &fields_skipped);
                 return Ok(EvalOutcome {
                     value,
                     console: snapshot_outcome.console,
@@ -318,11 +403,17 @@ impl JsSession {
             }
         };
 
+        // If the override pass didn't find the form but the snapshot
+        // also didn't, surface that — the selector pointed at nothing.
+        let _ = fields_matched_form; // reserved for future surface
+
         // No match / no submitter / cancelled → no HTTP traffic.
         let outcome = self.classify_skip(&snapshot);
         if let Some(skip) = outcome {
+            let mut value = skip_value(&skip, &snapshot);
+            attach_field_diagnostics(&mut value, &fields_applied, &fields_skipped);
             return Ok(EvalOutcome {
-                value: skip_value(&skip, &snapshot),
+                value,
                 console: snapshot_outcome.console,
             });
         }
@@ -330,7 +421,7 @@ impl JsSession {
         // Phase 2: issue the request. Falls back to a no-network
         // outcome if the engine wasn't built with a fetch client.
         let Some((client, rt_handle)) = live_fetch_handle(&self.engine) else {
-            let value = serde_json::json!({
+            let mut value = serde_json::json!({
                 "matched": true,
                 "defaultPrevented": false,
                 "submitted": false,
@@ -339,6 +430,7 @@ impl JsSession {
                 "enctype": snapshot.enctype,
                 "action": snapshot.action,
             });
+            attach_field_diagnostics(&mut value, &fields_applied, &fields_skipped);
             return Ok(EvalOutcome {
                 value,
                 console: snapshot_outcome.console,
@@ -348,7 +440,7 @@ impl JsSession {
         let response = match issue_request(&snapshot, &self.url, &client, &rt_handle) {
             Ok(r) => r,
             Err(e) => {
-                let value = serde_json::json!({
+                let mut value = serde_json::json!({
                     "matched": true,
                     "defaultPrevented": false,
                     "submitted": false,
@@ -358,6 +450,7 @@ impl JsSession {
                     "enctype": snapshot.enctype,
                     "action": snapshot.action,
                 });
+                attach_field_diagnostics(&mut value, &fields_applied, &fields_skipped);
                 return Ok(EvalOutcome {
                     value,
                     console: snapshot_outcome.console,
@@ -372,10 +465,26 @@ impl JsSession {
             final_url,
             body,
             status,
+            content_type,
         } = response;
         let _nav_outcome = self.navigate(&body, final_url.clone())?;
 
-        let value = serde_json::json!({
+        // Clamp the body to the documented cap and surface a flag when
+        // we trimmed it. Truncation is byte-counted on a UTF-8 string;
+        // we rewind to the nearest char boundary so the result is
+        // valid UTF-8 (otherwise serde_json output would round-trip
+        // through a lossy fallback in some readers).
+        let (body_for_output, truncated) = if body.len() > RESPONSE_BODY_TRUNCATE_BYTES {
+            let mut cap = RESPONSE_BODY_TRUNCATE_BYTES;
+            while cap > 0 && !body.is_char_boundary(cap) {
+                cap -= 1;
+            }
+            (body[..cap].to_owned(), true)
+        } else {
+            (body.clone(), false)
+        };
+
+        let mut value = serde_json::json!({
             "matched": true,
             "defaultPrevented": false,
             "submitted": true,
@@ -384,7 +493,28 @@ impl JsSession {
             "action": snapshot.action,
             "responseStatus": status,
             "responseUrl": final_url.as_str(),
+            "responseBody": body_for_output,
+            "responseBodyTruncated": truncated,
         });
+        if let Some(ct) = content_type.as_ref() {
+            value["responseContentType"] = serde_json::Value::String(ct.clone());
+        }
+        // Parse responseJson when the content-type's media component is
+        // a JSON type. Per IANA, `application/json` plus the
+        // structured-syntax-suffix forms `+json` (e.g.
+        // `application/vnd.api+json`) all signal JSON. Truncated bodies
+        // are NOT parsed because the JSON would be incomplete; agents
+        // can re-fetch if they need the full payload.
+        if !truncated {
+            if let Some(ct) = content_type.as_ref() {
+                if is_json_content_type(ct) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                        value["responseJson"] = parsed;
+                    }
+                }
+            }
+        }
+        attach_field_diagnostics(&mut value, &fields_applied, &fields_skipped);
         Ok(EvalOutcome {
             value,
             console: snapshot_outcome.console,
@@ -431,6 +561,44 @@ fn skip_value(skip: &SubmitSkip, snapshot: &FormSnapshot) -> serde_json::Value {
             "action": snapshot.action,
         }),
     }
+}
+
+/// Splice `fieldsApplied` / `fieldsSkipped` into `value` when the
+/// caller supplied field overrides. No-op when both are `Null`
+/// (legacy `submit()` callers — keeps their output shape stable).
+fn attach_field_diagnostics(
+    value: &mut serde_json::Value,
+    applied: &serde_json::Value,
+    skipped: &serde_json::Value,
+) {
+    if applied.is_null() && skipped.is_null() {
+        return;
+    }
+    if let Some(map) = value.as_object_mut() {
+        if !applied.is_null() {
+            map.insert("fieldsApplied".to_owned(), applied.clone());
+        }
+        if !skipped.is_null() {
+            map.insert("fieldsSkipped".to_owned(), skipped.clone());
+        }
+    }
+}
+
+/// Returns `true` when `content_type` declares a JSON media type. Per
+/// IANA ("Structured Syntax Suffix Specifications"), JSON-shaped
+/// payloads use either `application/json` (and the rarer
+/// `text/json`) or a `+json` suffix on a vendor type like
+/// `application/vnd.api+json`. We compare only the media-type prefix
+/// (before any `;` parameter list) and lowercase for caseless match.
+fn is_json_content_type(content_type: &str) -> bool {
+    let media = content_type
+        .split(';')
+        .next()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    media == "application/json"
+        || media == "text/json"
+        || media.ends_with("+json")
 }
 
 

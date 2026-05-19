@@ -120,11 +120,18 @@ pub(crate) struct FormSnapshot {
 /// Result of a successful HTTP form submission — the final URL after
 /// redirects and the response body bytes (decoded to a UTF-8 string;
 /// for HTML payloads this is what the next document is parsed from).
+///
+/// `content_type` carries the response's `Content-Type` header verbatim
+/// (when the server set one). The session-layer wrapper uses it to
+/// decide whether to also expose the body as parsed JSON
+/// (`responseJson`) in the caller-facing output, so agents don't have
+/// to re-parse it themselves.
 #[derive(Debug, Clone)]
 pub(crate) struct SubmitResponse {
     pub final_url: Url,
     pub body: String,
     pub status: u16,
+    pub content_type: Option<String>,
 }
 
 /// Reasons a submission may be skipped at the engine layer (before any
@@ -244,6 +251,155 @@ pub(crate) fn build_multipart_form(entries: &[FormEntry]) -> reqwest::multipart:
         }
     }
     form
+}
+
+/// Build a JS snippet that walks `<form selector>`'s named controls
+/// and applies `name → value` overrides. Returns a JS literal that
+/// yields `{matched: bool, applied: [name, ...], skipped: [name, ...]}`.
+///
+/// Semantics:
+///
+/// - Inputs are matched by their `name` attribute (the
+///   "successful control" key per HTML §4.10.22), NOT by `@eN`
+///   action-graph ref. This matches the spec semantics for what
+///   successful-control names mean.
+/// - For each `(name, value)`, the JS:
+///   1. Locates every descendant `input`/`textarea`/`select` with
+///      that name.
+///   2. For `input[type=checkbox]` / `radio`: sets `el.checked` to
+///      `true` when the override value matches `el.value` (case-
+///      sensitive). When the override is the literal string `"on"`
+///      and the input has no explicit `value` attribute, the input
+///      is checked. When the override is the empty string, the
+///      input is unchecked. This makes `--field consent=on` /
+///      `--field newsletter=` natural for boolean-shaped inputs.
+///   3. For `input[type=file]`: skipped (file upload is PR-X4 turf).
+///      The `skipped` array records the name with a `"file"` reason
+///      so the CLI can warn the user.
+///   4. For `<select>`: sets `el.value = override`, then walks
+///      `<option>` children and marks the one whose `value` (or
+///      textContent fallback) matches as `selected`. Other options
+///      are deselected. Multi-select isn't supported by the
+///      `--field` shape (you'd need repeated flag + array merging;
+///      out of scope for PR-X1).
+///   5. For text-shaped inputs (`type=text|email|password|...`) and
+///      `<textarea>`: sets `el.value = override` and dispatches
+///      `input` then `change` (matching `JsSession::fill`).
+///
+/// Returns a structured outcome so the Rust side can decide whether
+/// to error on "field not found in form" (currently it does NOT — a
+/// supplied name with no matching input is recorded in `skipped` with
+/// a `"no_match"` reason but submission proceeds). The fault model
+/// matches a real browser: nonexistent inputs are silently no-ops.
+pub(crate) fn build_apply_fields_js(selector: &str, fields: &[(String, String)]) -> String {
+    let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".to_owned());
+    // Each override is a `[name, value]` pair so JS-side iteration is
+    // a simple `for (const [n, v] of OVERRIDES)`.
+    let pairs: Vec<serde_json::Value> = fields
+        .iter()
+        .map(|(n, v)| serde_json::json!([n, v]))
+        .collect();
+    let overrides_lit =
+        serde_json::to_string(&serde_json::Value::Array(pairs)).unwrap_or_else(|_| "[]".to_owned());
+    format!(
+        r#"
+(() => {{
+    const form = document.querySelector({sel});
+    if (!form) return {{ matched: false, applied: [], skipped: [] }};
+    const OVERRIDES = {overrides_lit};
+    const applied = [];
+    const skipped = [];
+
+    const cssEscape = (s) => String(s).replace(/(["\\\\])/g, "\\\\$1");
+
+    for (const pair of OVERRIDES) {{
+        const name = pair[0];
+        const value = pair[1];
+        const sel = '[name="' + cssEscape(name) + '"]';
+        const matches = form.querySelectorAll(sel);
+        if (!matches || matches.length === 0) {{
+            skipped.push({{ name, reason: 'no_match' }});
+            continue;
+        }}
+        let touchedAny = false;
+        let fileSkip = false;
+        for (const el of matches) {{
+            const tag = (el.tagName || '').toLowerCase();
+            if (tag === 'input') {{
+                const type = (el.getAttribute('type') || 'text').toLowerCase();
+                if (type === 'file') {{
+                    // PR-X1 limitation: file inputs can't have their
+                    // value set from a string. Record + skip.
+                    fileSkip = true;
+                    continue;
+                }}
+                if (type === 'checkbox' || type === 'radio') {{
+                    const elVal = el.value || el.getAttribute('value') || 'on';
+                    if (value === '' || value === false) {{
+                        el.checked = false;
+                    }} else if (elVal === value || (value === 'on' && (el.getAttribute('value') === null))) {{
+                        el.checked = true;
+                    }} else if (type === 'radio') {{
+                        // Radio: only the matching value is checked;
+                        // others in the group are uncheck-by-default.
+                        el.checked = false;
+                    }} else {{
+                        // Checkbox with explicit value that doesn't
+                        // match the override: leave it. Real-browser
+                        // parity (user can only toggle one value).
+                    }}
+                    touchedAny = true;
+                    continue;
+                }}
+                // text-shaped + hidden + email + password + ...
+                el.value = value;
+                el.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
+                touchedAny = true;
+                continue;
+            }}
+            if (tag === 'textarea') {{
+                el.value = value;
+                el.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
+                touchedAny = true;
+                continue;
+            }}
+            if (tag === 'select') {{
+                // Try to set .value first; then walk options and
+                // mark the matching one selected. The serializer
+                // reads `selected`/`opt.selected`, so both routes
+                // need to agree.
+                el.value = value;
+                const opts = el.querySelectorAll('option');
+                for (const opt of opts) {{
+                    const optVal = (opt.getAttribute('value') !== null)
+                        ? opt.getAttribute('value')
+                        : (opt.textContent || '');
+                    if (optVal === value) {{
+                        opt.setAttribute('selected', '');
+                    }} else {{
+                        opt.removeAttribute('selected');
+                    }}
+                }}
+                el.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
+                touchedAny = true;
+                continue;
+            }}
+        }}
+        if (fileSkip && !touchedAny) {{
+            skipped.push({{ name, reason: 'file_input' }});
+        }} else if (touchedAny) {{
+            applied.push(name);
+        }} else {{
+            skipped.push({{ name, reason: 'no_match' }});
+        }}
+    }}
+
+    return {{ matched: true, applied, skipped }};
+}})()
+"#
+    )
 }
 
 /// Build a JS snippet that extracts the form snapshot and dispatches
@@ -546,32 +702,44 @@ pub(crate) fn issue_request(
     // wires a multi_thread runtime, so this hands work to another
     // worker rather than deadlocking.
     let client = client.clone();
-    let result: Result<(Url, String, u16), reqwest::Error> = tokio::task::block_in_place(|| {
-        rt_handle.block_on(async move {
-            let mut builder = client.request(method, request_url.as_str());
-            builder = match body_kind {
-                BodyKind::None => builder,
-                BodyKind::Urlencoded(s) => builder
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body(s),
-                BodyKind::TextPlain(s) => builder.header("Content-Type", "text/plain").body(s),
-                BodyKind::Multipart(form) => builder.multipart(form),
-            };
-            let resp = builder.send().await?;
-            let status = resp.status().as_u16();
-            let final_url_str = resp.url().as_str().to_owned();
-            let body = resp.text().await?;
-            let final_url = Url::parse(&final_url_str)
-                .unwrap_or_else(|_| Url::parse("about:blank").expect("about:blank parses"));
-            Ok((final_url, body, status))
-        })
-    });
+    let result: Result<(Url, String, u16, Option<String>), reqwest::Error> =
+        tokio::task::block_in_place(|| {
+            rt_handle.block_on(async move {
+                let mut builder = client.request(method, request_url.as_str());
+                builder = match body_kind {
+                    BodyKind::None => builder,
+                    BodyKind::Urlencoded(s) => builder
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .body(s),
+                    BodyKind::TextPlain(s) => builder.header("Content-Type", "text/plain").body(s),
+                    BodyKind::Multipart(form) => builder.multipart(form),
+                };
+                let resp = builder.send().await?;
+                let status = resp.status().as_u16();
+                let final_url_str = resp.url().as_str().to_owned();
+                // Snapshot Content-Type BEFORE consuming the body
+                // (resp.text() consumes self). `to_str()` strips any
+                // non-ASCII headers — fine here because the values we
+                // care about (`application/json`, `text/html`, etc.)
+                // are pure ASCII.
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_owned());
+                let body = resp.text().await?;
+                let final_url = Url::parse(&final_url_str)
+                    .unwrap_or_else(|_| Url::parse("about:blank").expect("about:blank parses"));
+                Ok((final_url, body, status, content_type))
+            })
+        });
 
     match result {
-        Ok((final_url, body, status)) => Ok(SubmitResponse {
+        Ok((final_url, body, status, content_type)) => Ok(SubmitResponse {
             final_url,
             body,
             status,
+            content_type,
         }),
         Err(e) => Err(EvalError::Engine(format!("form submit HTTP error: {e}"))),
     }

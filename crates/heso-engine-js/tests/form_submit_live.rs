@@ -125,6 +125,53 @@ async fn submit_multipart_post_to_httpbin_echoes_form_field() {
 }
 
 // =====================================================================
+// PR-X1: one-shot --field path against httpbin — the canonical
+// "agent files a form" workflow that AGENT_FINDINGS_V2.md said was
+// the showstopper.
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "hits public internet — run with --ignored"]
+async fn submit_with_fields_one_shot_against_httpbin_forms_post() {
+    // The exact agent shape AGENT_FINDINGS_V2.md task R2 / F2
+    // identified: fetch the form page, supply field values inline,
+    // submit, and observe the response body in one process. The
+    // httpbin pizza form has `custname` and `custemail` text inputs
+    // we override; the response JSON's `.form.custname` echoes back
+    // whatever the server received.
+    let html = r#"<!doctype html><html><body>
+        <form id="f" method="post" action="https://httpbin.org/post">
+            <input type="text" name="custname" value="">
+            <input type="text" name="custemail" value="">
+            <button type="submit">Submit order</button>
+        </form>
+        </body></html>"#;
+    let mut sess = open_session(html, Url::parse("https://example.com/").unwrap());
+    let overrides = vec![
+        ("custname".to_owned(), "Jane Doe".to_owned()),
+        ("custemail".to_owned(), "j@x.com".to_owned()),
+    ];
+    let outcome = sess
+        .submit_with_fields("#f", &overrides)
+        .expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(outcome.value["responseStatus"], serde_json::json!(200));
+    // httpbin sends `application/json` — responseJson should be
+    // populated and reflect the agent's supplied values verbatim.
+    let json = outcome
+        .value
+        .get("responseJson")
+        .expect("responseJson should be parsed on application/json content-type");
+    assert_eq!(
+        json["form"]["custname"].as_str(),
+        Some("Jane Doe"),
+        "echoed form: {:?}",
+        json["form"]
+    );
+    assert_eq!(json["form"]["custemail"].as_str(), Some("j@x.com"));
+}
+
+// =====================================================================
 // GET to httpbin.org/get
 // =====================================================================
 
