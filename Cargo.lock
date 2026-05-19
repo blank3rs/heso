@@ -769,6 +769,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "heso-compat-suite"
+version = "0.0.1"
+dependencies = [
+ "heso-engine-fetch",
+ "heso-engine-js",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "heso-compat-tests"
 version = "0.0.1"
 dependencies = [

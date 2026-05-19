@@ -63,6 +63,8 @@ No Chromium. No Node. No browser download. Just `cargo build && ./heso`.
 | Audit trail | every fetch → signable receipt | nothing |
 | Rendering pixels | ✗ — that's the point | ✓ |
 
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the live compatibility scorecard across real-world sites. Reproduce with `cargo run -p heso-compat-suite -- --markdown COMPATIBILITY.md`. Eval cost is **1–3 ms** per page in the current scorecard — fetch + parse dominate total wall-clock.
+
 If your agent needs to *look* at a canvas, a video, or a CSS animation: use Chromium. heso is honest about that.
 
 If your agent needs to *do things* on the agent-relevant half of the web — read, click, fill, extract, audit — heso is built for exactly that and nothing else.
