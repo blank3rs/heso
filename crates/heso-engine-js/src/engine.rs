@@ -389,6 +389,22 @@ impl JsEngine {
             None
         };
 
+        // Install `__hesoFormSubmitNow(form)` — the JS-side IDL method
+        // `HTMLFormElement.prototype.submit()` calls into this helper
+        // to issue the HTTP request without firing the `submit` event
+        // (per WHATWG HTML §4.10.3 and the jsdom WPT
+        // `HTMLFormElement's submit() does not fire a SubmitEvent`).
+        //
+        // Only installed when the engine was built with a fetch
+        // client (`new_with_fetch` / `new_with_seed_and_live_fetch`).
+        // Without one, `form.submit()` JS-side becomes a silent
+        // no-op — matching the spec's "no browsing context" branch.
+        if let Some(fs) = fetch_state.as_ref() {
+            if let FetchMode::Live { client, rt_handle } = &fs.mode {
+                install_form_submit_now(&context, client.clone(), rt_handle.clone())?;
+            }
+        }
+
         // Install `__hesoDeepResolve(v)` — the load-bearing helper that
         // [`Self::eval_value_with_promise_await`] wraps every user-eval
         // result in before serializing. Without it, a Promise nested
@@ -1429,6 +1445,121 @@ fn install_deep_resolve(context: &Context) -> Result<(), EvalError> {
             Ok(())
         })
         .map_err(|e| EvalError::Engine(format!("install __hesoDeepResolve: {e}")))?;
+    Ok(())
+}
+
+/// Install the JS-side `__hesoFormSubmitNow(form)` helper used by
+/// `HTMLFormElement.prototype.submit()` to issue an HTTP request
+/// without firing the `submit` event (per WHATWG HTML §4.10.3 and the
+/// jsdom WPT).
+///
+/// The helper:
+/// 1. Takes a live JS `Element` reference (the form).
+/// 2. Walks the form to build the entry list via the JS function
+///    body in [`crate::form_submit::NO_EVENT_SNAPSHOT_FN_BODY`].
+/// 3. Calls a native Rust callback (defined here) that synchronously
+///    issues the HTTP request against `client`, blocking the JS
+///    thread via `tokio::task::block_in_place`.
+/// 4. Returns nothing (per spec `submit()` is `void`).
+///
+/// Only installed when the engine was built with a live fetch client.
+/// Without a client this would be useless (no transport).
+fn install_form_submit_now(
+    context: &Context,
+    client: Arc<reqwest::Client>,
+    rt_handle: tokio::runtime::Handle,
+) -> Result<(), EvalError> {
+    use crate::form_submit::{issue_request, FormSnapshot, NO_EVENT_SNAPSHOT_FN_BODY};
+    use rquickjs::Function as RqFunction;
+
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            let globals = ctx.globals();
+
+            // Step 1: install the JS snapshot builder as a global
+            // function. This walks the form without dispatching a
+            // submit event.
+            //
+            // QuickJS `Function`s parse-from-string: wrapping the
+            // function body in `(...)` makes it an expression so
+            // `eval` returns the function value rather than a
+            // declaration with no value.
+            let builder: RqFunction =
+                ctx.eval(format!("({})", NO_EVENT_SNAPSHOT_FN_BODY))?;
+            globals.set("__hesoFormSnapshotNoEvent", builder)?;
+
+            // Step 2: install the native Rust callback that takes the
+            // JSON snapshot string + current URL string and issues the
+            // HTTP request synchronously.
+            //
+            // We accept the snapshot as a JSON string (rather than a
+            // JS object) so the native callback can deserialize via
+            // `serde_json` without re-walking the JS object. The
+            // wrapper JS function (below) handles the
+            // `JSON.stringify` round-trip.
+            let native_client = client.clone();
+            let native_handle = rt_handle.clone();
+            let native_callback = RqFunction::new(
+                ctx.clone(),
+                move |snapshot_json: String, base_url_str: String| -> rquickjs::Result<()> {
+                    let snapshot: FormSnapshot = match serde_json::from_str(&snapshot_json) {
+                        Ok(s) => s,
+                        Err(_) => return Ok(()),
+                    };
+                    if !snapshot.matched || snapshot.default_prevented {
+                        return Ok(());
+                    }
+                    // Parse the base URL. If unparseable, fall back
+                    // to `about:blank` — same as session navigation
+                    // does. This also covers the empty-base case.
+                    let base = match url::Url::parse(&base_url_str) {
+                        Ok(u) => u,
+                        Err(_) => match url::Url::parse("about:blank") {
+                            Ok(u) => u,
+                            Err(_) => return Ok(()),
+                        },
+                    };
+                    // Best-effort: errors are swallowed because
+                    // `form.submit()` is void per spec — there's no
+                    // place to surface a failure to JS. The
+                    // wire-level request still happened (or didn't);
+                    // the test asserts via the mock server, not via
+                    // a JS-side return value.
+                    let _ = issue_request(&snapshot, &base, &native_client, &native_handle);
+                    Ok(())
+                },
+            )?;
+            globals.set("__hesoFormSubmitNative", native_callback)?;
+
+            // Step 3: install the JS-side wrapper that the IDL
+            // method actually calls. Builds the snapshot, then
+            // hands it to the native callback alongside the current
+            // base URL.
+            ctx.eval::<(), _>(
+                r#"
+                globalThis.__hesoFormSubmitNow = function(form) {
+                    if (!form) return;
+                    var snap;
+                    try {
+                        snap = globalThis.__hesoFormSnapshotNoEvent(form);
+                    } catch (_) {
+                        return;
+                    }
+                    if (!snap || !snap.matched) return;
+                    if (snap.default_prevented) return;
+                    var baseUrl = '';
+                    try {
+                        baseUrl = (globalThis.location && globalThis.location.href) || '';
+                    } catch (_) {}
+                    try {
+                        globalThis.__hesoFormSubmitNative(JSON.stringify(snap), baseUrl);
+                    } catch (_) {}
+                };
+                "#,
+            )?;
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install __hesoFormSubmitNow: {e}")))?;
     Ok(())
 }
 

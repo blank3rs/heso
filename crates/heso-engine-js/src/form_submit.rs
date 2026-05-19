@@ -649,6 +649,165 @@ pub(crate) fn build_snapshot_js(selector: &str) -> String {
     )
 }
 
+/// JS snippet for a `function(form)` body that walks `form`'s
+/// controls and returns the same `FormSnapshot`-shaped object as
+/// [`build_snapshot_js`], but **without** dispatching the `submit`
+/// event.
+///
+/// This is the body used by `HTMLFormElement.submit()` (the JS-side
+/// IDL method on `<form>`), per WHATWG HTML §4.10.3:
+///
+/// > The `submit()` method, when invoked, must submit the form
+/// > element from the form element itself, with the *from `submit()`
+/// > method* flag set.
+///
+/// The "from `submit()` method" flag specifically suppresses the
+/// `submit` event dispatch (per the jsdom WPT and Chromium / Firefox
+/// behavior). Everything else — entry-list assembly, method/action/
+/// enctype reads, urlencoded vs multipart serialization — is
+/// identical to the dispatch-bearing path.
+///
+/// Designed to be installed once as a global function so the
+/// `form.submit()` IDL method can call it from inside the JS engine
+/// with a live form reference (no selector round-trip required).
+///
+/// Returns:
+/// - `{ matched: false }` if `form` is null / not a `<form>`.
+/// - `{ matched: true, default_prevented: false, method, action,
+///    enctype, entries, accept_charset }` on success.
+///
+/// Snake-case field names match the serde deserialization on
+/// [`FormSnapshot`].
+pub(crate) const NO_EVENT_SNAPSHOT_FN_BODY: &str = r#"
+function(form) {
+    if (!form) return { matched: false };
+    const tagName = (form.tagName || '').toLowerCase();
+    if (tagName !== 'form') return { matched: false };
+
+    // Read form-level submission attributes. Use the spec-normalized
+    // IDL getters where available (now that HTMLFormElement IDL is
+    // wired) so the values match what `form.method` / `form.enctype`
+    // would report from JS. Fall back to attribute parsing for
+    // compatibility with older test setups.
+    const rawMethod = (form.method || form.getAttribute('method') || 'get').toUpperCase();
+    const method = (rawMethod === 'POST' ? 'POST' : 'GET');
+    const action = form.getAttribute('action') || '';
+    const enctypeRaw = (form.enctype || form.getAttribute('enctype') || '').toLowerCase();
+    const enctype = enctypeRaw === 'multipart/form-data'
+        ? 'multipart/form-data'
+        : enctypeRaw === 'text/plain'
+            ? 'text/plain'
+            : 'application/x-www-form-urlencoded';
+    const acceptCharset = form.getAttribute('accept-charset');
+
+    // Per WHATWG HTML §4.10.22 "constructing the form data set":
+    // when invoked via `form.submit()` (no submitter), no button
+    // contributes to the entry list — submit / image buttons are
+    // skipped entirely. Reset / button-type buttons are skipped
+    // always.
+    const controls = form.querySelectorAll('input, select, textarea, button');
+    const entries = [];
+
+    const isDisabled = (el) => el.hasAttribute('disabled');
+
+    for (const el of controls) {
+        const tag = (el.tagName || '').toLowerCase();
+        const name = el.getAttribute('name');
+        if (!name) continue;
+        if (isDisabled(el)) continue;
+
+        if (tag === 'button') {
+            // No submitter in submit() mode → buttons never count.
+            continue;
+        }
+
+        if (tag === 'input') {
+            const type = (el.getAttribute('type') || 'text').toLowerCase();
+            switch (type) {
+                case 'submit':
+                case 'reset':
+                case 'button':
+                case 'image':
+                    // No submitter → skip every button-type input.
+                    continue;
+                case 'checkbox':
+                case 'radio': {
+                    if (!el.checked) continue;
+                    const v = el.value || el.getAttribute('value') || 'on';
+                    entries.push({ name, value: v, kind: 'text' });
+                    break;
+                }
+                case 'file': {
+                    let filename = '';
+                    if (el.files && el.files.length > 0) {
+                        filename = el.files[0].name || '';
+                    }
+                    entries.push({
+                        name,
+                        value: filename,
+                        kind: 'file',
+                        filename,
+                        content_type: 'application/octet-stream',
+                    });
+                    break;
+                }
+                default: {
+                    entries.push({
+                        name,
+                        value: (el.value || el.getAttribute('value') || ''),
+                        kind: 'text',
+                    });
+                }
+            }
+            continue;
+        }
+
+        if (tag === 'textarea') {
+            entries.push({
+                name,
+                value: (el.value || el.textContent || ''),
+                kind: 'text',
+            });
+            continue;
+        }
+
+        if (tag === 'select') {
+            const isMultiple = el.hasAttribute('multiple');
+            const optionEls = el.querySelectorAll('option');
+            let pickedAny = false;
+            for (const opt of optionEls) {
+                const selected = opt.hasAttribute('selected') || (opt.selected === true);
+                if (!selected) continue;
+                pickedAny = true;
+                const v = (opt.getAttribute('value') !== null)
+                    ? opt.getAttribute('value')
+                    : (opt.textContent || '');
+                entries.push({ name, value: v, kind: 'text' });
+                if (!isMultiple) break;
+            }
+            if (!isMultiple && !pickedAny && optionEls.length > 0) {
+                const opt = optionEls[0];
+                const v = (opt.getAttribute('value') !== null)
+                    ? opt.getAttribute('value')
+                    : (opt.textContent || '');
+                entries.push({ name, value: v, kind: 'text' });
+            }
+            continue;
+        }
+    }
+
+    return {
+        matched: true,
+        default_prevented: false,
+        method,
+        action,
+        enctype,
+        entries,
+        accept_charset: acceptCharset,
+    };
+}
+"#;
+
 /// Resolve `action` against `base` per §4.10.22.3 step 12. Missing or
 /// empty action → the base URL itself. Invalid action → error.
 fn resolve_action(base: &Url, action: &str) -> Result<Url, EvalError> {

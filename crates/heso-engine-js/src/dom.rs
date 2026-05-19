@@ -474,6 +474,158 @@ fn write_anchor_href<'js>(this: &This<Class<'js, Element>>, url: &Url) {
     }
 }
 
+// =====================================================================
+// HTMLFormElement helpers (WHATWG HTML §4.10.3)
+// =====================================================================
+//
+// The IDL surface for `<form>` lives below as gated methods on the
+// shared [`Element`] class (same pattern as the `HTMLHyperlinkElementUtils`
+// mixin on `<a>` / `<area>`). These helpers normalize the spec corners
+// so the getter bodies stay compact.
+
+/// True iff `name` is the `<form>` tag (case-insensitive). The
+/// HTMLFormElement IDL props (`action`, `method`, `enctype`,
+/// `elements`, `length`, `submit()`, `reset()`) all gate on this
+/// — every other tag returns the spec's "missing-value default"
+/// from the getters and silent no-ops from the methods.
+fn is_form_tag(name: &str) -> bool {
+    name.eq_ignore_ascii_case("form")
+}
+
+/// True iff `name` is a "listed element" per WHATWG HTML §4.10.2 —
+/// `button`, `fieldset`, `input`, `object`, `output`, `select`,
+/// `textarea`, `img` (when associated with a form via form= attribute).
+///
+/// Used by `form.elements` and `form.length` to filter the form's
+/// descendants down to its actual control set. We don't track the
+/// `form=` cross-tree association yet, so this just gates on tag
+/// name; that matches the common case where every control is a
+/// physical descendant of `<form>`.
+///
+/// Note: `<img>` is technically a listed element (for image-button
+/// purposes), but only `<img>` with an `ismap` / `usemap` semantics
+/// applies. We omit it from `form.elements` because real-world
+/// pages don't rely on the rare img-as-form-control path; if a
+/// page does, it would still find the img via
+/// `form.querySelector('img')`.
+fn is_listed_form_control_tag(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "button" | "fieldset" | "input" | "object" | "output" | "select" | "textarea"
+    )
+}
+
+/// Walk a form's element subtree and collect every listed form
+/// control. Returns the node ids in document order so callers can
+/// preserve the spec-required ordering.
+///
+/// Spec: <https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#the-form-element>
+/// step ("the elements IDL attribute must return an HTMLFormControlsCollection
+/// rooted at this form's node...").
+fn collect_form_listed_controls(doc: &Arc<DqDocument>, form_id: NodeId) -> Vec<NodeId> {
+    let Some(form) = doc.tree.get(&form_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for descendant in form.descendants_it() {
+        if !descendant.is_element() {
+            continue;
+        }
+        let Some(name) = descendant.node_name() else {
+            continue;
+        };
+        if is_listed_form_control_tag(name.as_ref()) {
+            out.push(descendant.id);
+        }
+    }
+    out
+}
+
+/// Resolve a form's `action` attribute against the document base
+/// URL per WHATWG HTML §4.10.3. The getter spec returns the
+/// resolved absolute URL when the attribute is set and parseable,
+/// or the document URL when the attribute is missing/empty.
+///
+/// Returns the serialized absolute URL or empty string when
+/// resolution fails (e.g. base URL itself isn't parseable).
+fn resolve_form_action<'js>(ctx: &Ctx<'js>, node: &NodeRef<'_>) -> rquickjs::Result<String> {
+    // Per spec: when action is missing or empty, use the document URL.
+    let raw_action = node.attr("action").map(|s| s.to_string());
+    let action = raw_action.as_deref().unwrap_or("");
+    // Empty string or absent → return the document base URL itself.
+    if action.is_empty() {
+        return Ok(document_base_url(ctx)?
+            .map(|u| u.as_str().to_owned())
+            .unwrap_or_default());
+    }
+    // Try absolute parse first.
+    if let Ok(u) = Url::parse(action) {
+        return Ok(u.as_str().to_owned());
+    }
+    // Relative — resolve against document base.
+    if let Some(base) = document_base_url(ctx)? {
+        if let Ok(u) = base.join(action) {
+            return Ok(u.as_str().to_owned());
+        }
+    }
+    // Parse failure with no base → fall back to the raw attribute.
+    Ok(action.to_owned())
+}
+
+/// Per WHATWG HTML §4.10.3, `form.method` getter normalizes the
+/// `method` content attribute to one of `"get"`, `"post"`,
+/// `"dialog"` (all lowercase). Anything else — including a missing
+/// attribute — returns the spec's "missing value default" of
+/// `"get"`.
+///
+/// Spec: <https://html.spec.whatwg.org/multipage/forms.html#dom-fs-method>.
+fn normalize_form_method(raw: Option<&str>) -> &'static str {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "post" => "post",
+        "dialog" => "dialog",
+        // "get" or any other value (including the empty string when
+        // the attribute is missing) → default state "get".
+        _ => "get",
+    }
+}
+
+/// Per WHATWG HTML §4.10.3, `form.enctype` getter normalizes the
+/// `enctype` content attribute to one of the three valid values
+/// (lowercase). Anything else falls back to the "missing value
+/// default" of `"application/x-www-form-urlencoded"`.
+///
+/// `form.encoding` is a spec-defined alias for `form.enctype` with
+/// identical semantics.
+///
+/// Spec: <https://html.spec.whatwg.org/multipage/forms.html#dom-fs-enctype>.
+fn normalize_form_enctype(raw: Option<&str>) -> &'static str {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "multipart/form-data" => "multipart/form-data",
+        "text/plain" => "text/plain",
+        // "application/x-www-form-urlencoded" or any other value
+        // (including missing) → default.
+        _ => "application/x-www-form-urlencoded",
+    }
+}
+
+/// Helper for `<form>`-gated IDL methods. Returns the form's
+/// [`NodeRef`] when the element is a `<form>`, else `None`.
+fn form_node_ref<'a, 'js>(
+    this: &This<Class<'js, Element>>,
+    doc: &'a Arc<DqDocument>,
+) -> Option<NodeRef<'a>> {
+    let node_id = this.0.borrow().node_id;
+    let node = doc.tree.get(&node_id)?;
+    let is_form = node
+        .node_name()
+        .map(|n| is_form_tag(n.as_ref()))
+        .unwrap_or(false);
+    if !is_form {
+        return None;
+    }
+    Some(node)
+}
+
 /// The `document` global.
 ///
 /// Wraps a parsed [`dom_query::Document`]. Construction is from Rust
@@ -716,6 +868,116 @@ impl Document {
     fn get_elements_by_tag_name(&self, name: String) -> Vec<Element> {
         let selector = if name == "*" { "*".to_owned() } else { name };
         match self.doc.try_select(&selector) {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    // ===== HTMLCollection accessors (WHATWG HTML §3.1.4) =====================
+    //
+    // `document.scripts` / `.forms` / `.images` / `.links` /
+    // `.anchors` are spec-defined "live HTMLCollection"s of common
+    // tag families. Per spec each is "live" — appending a new element
+    // re-shows up in the collection on next read. We snapshot at read
+    // time (each getter walks the tree and returns a plain Vec) for
+    // the same reason `getElementsByTagName` does: real pages iterate
+    // immediately, and re-reading the property produces an up-to-date
+    // snapshot anyway.
+    //
+    // Bug-of-record: V2 agent findings reported all five accessors
+    // return `undefined`, blocking the common scraping idiom of
+    // `Array.from(document.forms).filter(...)`. See AGENT_FINDINGS_V2.md
+    // "Bonus findings" + "Top NEW bugs" #6.
+
+    /// `document.scripts` — array of every `<script>` element in the
+    /// document, in document order.
+    ///
+    /// Snapshot HTMLCollection-shape per the module note on liveness.
+    /// Spec: <https://html.spec.whatwg.org/multipage/dom.html#dom-document-scripts>.
+    #[qjs(get)]
+    fn scripts(&self) -> Vec<Element> {
+        match self.doc.try_select("script") {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `document.forms` — array of every `<form>` element in the
+    /// document, in document order.
+    ///
+    /// Snapshot HTMLCollection-shape per the module note on liveness.
+    /// Spec: <https://html.spec.whatwg.org/multipage/dom.html#dom-document-forms>.
+    #[qjs(get)]
+    fn forms(&self) -> Vec<Element> {
+        match self.doc.try_select("form") {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `document.images` — array of every `<img>` element in the
+    /// document, in document order.
+    ///
+    /// Snapshot HTMLCollection-shape per the module note on liveness.
+    /// Spec: <https://html.spec.whatwg.org/multipage/dom.html#dom-document-images>.
+    #[qjs(get)]
+    fn images(&self) -> Vec<Element> {
+        match self.doc.try_select("img") {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `document.links` — array of every `<a>` and `<area>` element
+    /// that has an `href` content attribute, in document order. Per
+    /// WHATWG: "links" specifically requires the `href` attribute
+    /// (so anchors without one are excluded — they're not really
+    /// links).
+    ///
+    /// Snapshot HTMLCollection-shape per the module note on liveness.
+    /// Spec: <https://html.spec.whatwg.org/multipage/dom.html#dom-document-links>.
+    #[qjs(get)]
+    fn links(&self) -> Vec<Element> {
+        // `a[href], area[href]` — comma selector returns both, in
+        // document order. Per spec, only elements with the attribute
+        // count; the attribute-presence filter is the `[href]`
+        // matcher rather than a separate post-filter.
+        match self.doc.try_select("a[href], area[href]") {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `document.anchors` — array of every `<a>` element with a
+    /// `name` content attribute, in document order. Deprecated in
+    /// HTML5 (named anchors were superseded by `id`), but still
+    /// part of the spec for backward compat.
+    ///
+    /// Snapshot HTMLCollection-shape per the module note on liveness.
+    /// Spec: <https://html.spec.whatwg.org/multipage/dom.html#dom-document-anchors>.
+    #[qjs(get)]
+    fn anchors(&self) -> Vec<Element> {
+        match self.doc.try_select("a[name]") {
             Some(sel) => sel
                 .nodes()
                 .iter()
@@ -2385,6 +2647,425 @@ impl Element {
                 write_anchor_href(&this, &u);
             }
         }
+        Ok(())
+    }
+
+    // ===== HTMLFormElement IDL (`<form>`) ====================================
+    //
+    // WHATWG HTML §4.10.3 — `action`, `method`, `enctype`, `encoding`
+    // (alias for `enctype`), `target`, `acceptCharset`, `autocomplete`,
+    // `noValidate`, `length`, `elements`, `submit()`, `reset()`.
+    //
+    // Gated by tag-name check on `<form>` per the same pattern as the
+    // anchor mixin above and the `<input>`-specific IDL surface
+    // (`value` / `checked`). Non-`<form>` tags return the spec's
+    // "missing-value default" from getters and silent no-op from
+    // methods.
+    //
+    // `form.name` and `form.placeholder` are intentionally *not* listed
+    // here — the generic Element `.name` getter (further up) already
+    // does attribute reflection that matches the form's `name` IDL.
+    //
+    // Bug-of-record: prior to this batch, `form.method` / `form.action`
+    // / `form.enctype` all returned `undefined`, forcing scrapers to
+    // use `form.getAttribute(...)` (which doesn't normalize per spec).
+    // Sibling fix to the HTMLAnchorElement.href mixin landed in commit
+    // `17ddf77`. See `AGENT_FINDINGS_V2.md` "Bonus findings" + "Top NEW
+    // bugs" #3 for the original report.
+    //
+    // Spec: <https://html.spec.whatwg.org/multipage/forms.html#the-form-element>.
+
+    /// `form.action` IDL getter per WHATWG HTML §4.10.3.
+    ///
+    /// Algorithm:
+    /// 1. If this is not a `<form>`, return `""`.
+    /// 2. Resolve the `action` content attribute against the document
+    ///    base URL (`globalThis.location.href`).
+    /// 3. When the attribute is missing/empty, the spec says use the
+    ///    document URL itself (so the form posts back to the current
+    ///    page).
+    ///
+    /// Unlike `<a>`/`<area>` URL decomposition, `<form>` only exposes
+    /// `.action` as a single string — not the full `protocol`/`host`/
+    /// etc. mixin.
+    #[qjs(get)]
+    fn action<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
+        let doc = this.0.borrow().doc.clone();
+        let Some(node) = form_node_ref(&this, &doc) else {
+            return Ok(String::new());
+        };
+        resolve_form_action(&ctx, &node)
+    }
+
+    /// `form.action = "..."` IDL setter — writes the `action` content
+    /// attribute verbatim. Per spec the setter is "set the content
+    /// attribute to the given value"; URL resolution happens lazily
+    /// on the next getter call.
+    #[qjs(set, rename = "action")]
+    fn set_action<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<String>) {
+        let doc = this.0.borrow().doc.clone();
+        if let Some(node) = form_node_ref(&this, &doc) {
+            node.set_attr("action", &value.0);
+        }
+    }
+
+    /// `form.method` IDL getter per WHATWG HTML §4.10.3.
+    ///
+    /// Returns one of `"get"`, `"post"`, `"dialog"` (lowercase).
+    /// Missing or invalid attribute → `"get"` (the spec's
+    /// "missing value default" / "invalid value default").
+    ///
+    /// Note: this is intentionally NOT `getAttribute('method')` —
+    /// the IDL getter normalizes per spec, while `getAttribute`
+    /// returns the raw attribute text as authored.
+    #[qjs(get)]
+    fn method<'js>(this: This<Class<'js, Self>>) -> String {
+        let doc = this.0.borrow().doc.clone();
+        let Some(node) = form_node_ref(&this, &doc) else {
+            return String::new();
+        };
+        let raw = node.attr("method").map(|s| s.to_string());
+        normalize_form_method(raw.as_deref()).to_owned()
+    }
+
+    /// `form.method = "..."` IDL setter — writes the `method` content
+    /// attribute verbatim. Per spec the normalization happens on read,
+    /// not write, so `form.method = "POST"` stores `"POST"` literally
+    /// and `getAttribute('method')` returns `"POST"`.
+    #[qjs(set, rename = "method")]
+    fn set_method<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<String>) {
+        let doc = this.0.borrow().doc.clone();
+        if let Some(node) = form_node_ref(&this, &doc) {
+            node.set_attr("method", &value.0);
+        }
+    }
+
+    /// `form.enctype` IDL getter per WHATWG HTML §4.10.3.
+    ///
+    /// Returns one of `"application/x-www-form-urlencoded"`,
+    /// `"multipart/form-data"`, `"text/plain"`. Missing or invalid
+    /// attribute → `"application/x-www-form-urlencoded"` (the spec's
+    /// "missing value default").
+    #[qjs(get)]
+    fn enctype<'js>(this: This<Class<'js, Self>>) -> String {
+        let doc = this.0.borrow().doc.clone();
+        let Some(node) = form_node_ref(&this, &doc) else {
+            return String::new();
+        };
+        let raw = node.attr("enctype").map(|s| s.to_string());
+        normalize_form_enctype(raw.as_deref()).to_owned()
+    }
+
+    /// `form.enctype = "..."` IDL setter — writes the `enctype` content
+    /// attribute verbatim. Normalization on read, not write.
+    #[qjs(set, rename = "enctype")]
+    fn set_enctype<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<String>) {
+        let doc = this.0.borrow().doc.clone();
+        if let Some(node) = form_node_ref(&this, &doc) {
+            node.set_attr("enctype", &value.0);
+        }
+    }
+
+    /// `form.encoding` — spec-defined alias for `form.enctype` (same
+    /// getter, same setter, same defaults). Real pages do read this
+    /// alias.
+    ///
+    /// Spec: "The encoding IDL attribute, on getting, must return the
+    /// result of running the corresponding getter steps for the enctype
+    /// IDL attribute."
+    #[qjs(get)]
+    fn encoding<'js>(this: This<Class<'js, Self>>) -> String {
+        Self::enctype(this)
+    }
+
+    /// `form.encoding = "..."` — alias for `form.enctype = "..."`.
+    #[qjs(set, rename = "encoding")]
+    fn set_encoding<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<String>) {
+        Self::set_enctype(this, value);
+    }
+
+    /// `form.target` — reflects the `target` content attribute
+    /// (the browsing context name to navigate on submit, e.g. `_blank`).
+    /// Empty string when missing. No normalization on read per spec.
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> String {
+        let doc = this.0.borrow().doc.clone();
+        let Some(node) = form_node_ref(&this, &doc) else {
+            return String::new();
+        };
+        node.attr("target").map(|s| s.to_string()).unwrap_or_default()
+    }
+
+    /// `form.target = "..."` — write the `target` content attribute.
+    #[qjs(set, rename = "target")]
+    fn set_target<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<String>) {
+        let doc = this.0.borrow().doc.clone();
+        if let Some(node) = form_node_ref(&this, &doc) {
+            node.set_attr("target", &value.0);
+        }
+    }
+
+    /// `form.acceptCharset` — reflects the `accept-charset` content
+    /// attribute. JS name camel-cases the kebab. Empty string when
+    /// missing.
+    #[qjs(get, rename = "acceptCharset")]
+    fn accept_charset<'js>(this: This<Class<'js, Self>>) -> String {
+        let doc = this.0.borrow().doc.clone();
+        let Some(node) = form_node_ref(&this, &doc) else {
+            return String::new();
+        };
+        node.attr("accept-charset")
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `form.acceptCharset = "..."` — write the `accept-charset`
+    /// content attribute.
+    #[qjs(set, rename = "acceptCharset")]
+    fn set_accept_charset<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<String>) {
+        let doc = this.0.borrow().doc.clone();
+        if let Some(node) = form_node_ref(&this, &doc) {
+            node.set_attr("accept-charset", &value.0);
+        }
+    }
+
+    /// `form.autocomplete` — reflects the `autocomplete` content
+    /// attribute. Default per spec is `"on"`, but the getter returns
+    /// the raw attribute when present (only the missing-value default
+    /// is `"on"`). We return the raw attribute when set and `"on"`
+    /// when missing — that matches the most common framework
+    /// expectation.
+    #[qjs(get)]
+    fn autocomplete<'js>(this: This<Class<'js, Self>>) -> String {
+        let doc = this.0.borrow().doc.clone();
+        let Some(node) = form_node_ref(&this, &doc) else {
+            return String::new();
+        };
+        node.attr("autocomplete")
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "on".to_owned())
+    }
+
+    /// `form.autocomplete = "..."` — write the `autocomplete`
+    /// content attribute.
+    #[qjs(set, rename = "autocomplete")]
+    fn set_autocomplete<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<String>) {
+        let doc = this.0.borrow().doc.clone();
+        if let Some(node) = form_node_ref(&this, &doc) {
+            node.set_attr("autocomplete", &value.0);
+        }
+    }
+
+    /// `form.noValidate` — boolean IDL reflection of the `novalidate`
+    /// content attribute. `true` iff the attribute is present.
+    #[qjs(get, rename = "noValidate")]
+    fn no_validate<'js>(this: This<Class<'js, Self>>) -> bool {
+        let doc = this.0.borrow().doc.clone();
+        let Some(node) = form_node_ref(&this, &doc) else {
+            return false;
+        };
+        node.has_attr("novalidate")
+    }
+
+    /// `form.noValidate = bool` — toggle the `novalidate` content
+    /// attribute. `true` → `setAttribute('novalidate', '')`;
+    /// `false` → `removeAttribute('novalidate')`.
+    #[qjs(set, rename = "noValidate")]
+    fn set_no_validate<'js>(this: This<Class<'js, Self>>, value: rquickjs::Coerced<bool>) {
+        let doc = this.0.borrow().doc.clone();
+        if let Some(node) = form_node_ref(&this, &doc) {
+            if value.0 {
+                node.set_attr("novalidate", "");
+            } else {
+                node.remove_attr("novalidate");
+            }
+        }
+    }
+
+    /// `form.length` — number of listed form controls (`button`,
+    /// `fieldset`, `input`, `object`, `output`, `select`, `textarea`)
+    /// that are descendants of this form. Non-`<form>` tags return `0`.
+    ///
+    /// Spec: <https://html.spec.whatwg.org/multipage/forms.html#dom-form-length>.
+    #[qjs(get)]
+    fn length<'js>(this: This<Class<'js, Self>>) -> u32 {
+        let (doc, node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        let Some(node) = doc.tree.get(&node_id) else {
+            return 0;
+        };
+        let is_form = node
+            .node_name()
+            .map(|n| is_form_tag(n.as_ref()))
+            .unwrap_or(false);
+        if !is_form {
+            return 0;
+        }
+        collect_form_listed_controls(&doc, node_id).len() as u32
+    }
+
+    /// `form.elements` — array of listed form controls (`button`,
+    /// `fieldset`, `input`, `object`, `output`, `select`, `textarea`),
+    /// in document order.
+    ///
+    /// Per spec this returns a live `HTMLFormControlsCollection`. We
+    /// return a snapshot `Vec<Element>` for the same reason
+    /// `document.getElementsByTagName` does — most callers iterate
+    /// immediately, indexed access works (`form.elements[0]`,
+    /// `form.elements.length`), and the engine has no observer model
+    /// to invalidate a live collection on mutation. Real pages
+    /// rarely depend on liveness; if a page does, a re-read of
+    /// `form.elements` produces an up-to-date snapshot anyway.
+    ///
+    /// Spec: <https://html.spec.whatwg.org/multipage/forms.html#dom-form-elements>.
+    #[qjs(get)]
+    fn elements<'js>(this: This<Class<'js, Self>>) -> Vec<Element> {
+        let (doc, node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        let Some(node) = doc.tree.get(&node_id) else {
+            return Vec::new();
+        };
+        let is_form = node
+            .node_name()
+            .map(|n| is_form_tag(n.as_ref()))
+            .unwrap_or(false);
+        if !is_form {
+            return Vec::new();
+        }
+        collect_form_listed_controls(&doc, node_id)
+            .into_iter()
+            .map(|id| Element::from_id(doc.clone(), id))
+            .collect()
+    }
+
+    /// `form.submit()` — programmatically submit the form WITHOUT
+    /// firing the `submit` event, per WHATWG HTML §4.10.3 and the
+    /// jsdom WPT (`HTMLFormElement's submit() does not fire a
+    /// SubmitEvent`).
+    ///
+    /// Implementation: walks the form to build the entry list,
+    /// resolves the action URL against the document base, and routes
+    /// to a globalThis-installed `__hesoFormSubmitNow` helper that
+    /// synchronously issues the HTTP request via the engine's
+    /// shared `reqwest::Client`. Returns nothing (per spec it's
+    /// void).
+    ///
+    /// **Differences from real browsers / the verb path:**
+    /// - Real browsers navigate the top-level browsing context to
+    ///   the response URL. heso has no top-level context here (the
+    ///   call site is inside `eval-dom` / `eval-js`, not a session
+    ///   step), so we issue the HTTP request but DO NOT replace
+    ///   the document. The session-level `JsSession::submit` path
+    ///   (which fires the submit event AND navigates) is the
+    ///   end-to-end equivalent.
+    /// - Silent no-op when the engine was built without a fetch
+    ///   client (`JsEngine::new()` rather than
+    ///   `JsEngine::new_with_fetch`) — matches the spec's "no
+    ///   browsing context" branch.
+    ///
+    /// Bug-of-record: V2 agent findings reported `form.submit()`
+    /// throws `TypeError: not a function`. After this PR it
+    /// dispatches a real HTTP request.
+    fn submit<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<()> {
+        let (doc, node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        let Some(node) = doc.tree.get(&node_id) else {
+            return Ok(());
+        };
+        if !node
+            .node_name()
+            .map(|n| is_form_tag(n.as_ref()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        // Route to the JS-installed `__hesoFormSubmitNow(form)` helper
+        // which has captured a clone of the engine's `reqwest::Client`.
+        // Installed only when fetch state exists; absent in
+        // `JsEngine::new()` engines, in which case the call is a
+        // silent no-op.
+        let globals = ctx.globals();
+        let Ok(submit_now) = globals.get::<_, Function<'js>>("__hesoFormSubmitNow") else {
+            return Ok(());
+        };
+        let form_value: Value<'js> = this.0.clone().into_value();
+        let _ = submit_now.call::<_, Value<'js>>((form_value,))?;
+        Ok(())
+    }
+
+    /// `form.reset()` — reset every control in the form to its
+    /// default value per WHATWG HTML §4.10.3.
+    ///
+    /// Implementation: walks the form's listed controls and clears
+    /// the IDL value / checked dirty bits (so the next read of
+    /// `input.value` falls back to the `value` content attribute,
+    /// matching the spec). After resetting, fires a non-cancelable
+    /// `reset` event on the form per spec.
+    ///
+    /// **What we DO reset:**
+    /// - `<input>` IDL value (the dirty bit set by `input.value = ...`)
+    /// - `<input>` checked state (the dirty bit set by
+    ///   `input.checked = true/false`)
+    /// - `<textarea>` IDL value (same mechanism)
+    /// - `<select>` selected option (would clear; not stored as IDL
+    ///   state in this engine, so no-op).
+    ///
+    /// **What we don't:**
+    /// - File-input file lists (no file plumbing yet).
+    /// - Custom-element form-associated reset callbacks (no custom
+    ///   elements yet).
+    fn reset<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<()> {
+        let (doc, node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        let Some(node) = doc.tree.get(&node_id) else {
+            return Ok(());
+        };
+        if !node
+            .node_name()
+            .map(|n| is_form_tag(n.as_ref()))
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        // Walk listed controls and clear their per-node IDL state
+        // (value dirty + checked dirty). The shared
+        // `__nodeIdlState` registry lives on `document` — we just
+        // delete the entry for each control's NodeId.
+        let controls = collect_form_listed_controls(&doc, node_id);
+        let document: Option<Object<'js>> =
+            ctx.globals().get::<_, Option<Object<'js>>>("document")?;
+        if let Some(document) = document {
+            if let Some(registry) =
+                document.get::<_, Option<Object<'js>>>(PROP_NODE_IDL_STATE)?
+            {
+                for control_id in controls {
+                    let key = node_key(control_id);
+                    let _ = registry.remove(key.as_str());
+                }
+            }
+        }
+        // Fire a non-cancelable `reset` event on the form, per spec.
+        let event = events::Event::new_with_init(
+            "reset".to_owned(),
+            Some(events::EventInit {
+                bubbles: true,
+                cancelable: false,
+                composed: false,
+            }),
+        );
+        let event_class = Class::instance(ctx.clone(), event)?;
+        let event_value: Value<'js> = event_class.into_value();
+        let element = this.0.borrow().clone();
+        let path = build_dispatch_path(&ctx, &element)?;
+        let _ = dispatch_with_node_path(&ctx, &path, event_value)?;
         Ok(())
     }
 
