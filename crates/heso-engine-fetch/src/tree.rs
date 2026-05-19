@@ -35,10 +35,21 @@
 //! [ADR 0010]: ../../../decisions/0010-primitives-as-terminal-commands.md
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::{Deserialize, Serialize};
 use url::Url;
+
+// Each of these used to be `Selector::parse(...)` inside the hot
+// per-page extractors. Lifted to `LazyLock` so each pattern compiles
+// once per process.
+static TITLE_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title").expect("valid"));
+static META_DESC_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"meta[name="description"]"#).expect("valid"));
+static BODY_P_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("body p").expect("valid"));
+static BODY_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("body").expect("valid"));
 
 // ============================================================================
 // Errors
@@ -216,10 +227,7 @@ pub fn build_tree_from_doc(doc: &Html, url: &Url) -> HtmlTree {
     let description = extract_description(doc);
 
     let mut builder = TreeBuilder::new();
-    if let Some(body) = doc
-        .select(&Selector::parse("body").expect("`body` is a valid selector"))
-        .next()
-    {
+    if let Some(body) = doc.select(&BODY_SEL).next() {
         for child in body.children() {
             walk_node(child, &mut builder);
         }
@@ -245,16 +253,14 @@ pub fn build_tree_from_doc(doc: &Html, url: &Url) -> HtmlTree {
 // ============================================================================
 
 fn extract_title(doc: &Html) -> String {
-    let selector = Selector::parse("title").expect("`title` is a valid selector");
-    doc.select(&selector)
+    doc.select(&TITLE_SEL)
         .next()
-        .map(|t| collapse_ws(&t.text().collect::<Vec<_>>().join(" ")))
+        .map(|t| collapse_ws(&join_with_space(t.text())))
         .unwrap_or_default()
 }
 
 fn extract_description(doc: &Html) -> Option<String> {
-    let meta_selector = Selector::parse(r#"meta[name="description"]"#).expect("valid selector");
-    if let Some(meta) = doc.select(&meta_selector).next() {
+    if let Some(meta) = doc.select(&META_DESC_SEL).next() {
         if let Some(content) = meta.value().attr("content") {
             let trimmed = collapse_ws(content);
             if !trimmed.is_empty() {
@@ -262,8 +268,7 @@ fn extract_description(doc: &Html) -> Option<String> {
             }
         }
     }
-    let p_selector = Selector::parse("body p").expect("valid selector");
-    if let Some(p) = doc.select(&p_selector).next() {
+    if let Some(p) = doc.select(&BODY_P_SEL).next() {
         let text = collapse_ws(&p.text().collect::<String>());
         if text.is_empty() {
             return None;
@@ -430,7 +435,7 @@ fn walk_node(node: ego_tree::NodeRef<'_, Node>, builder: &mut TreeBuilder) {
                     // (`<br>`, `<span>`, `<em>`, ...) don't smash adjacent
                     // words together. `collapse_ws` then squashes any
                     // resulting whitespace runs.
-                    let heading = collapse_ws(&elem.text().collect::<Vec<_>>().join(" "));
+                    let heading = collapse_ws(&join_with_space(elem.text()));
                     if !heading.is_empty() {
                         builder.open_section(level, heading);
                         return;
@@ -535,7 +540,35 @@ pub(crate) fn slugify(input: &str) -> String {
 }
 
 pub(crate) fn collapse_ws(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Single allocation, no intermediate `Vec<&str>`: walk tokens once
+    // and push directly into the output. Same observable behaviour as
+    // `s.split_whitespace().collect::<Vec<_>>().join(" ")`.
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.split_whitespace();
+    if let Some(first) = iter.next() {
+        out.push_str(first);
+        for tok in iter {
+            out.push(' ');
+            out.push_str(tok);
+        }
+    }
+    out
+}
+
+/// Concatenate an iterator of `&str` chunks with a single ASCII space
+/// between each, without the intermediate `Vec<&str>` that
+/// `.collect::<Vec<_>>().join(" ")` allocates. Used by every action /
+/// tree / metadata pass that walks `scraper::ElementRef::text()`.
+pub(crate) fn join_with_space<'a, I: Iterator<Item = &'a str>>(mut it: I) -> String {
+    let mut out = String::new();
+    if let Some(first) = it.next() {
+        out.push_str(first);
+        for chunk in it {
+            out.push(' ');
+            out.push_str(chunk);
+        }
+    }
+    out
 }
 
 // ============================================================================

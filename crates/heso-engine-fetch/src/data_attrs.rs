@@ -48,7 +48,7 @@
 
 use std::collections::BTreeMap;
 
-use scraper::{Html, Selector};
+use scraper::{Html, Node};
 
 /// One occurrence of a recognized `data-*` JSON attribute.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,10 +68,14 @@ pub struct DataAttrValue {
 pub fn extract(doc: &Html) -> BTreeMap<String, Vec<DataAttrValue>> {
     let mut out: BTreeMap<String, Vec<DataAttrValue>> = BTreeMap::new();
 
-    let selector = Selector::parse("*").expect("universal selector is valid");
-    for el in doc.select(&selector) {
-        let elem = el.value();
-        let tag = elem.name().to_owned();
+    // Walk the underlying `ego_tree` directly rather than parsing a
+    // `*` selector and running selector-matching on every node — both
+    // the parse and the per-node selector match are pure overhead for
+    // a universal walk. The iteration order is the same (document
+    // order), and we still hit every `Node::Element`.
+    for node in doc.tree.values() {
+        let Node::Element(elem) = node else { continue };
+        let mut tag: Option<&str> = None;
         for (attr_name, attr_value) in elem.attrs() {
             if !attr_name.starts_with("data-") {
                 continue;
@@ -87,10 +91,14 @@ pub fn extract(doc: &Html) -> BTreeMap<String, Vec<DataAttrValue>> {
             if !is_meaningful_payload(&parsed) {
                 continue;
             }
+            // Lazy: only fetch the tag name when we know we'll keep
+            // the attr. Skips a `to_owned` per element on pages full
+            // of nodes with no `data-*` attrs.
+            let tag_str = *tag.get_or_insert_with(|| elem.name());
             out.entry(attr_name.to_owned())
                 .or_default()
                 .push(DataAttrValue {
-                    tag: tag.clone(),
+                    tag: tag_str.to_owned(),
                     value: parsed,
                 });
         }

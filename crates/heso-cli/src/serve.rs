@@ -172,7 +172,8 @@ pub async fn run() -> ExitCode {
             "methods": ["open", "ls", "cat", "find", "close", "ping"],
         }
     });
-    if write_line(&mut stdout, &hello).await.is_err() {
+    let hello_line = serde_json::to_string(&hello).unwrap_or_else(|_| String::from("{}"));
+    if write_line(&mut stdout, &hello_line).await.is_err() {
         return ExitCode::FAILURE;
     }
 
@@ -191,15 +192,18 @@ pub async fn run() -> ExitCode {
         }
 
         let response = handle(state.clone(), trimmed).await;
-        let value = match serde_json::to_value(&response) {
-            Ok(v) => v,
-            Err(_) => serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": serde_json::Value::Null,
-                "error": { "code": INTERNAL_ERROR, "message": "failed to serialize response" }
-            }),
+        // Serialize the Response straight to a String — `serde_json::to_string`
+        // walks the struct directly, no intermediate `Value` tree.
+        let line = match serde_json::to_string(&response) {
+            Ok(s) => s,
+            Err(_) => {
+                // Pre-canonicalized fallback. Tiny, no allocation
+                // beyond the single static literal copy.
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"failed to serialize response"}}"#
+                    .to_owned()
+            }
         };
-        if write_line(&mut stdout, &value).await.is_err() {
+        if write_line(&mut stdout, &line).await.is_err() {
             // stdout closed by the parent — we're done.
             break;
         }
@@ -207,11 +211,9 @@ pub async fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn write_line(out: &mut tokio::io::Stdout, v: &serde_json::Value) -> std::io::Result<()> {
-    let mut s = serde_json::to_string(v)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    s.push('\n');
-    out.write_all(s.as_bytes()).await?;
+async fn write_line(out: &mut tokio::io::Stdout, line: &str) -> std::io::Result<()> {
+    out.write_all(line.as_bytes()).await?;
+    out.write_all(b"\n").await?;
     out.flush().await
 }
 
@@ -338,16 +340,19 @@ async fn dispatch_open(
         }
     }
     // Compute the plat_hash AFTER all content fields are in place but
-    // BEFORE the page_id (which is server-instance-scoped, not part of
-    // the plat's portable identity). The plat module strips `plat_hash`
-    // and `page_id` would also bias the hash, so we hash a clone with
-    // `page_id` removed, then put it back.
-    let mut hash_input = payload.clone();
-    if let Some(obj) = hash_input.as_object_mut() {
-        obj.remove("page_id");
-    }
-    let hash = heso_engine_fetch::plat_hash(&hash_input);
+    // BEFORE re-attaching `page_id` (which is server-instance-scoped
+    // and would bias the hash). Detach `page_id` from the payload,
+    // hash the rest, re-attach. Previously this cloned the whole
+    // payload tree just to drop one key — for `--explore-links` plats
+    // with many linked pages, that clone dominated.
+    let page_id_value = payload
+        .as_object_mut()
+        .and_then(|obj| obj.remove("page_id"));
+    let hash = heso_engine_fetch::plat_hash(&payload);
     if let Some(obj) = payload.as_object_mut() {
+        if let Some(pid) = page_id_value {
+            obj.insert("page_id".to_owned(), pid);
+        }
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
     state.pages.lock().await.insert(page_id, page);

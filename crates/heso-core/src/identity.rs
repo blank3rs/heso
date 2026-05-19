@@ -58,13 +58,19 @@ pub const SIG_ALGORITHM: &str = "Ed25519";
 /// publicly callable on the receipt-verify path with no key material.
 pub struct IdentityKey {
     signing: SigningKey,
+    /// Precomputed base64 of the verifying key. `IdentityKey` is
+    /// long-lived (one per process for any sign-heavy workload) but
+    /// `sign()` used to re-encode the public key every call. Caching
+    /// at construction time keeps `sign()` allocation-free for the
+    /// public-key portion of the envelope.
+    public_key_b64: String,
 }
 
 impl std::fmt::Debug for IdentityKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never log private key material — only the public half.
         f.debug_struct("IdentityKey")
-            .field("public_key_b64", &self.public_key_b64())
+            .field("public_key_b64", &self.public_key_b64)
             .finish()
     }
 }
@@ -73,15 +79,19 @@ impl IdentityKey {
     /// Generate a fresh random keypair from the OS entropy source.
     pub fn generate() -> Self {
         let mut rng = OsRng;
-        Self {
-            signing: SigningKey::generate(&mut rng),
-        }
+        Self::from_signing(SigningKey::generate(&mut rng))
     }
 
     /// Construct from 32 raw seed bytes (the secret-key half).
     pub fn from_bytes(seed: &[u8; SECRET_KEY_LENGTH]) -> Self {
+        Self::from_signing(SigningKey::from_bytes(seed))
+    }
+
+    fn from_signing(signing: SigningKey) -> Self {
+        let public_key_b64 = B64.encode(signing.verifying_key().to_bytes());
         Self {
-            signing: SigningKey::from_bytes(seed),
+            signing,
+            public_key_b64,
         }
     }
 
@@ -144,9 +154,10 @@ impl IdentityKey {
     }
 
     /// Base64-encoded (standard alphabet) public key. The shape that
-    /// goes into a [`Signature`] envelope.
+    /// goes into a [`Signature`] envelope. Returns a clone of the
+    /// precomputed value cached at construction time.
     pub fn public_key_b64(&self) -> String {
-        B64.encode(self.public_key_bytes())
+        self.public_key_b64.clone()
     }
 
     /// Sign `payload` and produce an on-the-wire [`Signature`] envelope.
@@ -154,7 +165,7 @@ impl IdentityKey {
         let sig = self.signing.sign(payload);
         Signature {
             algorithm: SIG_ALGORITHM.to_owned(),
-            public_key: self.public_key_b64(),
+            public_key: self.public_key_b64.clone(),
             signature: B64.encode(sig.to_bytes()),
         }
     }

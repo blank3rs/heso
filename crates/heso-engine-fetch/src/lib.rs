@@ -382,7 +382,8 @@ fn extract_visible_text(html: &str) -> String {
 fn extract_visible_text_from_doc(doc: &Html) -> String {
     let mut out = String::new();
     walk(doc.root_element(), &mut out);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    // Same normalisation as `tree::collapse_ws`, single allocation.
+    tree::collapse_ws(&out)
 }
 
 /// Recursive DOM walker — appends text from each visible descendant text

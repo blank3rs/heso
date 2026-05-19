@@ -67,10 +67,17 @@
 //! its own client hydration — no JS execution required.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use regex::Regex;
 use scraper::{Html, Selector};
+
+// Selectors lifted out of the per-page extractors — each used to
+// `Selector::parse(...)` on every call.
+static APPLICATION_JSON_SCRIPT_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"script[type="application/json"]"#).expect("valid"));
+static SCRIPT_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("script").expect("valid"));
 
 /// Extract inline data from a parsed page.
 ///
@@ -98,9 +105,8 @@ pub fn extract(doc: &Html) -> BTreeMap<String, serde_json::Value> {
 /// `unnamed-{n}` synthetic keys in document order. Malformed JSON
 /// is skipped silently.
 fn extract_application_json(doc: &Html, out: &mut BTreeMap<String, serde_json::Value>) {
-    let selector = Selector::parse(r#"script[type="application/json"]"#).expect("valid selector");
     let mut unnamed_counter: usize = 0;
-    for s in doc.select(&selector) {
+    for s in doc.select(&APPLICATION_JSON_SCRIPT_SEL) {
         let raw: String = s.text().collect();
         // Strip a leading UTF-8 BOM (U+FEFF) before trimming —
         // `serde_json::from_str` rejects a BOM, and some servers (or
@@ -149,10 +155,9 @@ fn extract_rsc(doc: &Html, out: &mut BTreeMap<String, serde_json::Value>) {
             .expect("valid push regex")
     });
 
-    let script_selector = Selector::parse("script").expect("valid selector");
     let mut payload = String::new();
 
-    for s in doc.select(&script_selector) {
+    for s in doc.select(&SCRIPT_SEL) {
         if !is_plain_js_script(s.value().attr("type")) {
             continue;
         }
@@ -232,9 +237,7 @@ fn extract_js_data_assigns(doc: &Html, out: &mut BTreeMap<String, serde_json::Va
         Regex::new(IDENT_PATH_LHS_PATTERN_OBJECT_LITERAL).expect("valid object literal regex")
     });
 
-    let script_selector = Selector::parse("script").expect("valid selector");
-
-    for s in doc.select(&script_selector) {
+    for s in doc.select(&SCRIPT_SEL) {
         if !is_plain_js_script(s.value().attr("type")) {
             continue;
         }
@@ -526,8 +529,11 @@ fn is_plain_js_script(type_attr: Option<&str>) -> bool {
     match type_attr {
         None => true,
         Some(t) => {
-            let t = t.trim().to_ascii_lowercase();
-            t.is_empty() || t == "text/javascript" || t == "application/javascript" || t == "module"
+            let t = t.trim();
+            t.is_empty()
+                || t.eq_ignore_ascii_case("text/javascript")
+                || t.eq_ignore_ascii_case("application/javascript")
+                || t.eq_ignore_ascii_case("module")
         }
     }
 }

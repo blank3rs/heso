@@ -58,9 +58,24 @@ use serde_json::Value;
 /// with any top-level `plat_hash` field omitted from the input. 64 hex
 /// chars (256 bits).
 pub fn hash(value: &Value) -> String {
-    let canon = canonical_json(value);
-    let h = blake3::hash(canon.as_bytes());
-    h.to_hex().to_string()
+    // Stream the canonical bytes straight into the hasher — avoids
+    // building the whole canonical String just to feed it to BLAKE3.
+    // Output is identical to `blake3::hash(canonical_json(v).as_bytes())`.
+    let mut hasher = HasherWriter(blake3::Hasher::new());
+    write_canonical(value, &mut hasher);
+    hasher.0.finalize().to_hex().to_string()
+}
+
+/// `fmt::Write` adapter that funnels written UTF-8 directly into a
+/// BLAKE3 hasher without buffering. The canonical bytes are
+/// ASCII-and-escaped-UTF-8, so emitting via `fmt::Write` is well-defined.
+struct HasherWriter(blake3::Hasher);
+
+impl std::fmt::Write for HasherWriter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.update(s.as_bytes());
+        Ok(())
+    }
 }
 
 /// Return the plat's canonical-JSON string (sorted keys, compact). The
@@ -104,48 +119,95 @@ pub enum VerifyError {
 // Canonicalizer
 // ============================================================================
 
-fn write_canonical(v: &Value, out: &mut String) {
+fn write_canonical<W: std::fmt::Write>(v: &Value, out: &mut W) {
     match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::Null => {
+            let _ = out.write_str("null");
+        }
+        Value::Bool(b) => {
+            let _ = out.write_str(if *b { "true" } else { "false" });
+        }
+        Value::Number(n) => {
+            // `serde_json::Number`'s `Display` is canonical for the
+            // shapes the engine emits (no NaN, no Infinity).
+            let _ = write!(out, "{n}");
+        }
         Value::String(s) => {
-            // Delegate to serde_json for JSON-string escaping — it handles
-            // \", \\, \n, \t, \uXXXX, etc. correctly.
-            let escaped = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
-            out.push_str(&escaped);
+            // Inline JSON string escape — avoids the `serde_json::to_string`
+            // per-string allocation that the previous implementation paid.
+            write_json_string(out, s);
         }
         Value::Array(arr) => {
-            out.push('[');
+            let _ = out.write_char('[');
             for (i, item) in arr.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    let _ = out.write_char(',');
                 }
                 write_canonical(item, out);
             }
-            out.push(']');
+            let _ = out.write_char(']');
         }
         Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            // Skip the `plat_hash` field at every level — we hash the
-            // content the field describes, not the field itself.
-            keys.retain(|k| k.as_str() != "plat_hash");
+            // Collect keys, drop `plat_hash` at every level (we hash the
+            // content the field names, not the field itself), then sort.
+            let mut keys: Vec<&String> = map.keys().filter(|k| k.as_str() != "plat_hash").collect();
             keys.sort();
-            out.push('{');
+            let _ = out.write_char('{');
             for (i, key) in keys.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    let _ = out.write_char(',');
                 }
-                let escaped = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
-                out.push_str(&escaped);
-                out.push(':');
+                write_json_string(out, key);
+                let _ = out.write_char(':');
                 // SAFETY: `keys` came from `map.keys()`, so the lookup
                 // can't fail.
                 write_canonical(&map[*key], out);
             }
-            out.push('}');
+            let _ = out.write_char('}');
         }
     }
+}
+
+/// Emit `s` as a JSON-escaped string literal directly into `out`, no
+/// intermediate `String` allocation. Same escape rules as
+/// `serde_json::to_string(s)` for the value shapes plats carry
+/// (ASCII control bytes escape to `\\u00XX`; `"` and `\\` are escaped;
+/// `\n`, `\r`, `\t`, `\f`, `\b` get their short form; everything else
+/// passes through verbatim).
+fn write_json_string<W: std::fmt::Write>(out: &mut W, s: &str) {
+    let _ = out.write_char('"');
+    for c in s.chars() {
+        match c {
+            '"' => {
+                let _ = out.write_str("\\\"");
+            }
+            '\\' => {
+                let _ = out.write_str("\\\\");
+            }
+            '\n' => {
+                let _ = out.write_str("\\n");
+            }
+            '\r' => {
+                let _ = out.write_str("\\r");
+            }
+            '\t' => {
+                let _ = out.write_str("\\t");
+            }
+            '\x08' => {
+                let _ = out.write_str("\\b");
+            }
+            '\x0c' => {
+                let _ = out.write_str("\\f");
+            }
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => {
+                let _ = out.write_char(c);
+            }
+        }
+    }
+    let _ = out.write_char('"');
 }
 
 // ============================================================================

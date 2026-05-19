@@ -32,7 +32,11 @@ url = { version = "2", features = ["serde"] }
 tracing = "0.1"
 blake3 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "http2"] }
-scraper = "0.21"
+# `scraper`'s default feature set enables `getopts` via the `main`
+# feature, which is only used by scraper's own bundled CLI binary.
+# Pruning to `errors` keeps the public API we use and drops one
+# transitive crate from the build.
+scraper = { version = "0.21", default-features = false, features = ["errors"] }
 ego-tree = "0.9"
 regex = "1"
 # Ed25519 signing (item H — signed receipts; ADR 0005). 2.x is the current
@@ -48,6 +52,28 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# Shipping profile. Use for the binary that lands in releases:
+# `cargo build --profile dist`. Inherits release defaults, then turns on
+# fat LTO + panic = abort, which together shave roughly 15–25% off the
+# stripped binary. `panic = "abort"` is safe here — every crate sets
+# `unsafe_code = "forbid"` and no code uses `catch_unwind`, so we have
+# nothing to unwind for. CI/tests keep using the default `release`/`dev`
+# profiles so this never slows iteration.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+panic = "abort"
+codegen-units = 1
+strip = "symbols"
+
 [profile.dev]
 opt-level = 0
 debug = true
+
+# Dev/test wall-clock optimisation: compile dependencies (scraper,
+# regex, rquickjs, dom_query, html5ever, blake3, brotli, rustls, …) at
+# opt-level = 3 once and cache them, while leaving our own crates at
+# opt-level = 0 so incremental rebuilds stay fast. Big win for the
+# 324-test suite which does real HTML parsing + crypto in tests.
+[profile.dev.package."*"]
+opt-level = 3

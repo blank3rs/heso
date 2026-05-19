@@ -34,9 +34,27 @@
 //! [ADR 0008]: ../../../decisions/0008-determinism-by-default.md
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
+
+// All metadata extractors used to call `Selector::parse(...)` per page
+// fetch. Each call does CSS parsing + SelectorList build — non-trivial
+// — and `extract` runs six of them. Hoisting to `LazyLock` statics
+// compiles each once per process, then everyone reuses the same
+// `Selector`. The selector string is identical so the behaviour is
+// unchanged.
+static JSONLD_SCRIPT_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"script[type="application/ld+json"]"#).expect("valid"));
+static META_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("meta").expect("valid"));
+static META_NAME_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("meta[name]").expect("valid"));
+static LINK_CANONICAL_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse(r#"link[rel="canonical"]"#).expect("valid"));
+static LINK_REL_SEL: LazyLock<Selector> =
+    LazyLock::new(|| Selector::parse("link[rel]").expect("valid"));
+static HTML_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("html").expect("valid"));
 
 /// Structured metadata extracted from a page.
 ///
@@ -97,10 +115,28 @@ impl PageMetadata {
     /// Total bytes of the JSON-LD payload (sum of each block's serialized
     /// size). Useful for context-budget accounting in agents.
     pub fn jsonld_bytes(&self) -> usize {
-        self.jsonld
-            .iter()
-            .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-            .sum()
+        // Count by serializing into a byte-counting writer rather than
+        // allocating a full `String` per block then dropping it. Same
+        // count, no heap churn — matters when an agent calls this on
+        // every metadata fetch.
+        struct ByteCounter(usize);
+        impl std::io::Write for ByteCounter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut total = 0;
+        for v in &self.jsonld {
+            let mut c = ByteCounter(0);
+            if serde_json::to_writer(&mut c, v).is_ok() {
+                total += c.0;
+            }
+        }
+        total
     }
 }
 
@@ -125,9 +161,7 @@ pub fn extract(doc: &Html) -> PageMetadata {
 // ============================================================================
 
 fn extract_jsonld(doc: &Html) -> Vec<serde_json::Value> {
-    let selector =
-        Selector::parse(r#"script[type="application/ld+json"]"#).expect("valid selector");
-    doc.select(&selector)
+    doc.select(&JSONLD_SCRIPT_SEL)
         .filter_map(|s| {
             let raw: String = s.text().collect();
             let trimmed = raw.trim();
@@ -144,9 +178,8 @@ fn extract_jsonld(doc: &Html) -> Vec<serde_json::Value> {
 }
 
 fn extract_meta_prefixed(doc: &Html, attr: &str, prefix: &str) -> BTreeMap<String, String> {
-    let selector = Selector::parse("meta").expect("valid selector");
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for el in doc.select(&selector) {
+    for el in doc.select(&META_SEL) {
         let key = match el.value().attr(attr) {
             Some(k) => k,
             None => continue,
@@ -169,9 +202,8 @@ fn extract_meta_prefixed(doc: &Html, attr: &str, prefix: &str) -> BTreeMap<Strin
 }
 
 fn extract_meta_unprefixed(doc: &Html) -> BTreeMap<String, String> {
-    let selector = Selector::parse("meta[name]").expect("valid selector");
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    for el in doc.select(&selector) {
+    for el in doc.select(&META_NAME_SEL) {
         let key = match el.value().attr("name") {
             Some(k) => k,
             None => continue,
@@ -192,8 +224,7 @@ fn extract_meta_unprefixed(doc: &Html) -> BTreeMap<String, String> {
 }
 
 fn extract_canonical(doc: &Html) -> Option<String> {
-    let selector = Selector::parse(r#"link[rel="canonical"]"#).expect("valid selector");
-    doc.select(&selector)
+    doc.select(&LINK_CANONICAL_SEL)
         .next()
         .and_then(|el| el.value().attr("href"))
         .map(|h| h.trim().to_owned())
@@ -203,9 +234,8 @@ fn extract_canonical(doc: &Html) -> Option<String> {
 fn extract_icons(doc: &Html) -> Vec<String> {
     // `rel` can hold multiple space-separated tokens. Match any link whose
     // rel set contains an icon-flavored token.
-    let selector = Selector::parse("link[rel]").expect("valid selector");
     let mut out = Vec::new();
-    for el in doc.select(&selector) {
+    for el in doc.select(&LINK_REL_SEL) {
         let rel = match el.value().attr("rel") {
             Some(r) => r,
             None => continue,
@@ -227,8 +257,7 @@ fn extract_icons(doc: &Html) -> Vec<String> {
 }
 
 fn extract_lang(doc: &Html) -> Option<String> {
-    let selector = Selector::parse("html").expect("valid selector");
-    doc.select(&selector)
+    doc.select(&HTML_SEL)
         .next()
         .and_then(|el| el.value().attr("lang"))
         .map(|l| l.trim().to_owned())

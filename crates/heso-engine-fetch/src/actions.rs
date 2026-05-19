@@ -41,11 +41,16 @@
 //! whose `section == "/pricing"` agree exactly.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::LazyLock;
 
 use scraper::{ElementRef as ScraperElementRef, Html, Node, Selector};
 use serde::{Deserialize, Serialize};
 
-use crate::tree::{collapse_ws, slugify, unique_slug};
+use crate::tree::{collapse_ws, join_with_space, slugify, unique_slug};
+
+// Compiled once per process; `extract` ran `Selector::parse("body")` per
+// page fetch before.
+static BODY_SEL: LazyLock<Selector> = LazyLock::new(|| Selector::parse("body").expect("valid"));
 
 // ============================================================================
 // Types
@@ -92,8 +97,7 @@ pub struct ElementRef {
 /// Walk `doc` and produce the page's action graph in document order.
 pub fn extract(doc: &Html) -> Vec<ElementRef> {
     let mut state = WalkState::default();
-    let body_sel = Selector::parse("body").expect("`body` is a valid selector");
-    if let Some(body) = doc.select(&body_sel).next() {
+    if let Some(body) = doc.select(&BODY_SEL).next() {
         for child in body.children() {
             walk(child, &mut state);
         }
@@ -174,7 +178,7 @@ fn walk(node: ego_tree::NodeRef<'_, Node>, state: &mut WalkState) {
     // interactive descendants get attributed to the new section.
     if let Some(level) = heading_level(tag) {
         if let Some(elem) = ScraperElementRef::wrap(node) {
-            let heading_text = collapse_ws(&elem.text().collect::<Vec<_>>().join(" "));
+            let heading_text = collapse_ws(&join_with_space(elem.text()));
             if !heading_text.is_empty() {
                 open_section(state, level, &heading_text);
             }
@@ -250,19 +254,26 @@ fn heading_level(tag: &str) -> Option<u8> {
 fn compute_role(el: &ScraperElementRef) -> Option<&'static str> {
     // Explicit role first — but only honor roles we actually surface, to
     // avoid leaking ARIA exotica (region, complementary, ...) the agent
-    // can't act on.
+    // can't act on. Compare case-insensitively without allocating the
+    // lowercase intermediate.
     if let Some(r) = el.value().attr("role") {
-        let r = r.trim().to_ascii_lowercase();
-        match r.as_str() {
-            "link" => return Some("link"),
-            "button" => return Some("button"),
-            "textbox" | "searchbox" => return Some("textbox"),
-            "checkbox" => return Some("checkbox"),
-            "radio" => return Some("radio"),
-            "combobox" | "listbox" => return Some("combobox"),
-            "form" => return Some("form"),
-            _ => {} // fall through to implicit role
+        let r = r.trim();
+        if r.eq_ignore_ascii_case("link") {
+            return Some("link");
+        } else if r.eq_ignore_ascii_case("button") {
+            return Some("button");
+        } else if r.eq_ignore_ascii_case("textbox") || r.eq_ignore_ascii_case("searchbox") {
+            return Some("textbox");
+        } else if r.eq_ignore_ascii_case("checkbox") {
+            return Some("checkbox");
+        } else if r.eq_ignore_ascii_case("radio") {
+            return Some("radio");
+        } else if r.eq_ignore_ascii_case("combobox") || r.eq_ignore_ascii_case("listbox") {
+            return Some("combobox");
+        } else if r.eq_ignore_ascii_case("form") {
+            return Some("form");
         }
+        // unrecognised role → fall through to implicit role from tag
     }
 
     let tag = el.value().name();
@@ -274,20 +285,30 @@ fn compute_role(el: &ScraperElementRef) -> Option<&'static str> {
         }
         "button" => Some("button"),
         "input" => {
+            // Compare without allocating; HTML type attribute is ASCII.
             let t = el
                 .value()
                 .attr("type")
-                .map(|s| s.trim().to_ascii_lowercase())
-                .unwrap_or_else(|| "text".to_owned());
-            match t.as_str() {
-                "hidden" => None, // not actionable
-                "submit" | "button" | "reset" | "image" | "file" => Some("button"),
-                "checkbox" => Some("checkbox"),
-                "radio" => Some("radio"),
+                .map(|s| s.trim())
+                .unwrap_or("text");
+            if t.eq_ignore_ascii_case("hidden") {
+                None
+            } else if t.eq_ignore_ascii_case("submit")
+                || t.eq_ignore_ascii_case("button")
+                || t.eq_ignore_ascii_case("reset")
+                || t.eq_ignore_ascii_case("image")
+                || t.eq_ignore_ascii_case("file")
+            {
+                Some("button")
+            } else if t.eq_ignore_ascii_case("checkbox") {
+                Some("checkbox")
+            } else if t.eq_ignore_ascii_case("radio") {
+                Some("radio")
+            } else {
                 // Everything else (text, email, search, tel, url, password,
                 // date, time, datetime-local, month, week, color, number,
                 // range, plus unknown values) is a textbox-shaped input.
-                _ => Some("textbox"),
+                Some("textbox")
             }
         }
         "textarea" => Some("textbox"),
@@ -300,31 +321,6 @@ fn compute_role(el: &ScraperElementRef) -> Option<&'static str> {
 // ============================================================================
 // Name + attrs
 // ============================================================================
-
-const ATTRS_TO_KEEP: &[&str] = &[
-    "href",
-    "type",
-    "name",
-    "value",
-    "placeholder",
-    "required",
-    "alt",
-    "title",
-    "action",
-    "method",
-    "id",
-    "target",
-    "rel",
-    "checked",
-    "disabled",
-    "readonly",
-    "max",
-    "min",
-    "step",
-    "pattern",
-    "multiple",
-    "for",
-];
 
 fn compute_name(el: &ScraperElementRef) -> Option<String> {
     // 1. aria-label wins.
@@ -372,7 +368,7 @@ fn compute_name(el: &ScraperElementRef) -> Option<String> {
     }
 
     // 3. Text content — the natural label for links, buttons, forms.
-    let text = collapse_ws(&el.text().collect::<Vec<_>>().join(" "));
+    let text = collapse_ws(&join_with_space(el.text()));
     if !text.is_empty() {
         // Cap length so a button containing a whole paragraph of nested
         // content doesn't blow up the JSON. 120 chars is plenty for an
@@ -399,25 +395,44 @@ fn compute_name(el: &ScraperElementRef) -> Option<String> {
 }
 
 fn pick_relevant_attrs(el: &ScraperElementRef) -> BTreeMap<String, String> {
+    // Single pass over the element's attrs: dispatch into the BTreeMap if
+    // the attribute is in our keep-list OR is `aria-*` (excluding the
+    // already-surfaced `aria-label`). Replaces 22 `elv.attr(k)` lookups
+    // plus a second pass for aria-* with one walk of the underlying
+    // attr map.
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    let elv = el.value();
-    for &k in ATTRS_TO_KEEP {
-        if let Some(v) = elv.attr(k) {
-            let t = collapse_ws(v);
-            if !t.is_empty() {
-                out.insert(k.to_owned(), t);
-            }
+    for (k, v) in el.value().attrs() {
+        let keep = matches!(
+            k,
+            "href"
+                | "type"
+                | "name"
+                | "value"
+                | "placeholder"
+                | "required"
+                | "alt"
+                | "title"
+                | "action"
+                | "method"
+                | "id"
+                | "target"
+                | "rel"
+                | "checked"
+                | "disabled"
+                | "readonly"
+                | "max"
+                | "min"
+                | "step"
+                | "pattern"
+                | "multiple"
+                | "for"
+        ) || (k.starts_with("aria-") && k != "aria-label");
+        if !keep {
+            continue;
         }
-    }
-    // Preserve every aria-* (other than aria-label, which we've already
-    // surfaced as `name`) so the LLM sees role-clarifying state like
-    // `aria-pressed`, `aria-expanded`, `aria-required`.
-    for (k, v) in elv.attrs() {
-        if k.starts_with("aria-") && k != "aria-label" {
-            let t = collapse_ws(v);
-            if !t.is_empty() {
-                out.insert(k.to_owned(), t);
-            }
+        let t = collapse_ws(v);
+        if !t.is_empty() {
+            out.insert(k.to_owned(), t);
         }
     }
     out
