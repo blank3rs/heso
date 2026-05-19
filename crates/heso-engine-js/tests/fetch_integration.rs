@@ -6,12 +6,12 @@
 //! exchanges so the workspace `cargo test` stays hermetic, plus one
 //! `data:` URL test that needs no server at all.
 //!
-//! Limitation pinned by these tests: `await fetch(...)` at top-level
-//! does **not** yet work because the microtask pump (next-phase item
-//! K) hasn't been wired with [`rquickjs::AsyncRuntime`]. The
-//! `.then(...)` shape is the one PR2 supports; we test that shape
-//! exclusively and document the await-doesn't-work limitation in the
-//! `await_top_level_returns_pending_promise` test below.
+//! The PR3 `__hesoDeepResolve` wrap (see the `engine` module docs)
+//! makes both `(async () => { await fetch(...); ... })()` and
+//! nested-Promise return values (`[fetch(...), fetch(...)]`, etc.)
+//! serialize to their data rather than to `{}`. The
+//! `nested_promise_*` and `async_iife_with_real_http_fetch_*` tests
+//! pin those load-bearing behaviors.
 
 use std::sync::Arc;
 
@@ -354,6 +354,145 @@ async fn await_top_level_unwraps_fetch_via_microtask_pump() {
         )
         .expect("eval");
     assert_eq!(out.value, "async-now-pumped");
+}
+
+// ===== Deep-Promise unwrap (PR-3): nested Promises become resolved values =====
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_promise_in_array_is_deep_resolved_not_serialized_as_empty_object() {
+    // Pinned regression: prior to the `__hesoDeepResolve` wrap landing,
+    // a Promise nested in an array passed through `JSON.stringify`
+    // unchanged — and Promises have no own enumerable properties, so
+    // each element serialized as `{}`. AGENT_FINDINGS Task 3 reported
+    // this as "A returned Promise serializes as `{}`."
+    let engine = engine_with_fetch();
+    let out = engine
+        .eval("[Promise.resolve(1), Promise.resolve(2), Promise.resolve(3)]")
+        .expect("eval");
+    assert_eq!(out.value, serde_json::json!([1, 2, 3]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_promise_in_object_property_is_deep_resolved() {
+    // Same shape as above but through an object property. Real agent
+    // patterns produce this when packaging up partial extractions
+    // (e.g. `{title: ..., body: fetch(...).then(r => r.text())}`).
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/payload"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("hello"))
+        .mount(&server)
+        .await;
+    let engine = engine_with_fetch();
+    let url = format!("{}/payload", server.uri());
+    let out = engine
+        .eval(&format!(
+            r#"({{
+                title: "ok",
+                body: fetch({url:?}).then(r => r.text()),
+            }})"#,
+            url = url,
+        ))
+        .expect("eval");
+    assert_eq!(out.value["title"], "ok");
+    assert_eq!(out.value["body"], "hello");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn async_iife_with_real_http_fetch_json_returns_extracted_property() {
+    // Pinned regression for AGENT_FINDINGS Task 3's reproducing pattern.
+    // The agent wrote (in their words):
+    //
+    //     "Tried `eval-dom --js-fetch` with `await`/promise → fetch global
+    //      exists, but the JS engine returns the script's last expression
+    //      synchronously without draining the QuickJS job queue."
+    //
+    // The pattern below is what they should have used and now works:
+    //
+    //     (async () => {
+    //         const r = await fetch("https://httpbin.org/get?ping=pong");
+    //         const j = await r.json();
+    //         return j.args.ping;   // "pong"
+    //     })()
+    //
+    // We simulate httpbin's `/get?ping=...` shape via wiremock to keep
+    // the workspace `cargo test` hermetic (no real network). The
+    // engine's existing thenable-await path resolves the IIFE; this
+    // test pins that real-HTTP (not just `data:` URL) doesn't regress.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/get"))
+        .respond_with(|req: &wiremock::Request| {
+            // Echo back the `ping` query param in an `args` object,
+            // matching httpbin's response shape.
+            let ping = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "ping")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "args": { "ping": ping },
+                "url": req.url.to_string(),
+            }))
+        })
+        .mount(&server)
+        .await;
+
+    let engine = engine_with_fetch();
+    let url = format!("{}/get?ping=pong", server.uri());
+    let out = engine
+        .eval(&format!(
+            r#"
+            (async () => {{
+                const r = await fetch({url:?});
+                const j = await r.json();
+                return j.args.ping;
+            }})()
+            "#,
+            url = url,
+        ))
+        .expect("eval");
+    assert_eq!(out.value, "pong");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn parallel_fetches_via_array_map_unwrap_to_resolved_values() {
+    // `[1, 2, 3].map(n => fetch(...).then(r => r.json()))` returns an
+    // array of Promises. Pre-fix this serialized as `[{}, {}, {}]`.
+    // Now each element resolves to its value because `__hesoDeepResolve`
+    // walks the array.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/get"))
+        .respond_with(|req: &wiremock::Request| {
+            let n = req
+                .url
+                .query_pairs()
+                .find(|(k, _)| k == "n")
+                .map(|(_, v)| v.into_owned())
+                .unwrap_or_default();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "args": { "n": n },
+            }))
+        })
+        .mount(&server)
+        .await;
+    let engine = engine_with_fetch();
+    let base = server.uri();
+    let out = engine
+        .eval(&format!(
+            r#"
+            [1, 2, 3].map(n =>
+                fetch("{base}/get?n=" + n)
+                    .then(r => r.json())
+                    .then(j => j.args.n)
+            )
+            "#,
+            base = base,
+        ))
+        .expect("eval");
+    assert_eq!(out.value, serde_json::json!(["1", "2", "3"]));
 }
 
 // ===== Page-script integration: <script src=> honored under Fetch policy =====

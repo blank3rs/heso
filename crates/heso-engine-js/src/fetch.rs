@@ -67,10 +67,13 @@
 //!    function is invoked, and [`JsEngine::run_pending_jobs`] drives
 //!    `Runtime::execute_pending_job` until idle.
 //!
-//! This pattern is a deliberate punt on "top-level `await fetch(...)`
-//! works" — that requires an `AsyncRuntime`/`AsyncContext` switch
-//! (item K, microtask pump). For PR2 the `.then(...)` shape is enough
-//! and matches what real pages emit in production.
+//! Both the `.then(...)` shape and the `(async () => { await fetch(...);
+//! ... })()` IIFE shape work — the engine wraps every user-eval result
+//! in `globalThis.__hesoDeepResolve(v)` (see [`crate::engine`] module
+//! docs), which awaits every Promise in the returned tree before
+//! serializing. Nested-Promise shapes like `[fetch(...), fetch(...)]`
+//! or `{a: fetch(...).then(r => r.json())}` resolve to their data
+//! rather than serializing as `[{}, {}]` / `{a: {}}`.
 //!
 //! [plan]: ../../.agent/next-phase-plan.md
 

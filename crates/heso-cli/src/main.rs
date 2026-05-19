@@ -140,6 +140,13 @@ fn print_banner() {
     println!("                                pass --js-fetch to install the JS `fetch()` global and honor <script src=...>");
     println!("                                via the same `reqwest::Client` used for the page load (cookies + receipts coherent).");
     println!("                                Under --seed N + --js-fetch, fetch() rejects with a clear cassette error (ADR 0008).");
+    println!("                                Async patterns: the engine deep-resolves Promises in the returned value, so all of");
+    println!("                                  (a) `(async () => {{ const r = await fetch(URL); return await r.json(); }})()`,");
+    println!("                                  (b) `fetch(URL).then(r => r.json())`,");
+    println!("                                  (c) `[fetch(URL).then(r => r.json()), fetch(URL2).then(r => r.json())]`");
+    println!("                                resolve to their data before serialization. Bare side-effect reads like");
+    println!("                                `globalThis.X = null; fetch(URL).then(j => globalThis.X = j); globalThis.X` will NOT");
+    println!("                                work — the final expression captures `null` before the .then fires. Use shape (a).");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso action-hash <url> [actions-json | -]");
     println!("                                Keyless, deterministic fingerprint over (URL, actions). Two");
@@ -759,6 +766,41 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
 /// so an SSR page that hydrates by setting `document.title =`,
 /// mutating `<div id="root">` children, or stashing state on
 /// `globalThis` will already have done so by the time `js` runs.
+///
+/// # Async patterns
+///
+/// `<js>` may return a Promise (or an array / plain object containing
+/// Promises); the engine's `__hesoDeepResolve` wrap awaits every
+/// thenable in the returned tree before serializing. Concretely, all
+/// of these now serialize to their resolved data, not `{}`:
+///
+/// - `(async () => { const r = await fetch(URL); return await r.json(); })()`
+/// - `fetch(URL).then(r => r.json())`
+/// - `[fetch(URL1).then(r => r.json()), fetch(URL2).then(r => r.json())]`
+/// - `{ a: fetch(URL1).then(r => r.text()), b: 42 }`
+///
+/// **What still does not work:** reading a side-effected global
+/// synchronously after a `.then(...)` that has not fired yet. The
+/// final expression is captured at eval time, BEFORE the fetch
+/// resolves; the queue drains *after* the value is captured. Example
+/// of what NOT to do:
+///
+/// ```text
+/// // BROKEN — `globalThis.__r` is read synchronously as `null`.
+/// globalThis.__r = null;
+/// fetch(URL).then(r => r.json()).then(j => { globalThis.__r = j; });
+/// globalThis.__r
+/// ```
+///
+/// Wrap in an async IIFE instead:
+///
+/// ```text
+/// // WORKS — the IIFE returns a Promise the engine awaits.
+/// (async () => {
+///     const r = await fetch(URL);
+///     return await r.json();
+/// })()
+/// ```
 ///
 /// Argument forms (flag is order-tolerant — may appear before or
 /// after the URL):

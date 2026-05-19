@@ -15,6 +15,24 @@
 //! No DOM, no `window`, no `<script>`-tag execution yet — that's
 //! Phase 1B. Right now the engine is a sandboxed JS evaluator with
 //! captured console output, and that's it.
+//!
+//! ## Deep-Promise unwrap
+//!
+//! Every user-eval result is wrapped in `globalThis.__hesoDeepResolve(v)`
+//! before serialization (see [`install_deep_resolve`] and
+//! [`JsEngine::eval_value_with_promise_await`]). The helper walks the
+//! returned tree and substitutes every Promise it finds with its
+//! resolved value, so all four of these patterns serialize to their
+//! data rather than to `{}`:
+//!
+//! - `(async () => { const r = await fetch(URL); return await r.json(); })()`
+//! - `fetch(URL).then(r => r.json())`
+//! - `[fetch(URL1).then(r => r.json()), fetch(URL2).then(r => r.json())]`
+//! - `{ a: fetch(URL).then(r => r.text()), b: 42 }`
+//!
+//! The wrap only descends into `Object.prototype`-rooted plain objects
+//! and Arrays — class instances (DOM Elements, Response objects, Map,
+//! Set, etc.) flow through unchanged.
 
 use std::sync::{Arc, Mutex};
 
@@ -363,6 +381,24 @@ impl JsEngine {
             None
         };
 
+        // Install `__hesoDeepResolve(v)` — the load-bearing helper that
+        // [`Self::eval_value_with_promise_await`] wraps every user-eval
+        // result in before serializing. Without it, a Promise nested
+        // inside an array or plain object (e.g. `[fetch(...), fetch(...)]`
+        // or `{a: fetch(...).then(r => r.json())}`) serializes as `{}`
+        // because `JSON.stringify` walks own enumerable properties and
+        // a Promise has none. With it, every Promise in the returned
+        // tree is `await`ed and substituted with its resolved value,
+        // matching the agent-shaped "I called fetch, give me the data"
+        // mental model the CLI is supposed to support.
+        //
+        // Recursion is bounded by `__HESO_DEEP_RESOLVE_MAX_DEPTH` so
+        // a cyclic object can't lock the eval. Class-instance objects
+        // (DOM Element / Document, Response, etc.) are skipped via the
+        // `Object.getPrototypeOf(v) === Object.prototype` gate so we
+        // don't accidentally rewrite their internal shape.
+        install_deep_resolve(&context)?;
+
         Ok(Self {
             _runtime: runtime,
             context,
@@ -560,22 +596,38 @@ impl JsEngine {
 
     /// Eval `code` and capture its completion value as JSON.
     ///
-    /// If the value is a thenable (a Promise or a Promise-shaped
-    /// object), register `.then(resolve, reject)` callbacks that
-    /// stash the settled JSON into a shared slot, drive the
-    /// microtask pump via [`Self::run_pending_jobs`], and return
-    /// the slot's resolved value. Otherwise, serialize the value
-    /// synchronously.
+    /// Two synchronous steps inside one [`rquickjs::Context::with`]:
     ///
-    /// This is what lets a user expression `await heso.flush()`
+    /// 1. Evaluate `code` as a script. Catch JS exceptions and thrown
+    ///    values into [`EvalError`]; otherwise, hold onto the resulting
+    ///    `raw` value reference.
+    /// 2. Hand `raw` to `globalThis.__hesoDeepResolve` — the JS-side
+    ///    helper installed at engine construction (see
+    ///    [`install_deep_resolve`]). It walks the value and substitutes
+    ///    every Promise in the tree with its resolved value, returning
+    ///    a single outer Promise that settles to the substituted tree.
+    ///    This is the load-bearing step: without it, a Promise nested
+    ///    inside an array (`[fetch(...), fetch(...)]`) or a plain object
+    ///    (`{a: fetch(...).then(r => r.json())}`) serializes as `{}`
+    ///    because `JSON.stringify` walks own enumerable properties and
+    ///    a Promise has none.
+    ///
+    /// We then `.then(resolve, reject)` that outer Promise and drive
+    /// the microtask pump via [`Self::run_pending_jobs`] until the
+    /// slot is settled. This is the same machinery the original
+    /// `(async () => ...)()` pattern used; we just always go through
+    /// it now because `__hesoDeepResolve` is itself async.
+    ///
+    /// This is also what lets a user expression `await heso.flush()`
     /// observe DOM mutations queued by an earlier `dispatchEvent`
     /// — Preact's re-render is queued as a microtask, and the
     /// microtask checkpoint runs before our `.then(resolve)` fires.
     ///
     /// A thenable that never settles (e.g. waits on a macrotask we
-    /// don't advance) yields [`serde_json::Value::Null`]. We trust
-    /// the run loop to make the user's next call see the eventually
-    /// settled state via the virtual clock.
+    /// don't advance via [`Self::advance_clock`]) yields
+    /// [`serde_json::Value::Null`]. We trust the run loop to make the
+    /// user's next call see the eventually settled state via the
+    /// virtual clock.
     fn eval_value_with_promise_await(
         &self,
         code: &str,
@@ -604,16 +656,40 @@ impl JsEngine {
                     }
                 };
 
+                // Wrap the raw value in `__hesoDeepResolve(raw)`. The
+                // helper itself is `async` — it always returns a
+                // Promise, even for sync primitives — so the rest of
+                // this function only ever has to handle the thenable
+                // path. If the helper isn't installed (which means an
+                // engine constructor forgot to call
+                // [`install_deep_resolve`] — should never happen, but
+                // be defensive) we fall back to the legacy "serialize
+                // sync, await thenables only at top level" path.
+                let helper: Option<Function<'_>> = ctx
+                    .globals()
+                    .get::<_, Value>("__hesoDeepResolve")
+                    .ok()
+                    .and_then(|v| v.into_function());
+                let raw_for_eval = match helper {
+                    Some(f) => f.call::<_, Value<'_>>((raw,)).map_err(|e| {
+                        EvalError::Engine(format!("call __hesoDeepResolve: {e}"))
+                    })?,
+                    None => raw,
+                };
+
                 // Thenable detection: an object whose `.then` is a
                 // function. Per Promises/A+ §1.1 that's a thenable.
-                let then_fn: Option<Function<'_>> = raw
+                // With `__hesoDeepResolve` installed every non-error
+                // path returns a Promise here; the legacy non-thenable
+                // branch survives for the defensive fallback above.
+                let then_fn: Option<Function<'_>> = raw_for_eval
                     .as_object()
                     .and_then(|o| o.get::<_, Value>("then").ok())
                     .and_then(|v| v.into_function());
 
                 let Some(then_fn) = then_fn else {
                     // Sync value — serialize and stash.
-                    let json = js_value_to_json(&ctx, raw)?;
+                    let json = js_value_to_json(&ctx, raw_for_eval)?;
                     *slot.lock().expect("settle slot poisoned") =
                         Some(Ok(json));
                     return Ok(false);
@@ -673,7 +749,7 @@ impl JsEngine {
                 // promise.then(resolve, reject) — bind `this` to the
                 // promise so `then` sees its own internal slots.
                 then_fn
-                    .call::<_, ()>((This(raw.clone()), resolve, reject))
+                    .call::<_, ()>((This(raw_for_eval.clone()), resolve, reject))
                     .map_err(|e| {
                         EvalError::Engine(format!("call .then: {e}"))
                     })?;
@@ -1265,6 +1341,78 @@ const ON_EVENT_HANDLERS_BOOTSTRAP: &str = r#"
     });
 })();
 "#;
+
+/// JS source for `globalThis.__hesoDeepResolve(v)`.
+///
+/// Walks `v` and substitutes every Promise in the tree with its
+/// resolved value, then returns the substituted tree wrapped in a
+/// single Promise. The eval host calls this on every user-eval result
+/// before serializing so a Promise nested in an array or plain object
+/// shows up as its resolved value instead of `{}`.
+///
+/// Recursion only descends into Arrays and `Object.prototype`-rooted
+/// plain objects so class instances (DOM Elements, the Response-shaped
+/// fetch return value, etc.) are returned by reference — same shape
+/// they had on the JS side. Cycle-safety is provided by a hard depth
+/// cap (`__HESO_DEEP_RESOLVE_MAX_DEPTH = 32`) which is well above what
+/// any agent-shaped extraction returns.
+const DEEP_RESOLVE_JS: &str = r#"
+(function() {
+    const MAX_DEPTH = 32;
+    async function deepResolve(v, depth) {
+        if (depth === undefined) depth = 0;
+        if (depth > MAX_DEPTH) return v;
+        // Thenable: await once, then recurse on the settled value so
+        // a Promise<Promise<...>> chain fully unwraps.
+        if (v !== null && v !== undefined && typeof v === 'object'
+            && typeof v.then === 'function') {
+            const settled = await v;
+            return deepResolve(settled, depth + 1);
+        }
+        if (Array.isArray(v)) {
+            const out = new Array(v.length);
+            for (let i = 0; i < v.length; i++) {
+                out[i] = await deepResolve(v[i], depth + 1);
+            }
+            return out;
+        }
+        // Only descend into plain `{...}` objects so DOM nodes, Response
+        // objects, RegExp, Map/Set, etc. flow through untouched.
+        if (v !== null && typeof v === 'object'
+            && Object.getPrototypeOf(v) === Object.prototype) {
+            const out = {};
+            const keys = Object.keys(v);
+            for (let i = 0; i < keys.length; i++) {
+                out[keys[i]] = await deepResolve(v[keys[i]], depth + 1);
+            }
+            return out;
+        }
+        return v;
+    }
+    Object.defineProperty(globalThis, '__hesoDeepResolve', {
+        value: deepResolve,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+    });
+})();
+"#;
+
+/// Install `globalThis.__hesoDeepResolve` — the deep-Promise-unwrap
+/// helper [`JsEngine::eval_value_with_promise_await`] uses to make
+/// nested Promises observable to the agent.
+///
+/// Idempotent: the property is non-configurable, so a second
+/// installation on the same context is a no-op rather than a clobber.
+fn install_deep_resolve(context: &Context) -> Result<(), EvalError> {
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            ctx.eval::<(), _>(DEEP_RESOLVE_JS)?;
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install __hesoDeepResolve: {e}")))?;
+    Ok(())
+}
 
 /// Install a `console` global on the given context that routes calls
 /// into `buffer`. Each method (`log`, `info`, `warn`, `error`,
