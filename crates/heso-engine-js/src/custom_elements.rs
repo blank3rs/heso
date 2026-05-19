@@ -290,21 +290,30 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
     //
     // Bare `new DocumentFragment()` is legal per WHATWG DOM (§4.7).
     // We provide a callable form that returns a real orphan node.
+    //
+    // Idempotent: the `dom` module's Shadow DOM bootstrap installs its
+    // own DocumentFragment first and chains
+    // `ShadowRoot.prototype.__proto__ = DocumentFragment.prototype`. If
+    // we overwrite it here, the chain breaks and `root instanceof
+    // DocumentFragment` returns false for shadow roots. Skip when the
+    // global is already populated.
     // ---------------------------------------------------------------
-    var DocumentFragment = function DocumentFragment() {
-        if (typeof document === 'undefined' || !document.createDocumentFragment) {
-            throw new TypeError('DocumentFragment: no document available');
-        }
-        return document.createDocumentFragment();
-    };
-    Object.defineProperty(DocumentFragment, 'prototype', {
-        value: elementProto,
-        writable: false,
-        configurable: false,
-        enumerable: false,
-    });
-    Object.defineProperty(DocumentFragment, 'name', { value: 'DocumentFragment', configurable: true });
-    globalThis.DocumentFragment = DocumentFragment;
+    if (typeof globalThis.DocumentFragment === 'undefined') {
+        var DocumentFragment = function DocumentFragment() {
+            if (typeof document === 'undefined' || !document.createDocumentFragment) {
+                throw new TypeError('DocumentFragment: no document available');
+            }
+            return document.createDocumentFragment();
+        };
+        Object.defineProperty(DocumentFragment, 'prototype', {
+            value: elementProto,
+            writable: false,
+            configurable: false,
+            enumerable: false,
+        });
+        Object.defineProperty(DocumentFragment, 'name', { value: 'DocumentFragment', configurable: true });
+        globalThis.DocumentFragment = DocumentFragment;
+    }
 
     // ---------------------------------------------------------------
     // DOMTokenList — shares the rquickjs DomTokenList prototype.
