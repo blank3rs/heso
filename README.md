@@ -2,9 +2,23 @@
 
 A headless browser for agents. One Rust binary. No Chromium, no Node.
 
-heso fetches a URL, parses the HTML, runs the page's JavaScript against an agent-shaped DOM, holds a stateful session across clicks/fills/submits, and hands back content-hashed JSON you can sign, diff, and replay byte-for-byte.
+heso fetches a URL, parses the HTML, runs the page's JavaScript against an agent-shaped DOM, holds a stateful session across clicks/fills/submits, and emits content-hashed JSON.
 
-The bet: agents don't need the rendering half of the browser. No Skia, no Blink layout, no compositor, no GPU, no canvas, no video stack. That's the bulk of Chromium's footprint and most of its startup cost. Drop it, ship one binary.
+## Where heso fits
+
+Two things distinguish heso from the existing options:
+
+**Deployment shape.** A single static Rust binary, 7.65 MB, 17 MB peak RSS. No `node_modules`, no headless Chromium download, no Playwright driver. Drops cleanly into edge runtimes, lambda packages, CI images, CLI distributions, and locked-down environments where bundling a Node runtime or a browser binary is a problem.
+
+**Reproducibility.** Every page session can be deterministic: seeded ChaCha20 PRNG (`Math.random` / `crypto.*` / `crypto.randomUUID`), virtual clock (`Date.now` / `setTimeout` / `performance.now`), content-hashed plats (BLAKE3), and a BLAKE3 Merkle chain over the action trace. The same trace replayed anywhere produces the same fingerprint, with no central server, no shared keys, and no shared clock. Useful for audit, compliance, archival, RAG provenance, and CI snapshot testing.
+
+heso isn't trying to be a broader-compat jsdom or a smaller Chromium. It's a different deployment shape with a different reproducibility story.
+
+## What heso isn't
+
+- **Not a rendering engine.** No canvas, no WebGL, no computed CSS layout, no video, no compositor. If your agent reads pixels, use Chromium.
+- **Not at parity with jsdom or Chromium on modern bundler SPAs yet.** Static + server-rendered + simple SPAs (Preact-shaped) work today. React 19 full interaction round-trips, Turbopack-chunked Next.js, and full SVG namespace handling are open work — see the Status table below.
+- **Not a replacement for Playwright in long-running session loops.** Playwright with a persistent context amortizes Chromium's startup across many requests, and the per-request gap shrinks. heso's clearest wins are one-shot workloads, fleet-scale fan-out, and any case where memory or binary size matter.
 
 ## Demo
 
@@ -26,21 +40,19 @@ $ heso eval-dom https://news.ycombinator.com \
 
 Live fetch, parse, JS eval — five real titles in under 400 ms from a 7.65 MB binary.
 
-## Measured against Playwright + Chromium
+## Measured numbers
 
-|  | heso | Playwright + Chromium |
+| Metric | heso | Notes |
 |---|---|---|
-| Install size | 7.65 MB | ~240 MB + Node + browser bundle |
-| Cold start (`--help`) | 15 ms | 1–2 seconds |
-| Per-target wall-clock (mean of 8 URLs) | 125 ms | 336 ms |
-| Peak RSS after 14-site run | 17 MB | 100+ MB per browser |
-| Reproducibility | content-hashed, seeded RNG, virtual clock | non-deterministic |
-| Audit trail | signed receipts per fetch | none |
-| Rendering pixels | ✗ | ✓ |
+| Install size | 7.65 MB | one static binary |
+| Cold start (`--help`) | 15 ms | |
+| One-shot per-URL wall-clock | 125 ms (mean of 8) | static + server-rendered + framework docs sites |
+| Peak RSS after a 14-site run | 17 MB | |
+| Workspace tests | 895 / 0 fail / 7 ignored | |
 
-2.69× faster mean wall-clock on the same 8 URLs, same machine, same network. Biggest wins on docs sites (MDN 7.63×, docs.rs 5.07×) where Chromium's startup dominates. Reproduce in [`bench/playwright/RESULTS.md`](bench/playwright/RESULTS.md).
+**vs. Playwright + Chromium, one-shot only**: 2.69× faster mean wall-clock on the same 8 URLs (heso 125 ms vs Playwright 336 ms), same machine, same network. This compares cold-start to cold-start — production Playwright setups that hold a persistent context across many requests amortize Chromium's startup and the per-request gap narrows. The honest framing: heso's speed advantage is in one-shot workloads (CI scrapers, edge functions, CLI tools, one-off agent calls) and at fleet scale where memory matters. Numbers and reproduction in [`bench/playwright/RESULTS.md`](bench/playwright/RESULTS.md).
 
-If your agent needs canvas, video, computed layout, or WebGL: use Chromium. heso doesn't render pixels. For everything else — read, click, fill, extract, audit — that's what this is for.
+**vs. jsdom + node-fetch**: not benchmarked head-to-head yet. jsdom is the obvious comparison for "minimal DOM environment" and has more years of compat work behind it. heso's differentiation is the deployment shape (one Rust binary vs `node_modules`) and the reproducibility/audit story (signed receipts, seeded RNG, virtual clock) — not raw compat breadth. If your workload is "fetch + parse + DOM read", jsdom probably handles it today; heso makes sense when you also need single-binary deploy or signed traces.
 
 ## 30-second quickstart
 
@@ -118,7 +130,7 @@ heso cat  https://stripe.com /pricing/business
 
 The page is a tree of heading-defined sections. Navigate it like a directory.
 
-**Stateful replay — every action keyed, every page recoverable:**
+**Stateful replay with a content-hashed trace:**
 ```console
 $ heso action-hash https://example.com '[{"verb":"open","url":"https://example.com/"},{"verb":"click","ref":"@e0"}]' > trace.json
 $ heso replay trace.json
@@ -131,7 +143,7 @@ $ heso replay trace.json
 }
 ```
 
-The `trace_id` is a **BLAKE3 Merkle chain** over the URL + canonical actions. Anyone running the same trace anywhere gets the same hash — no keys, no central server, no central clock. Tampering breaks it. Replay carries one `JsSession` across every step: DOM mutations persist, `addEventListener` handlers fire, `setTimeout` chains progress through a virtual clock, `e.preventDefault()` on `<a href>` clicks stops navigation just like a real SPA router.
+`trace_id` is a BLAKE3 Merkle chain over the URL + canonical actions. The same trace replayed elsewhere produces the same hash — no shared keys, server, or clock. Replay carries one `JsSession` across every step: DOM mutations persist, `addEventListener` handlers fire, `setTimeout` chains progress through the virtual clock, `e.preventDefault()` on `<a href>` clicks stops navigation as on a real SPA.
 
 **Stateful sessions over stdio:**
 ```sh
@@ -189,7 +201,7 @@ description: Use the heso headless browser (one 7.65 MB Rust binary, no Chromium
 
 ## What I can't do
 
-I have no rendering engine — no canvas, no WebGL, no computed CSS layout, no video. If you need pixels, use Chromium. I'm honest about that.
+No canvas, WebGL, computed CSS layout, or video. If you need rendered pixels or a full modern bundler-SPA execution path, use Chromium.
 ```
 
 That's it. The harness routes "go look at this URL" / "fill this form" / "scrape this page" calls to `heso` instead of spinning up Chromium-via-Playwright, and the rest of the agent code doesn't change.
@@ -198,15 +210,16 @@ Works the same way in any harness that supports tool/skill markdown — Cursor, 
 
 ## Who this is for
 
-- Agent framework builders who don't want to ship 240 MB of Chromium for `document.querySelector`.
-- RAG pipelines that ingest docs sites at scale.
-- Compliance / archival workflows where "prove what the page said" matters.
-- CI test suites needing reproducible page snapshots without flaky timing.
-- Wide-crawl pipelines targeting ~100 ms per page on a single machine.
+- Edge / serverless / CI environments where bundling Node + Chromium hurts more than narrower modern-SPA compat does.
+- RAG pipelines, archival workflows, and compliance use cases that need a signed, reproducible record of "what the page said when the agent acted on it."
+- Wide-crawl or fan-out workloads where 17 MB per worker beats 100+ MB per browser context.
+- One-shot agent calls (single-URL fetch + DOM read + maybe a click) where cold-start dominates total wall-clock.
 
-Not for: scraping behind canvas, video, computed CSS layout, WebGL, or service workers. Use a real browser for those.
+Probably not the right fit for: deep React 19 / Turbopack-Next.js interaction loops today (those are work-in-progress — see Status), long-lived persistent-context Playwright sessions (Playwright amortizes startup), or anything needing rendered pixels.
 
 ## Status
+
+Pre-alpha. The feature surface is broad for the age of the project, but the modern-SPA compat gap is real — see the 🚧 rows. Shippable today for static + server-rendered + simple-SPA workloads; not yet a default for production scraping against React 19 / Turbopack-chunked Next.js.
 
 | | |
 |---|---|
@@ -260,7 +273,7 @@ Not for: scraping behind canvas, video, computed CSS layout, WebGL, or service w
 
 ## The precedent
 
-[jsdom](https://github.com/jsdom/jsdom) (~50k LOC of JS) and [happy-dom](https://github.com/capricorn86/happy-dom) (~30k LOC) both showed that a minimal DOM + JS environment handles the agent-relevant half of the web. Both are JS-in-JS, both are framed as test tools. Doing it in Rust against QuickJS is the next step.
+[jsdom](https://github.com/jsdom/jsdom) (~50k LOC of JS) and [happy-dom](https://github.com/capricorn86/happy-dom) (~30k LOC) showed that a minimal DOM + JS environment handles the agent-relevant half of the web. Both have more years of compat work than heso and broader Node-ecosystem support; for many workloads they're the right tool today. heso bets on a different deployment shape (one Rust binary, no Node runtime) and on reproducibility as a first-class engine concern. Whether those tradeoffs are worth the current compat delta depends entirely on your target sites and deployment constraints — be honest about that when picking.
 
 ## Try it
 
