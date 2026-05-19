@@ -329,6 +329,14 @@ impl JsEngine {
         // when the host navigates the engine to a real page.
         install_location(&context, None)?;
 
+        // Install `globalThis.history` + `PopStateEvent` + the
+        // window-level `addEventListener` / `removeEventListener` /
+        // `dispatchEvent` surface SPA routers (Next.js, React Router,
+        // Vue Router) gate on. Depends on `location.href` being
+        // installed (above) and on `Event` from `install_events`
+        // (further above). See [`crate::history::install_history`].
+        crate::history::install_history(&context)?;
+
         // Install the "trivial browser globals" cluster — small APIs
         // that real pages reach for during init (`navigator`, storage,
         // `performance.now`, `queueMicrotask`, `requestAnimationFrame`,
@@ -382,6 +390,17 @@ impl JsEngine {
         // best-effort cosmetic and a failure shouldn't poison
         // navigation.
         let _ = install_location(&self.context, url.as_ref());
+        // Cross-document navigation also resets the in-document
+        // history stack to a single entry at the new URL — matches
+        // what real browsers do on a full page load. SPA `pushState`
+        // calls add more entries from there. Best-effort: a failure
+        // here just leaves the previous stack in place, which is no
+        // worse than the pre-history-PR behavior.
+        let href = match url.as_ref() {
+            Some(u) => u.as_str().to_string(),
+            None => "about:blank".to_string(),
+        };
+        let _ = crate::history::reset_history(&self.context, &href);
     }
 
     /// Current page URL, if any. See [`Self::set_base_url`].
