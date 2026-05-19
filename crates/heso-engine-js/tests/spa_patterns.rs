@@ -1208,3 +1208,128 @@ fn document_listener_event_target_is_the_element() {
     let out = sess.eval("globalThis.targets").unwrap();
     assert_eq!(out.value, serde_json::json!(["b"]));
 }
+
+
+// =====================================================================
+// Node traversal: childNodes / firstChild / lastChild / siblings /
+// firstElementChild / lastElementChild / *ElementSibling /
+// childElementCount / hasChildNodes / contains / isConnected /
+// cloneNode / remove. SSR-hydration load-bearing surface — React /
+// Preact / lit-html walk these on every diff. See dom.rs.
+// =====================================================================
+
+#[test]
+fn child_nodes_includes_text_and_elements() {
+    let html = "<!doctype html><html><body><div id='d'>hello<span id='s'>x</span>world</div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("Array.from(document.getElementById('d').childNodes).map(n => n.nodeType + ':' + (n.nodeName || ''))").unwrap();
+    let v = out.value;
+    let arr = v.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    // 3:#text, 1:SPAN, 3:#text
+    assert_eq!(arr[0], serde_json::json!("3:#text"));
+    assert_eq!(arr[1], serde_json::json!("1:SPAN"));
+    assert_eq!(arr[2], serde_json::json!("3:#text"));
+}
+
+#[test]
+fn first_child_and_last_child_traversal() {
+    let html = "<!doctype html><html><body><div id='d'><a>a</a><b>b</b><c>c</c></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({first: document.getElementById('d').firstChild.nodeName, last: document.getElementById('d').lastChild.nodeName})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["first"], "A");
+    assert_eq!(parsed["last"], "C");
+}
+
+#[test]
+fn next_and_previous_sibling_skip_into_text() {
+    let html = "<!doctype html><html><body><div id='d'><a>a</a>text<b>b</b></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("(()=>{ const a = document.querySelector('#d > a'); const next = a.nextSibling; return next.nodeType; })()").unwrap();
+    assert_eq!(out.value, serde_json::json!(3));
+}
+
+#[test]
+fn element_sibling_skips_text_nodes() {
+    let html = "<!doctype html><html><body><div id='d'><a>a</a>text<b>b</b></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("(()=>{ const a = document.querySelector('#d > a'); return a.nextElementSibling.nodeName; })()").unwrap();
+    assert_eq!(out.value, serde_json::json!("B"));
+}
+
+#[test]
+fn child_element_count() {
+    let html = "<!doctype html><html><body><div id='d'>t<a></a>t<b></b><c></c></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("document.getElementById('d').childElementCount").unwrap();
+    assert_eq!(out.value, serde_json::json!(3));
+}
+
+#[test]
+fn contains_descendant_and_self() {
+    let html = "<!doctype html><html><body><div id='outer'><span id='inner'>x</span></div><div id='other'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({self: document.getElementById('outer').contains(document.getElementById('outer')), desc: document.getElementById('outer').contains(document.getElementById('inner')), unrel: document.getElementById('outer').contains(document.getElementById('other'))})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["self"], true);
+    assert_eq!(parsed["desc"], true);
+    assert_eq!(parsed["unrel"], false);
+}
+
+#[test]
+fn is_connected_true_for_attached_false_for_orphan() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({attached: document.getElementById('d').isConnected, orphan: document.createElement('div').isConnected})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["attached"], true);
+    assert_eq!(parsed["orphan"], false);
+}
+
+#[test]
+fn clone_node_shallow_does_not_clone_children() {
+    let html = "<!doctype html><html><body><div id='d'><span>inner</span></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("(()=>{ const c = document.getElementById('d').cloneNode(false); return JSON.stringify({tag: c.tagName, kids: c.childNodes.length}); })()").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["tag"], "DIV");
+    assert_eq!(parsed["kids"], 0);
+}
+
+#[test]
+fn clone_node_deep_clones_subtree() {
+    let html = "<!doctype html><html><body><div id='d' class='x'><span>inner</span>tail</div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("(()=>{ const c = document.getElementById('d').cloneNode(true); return JSON.stringify({tag: c.tagName, cls: c.getAttribute('class'), kids: c.childNodes.length, span: c.querySelector('span').textContent}); })()").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["tag"], "DIV");
+    assert_eq!(parsed["cls"], "x");
+    assert_eq!(parsed["kids"], 2);
+    assert_eq!(parsed["span"], "inner");
+}
+
+#[test]
+fn remove_detaches_from_parent() {
+    let html = "<!doctype html><html><body><div id='outer'><span id='inner'>x</span></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('inner').remove();").unwrap();
+    // `getElementById` returns `Option<Element>` which rquickjs
+    // converts to `undefined` (not `null`) — loose-equality `== null`
+    // matches both, which is the semantically-correct "absence"
+    // check at the JS layer. Aligning getElementById's None path
+    // with explicit JS null is a separate fix; out of scope here.
+    let out = sess.eval("JSON.stringify({outerHTML: document.getElementById('outer').innerHTML, gone: document.getElementById('inner') == null})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["outerHTML"], "");
+    assert_eq!(parsed["gone"], true);
+}
+
+#[test]
+fn has_child_nodes_returns_boolean() {
+    let html = "<!doctype html><html><body><div id='full'><a></a></div><div id='empty'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({full: document.getElementById('full').hasChildNodes(), empty: document.getElementById('empty').hasChildNodes()})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["full"], true);
+    assert_eq!(parsed["empty"], false);}

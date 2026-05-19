@@ -1252,6 +1252,362 @@ impl Element {
         Ok(child)
     }
 
+    /// `node.nodeType` — the WHATWG node-type constant: 1 for
+    /// element, 3 for text, 8 for comment, 9 for document, 0 as a
+    /// conservative fallback. Frameworks gate on `nodeType === 1`
+    /// before they'll mount into a container (React 19's
+    /// `createRoot` throws "Target container is not a DOM
+    /// element" otherwise), so this isn't optional.
+    #[qjs(get)]
+    fn node_type(&self) -> u32 {
+        match self.node_ref() {
+            Some(n) if n.is_element() => 1,
+            Some(n) if n.is_text() => 3,
+            Some(n) if n.is_comment() => 8,
+            Some(n) if n.is_document() => 9,
+            _ => 0,
+        }
+    }
+
+    /// `node.nodeName` — the uppercase tag name for elements,
+    /// `"#text"` / `"#comment"` / `"#document"` for non-elements.
+    /// Mirrors `tagName` for element nodes but is defined on every
+    /// node type per the DOM spec, which the SSR-hydration walk
+    /// (childNodes / firstChild) needs.
+    #[qjs(get)]
+    fn node_name(&self) -> String {
+        match self.node_ref() {
+            Some(n) if n.is_text() => "#text".to_owned(),
+            Some(n) if n.is_comment() => "#comment".to_owned(),
+            Some(n) if n.is_document() => "#document".to_owned(),
+            Some(n) => n
+                .node_name()
+                .map(|s| s.as_ref().to_ascii_uppercase())
+                .unwrap_or_default(),
+            None => String::new(),
+        }
+    }
+
+    /// `node.childNodes` — direct children of any node type
+    /// (element, text, comment), in document order. Returned as a
+    /// plain JS array because Phase 1B does not implement live
+    /// `NodeList` semantics; callers iterate immediately
+    /// (`Array.from(...)`, `forEach`, indexed access) and React /
+    /// Preact / lit-html never depend on the liveness of the
+    /// returned collection — they re-read on each diff pass.
+    ///
+    /// Distinct from `children` (which is element-only):
+    /// `childNodes` is the load-bearing surface for SSR-hydration
+    /// reconcilers that need to walk text-node siblings, and a
+    /// React `cloneNode(true)` round-trip is meaningless without
+    /// text-node visibility here.
+    ///
+    /// `dom_query::NodeRef::children_it(false)` iterates all child
+    /// node types forward — the `false` argument means "do not
+    /// reverse the iteration", not "skip text". Confirmed via the
+    /// upstream source in dom_query 0.28.
+    #[qjs(get)]
+    fn child_nodes(&self) -> Vec<Element> {
+        let n = match self.node_ref() {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+        n.children_it(false)
+            .map(|nr| Element::from_id(self.doc.clone(), nr.id))
+            .collect()
+    }
+
+    /// `node.firstChild` — first child of any node type, or `null`.
+    ///
+    /// Counterpart to `firstElementChild` (which filters to
+    /// elements); React's reconciler depends on this returning text
+    /// nodes too when matching server-rendered output against the
+    /// client tree.
+    #[qjs(get)]
+    fn first_child<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.node_ref().and_then(|n| n.first_child()) {
+            Some(child) => {
+                let el = Element::from_id(self.doc.clone(), child.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                Ok(instance.into_value())
+            }
+            // DOM spec: firstChild is `null` (not `undefined`) when
+            // the node has no children. rquickjs's `Option<T>` →
+            // `undefined` conversion is the wrong shape; framework
+            // code branches on `child === null` (strict), so we
+            // emit JS `null` explicitly.
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    /// `node.lastChild` — last child of any node type, or `null`.
+    /// Uses `dom_query::NodeRef::last_child` directly (cheaper than
+    /// walking `children_it` to the end).
+    #[qjs(get)]
+    fn last_child<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.node_ref().and_then(|n| n.last_child()) {
+            Some(child) => {
+                let el = Element::from_id(self.doc.clone(), child.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                Ok(instance.into_value())
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    /// `node.nextSibling` — next sibling of any node type, or
+    /// `null`. Walks text-node siblings too — a `<a>a</a>text<b>`
+    /// chain reads as `<a>.nextSibling` returning the text node.
+    #[qjs(get)]
+    fn next_sibling<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.node_ref().and_then(|n| n.next_sibling()) {
+            Some(sib) => {
+                let el = Element::from_id(self.doc.clone(), sib.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                Ok(instance.into_value())
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    /// `node.previousSibling` — previous sibling of any node
+    /// type, or `null`.
+    #[qjs(get)]
+    fn previous_sibling<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.node_ref().and_then(|n| n.prev_sibling()) {
+            Some(sib) => {
+                let el = Element::from_id(self.doc.clone(), sib.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                Ok(instance.into_value())
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    /// `element.firstElementChild` — first child that is an
+    /// element, skipping text and comment siblings, or `null`.
+    /// Counterpart to the existing `children[0]` shape.
+    #[qjs(get)]
+    fn first_element_child<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let n = match self.node_ref() {
+            Some(n) => n,
+            None => return Ok(Value::new_null(ctx)),
+        };
+        for child in n.children_it(false) {
+            if child.is_element() {
+                let el = Element::from_id(self.doc.clone(), child.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                return Ok(instance.into_value());
+            }
+        }
+        Ok(Value::new_null(ctx))
+    }
+
+    /// `element.lastElementChild` — last child that is an
+    /// element, or `null`. Uses `children_it(true)` (reverse
+    /// iteration) so we stop at the first element from the end,
+    /// avoiding a full children walk on long lists.
+    #[qjs(get)]
+    fn last_element_child<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let n = match self.node_ref() {
+            Some(n) => n,
+            None => return Ok(Value::new_null(ctx)),
+        };
+        for child in n.children_it(true) {
+            if child.is_element() {
+                let el = Element::from_id(self.doc.clone(), child.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                return Ok(instance.into_value());
+            }
+        }
+        Ok(Value::new_null(ctx))
+    }
+
+    /// `element.nextElementSibling` — next sibling that is an
+    /// element, or `null`. Walks the `next_sibling` chain past any
+    /// text / comment nodes — React's reconciler reads this to
+    /// match up server-rendered element siblings while ignoring
+    /// the whitespace text between them.
+    #[qjs(get)]
+    fn next_element_sibling<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let mut cur = self.node_ref().and_then(|n| n.next_sibling());
+        while let Some(n) = cur {
+            if n.is_element() {
+                let el = Element::from_id(self.doc.clone(), n.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                return Ok(instance.into_value());
+            }
+            cur = n.next_sibling();
+        }
+        Ok(Value::new_null(ctx))
+    }
+
+    /// `element.previousElementSibling` — previous sibling that
+    /// is an element, or `null`.
+    #[qjs(get)]
+    fn previous_element_sibling<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let mut cur = self.node_ref().and_then(|n| n.prev_sibling());
+        while let Some(n) = cur {
+            if n.is_element() {
+                let el = Element::from_id(self.doc.clone(), n.id);
+                let instance = Class::instance(ctx.clone(), el)?;
+                return Ok(instance.into_value());
+            }
+            cur = n.prev_sibling();
+        }
+        Ok(Value::new_null(ctx))
+    }
+
+    /// `element.childElementCount` — count of element children
+    /// (skipping text and comment nodes). Used as a hydration
+    /// sentinel by React: when the server-rendered HTML's child
+    /// count disagrees with the client's expected count, React
+    /// throws "Hydration failed".
+    #[qjs(get)]
+    fn child_element_count(&self) -> u32 {
+        let n = match self.node_ref() {
+            Some(n) => n,
+            None => return 0,
+        };
+        n.children_it(false).filter(|c| c.is_element()).count() as u32
+    }
+
+    /// `node.hasChildNodes()` — true if this node has any child
+    /// of any type. Defined for every node type per the DOM spec.
+    fn has_child_nodes(&self) -> bool {
+        self.node_ref()
+            .map(|n| n.first_child().is_some())
+            .unwrap_or(false)
+    }
+
+    /// `node.contains(other)` — true if `other` is a descendant
+    /// of `self`, or `self` itself, per the DOM spec. `null`/missing
+    /// `other` → `false` (the spec allows it; we get that for free
+    /// via `Option<Element>`).
+    ///
+    /// Implementation walks `other`'s `ancestors_it()` and compares
+    /// node ids against `self.node_id`. The walk is
+    /// O(depth-of-other), which is the cheapest direction
+    /// (descending from `self` would be O(subtree-size)).
+    fn contains(&self, other: Option<Element>) -> bool {
+        let Some(other) = other else { return false };
+        if other.node_id == self.node_id {
+            return true;
+        }
+        let Some(other_ref) = other.node_ref() else {
+            return false;
+        };
+        // `ancestors_it(None)` yields all ancestors up to the
+        // document root, excluding `other` itself (already
+        // compared above). Both `other` and `self` must live in
+        // the same `Tree` for the id-equality check to be
+        // meaningful — guaranteed because `Element` instances are
+        // minted only by `Document::*` methods on a single
+        // `Arc<DqDocument>`.
+        for ancestor in other_ref.ancestors_it(None) {
+            if ancestor.id == self.node_id {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `node.isConnected` — true iff the node is in the document
+    /// tree (i.e., a `parent()` walk eventually reaches the
+    /// `dom_query::NodeData::Document` root). Returns `false` for
+    /// `createElement`-built orphans that have never been
+    /// `appendChild`'d, and for nodes that have been detached via
+    /// `remove()` / `removeChild`.
+    ///
+    /// React's `createRoot` checks `container.isConnected` before
+    /// mounting; passing an orphan container surfaces as
+    /// "Target container is not a DOM element" otherwise.
+    #[qjs(get)]
+    fn is_connected(&self) -> bool {
+        let Some(n) = self.node_ref() else {
+            return false;
+        };
+        // Walk parents; if any ancestor is the Document root, the
+        // node is connected. Orphans (no parent) return `false`
+        // immediately because `ancestors_it` yields nothing.
+        for ancestor in n.ancestors_it(None) {
+            if ancestor.is_document() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `node.cloneNode(deep?)` — return a copy of this node.
+    ///
+    /// Shallow (`deep` falsy or absent): copy this node's type and
+    /// attributes (for elements) or text data (for text nodes)
+    /// into a fresh orphan node in the same `dom_query::Tree`. No
+    /// children are cloned.
+    ///
+    /// Deep (`deep === true`): also recursively clone every
+    /// descendant. Each cloned subtree shares the source's tag
+    /// names, attribute values, and text content. Listeners are
+    /// NOT copied — the DOM spec is explicit that listeners
+    /// registered via `addEventListener` do not clone. Inline
+    /// handlers (`onclick="..."`) ARE preserved because they're
+    /// stored as attributes.
+    ///
+    /// Used heavily by `lit-html` (templates clone a parsed
+    /// `<template>` body per render) and `preact/compat` (the
+    /// shim for React-compat code), so a `cloneNode is not a
+    /// function` throw halts hydration on otherwise-clean pages.
+    ///
+    /// `dom_query` 0.28 does not expose a public `clone_node`
+    /// primitive at the time of writing, so the implementation
+    /// walks `children_it(false)` manually and rebuilds the
+    /// subtree via `Tree::new_element` / `Tree::new_text`. Comment
+    /// nodes are skipped (placeholder empty text) because
+    /// dom_query's `Tree` has no public `new_comment` constructor
+    /// and they don't appear in SSR output that matters for
+    /// hydration.
+    fn clone_node(&self, deep: Opt<bool>) -> Element {
+        let deep = deep.0.unwrap_or(false);
+        let new_id = clone_subtree(&self.doc, self.node_id, deep);
+        Element::from_id(self.doc.clone(), new_id)
+    }
+
+    /// `node.remove()` — detach `self` from its parent. No-op on
+    /// a node that has no parent (already-orphan `createElement`
+    /// nodes or roots).
+    ///
+    /// Listener-registry entries for every NodeId in the removed
+    /// subtree are dropped, matching [`Self::remove_child`]'s
+    /// cleanup semantics: the registry is keyed off
+    /// `dom_query::NodeId`, and stale entries would (a) leak
+    /// across long-lived sessions and (b) contaminate a future
+    /// element that happened to be allocated the same id.
+    ///
+    /// Used heavily by SPA route teardown and by
+    /// `@floating-ui/dom` (popover dismissal walks
+    /// `popover.remove()` on close).
+    fn remove<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<()> {
+        let self_id = this.0.borrow().node_id;
+        let doc = this.0.borrow().doc.clone();
+        let mut to_clear: Vec<NodeId> = Vec::new();
+        if let Some(node_ref) = doc.tree.get(&self_id) {
+            // Element.remove is defined as
+            // "If this's parent is null, then return" — no-op
+            // when already detached.
+            if node_ref.parent().is_some() {
+                to_clear.push(self_id);
+                for descendant in node_ref.descendants_it() {
+                    to_clear.push(descendant.id);
+                }
+                node_ref.remove_from_parent();
+            }
+        }
+        if !to_clear.is_empty() {
+            clear_listeners_for_nodes(&ctx, &to_clear)?;
+        }
+        Ok(())
+    }
+
     /// `element.classList` — a freshly-constructed [`DomTokenList`]
     /// view of the element's space-separated `class` attribute.
     ///
@@ -1766,6 +2122,101 @@ impl Element {
     fn scroll_into_view(&self, _arg: Opt<Value<'_>>) {
         // intentional no-op — no layout.
     }
+}
+
+/// Recursively clone the subtree rooted at `source_id` into the
+/// same `dom_query::Tree`. Returns the [`NodeId`] of the new
+/// orphan root.
+///
+/// Used by [`Element::clone_node`]. The walk:
+///
+/// 1. Look up the source node's [`dom_query::NodeData`]. For
+///    elements, create a fresh element with the same tag via
+///    [`dom_query::Tree::new_element`] and copy every attribute
+///    (the `attrs()` snapshot is taken once, so subsequent
+///    mutations to the source's attributes do not bleed into the
+///    clone). For text nodes, create a fresh text node with the
+///    same data via [`dom_query::Tree::new_text`]. For comment /
+///    doctype / processing-instruction / document / fragment
+///    nodes, fall back to creating a placeholder text node with
+///    an empty string — dom_query 0.28 has no public
+///    constructor for those types on [`dom_query::Tree`], and
+///    they don't appear in SSR output that matters for
+///    hydration.
+/// 2. If `deep` is `true`, walk `children_it(false)` of the
+///    source and recursively clone each child, then `append_child`
+///    the new child into the new parent. Depth-first pre-order,
+///    matching `Node.cloneNode(true)` per the DOM spec.
+/// 3. Otherwise, leave the new node childless.
+///
+/// Listeners are *not* copied — the DOM spec is explicit that
+/// `addEventListener`-registered listeners do not clone. Inline
+/// handlers (`onclick="..."`) are preserved because they live in
+/// the attribute store, which step 1 copies.
+fn clone_subtree(doc: &Arc<DqDocument>, source_id: NodeId, deep: bool) -> NodeId {
+    let tree = &doc.tree;
+    // Build the new orphan node first (mirroring source's kind and
+    // immediate data); release the source borrow before any
+    // recursion so the inner allocations don't deadlock on the
+    // RefCell.
+    let new_id = {
+        let Some(source) = tree.get(&source_id) else {
+            // Stale source NodeId — can't read what to clone.
+            // Fall back to an empty text node so the JS contract
+            // (cloneNode always returns a node) is preserved.
+            return tree.new_text(String::new()).id;
+        };
+        if source.is_element() {
+            // Element clone: copy tag name + every attribute.
+            let tag = source
+                .node_name()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "div".to_owned());
+            let new_node = tree.new_element(&tag);
+            for attr in source.attrs() {
+                // `attr.name.local` is the bare (non-namespaced)
+                // attribute name — matches what
+                // `dom_query::NodeRef::set_attr` writes, so the
+                // clone's `getAttribute(name)` reads back the
+                // same value as the source's would.
+                new_node.set_attr(&attr.name.local, &attr.value);
+            }
+            new_node.id
+        } else if source.is_text() {
+            // Text node: replicate the contents. `text()` on a
+            // pure text node yields exactly that node's data
+            // (no recursion needed — text nodes have no children).
+            let data = source.text().to_string();
+            tree.new_text(data).id
+        } else {
+            // Comment / doctype / processing-instruction /
+            // document / fragment. dom_query 0.28 has no public
+            // `Tree::new_comment` etc., so we fall back to an
+            // empty text-node placeholder. None of these appear
+            // in SSR output that matters for hydration
+            // (`<!-- -->` rarely survives a render diff intact).
+            tree.new_text(String::new()).id
+        }
+    };
+
+    if deep {
+        // Snapshot child ids first so we don't hold the source
+        // node's tree borrow across the recursive call (the
+        // recursion mutates `tree.nodes` via `new_element` /
+        // `new_text`, which would re-borrow).
+        let child_ids: Vec<NodeId> = match tree.get(&source_id) {
+            Some(n) => n.children_it(false).map(|c| c.id).collect(),
+            None => Vec::new(),
+        };
+        for child_id in child_ids {
+            let cloned_child_id = clone_subtree(doc, child_id, true);
+            if let Some(parent) = tree.get(&new_id) {
+                parent.append_child(&cloned_child_id);
+            }
+        }
+    }
+
+    new_id
 }
 
 /// Build the W3C event-dispatch path for `target` — `[root, ...,
