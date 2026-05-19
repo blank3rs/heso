@@ -323,6 +323,100 @@ const TARGETS: &[Target] = &[
             needle: "Vercel",
         },
     },
+    // ---- Framework docs / SPA-router sites ----
+    //
+    // These exercise the same code paths but ship MORE client-side JS
+    // (Next.js / VitePress / SvelteKit) and use `history.pushState` for
+    // routing. The probe is still `document.title` (cheapest stable
+    // signal) — what's being tested is that the page's inline scripts
+    // don't throw during init now that observer ctors and pushState
+    // are installed.
+    Target {
+        name: "react.dev",
+        category: "framework-docs",
+        url: "https://react.dev/",
+        js_fetch: false,
+        // Next.js head-rendered: `<title data-next-head>React</title>`.
+        // `document.title` returns the text "React".
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "React",
+        },
+    },
+    Target {
+        name: "vuejs.org",
+        category: "framework-docs",
+        url: "https://vuejs.org/",
+        js_fetch: false,
+        // VitePress docs site.
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "Vue.js",
+        },
+    },
+    Target {
+        name: "svelte.dev",
+        category: "framework-docs",
+        url: "https://svelte.dev/",
+        js_fetch: false,
+        // SvelteKit. Title is "Svelte • Web development for the rest of us".
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "Svelte",
+        },
+    },
+    Target {
+        name: "nextjs.org",
+        category: "framework-docs",
+        url: "https://nextjs.org/",
+        js_fetch: false,
+        // Next.js self-hosted on Next.js.
+        probe: Probe::Contains {
+            js: "document.title",
+            needle: "Next.js",
+        },
+    },
+    // ---- Feature smoke probes ----
+    //
+    // These point at a cheap host (example.com) but the *probe* is the
+    // interesting part: an inline JS expression that exercises one of
+    // the recently-shipped globals and asserts a known-good value.
+    // Catches regressions in the engine itself rather than in any
+    // particular site.
+    Target {
+        name: "feature: URLSearchParams reflects into URL",
+        category: "feature",
+        url: "https://example.com",
+        js_fetch: false,
+        // Mutating searchParams must write back through `url.toString()`.
+        probe: Probe::Contains {
+            js: "(() => { const u = new URL('https://x/?a=1'); u.searchParams.set('b', '2'); return u.toString(); })()",
+            needle: "a=1&b=2",
+        },
+    },
+    Target {
+        name: "feature: history.pushState updates location",
+        category: "feature",
+        url: "https://example.com",
+        js_fetch: false,
+        // pushState must update location.pathname synchronously.
+        probe: Probe::Contains {
+            js: "(() => { history.pushState({x:1}, '', '/probe-path'); return location.pathname; })()",
+            needle: "/probe-path",
+        },
+    },
+    Target {
+        name: "feature: MutationObserver init does not throw",
+        category: "feature",
+        url: "https://example.com",
+        js_fetch: false,
+        // Observer ctors are noops but must accept the spec API surface
+        // (callback arg + observe/disconnect/takeRecords methods).
+        probe: Probe::Contains {
+            js: "(() => { const o = new MutationObserver(() => {}); o.observe(document.body, {childList: true}); o.disconnect(); return 'observer-ok'; })()",
+            needle: "observer-ok",
+        },
+    },
 ];
 
 // ============================================================================
