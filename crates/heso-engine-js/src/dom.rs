@@ -784,6 +784,66 @@ impl Element {
             .unwrap_or_default()
     }
 
+    /// `element.style` — a Proxy over the element's `style` attribute
+    /// shaped like the DOM [`CSSStyleDeclaration`][spec] interface.
+    ///
+    /// Reads/writes round-trip through the inline `style="..."`
+    /// attribute, so `style.color = "red"` becomes visible via
+    /// `outerHTML` / `getAttribute('style')` and vice versa. The
+    /// Proxy itself is created by `globalThis.__hesoMakeStyleProxy`
+    /// (installed in [`crate::engine::install_style_proxy`]); see the
+    /// `STYLE_PROXY_BOOTSTRAP` constant there for trap-by-trap
+    /// semantics — in particular the `has` trap is gated on a real
+    /// allow-list of CSS property names so React's hydration
+    /// feature-detect (`for (t in n) if (t in Ct) ...`) discriminates
+    /// real CSS properties from arbitrary attribute keys.
+    ///
+    /// On a stale element handle (the underlying node has been
+    /// detached and recycled — defensive only; not reachable via the
+    /// public constructors), reads return empty and writes silently
+    /// no-op.
+    ///
+    /// [spec]: https://drafts.csswg.org/cssom/#cssstyledeclaration
+    #[qjs(get)]
+    fn style<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+    ) -> rquickjs::Result<Value<'js>> {
+        let element = this.0.borrow().clone();
+
+        // `read` returns the current `style` attribute value (or "").
+        let read_el = element.clone();
+        let read = Function::new(ctx.clone(), move || -> String {
+            read_el
+                .node_ref()
+                .and_then(|n| n.attr("style"))
+                .map(|s| s.to_string())
+                .unwrap_or_default()
+        })?;
+
+        // `write` replaces the `style` attribute with the given
+        // serialized string. Empty string clears the attribute
+        // (mirrors `setAttribute('style', '')` semantics — the
+        // attribute stays but is empty; cheap to keep consistent
+        // with the read path).
+        let write_el = element;
+        let write = Function::new(ctx.clone(), move |value: String| {
+            if let Some(n) = write_el.node_ref() {
+                n.set_attr("style", &value);
+            }
+        })?;
+
+        // Reach for the JS-side factory installed at engine boot. If
+        // the factory is missing (shouldn't happen — `install_style_proxy`
+        // runs unconditionally), fall back to returning `null` so the
+        // caller sees a TypeError on member access rather than a
+        // panic.
+        let globals = ctx.globals();
+        let factory: Function<'js> = globals.get("__hesoMakeStyleProxy")?;
+        let proxy: Value<'js> = factory.call((read, write))?;
+        Ok(proxy)
+    }
+
     /// `element.getAttribute(name)` — return the attribute value, or
     /// `null` if not present.
     fn get_attribute(&self, name: String) -> Option<String> {

@@ -287,6 +287,10 @@ impl JsEngine {
 
         install_console(&context, console_buffer.clone())?;
         install_dom_classes(&context)?;
+        // Install the JS-side `__hesoMakeStyleProxy` factory before
+        // any Element wrapper is created — `Element.style` reaches
+        // for the global on every access.
+        install_style_proxy(&context)?;
         crate::events::install_events(&context)?;
 
         // rquickjs's `Persistent<Function<'static>>` (held inside
@@ -1373,6 +1377,326 @@ fn install_location(context: &Context, url: Option<&Url>) -> Result<(), EvalErro
         .map_err(|e| EvalError::Engine(format!("install location: {e}")))?;
     Ok(())
 }
+
+/// Install `globalThis.__hesoMakeStyleProxy` — the JS-side factory
+/// backing the [`Element.style`](crate::dom::Element) getter. Idempotent
+/// (calling twice rebinds the global, which is fine).
+///
+/// See [`STYLE_PROXY_BOOTSTRAP`] for the source and a design discussion
+/// of the trap semantics.
+fn install_style_proxy(context: &Context) -> Result<(), EvalError> {
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            ctx.eval::<(), _>(STYLE_PROXY_BOOTSTRAP)?;
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install style proxy: {e}")))?;
+    Ok(())
+}
+
+/// JS source for `__hesoMakeStyleProxy`. Backs the `Element.style`
+/// getter; see [`crate::dom::Element::style`] for the call site.
+///
+/// Design notes:
+///
+/// - `has(key)` consults `KNOWN_CSS_PROPS`, a Set built from the
+///   csstype standard-property list (derived from MDN data —
+///   <https://github.com/frenic/csstype>, longhands + shorthands +
+///   SVG presentation properties, vendor prefixes stripped). Real
+///   `CSSStyleDeclaration` exposes a *closed* property list:
+///   `'color' in el.style === true` but `'foo' in el.style === false`
+///   in every shipping browser. React's feature-detect (`for (t in n)
+///   if (t in Ct) ...` where `Ct = el.style`) specifically relies on
+///   that closed list to discover whether `n`'s key maps to a real
+///   CSS property; returning `true` for everything makes React copy
+///   arbitrary keys onto inline style and silently corrupts opinionated
+///   CSS-in-JS libraries. CSS custom properties (those starting with
+///   `--`) bypass the allow-list and are always reported present, per
+///   spec (they're open-ended by design).
+/// - camelCase ↔ kebab-case normalization runs on every access so
+///   `style.backgroundColor = "red"` and `style.getPropertyValue
+///   ("background-color")` agree. CSS custom properties (those
+///   starting with `--`) bypass the conversion.
+/// - Writes go through `set_attr` on the backing element, so the
+///   serialized `style="..."` attribute stays in sync and is
+///   visible via `outerHTML` / `getAttribute('style')`. We do *not*
+///   filter `set` through `KNOWN_CSS_PROPS` even though real browsers
+///   silently no-op writes to unknown property names — too many
+///   frameworks rely on the open write surface, and the read path
+///   (which is what `for ... in` ultimately consults) is the
+///   load-bearing half.
+/// - The `getPropertyValue` / `setProperty` / `removeProperty`
+///   methods are the spec-canonical interface; some frameworks
+///   reach for them instead of direct property access. Wired here
+///   so they share the same parse/serialize round-trip.
+const STYLE_PROXY_BOOTSTRAP: &str = r#"
+(function() {
+    // Canonical CSS property allow-list. Source: csstype standard-only
+    // surface (longhands + shorthands + SVG presentation props),
+    // derived from MDN's compat data — https://github.com/frenic/csstype.
+    // Vendor-prefixed entries (`-webkit-*`, `-moz-*`, `-ms-*`, `-o-*`,
+    // `-khtml-*`, `-epub-*`, `-apple-*`) are intentionally excluded:
+    // React's feature-detect for prefixed CSS does
+    // `prefix + camelCased in style` (e.g. `'WebkitTransform' in style`),
+    // which lookups would *fail* against this set, sending React to its
+    // unprefixed-fallback branch — which is what we want, since we
+    // serialize a single unprefixed value and the browser would do its
+    // own normalization downstream.
+    const KNOWN_CSS_PROPS = new Set([
+        'accent-color', 'align-content', 'align-items', 'align-self',
+        'align-tracks', 'alignment-baseline', 'all', 'anchor-name',
+        'anchor-scope', 'animation', 'animation-composition', 'animation-delay',
+        'animation-direction', 'animation-duration', 'animation-fill-mode',
+        'animation-iteration-count', 'animation-name', 'animation-play-state',
+        'animation-range', 'animation-range-end', 'animation-range-start',
+        'animation-timeline', 'animation-timing-function', 'appearance',
+        'aspect-ratio', 'backdrop-filter', 'backface-visibility', 'background',
+        'background-attachment', 'background-blend-mode', 'background-clip',
+        'background-color', 'background-image', 'background-origin',
+        'background-position', 'background-position-x', 'background-position-y',
+        'background-repeat', 'background-size', 'baseline-shift', 'block-size',
+        'border', 'border-block', 'border-block-color', 'border-block-end',
+        'border-block-end-color', 'border-block-end-style',
+        'border-block-end-width', 'border-block-start',
+        'border-block-start-color', 'border-block-start-style',
+        'border-block-start-width', 'border-block-style', 'border-block-width',
+        'border-bottom', 'border-bottom-color', 'border-bottom-left-radius',
+        'border-bottom-right-radius', 'border-bottom-style',
+        'border-bottom-width', 'border-collapse', 'border-color',
+        'border-end-end-radius', 'border-end-start-radius', 'border-image',
+        'border-image-outset', 'border-image-repeat', 'border-image-slice',
+        'border-image-source', 'border-image-width', 'border-inline',
+        'border-inline-color', 'border-inline-end', 'border-inline-end-color',
+        'border-inline-end-style', 'border-inline-end-width',
+        'border-inline-start', 'border-inline-start-color',
+        'border-inline-start-style', 'border-inline-start-width',
+        'border-inline-style', 'border-inline-width', 'border-left',
+        'border-left-color', 'border-left-style', 'border-left-width',
+        'border-radius', 'border-right', 'border-right-color',
+        'border-right-style', 'border-right-width', 'border-spacing',
+        'border-start-end-radius', 'border-start-start-radius', 'border-style',
+        'border-top', 'border-top-color', 'border-top-left-radius',
+        'border-top-right-radius', 'border-top-style', 'border-top-width',
+        'border-width', 'bottom', 'box-decoration-break', 'box-shadow',
+        'box-sizing', 'break-after', 'break-before', 'break-inside',
+        'caption-side', 'caret', 'caret-color', 'caret-shape', 'clear', 'clip',
+        'clip-path', 'clip-rule', 'color', 'color-adjust', 'color-interpolation',
+        'color-interpolation-filters', 'color-rendering', 'color-scheme',
+        'column-count', 'column-fill', 'column-gap', 'column-rule',
+        'column-rule-color', 'column-rule-style', 'column-rule-width',
+        'column-span', 'column-width', 'columns', 'contain',
+        'contain-intrinsic-block-size', 'contain-intrinsic-height',
+        'contain-intrinsic-inline-size', 'contain-intrinsic-size',
+        'contain-intrinsic-width', 'container', 'container-name',
+        'container-type', 'content', 'content-visibility', 'counter-increment',
+        'counter-reset', 'counter-set', 'cursor', 'cx', 'cy', 'd', 'direction',
+        'display', 'dominant-baseline', 'empty-cells', 'field-sizing', 'fill',
+        'fill-opacity', 'fill-rule', 'filter', 'flex', 'flex-basis',
+        'flex-direction', 'flex-flow', 'flex-grow', 'flex-shrink', 'flex-wrap',
+        'float', 'flood-color', 'flood-opacity', 'font', 'font-family',
+        'font-feature-settings', 'font-kerning', 'font-language-override',
+        'font-optical-sizing', 'font-palette', 'font-size', 'font-size-adjust',
+        'font-smooth', 'font-stretch', 'font-style', 'font-synthesis',
+        'font-synthesis-position', 'font-synthesis-small-caps',
+        'font-synthesis-style', 'font-synthesis-weight', 'font-variant',
+        'font-variant-alternates', 'font-variant-caps', 'font-variant-east-asian',
+        'font-variant-emoji', 'font-variant-ligatures', 'font-variant-numeric',
+        'font-variant-position', 'font-variation-settings', 'font-weight',
+        'font-width', 'forced-color-adjust', 'gap', 'glyph-orientation-vertical',
+        'grid', 'grid-area', 'grid-auto-columns', 'grid-auto-flow',
+        'grid-auto-rows', 'grid-column', 'grid-column-end', 'grid-column-start',
+        'grid-row', 'grid-row-end', 'grid-row-start', 'grid-template',
+        'grid-template-areas', 'grid-template-columns', 'grid-template-rows',
+        'hanging-punctuation', 'height', 'hyphenate-character',
+        'hyphenate-limit-chars', 'hyphens', 'image-orientation',
+        'image-rendering', 'image-resolution', 'initial-letter',
+        'initial-letter-align', 'inline-size', 'inset', 'inset-block',
+        'inset-block-end', 'inset-block-start', 'inset-inline',
+        'inset-inline-end', 'inset-inline-start', 'interpolate-size', 'isolation',
+        'justify-content', 'justify-items', 'justify-self', 'justify-tracks',
+        'left', 'letter-spacing', 'lighting-color', 'line-break', 'line-clamp',
+        'line-height', 'line-height-step', 'list-style', 'list-style-image',
+        'list-style-position', 'list-style-type', 'margin', 'margin-block',
+        'margin-block-end', 'margin-block-start', 'margin-bottom',
+        'margin-inline', 'margin-inline-end', 'margin-inline-start',
+        'margin-left', 'margin-right', 'margin-top', 'margin-trim', 'marker',
+        'marker-end', 'marker-mid', 'marker-start', 'mask', 'mask-border',
+        'mask-border-mode', 'mask-border-outset', 'mask-border-repeat',
+        'mask-border-slice', 'mask-border-source', 'mask-border-width',
+        'mask-clip', 'mask-composite', 'mask-image', 'mask-mode', 'mask-origin',
+        'mask-position', 'mask-repeat', 'mask-size', 'mask-type',
+        'masonry-auto-flow', 'math-depth', 'math-shift', 'math-style',
+        'max-block-size', 'max-height', 'max-inline-size', 'max-lines',
+        'max-width', 'min-block-size', 'min-height', 'min-inline-size',
+        'min-width', 'mix-blend-mode', 'motion', 'motion-distance', 'motion-path',
+        'motion-rotation', 'object-fit', 'object-position', 'object-view-box',
+        'offset', 'offset-anchor', 'offset-distance', 'offset-path',
+        'offset-position', 'offset-rotate', 'offset-rotation', 'opacity', 'order',
+        'orphans', 'outline', 'outline-color', 'outline-offset', 'outline-style',
+        'outline-width', 'overflow', 'overflow-anchor', 'overflow-block',
+        'overflow-clip-box', 'overflow-clip-margin', 'overflow-inline',
+        'overflow-wrap', 'overflow-x', 'overflow-y', 'overlay',
+        'overscroll-behavior', 'overscroll-behavior-block',
+        'overscroll-behavior-inline', 'overscroll-behavior-x',
+        'overscroll-behavior-y', 'padding', 'padding-block', 'padding-block-end',
+        'padding-block-start', 'padding-bottom', 'padding-inline',
+        'padding-inline-end', 'padding-inline-start', 'padding-left',
+        'padding-right', 'padding-top', 'page', 'paint-order', 'perspective',
+        'perspective-origin', 'place-content', 'place-items', 'place-self',
+        'pointer-events', 'position', 'position-anchor', 'position-area',
+        'position-try', 'position-try-fallbacks', 'position-try-order',
+        'position-visibility', 'print-color-adjust', 'quotes', 'r', 'resize',
+        'right', 'rotate', 'row-gap', 'ruby-align', 'ruby-merge', 'ruby-overhang',
+        'ruby-position', 'rx', 'ry', 'scale', 'scroll-behavior',
+        'scroll-initial-target', 'scroll-margin', 'scroll-margin-block',
+        'scroll-margin-block-end', 'scroll-margin-block-start',
+        'scroll-margin-bottom', 'scroll-margin-inline',
+        'scroll-margin-inline-end', 'scroll-margin-inline-start',
+        'scroll-margin-left', 'scroll-margin-right', 'scroll-margin-top',
+        'scroll-padding', 'scroll-padding-block', 'scroll-padding-block-end',
+        'scroll-padding-block-start', 'scroll-padding-bottom',
+        'scroll-padding-inline', 'scroll-padding-inline-end',
+        'scroll-padding-inline-start', 'scroll-padding-left',
+        'scroll-padding-right', 'scroll-padding-top', 'scroll-snap-align',
+        'scroll-snap-margin', 'scroll-snap-margin-bottom',
+        'scroll-snap-margin-left', 'scroll-snap-margin-right',
+        'scroll-snap-margin-top', 'scroll-snap-stop', 'scroll-snap-type',
+        'scroll-timeline', 'scroll-timeline-axis', 'scroll-timeline-name',
+        'scrollbar-color', 'scrollbar-gutter', 'scrollbar-width',
+        'shape-image-threshold', 'shape-margin', 'shape-outside',
+        'shape-rendering', 'speak-as', 'stop-color', 'stop-opacity', 'stroke',
+        'stroke-color', 'stroke-dasharray', 'stroke-dashoffset', 'stroke-linecap',
+        'stroke-linejoin', 'stroke-miterlimit', 'stroke-opacity', 'stroke-width',
+        'tab-size', 'table-layout', 'text-align', 'text-align-last',
+        'text-anchor', 'text-autospace', 'text-box', 'text-box-edge',
+        'text-box-trim', 'text-combine-upright', 'text-decoration',
+        'text-decoration-color', 'text-decoration-line', 'text-decoration-skip',
+        'text-decoration-skip-ink', 'text-decoration-style',
+        'text-decoration-thickness', 'text-emphasis', 'text-emphasis-color',
+        'text-emphasis-position', 'text-emphasis-style', 'text-indent',
+        'text-justify', 'text-orientation', 'text-overflow', 'text-rendering',
+        'text-shadow', 'text-size-adjust', 'text-spacing-trim', 'text-transform',
+        'text-underline-offset', 'text-underline-position', 'text-wrap',
+        'text-wrap-mode', 'text-wrap-style', 'timeline-scope', 'top',
+        'touch-action', 'transform', 'transform-box', 'transform-origin',
+        'transform-style', 'transition', 'transition-behavior',
+        'transition-delay', 'transition-duration', 'transition-property',
+        'transition-timing-function', 'translate', 'unicode-bidi', 'user-select',
+        'vector-effect', 'vertical-align', 'view-timeline', 'view-timeline-axis',
+        'view-timeline-inset', 'view-timeline-name', 'view-transition-class',
+        'view-transition-name', 'visibility', 'white-space',
+        'white-space-collapse', 'widows', 'width', 'will-change', 'word-break',
+        'word-spacing', 'word-wrap', 'writing-mode', 'x', 'y', 'z-index', 'zoom'
+    ]);
+    function parseStyle(s) {
+        const out = Object.create(null);
+        if (!s) return out;
+        for (const part of s.split(';')) {
+            const i = part.indexOf(':');
+            if (i < 0) continue;
+            const k = part.slice(0, i).trim();
+            const v = part.slice(i + 1).trim();
+            if (k) out[k] = v;
+        }
+        return out;
+    }
+    function serializeStyle(o) {
+        const parts = [];
+        for (const k of Object.keys(o)) parts.push(k + ': ' + o[k]);
+        return parts.join('; ');
+    }
+    function camelToKebab(s) {
+        // Custom properties (--*) are not camelCase — pass through.
+        if (s.startsWith('--')) return s;
+        return s.replace(/[A-Z]/g, function(m) { return '-' + m.toLowerCase(); });
+    }
+    function isKnownProp(prop) {
+        // CSS custom properties are open-ended; spec says they're
+        // always "present" on the declaration regardless of allow-list.
+        if (prop.startsWith('--')) return true;
+        // Normalize camelCase queries (`backgroundColor`) to the kebab
+        // form the allow-list stores. Leading-capital queries
+        // (`BackgroundColor`) become `-background-color` after the
+        // regex, which fails the lookup — matching real-browser
+        // behavior where `'BackgroundColor' in el.style === false`.
+        return KNOWN_CSS_PROPS.has(camelToKebab(prop));
+    }
+    globalThis.__hesoMakeStyleProxy = function(read, write) {
+        const methods = {
+            getPropertyValue: function(name) {
+                const o = parseStyle(read());
+                return o[camelToKebab(String(name))] || '';
+            },
+            setProperty: function(name, value) {
+                const o = parseStyle(read());
+                const k = camelToKebab(String(name));
+                if (value == null || value === '') delete o[k];
+                else o[k] = String(value);
+                write(serializeStyle(o));
+            },
+            removeProperty: function(name) {
+                const o = parseStyle(read());
+                const k = camelToKebab(String(name));
+                const prev = o[k] || '';
+                delete o[k];
+                write(serializeStyle(o));
+                return prev;
+            }
+        };
+        return new Proxy(Object.create(null), {
+            get: function(_, prop) {
+                if (typeof prop === 'symbol') return undefined;
+                if (prop === 'cssText') return read();
+                if (methods[prop]) return methods[prop];
+                if (prop === 'length') return Object.keys(parseStyle(read())).length;
+                const o = parseStyle(read());
+                return o[camelToKebab(prop)] || '';
+            },
+            set: function(_, prop, value) {
+                if (typeof prop === 'symbol') return true;
+                if (prop === 'cssText') { write(String(value == null ? '' : value)); return true; }
+                const o = parseStyle(read());
+                const k = camelToKebab(prop);
+                const v = value == null ? '' : String(value);
+                if (v === '') delete o[k];
+                else o[k] = v;
+                write(serializeStyle(o));
+                return true;
+            },
+            has: function(_, prop) {
+                // Real-browser `CSSStyleDeclaration` is a *closed*
+                // property list. React's hydration feature-detect
+                // (`for (t in n) if (t in Ct) ...` where `Ct = el.style`)
+                // depends on the closed list — returning `true` for
+                // every key makes React copy arbitrary attributes onto
+                // inline style and silently corrupts opinionated
+                // CSS-in-JS libraries. Custom properties (`--*`) are
+                // open-ended per spec; everything else is gated by
+                // the allow-list.
+                if (typeof prop !== 'string') return false;
+                return isKnownProp(prop);
+            },
+            deleteProperty: function(_, prop) {
+                if (typeof prop !== 'string') return true;
+                const o = parseStyle(read());
+                delete o[camelToKebab(prop)];
+                write(serializeStyle(o));
+                return true;
+            },
+            ownKeys: function() {
+                return Object.keys(parseStyle(read()));
+            },
+            getOwnPropertyDescriptor: function(_, prop) {
+                if (typeof prop !== 'string') return undefined;
+                const o = parseStyle(read());
+                const k = camelToKebab(prop);
+                if (k in o) return { enumerable: true, configurable: true, value: o[k], writable: true };
+                return undefined;
+            }
+        });
+    };
+})();
+"#;
 
 fn install_console_method<'js>(
     ctx: &Ctx<'js>,

@@ -963,3 +963,145 @@ fn input_type_defaults_to_text_and_reflects() {
     assert_eq!(parsed["a"], "text");
     assert_eq!(parsed["b"], "email");
 }
+
+// element.style — Proxy backed by the style attribute.
+//
+// Real `CSSStyleDeclaration` exposes a *closed* property list. The
+// `has` trap consults the csstype standard-property allow-list (~500
+// names) so React's hydration feature-detect
+// (`for (t in n) if (t in Ct) ...` where `Ct = el.style`) only sees
+// real CSS properties — not arbitrary keys. Custom properties (`--*`)
+// stay open-ended per spec.
+// =====================================================================
+
+#[test]
+fn style_has_returns_true_for_known_properties() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({color: 'color' in document.getElementById('d').style, bg: 'backgroundColor' in document.getElementById('d').style, fontSize: 'fontSize' in document.getElementById('d').style, kebab: 'background-color' in document.getElementById('d').style})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["color"], true);
+    assert_eq!(parsed["bg"], true);
+    assert_eq!(parsed["fontSize"], true);
+    assert_eq!(parsed["kebab"], true);
+}
+
+#[test]
+fn style_has_returns_false_for_unknown_properties() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({nonsense: 'foobarbaz' in document.getElementById('d').style, capitalGarbage: 'BackgroundColor' in document.getElementById('d').style, random: 'xyz123' in document.getElementById('d').style})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["nonsense"], false);
+    assert_eq!(parsed["random"], false);
+    // 'BackgroundColor' is not a valid form — real browsers return false.
+    assert_eq!(parsed["capitalGarbage"], false);
+}
+
+#[test]
+fn style_has_returns_true_for_css_custom_properties() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({brand: '--brand-color' in document.getElementById('d').style, anyCustom: '--anything-here' in document.getElementById('d').style})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["brand"], true);
+    assert_eq!(parsed["anyCustom"], true);
+}
+
+#[test]
+fn style_has_handles_modern_logical_properties() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("JSON.stringify({bs: 'blockSize' in document.getElementById('d').style, mi: 'marginInline' in document.getElementById('d').style})").unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["bs"], true);
+    assert_eq!(parsed["mi"], true);
+}
+
+// Coverage of the broader style-proxy surface (read, write, kebab/camel
+// agreement, cssText, setProperty / getPropertyValue, custom-property
+// round-trip) so the `has` fix doesn't regress the wider behavior.
+
+#[test]
+fn style_is_defined_and_supports_in_operator_check() {
+    // React 19 unblocker: `Ct = el.style; "color" in Ct` must work
+    // (the `in` operator routes through the `has` trap) and report
+    // true for real CSS properties.
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval(
+        "JSON.stringify({ defined: typeof document.getElementById('d').style === 'object', inOp: ('color' in document.getElementById('d').style) })"
+    ).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["defined"], true);
+    assert_eq!(parsed["inOp"], true);
+}
+
+#[test]
+fn style_reads_existing_attribute_in_kebab_and_camel_case() {
+    let html = "<!doctype html><html><body><div id='d' style='background-color: red; font-size: 14px'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval(
+        "const s = document.getElementById('d').style; JSON.stringify({ kebab: s['background-color'], camel: s.backgroundColor, fs: s.fontSize })"
+    ).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["kebab"], "red");
+    assert_eq!(parsed["camel"], "red");
+    assert_eq!(parsed["fs"], "14px");
+}
+
+#[test]
+fn style_writes_persist_back_to_attribute() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval(
+        "const d = document.getElementById('d'); d.style.color = 'blue'; d.style.backgroundColor = 'red';"
+    ).unwrap();
+    let out = sess.eval("document.getElementById('d').getAttribute('style')").unwrap();
+    let s = out.value.as_str().unwrap();
+    assert!(s.contains("color: blue"), "got: {}", s);
+    assert!(s.contains("background-color: red"), "got: {}", s);
+}
+
+#[test]
+fn style_csstext_get_and_set_round_trips() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('d').style.cssText = 'margin: 4px; padding: 8px'").unwrap();
+    let out = sess.eval("document.getElementById('d').style.cssText").unwrap();
+    let s = out.value.as_str().unwrap();
+    assert!(s.contains("margin: 4px"));
+    assert!(s.contains("padding: 8px"));
+}
+
+#[test]
+fn style_set_to_empty_string_removes_property() {
+    let html = "<!doctype html><html><body><div id='d' style='color: red; margin: 4px'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('d').style.color = ''").unwrap();
+    let out = sess.eval(
+        "JSON.stringify({color: document.getElementById('d').style.color, margin: document.getElementById('d').style.margin})"
+    ).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["color"], "");
+    assert_eq!(parsed["margin"], "4px");
+}
+
+#[test]
+fn style_set_property_get_property_value_round_trip() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval(
+        "(() => { const s = document.getElementById('d').style; s.setProperty('color', 'green'); s.setProperty('--brand', '#abc'); })()"
+    ).unwrap();
+    let out = sess.eval(
+        "(() => { const s = document.getElementById('d').style; return JSON.stringify({c: s.getPropertyValue('color'), brand: s.getPropertyValue('--brand')}); })()"
+    ).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["c"], "green");
+    assert_eq!(parsed["brand"], "#abc");
+}
