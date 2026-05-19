@@ -63,7 +63,9 @@ No Chromium. No Node. No browser download. Just `cargo build && ./heso`.
 | Audit trail | every fetch → signable receipt | nothing |
 | Rendering pixels | ✗ — that's the point | ✓ |
 
-See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the live compatibility scorecard across real-world sites. Reproduce with `cargo run -p heso-compat-suite -- --markdown COMPATIBILITY.md`. Eval cost is **1–3 ms** per page in the current scorecard — fetch + parse dominate total wall-clock.
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the live compatibility scorecard across real-world sites — currently **14 / 14 passing** (example.com, HN, Wikipedia, httpbin, MDN, rust-lang.org, docs.rs, TodoMVC Preact/React/Vue, github.com, stripe.com, vercel.com). Reproduce with `cargo run -p heso-compat-suite -- --markdown COMPATIBILITY.md`. Eval cost is **1–95 ms** per page (sub-3 ms for static HTML extraction, 80–95 ms for JS-rendered SPAs that need framework script execution). Peak RSS climbs from **13 MB → 17 MB** across all 14 targets — heso holds onto a tiny working set even after running through that whole battery.
+
+Side-by-side comparison vs Playwright on the same URLs is in [`bench/playwright/`](bench/playwright/) — Node + Playwright sidecar that emits column-compatible JSON.
 
 If your agent needs to *look* at a canvas, a video, or a CSS animation: use Chromium. heso is honest about that.
 
