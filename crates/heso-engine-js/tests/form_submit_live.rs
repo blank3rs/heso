@@ -43,8 +43,8 @@ fn open_session(html: &str, url: Url) -> JsSession {
 #[ignore = "hits public internet — run with --ignored"]
 async fn submit_urlencoded_post_to_httpbin_echoes_form_field() {
     // Page that posts to httpbin.org/post — the same shape
-    // `AGENT_FINDINGS.md` task 3 used to file the bug, so passing
-    // this test is the "AGENT_FINDINGS.md task 3 unblocked" check.
+    // `agent regression testing` task 3 used to file the bug, so passing
+    // this test is the "agent regression testing task 3 unblocked" check.
     let html = r#"<!doctype html><html><body>
         <form id="f" method="post" action="https://httpbin.org/post">
             <input type="text" name="custname" value="Jane Doe">
@@ -126,14 +126,14 @@ async fn submit_multipart_post_to_httpbin_echoes_form_field() {
 
 // =====================================================================
 // PR-X1: one-shot --field path against httpbin — the canonical
-// "agent files a form" workflow that AGENT_FINDINGS_V2.md said was
+// "agent files a form" workflow that agent regression testing said was
 // the showstopper.
 // =====================================================================
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "hits public internet — run with --ignored"]
 async fn submit_with_fields_one_shot_against_httpbin_forms_post() {
-    // The exact agent shape AGENT_FINDINGS_V2.md task R2 / F2
+    // The exact agent shape agent regression testing task R2 / F2
     // identified: fetch the form page, supply field values inline,
     // submit, and observe the response body in one process. The
     // httpbin pizza form has `custname` and `custemail` text inputs

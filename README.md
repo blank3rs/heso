@@ -1,35 +1,12 @@
-<div align="center">
-
 # heso
 
-**A browser for agents, not for humans.**
+A headless browser for agents. One Rust binary. No Chromium, no Node.
 
-One 7.65 MB Rust binary. No Chromium. No Node. No `npm install playwright`.
-Fetches, parses, runs JS, holds a stateful page session across clicks, hands back content-hashed JSON you can sign, diff, and **replay byte-for-byte**.
+heso fetches a URL, parses the HTML, runs the page's JavaScript against an agent-shaped DOM, holds a stateful session across clicks/fills/submits, and hands back content-hashed JSON you can sign, diff, and replay byte-for-byte.
 
-</div>
+The bet: agents don't need the rendering half of the browser. No Skia, no Blink layout, no compositor, no GPU, no canvas, no video stack. That's the bulk of Chromium's footprint and most of its startup cost. Drop it, ship one binary.
 
----
-
-## The problem
-
-Every agent framework today — Browser Use, Stagehand, Skyvern, Operator — is a Python or Node loop wrapped around Playwright wrapped around **240 MB of headless Chromium**.
-
-Your agent is reading a docs page. Filling a login form. Clicking through a checkout.
-
-It does not need Skia. It does not need Blink's layout engine. It does not need the compositor, the GPU pipeline, WebGL, canvas, or the video stack. That is roughly **70% of why Chromium is huge** — and 100% of why it's slow to start, painful to deploy, and miserable to run at scale.
-
-You're paying for a rendering engine to render pixels nobody will ever look at.
-
-## The bet
-
-Keep the boring half of the browser — fetch, parse, JS, DOM, cookies, forms, clicks, sessions, sandboxing.
-
-Drop the rendering half.
-
-Ship it as one binary.
-
-## The "holy shit" demo
+## Demo
 
 ```console
 $ heso eval-dom https://news.ycombinator.com \
@@ -47,30 +24,23 @@ $ heso eval-dom https://news.ycombinator.com \
 }
 ```
 
-Five real story titles, off the live wire, fetched + parsed + JS-evaluated, in **under 400 ms**, from a **7.65 MB single binary**.
+Live fetch, parse, JS eval — five real titles in under 400 ms from a 7.65 MB binary.
 
-No Chromium. No Node. No browser download. Just `cargo build && ./heso`.
-
-## Why this matters
+## Measured against Playwright + Chromium
 
 |  | heso | Playwright + Chromium |
 |---|---|---|
-| Install size | **7.65 MB** (measured) | ~240 MB + Node + browser bundle |
-| Cold start (`--help`) | **15 ms** (measured) | 1–2 seconds |
-| Per-target wall-clock (mean of 8 real URLs) | **125 ms** (measured) | **336 ms** (measured) |
-| Peak RSS after extracting from 14 sites | **17 MB** (measured) | 100+ MB per browser |
-| Deploy unit | one static binary | runtime + browser + driver |
+| Install size | 7.65 MB | ~240 MB + Node + browser bundle |
+| Cold start (`--help`) | 15 ms | 1–2 seconds |
+| Per-target wall-clock (mean of 8 URLs) | 125 ms | 336 ms |
+| Peak RSS after 14-site run | 17 MB | 100+ MB per browser |
 | Reproducibility | content-hashed, seeded RNG, virtual clock | non-deterministic |
-| Audit trail | every fetch → signable receipt | nothing |
-| Rendering pixels | ✗ — that's the point | ✓ |
+| Audit trail | signed receipts per fetch | none |
+| Rendering pixels | ✗ | ✓ |
 
-**Measured head-to-head: heso is 2.69× faster** than Playwright on the same 8 URLs (same machine, same network, same probe). Biggest wins on docs sites — MDN 7.63×, docs.rs 5.07× — where Chromium's startup cost dominates total wall-clock. Reproduce in [`bench/playwright/RESULTS.md`](bench/playwright/RESULTS.md).
+2.69× faster mean wall-clock on the same 8 URLs, same machine, same network. Biggest wins on docs sites (MDN 7.63×, docs.rs 5.07×) where Chromium's startup dominates. Reproduce in [`bench/playwright/RESULTS.md`](bench/playwright/RESULTS.md).
 
-See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the live compatibility scorecard — currently **21 / 21 passing** across five categories: smoke + server-rendered (example.com, HN, Wikipedia), static / docs / marketing (httpbin, MDN, rust-lang.org, docs.rs), JS-rendered SPAs (TodoMVC Preact/React/Vue), heavy real-world SPAs (github, stripe, vercel), framework docs sites (react.dev, vuejs.org, svelte.dev, nextjs.org), plus inline feature probes that verify `URLSearchParams` / `history.pushState` / `MutationObserver` work in `eval-dom` context. Reproduce with `cargo run -p heso-compat-suite -- --markdown COMPATIBILITY.md`. Eval cost is **1–95 ms** per page (sub-3 ms for static HTML extraction, ~80 ms for JS-rendered SPAs that need framework script execution). Peak RSS climbs from **13 MB → 18 MB** across all 21 targets — heso holds onto a tiny working set even after running through that whole battery.
-
-If your agent needs to *look* at a canvas, a video, or a CSS animation: use Chromium. heso is honest about that.
-
-If your agent needs to *do things* on the agent-relevant half of the web — read, click, fill, extract, audit — heso is built for exactly that and nothing else.
+If your agent needs canvas, video, computed layout, or WebGL: use Chromium. heso doesn't render pixels. For everything else — read, click, fill, extract, audit — that's what this is for.
 
 ## 30-second quickstart
 
@@ -93,11 +63,9 @@ That gives you a **plat** — an agent-shaped JSON map of the page:
 }
 ```
 
-Same page → same hash, byte for byte. On any machine. Forever.
+Same input → same hash, byte for byte, on any machine. The hash is a receipt: sign it, store it, diff it later to prove what the page said when your agent acted on it.
 
-That hash is the receipt. Sign it, store it, diff it next week, prove what the page said when your agent acted on it.
-
-## One example per killer feature
+## Examples
 
 **JS that mutates the DOM, on a real fetched page:**
 ```console
@@ -139,7 +107,7 @@ $ heso eval-js --seed 42 'Math.random()'  →  0.5140492957650241
 $ heso eval-js --seed 99 'Math.random()'  →  0.5052084295432834
 ```
 
-`Math.random`, `crypto.getRandomValues`, `crypto.randomUUID` — all routed through a seeded ChaCha20 PRNG. Same seed, byte-identical output, on every machine, forever.
+`Math.random`, `crypto.getRandomValues`, `crypto.randomUUID` all route through a seeded ChaCha20 PRNG. Same seed, byte-identical output across machines.
 
 **Sites as filesystems:**
 ```sh
@@ -165,18 +133,18 @@ $ heso replay trace.json
 
 The `trace_id` is a **BLAKE3 Merkle chain** over the URL + canonical actions. Anyone running the same trace anywhere gets the same hash — no keys, no central server, no central clock. Tampering breaks it. Replay carries one `JsSession` across every step: DOM mutations persist, `addEventListener` handlers fire, `setTimeout` chains progress through a virtual clock, `e.preventDefault()` on `<a href>` clicks stops navigation just like a real SPA router.
 
-**Drop-in for any agent framework:**
+**Stateful sessions over stdio:**
 ```sh
-heso serve     # JSON-RPC 2.0 over stdin/stdout, stateful page sessions
+heso serve     # JSON-RPC 2.0, persistent DOM across calls
 ```
 
-Point Browser Use, Stagehand, or your own loop at the stdio transport. Swap Chromium out, leave the agent code alone.
+Point Browser Use, Stagehand, or your own agent loop at the stdio transport. The session keeps DOM mutations, listeners, and form state alive across `fill` → `click` → `submit` cycles.
 
-## Drop into Claude Code (or any agent harness) as a skill
+## Use as a Claude Code (or other harness) skill
 
-heso is built to be **a tool an LLM agent calls**, not a library a human drives. The shape that fits cleanest is the "skill" / "tool" pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses all support: a markdown file that tells the model when to reach for the tool and which verbs to invoke.
+heso is designed to be a tool an LLM agent calls. The cleanest integration is the skill/tool markdown pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses support — a markdown file describing when to invoke the tool and which verbs are available.
 
-Drop this into `.claude/skills/heso/SKILL.md` (or your harness's equivalent) and your agent gets a 7.65 MB headless browser:
+Drop the following into `.claude/skills/heso/SKILL.md` (or the equivalent path in your harness):
 
 ```markdown
 ---
@@ -230,13 +198,13 @@ Works the same way in any harness that supports tool/skill markdown — Cursor, 
 
 ## Who this is for
 
-- **Agent framework builders** who are tired of shipping 240 MB of Chromium to do `document.querySelector`.
-- **RAG pipelines** that need to ingest docs sites at scale without operating a headless Chromium farm.
-- **Compliance / archival** workflows where "prove what the page said" matters more than "show me the pixels."
-- **CI test suites** that need reproducible page snapshots without flaky timing.
-- **Anyone wide-crawling for competitive intel** who wants ~100 ms per page on one machine instead of a fleet.
+- Agent framework builders who don't want to ship 240 MB of Chromium for `document.querySelector`.
+- RAG pipelines that ingest docs sites at scale.
+- Compliance / archival workflows where "prove what the page said" matters.
+- CI test suites needing reproducible page snapshots without flaky timing.
+- Wide-crawl pipelines targeting ~100 ms per page on a single machine.
 
-Not for: scraping data behind canvas, video, computed CSS layout, WebGL, or service workers. Use a real browser — that's what they're for.
+Not for: scraping behind canvas, video, computed CSS layout, WebGL, or service workers. Use a real browser for those.
 
 ## Status
 
@@ -275,19 +243,24 @@ Not for: scraping data behind canvas, video, computed CSS layout, WebGL, or serv
 | **`MutationObserver` / `IntersectionObserver` / `ResizeObserver` / `PerformanceObserver`** — noop ctors with spec method surface; unblocks SPAs that init observers in hydration | ✅ |
 | **WHATWG `URLSearchParams`** — `get`/`getAll`/`set`/`append`/`delete`/`has`/`sort`/`size`/iteration, with parent-URL reflection back into `url.toString()` | ✅ |
 | **`history.pushState` / `replaceState` / `back` / `forward` / `go`** with synchronous `popstate` dispatch, cached `location` reference identity preserved | ✅ |
-| **641 workspace tests, 2 ignored** (TypeError-throw guards pending Ctx-bound merge with IDL paths) | ✅ |
+| **WHATWG `Blob` / `File` / `Headers` / `FormData`** — multipart serializer wired into `fetch()` (file uploads round-trip) | ✅ |
+| **`HTMLFormElement` IDL** — `.method` / `.action` / `.enctype` / `.elements` / `.submit()` / `.reset()`, plus `document.scripts` / `forms` / `images` / `links` / `anchors` collections | ✅ |
+| **`HTMLAnchorElement.href` + url-decomposition mixin** — `.protocol` / `.host` / `.hostname` / `.pathname` / `.search` / `.hash` reflect | ✅ |
+| **`<script type="module">`** — real ES module loader (rquickjs `Module::declare` + custom HTTP-backed `Loader`), per-URL cache, cyclic-import safe | ✅ |
+| **Import map parser** — WHATWG §8.1.3.5 `<script type="importmap">`, bare/scoped/longest-prefix resolution | ✅ |
+| **Dynamic `import()`** — `globalThis.import` shim with pluggable resolver seam | ✅ |
+| **`heso serve` multi-step sessions** — JSON-RPC `fill` / `click` / `submit` / `eval` / `navigate` methods persist DOM mutations + listeners across calls | ✅ |
+| **895 workspace tests, 7 ignored** | ✅ |
 | Recorded-network playback (cassettes) for byte-identical replay | 🚧 designed |
+| Import-map wired into static `<script type="module">` resolver (parser ships, wire-up pending) | 🚧 next |
+| Turbopack chunk env detection for Next.js-bundled SPAs | 🚧 next |
 | SVG namespace tracking + `tagName` casing | 🚧 next |
 | React 19 full interaction round-trip — `KeyboardEvent` / `InputEvent` / `MouseEvent` ctors, focus tracker | 🚧 weeks |
 | Real `document.cookie` jar (shared with `reqwest`) | 🚧 weeks |
 
-Honest about scope. Honest about gaps. No vapor.
-
 ## The precedent
 
-[jsdom](https://github.com/jsdom/jsdom) (~50k LOC of JS) and [happy-dom](https://github.com/capricorn86/happy-dom) (~30k LOC) both proved that **a minimal DOM + JS environment handles the agent half of the web**. Both are slow because they're JS-in-JS. Both are framed as test tools, not as agent infrastructure.
-
-Doing it in Rust against QuickJS is the obvious next move — and nobody has shipped it yet. That gap is the bet.
+[jsdom](https://github.com/jsdom/jsdom) (~50k LOC of JS) and [happy-dom](https://github.com/capricorn86/happy-dom) (~30k LOC) both showed that a minimal DOM + JS environment handles the agent-relevant half of the web. Both are JS-in-JS, both are framed as test tools. Doing it in Rust against QuickJS is the next step.
 
 ## Try it
 
@@ -306,11 +279,3 @@ cargo build --release -p heso-cli
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) and [Apache 2.0](LICENSE-APACHE).
-
----
-
-<div align="center">
-
-**Built on the bet that the agent half of the web doesn't need a rendering engine.**
-
-</div>

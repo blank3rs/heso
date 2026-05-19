@@ -1,5 +1,5 @@
 //! Integration tests for the PR-Y2 stateful JSON-RPC surface of
-//! `heso serve`. Mirrors AGENT_FINDINGS_V3.md task F-X1 and the
+//! `heso serve`. Mirrors agent regression testing task F-X1 and the
 //! "Top NEW bugs" #2 verdict — the single biggest gap V3 flagged was
 //! that `heso serve` didn't expose `fill` / `click` / `submit` / `eval`
 //! / `navigate`, making multi-step stateful workflows structurally
@@ -19,7 +19,7 @@
 //!    `document.title`.
 //! 7. **end-to-end multi-step flow** — open → fill → fill → submit →
 //!    assert the mock server received both fields. This is the test
-//!    AGENT_FINDINGS_V3 would have run if multi-step state had worked.
+//!    agent regression testing would have run if multi-step state had worked.
 //!
 //! Each test spawns `heso serve` as a child process (so we exercise the
 //! actual binary an external agent would invoke, including the
@@ -480,7 +480,7 @@ async fn navigate_replaces_page_with_new_title() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn end_to_end_multi_step_open_fill_fill_submit() {
-    // The shape that AGENT_FINDINGS_V3.md F-X1 was trying to run, now
+    // The shape that agent regression testing F-X1 was trying to run, now
     // working end-to-end. Two text fields filled via two `fill` calls
     // against the SAME session; `submit` sends both values to a mock
     // /post endpoint; we assert the request body the mock received

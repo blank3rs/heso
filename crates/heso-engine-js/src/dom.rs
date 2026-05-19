@@ -890,7 +890,7 @@ impl Document {
     //
     // Bug-of-record: V2 agent findings reported all five accessors
     // return `undefined`, blocking the common scraping idiom of
-    // `Array.from(document.forms).filter(...)`. See AGENT_FINDINGS_V2.md
+    // `Array.from(document.forms).filter(...)`. See agent regression testing
     // "Bonus findings" + "Top NEW bugs" #6.
 
     /// `document.scripts` — array of every `<script>` element in the
@@ -2330,7 +2330,7 @@ impl Element {
     // Bug-of-record: prior to this getter, `anchor.href` returned
     // `undefined`, forcing every Playwright migration to fall back to
     // `anchor.getAttribute('href')` (which, unlike `.href`, does NOT
-    // resolve relative URLs). See `AGENT_FINDINGS.md` (commit
+    // resolve relative URLs). See `agent regression testing` (commit
     // `2cebf12`) for the original bug report.
     //
     // Spec: <https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinkelementutils>.
@@ -2670,7 +2670,7 @@ impl Element {
     // / `form.enctype` all returned `undefined`, forcing scrapers to
     // use `form.getAttribute(...)` (which doesn't normalize per spec).
     // Sibling fix to the HTMLAnchorElement.href mixin landed in commit
-    // `17ddf77`. See `AGENT_FINDINGS_V2.md` "Bonus findings" + "Top NEW
+    // `17ddf77`. See `agent regression testing` "Bonus findings" + "Top NEW
     // bugs" #3 for the original report.
     //
     // Spec: <https://html.spec.whatwg.org/multipage/forms.html#the-form-element>.

@@ -1,6 +1,6 @@
 //! Integration tests for the PR-1 form-submit surface:
 //! `JsSession::submit` actually issues HTTP requests per WHATWG HTML
-//! §4.10.22 — the bug `AGENT_FINDINGS.md` filed as the single biggest
+//! §4.10.22 — the bug `agent regression testing` filed as the single biggest
 //! gap for write-shaped agent workloads.
 //!
 //! These tests use `wiremock::MockServer` for localhost HTTP exchanges
@@ -710,7 +710,7 @@ async fn submit_unmatched_selector_reports_no_form() {
 // PR-X1: --field NAME=VALUE one-shot — `submit_with_fields` sets named
 // inputs before serializing, response body is in the outcome, parsed
 // JSON exposed when content-type is `application/json`, file inputs
-// are silently skipped. Mirrors the AGENT_FINDINGS_V2.md Task R2 / F2
+// are silently skipped. Mirrors the agent regression testing Task R2 / F2
 // failure modes.
 // =====================================================================
 
@@ -938,7 +938,7 @@ async fn submit_with_fields_overrides_radio_and_checkbox() {
 async fn submit_response_body_is_in_outcome_for_urlencoded_post() {
     // The submit outcome now carries `responseBody` and
     // `responseContentType` so an agent can observe what the server
-    // echoed back — matches AGENT_FINDINGS_V2.md task R2's second
+    // echoed back — matches agent regression testing task R2's second
     // gap ("no body field, no echo").
     //
     // We use `set_body_raw(body, mime)` (not `set_body_string` then

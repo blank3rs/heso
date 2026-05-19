@@ -12,7 +12,7 @@
 //! Bug-of-record: the May 2026 agent-driven HN extraction test
 //! discovered `a.href` returned `undefined`, forcing every Playwright
 //! migration to fall back to `a.getAttribute('href')`. See
-//! `AGENT_FINDINGS.md` (commit `2cebf12`) for the original report.
+//! `agent regression testing` (commit `2cebf12`) for the original report.
 //! These tests pin the spec-correct behavior so the bug stays fixed.
 //!
 //! Spec: <https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinkelementutils>.
@@ -22,7 +22,7 @@ use url::Url;
 
 /// Convenience: a representative document base URL for "the page is
 /// served from <https://news.ycombinator.com/>". Matches the
-/// `AGENT_FINDINGS.md` reproducer.
+/// `agent regression testing` reproducer.
 fn hn_url() -> Url {
     Url::parse("https://news.ycombinator.com/").unwrap()
 }
@@ -36,12 +36,12 @@ fn engine_at(href: &str) -> JsEngine {
 }
 
 // =====================================================================
-// href getter — the original AGENT_FINDINGS.md failure
+// href getter — the original agent regression testing failure
 // =====================================================================
 
 #[test]
 fn anchor_href_returns_resolved_absolute_url_when_attribute_is_absolute() {
-    // The AGENT_FINDINGS.md reproducer: HN's story-title anchors use
+    // The agent regression testing reproducer: HN's story-title anchors use
     // absolute `href` attributes. `a.href` MUST return the canonical
     // absolute string, not undefined / empty.
     let html = r#"<!doctype html><html><body>

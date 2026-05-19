@@ -2,7 +2,7 @@
 //!
 //! WHATWG `Blob`, `File`, `Headers`, and `FormData` globals — the
 //! constructor surface every modern fetch+upload code path reaches
-//! for. Per `AGENT_FINDINGS_V2.md` task F1 and "Top NEW bugs" item 4,
+//! for. Per `agent regression testing` task F1 and "Top NEW bugs" item 4,
 //! the absence of these four constructors was the single biggest gap
 //! blocking file uploads and modern `fetch()` patterns from inside
 //! agent-driven JS.

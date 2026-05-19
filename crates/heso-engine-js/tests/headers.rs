@@ -1,6 +1,6 @@
 //! Integration tests for the WHATWG `Headers` constructor installed
 //! by [`heso_engine_js::web_apis::install_web_apis`]. Per
-//! AGENT_FINDINGS_V2.md F1 and "Top NEW bugs" #4. The fetch path
+//! agent regression testing F1 and "Top NEW bugs" #4. The fetch path
 //! already used a Headers-shaped object for response.headers; this
 //! suite pins the actual constructor.
 

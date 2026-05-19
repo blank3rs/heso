@@ -363,7 +363,7 @@ async fn nested_promise_in_array_is_deep_resolved_not_serialized_as_empty_object
     // Pinned regression: prior to the `__hesoDeepResolve` wrap landing,
     // a Promise nested in an array passed through `JSON.stringify`
     // unchanged — and Promises have no own enumerable properties, so
-    // each element serialized as `{}`. AGENT_FINDINGS Task 3 reported
+    // each element serialized as `{}`. agent regression testing Task 3 reported
     // this as "A returned Promise serializes as `{}`."
     let engine = engine_with_fetch();
     let out = engine
@@ -400,7 +400,7 @@ async fn nested_promise_in_object_property_is_deep_resolved() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn async_iife_with_real_http_fetch_json_returns_extracted_property() {
-    // Pinned regression for AGENT_FINDINGS Task 3's reproducing pattern.
+    // Pinned regression for agent regression testing Task 3's reproducing pattern.
     // The agent wrote (in their words):
     //
     //     "Tried `eval-dom --js-fetch` with `await`/promise → fetch global
@@ -547,7 +547,7 @@ async fn external_script_src_failed_fetch_writes_console_error() {
     );
 }
 
-// ===== AGENT_FINDINGS_V3 silent-null regression =====
+// ===== agent regression testing silent-null regression =====
 //
 // `await heso.flush()` (or any `await Promise.resolve()` / `await <non-thenable>`)
 // followed by `await fetch(...)` used to return `null` instead of the fetched
@@ -568,7 +568,7 @@ async fn external_script_src_failed_fetch_writes_console_error() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn await_heso_flush_then_await_fetch_resolves_to_real_response() {
-    // The exact shape AGENT_FINDINGS_V3.md flagged as "silent null":
+    // The exact shape agent regression testing flagged as "silent null":
     //
     //     (async () => {
     //         await heso.flush();
@@ -682,7 +682,7 @@ async fn await_non_thenable_then_await_fetch_resolves() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_side_effect_then_flush_then_fetch_resolves() {
-    // The full AGENT_FINDINGS_V3 reproducer chain: a synchronous DOM
+    // The full agent regression testing reproducer chain: a synchronous DOM
     // mutation + form.submit() (which itself block_on's an HTTP call
     // via __hesoFormSubmitNow), then `await heso.flush()`, then
     // `await fetch(...)`. The `f.submit()` makes the chain match the
@@ -732,7 +732,7 @@ async fn sync_side_effect_then_flush_then_fetch_resolves() {
             ),
         )
         .expect("eval");
-    // The verbatim AGENT_FINDINGS_V3 reproducer: before the fix this
+    // The verbatim agent regression testing reproducer: before the fix this
     // silently returned `null`. After the fix it returns the JSON
     // body the mock served.
     assert!(

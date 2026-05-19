@@ -215,7 +215,7 @@ pub struct JsEngine {
     /// loader) wires into when it lands. M-C ships only the shim plus
     /// the seam — the engine itself ships no real resolver, because
     /// "what counts as a module" (file resolver? import map? bundler?)
-    /// is M-A's call. See AGENT_FINDINGS (M-C task).
+    /// is M-A's call. See agent regression testing (M-C task).
     ///
     /// `Arc<Mutex<…>>` (not just `Mutex<…>`) because the JS-side shim
     /// holds an `Arc` clone for as long as the engine is alive —
@@ -446,7 +446,7 @@ impl JsEngine {
 
         // Install `Blob`, `File`, `Headers`, `FormData` globals
         // (WHATWG File API §3-4, Fetch §5, XHR §5). Closes the gap
-        // documented in `AGENT_FINDINGS_V2.md` task F1 + "Top NEW
+        // documented in `agent regression testing` task F1 + "Top NEW
         // bugs" item 4: file uploads and modern fetch() patterns were
         // dead because these four constructors were undefined. See
         // [`crate::web_apis`].
@@ -704,7 +704,7 @@ impl JsEngine {
         // observe `drained == 0` and exit while a Promise nobody
         // settles still waits on the queued-but-undrained fetch.
         //
-        // After AGENT_FINDINGS_V3.md flagged this as silent-null:
+        // After agent regression testing flagged this as silent-null:
         // `await heso.flush()` + later `await fetch(...)` returned
         // `null` because `heso.flush()` is `Promise.resolve()`, and
         // every subsequent `await fetch(...)` lands in this same
@@ -2997,7 +2997,7 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     //
     // V2 agent finding F3 saw 49 inline scripts on nextjs.org error
     // with `ReferenceError: self is not defined`; this one-liner is
-    // the fix.  See AGENT_FINDINGS_V2.md (commit 039d006).
+    // the fix.  See agent regression testing (commit 039d006).
     // -------------------------------------------------------------
 
     // `self` — WindowOrWorkerGlobalScope.self: returns the global object.

@@ -42,7 +42,7 @@
 //!   `responseContentType`, and `responseJson` when the server sent
 //!   `application/json`). One-shot: fetch + fill + submit + observe in
 //!   a single CLI invocation, fixing the stateless-fill gap that
-//!   `AGENT_FINDINGS_V2.md` filed.
+//!   `agent regression testing` filed.
 //! - `heso meta <url>` — Fetch + extract structured metadata (JSON-LD,
 //!   OpenGraph, Twitter cards, SEO meta, canonical, icons, lang). Returns
 //!   the [`PageMetadata`] as JSON.
@@ -1297,8 +1297,8 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
 ///
 /// Pre-PR-1 behavior dispatched a click on the submit button without
 /// issuing any HTTP traffic — filed as the top write-side gap in
-/// `AGENT_FINDINGS.md`. PR-1 closed that. PR-X1 (this revision) closes
-/// the next layer of the same gap that `AGENT_FINDINGS_V2.md` filed:
+/// `agent regression testing`. PR-1 closed that. PR-X1 (this revision) closes
+/// the next layer of the same gap that `agent regression testing` filed:
 /// in V2 every CLI invocation was a fresh process, so `heso fill`'s
 /// typed-in value never reached the next `heso submit` invocation. The
 /// `--field NAME=VALUE` / `--data JSON` flags make submit a one-shot:

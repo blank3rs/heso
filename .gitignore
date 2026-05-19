@@ -61,6 +61,16 @@ heso-local-data/
 /state.json
 /state.schema.json
 
+# Agent-process scratch — testing reports, regression dumps, scratch
+# JSON outputs from running heso against fixtures. Keep them on disk
+# while iterating; never commit.
+/AGENT_FINDINGS*.md
+/REGRESSION_*.md
+/REGRESSION_*.json
+/COMPATIBILITY.md
+/tm*.json
+/todomvc.json
+
 # Environment / secrets
 .env
 .env.local

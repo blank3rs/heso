@@ -1,6 +1,6 @@
 //! Integration tests for the WHATWG `FormData` constructor installed
 //! by [`heso_engine_js::web_apis::install_web_apis`]. Per
-//! AGENT_FINDINGS_V2.md F1 and "Top NEW bugs" #4. Includes the
+//! agent regression testing F1 and "Top NEW bugs" #4. Includes the
 //! end-to-end `fetch(url, {body: new FormData()})` multipart path
 //! against wiremock plus an `#[ignore]`-gated live httpbin upload.
 

@@ -977,7 +977,7 @@ fn dispatch_without_flush_still_sees_synchronous_handler_effects() {
 // top-level window. Bundler-emitted hydration code on every major
 // framework (React, Next.js, Vue, etc.) reads `self` on its first
 // line; without the alias the script ReferenceErrors and hydration
-// never starts. See AGENT_FINDINGS_V2.md F3.
+// never starts. See agent regression testing F3.
 //
 // Spec refs:
 // - https://html.spec.whatwg.org/multipage/window-object.html#the-window-object

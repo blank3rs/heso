@@ -260,7 +260,7 @@ impl JsSession {
     /// response body.
     ///
     /// Replaces the pre-PR-1 dispatch-only path that was filed as the
-    /// single biggest agent-write bug in `AGENT_FINDINGS.md` (every
+    /// single biggest agent-write bug in `agent regression testing` (every
     /// `heso submit` returned `ok=true` but issued no HTTP traffic).
     ///
     /// Behavior summary:
@@ -308,7 +308,7 @@ impl JsSession {
     /// Apply `(name, value)` field overrides to the form at `selector`,
     /// then submit. Combines `fill`-by-name with `submit` into one
     /// in-process call — fixes the agent UX gap filed as `R2`/`F2` in
-    /// `AGENT_FINDINGS_V2.md` ("fill doesn't persist across verbs, so
+    /// `agent regression testing` ("fill doesn't persist across verbs, so
     /// the typed value never reaches submit"). Field overrides are keyed
     /// by the input's `name` attribute (the WHATWG "successful control"
     /// key), not by `@eN` action-graph ref.

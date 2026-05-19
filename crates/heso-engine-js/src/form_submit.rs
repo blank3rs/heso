@@ -5,7 +5,7 @@
 //!
 //! The pre-PR-1 `JsSession::submit` / `JsEngine::submit_form` only
 //! dispatched a click on the form's submit button — a no-op for any
-//! page that didn't already wire a JS handler. `AGENT_FINDINGS.md`
+//! page that didn't already wire a JS handler. `agent regression testing`
 //! filed this as the single biggest gap for write-shaped agent
 //! workloads: "every step returns ok=true but no HTTP POST is ever
 //! issued."
@@ -34,7 +34,7 @@
 //!   filename; sending just the filename as a part is worse than
 //!   nothing (servers reject it). Filed as a deferred follow-up.
 //!   `FormData` is also still undefined — flagged in the
-//!   AGENT_FINDINGS report.
+//!   agent regression testing report.
 //! - **`enctype` overrides on the submit button** (`formenctype`,
 //!   `formaction`, `formmethod`) are not honored yet — the form's
 //!   own attributes win. Most pages don't use these.

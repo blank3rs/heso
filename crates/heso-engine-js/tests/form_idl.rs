@@ -19,7 +19,7 @@
 //! `form.action` / `form.enctype` all returned `undefined` and
 //! `form.submit()` threw `TypeError: not a function`. Sibling fix to
 //! the `HTMLAnchorElement.href` mixin landed in commit `17ddf77`.
-//! See `AGENT_FINDINGS_V2.md` "Bonus findings" + "Top NEW bugs" #3.
+//! See `agent regression testing` "Bonus findings" + "Top NEW bugs" #3.
 //!
 //! Spec: <https://html.spec.whatwg.org/multipage/forms.html#the-form-element>.
 

@@ -633,7 +633,7 @@ mod tests {
         assert_eq!(about_links[0].name.as_deref(), Some("About"));
     }
 
-    /// Regression test for AGENT_FINDINGS_V3.md "NEW MINOR BUG — `heso find
+    /// Regression test for agent regression testing "NEW MINOR BUG — `heso find
     /// --name <regex>` is not substring-matching". The V3 agent reported
     /// that `heso find --role link --name "comment"` on news.ycombinator.com
     /// returned `count: 0` even though 29 anchors with names like

@@ -1,6 +1,6 @@
 //! Integration tests for the WHATWG `Blob` and `File` globals
 //! installed by [`heso_engine_js::web_apis::install_web_apis`]. Per
-//! AGENT_FINDINGS_V2.md F1 and "Top NEW bugs" #4 — these constructors
+//! agent regression testing F1 and "Top NEW bugs" #4 — these constructors
 //! were the gap blocking every file-upload path.
 
 use heso_engine_js::JsEngine;
