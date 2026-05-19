@@ -969,3 +969,97 @@ fn dispatch_without_flush_still_sees_synchronous_handler_effects() {
         .expect("eval value");
     assert_eq!(out.value, serde_json::json!(""));
 }
+
+// ===== self / frames / parent / top global aliases ====================
+//
+// WindowOrWorkerGlobalScope (`self`) + Window-interface attributes
+// (`frames`, `parent`, `top`) — all four spec to "return this" on a
+// top-level window. Bundler-emitted hydration code on every major
+// framework (React, Next.js, Vue, etc.) reads `self` on its first
+// line; without the alias the script ReferenceErrors and hydration
+// never starts. See AGENT_FINDINGS_V2.md F3.
+//
+// Spec refs:
+// - https://html.spec.whatwg.org/multipage/window-object.html#the-window-object
+// - https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-window-frames
+// - https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-parent
+// - https://html.spec.whatwg.org/multipage/nav-history-apis.html#dom-top
+
+#[test]
+fn self_equals_global_this() {
+    let out = engine().eval("self === globalThis").expect("eval");
+    assert_eq!(out.value, serde_json::json!(true));
+}
+
+#[test]
+fn self_equals_window() {
+    // Both `self` and `window` are aliases for `globalThis` on the
+    // top-level browsing context, so they must be identical.
+    let out = engine().eval("self === window").expect("eval");
+    assert_eq!(out.value, serde_json::json!(true));
+}
+
+#[test]
+fn frames_equals_global_this() {
+    let out = engine().eval("frames === globalThis").expect("eval");
+    assert_eq!(out.value, serde_json::json!(true));
+}
+
+#[test]
+fn parent_equals_global_this() {
+    // For a top-level browsing context (no iframes), `parent` returns
+    // the window itself.
+    let out = engine().eval("parent === globalThis").expect("eval");
+    assert_eq!(out.value, serde_json::json!(true));
+}
+
+#[test]
+fn top_equals_global_this() {
+    // Top-level context → `top === window === self`.
+    let out = engine().eval("top === globalThis").expect("eval");
+    assert_eq!(out.value, serde_json::json!(true));
+}
+
+// ===== window iframe-detection POJO stubs =============================
+//
+// Site init code reads `window.closed`, `window.length`, `window.name`,
+// `window.opener` to decide "am I in an iframe? am I a popup?". Defaults
+// below match a freshly-loaded top-level browsing context.
+
+#[test]
+fn window_closed_is_false() {
+    let out = engine().eval("window.closed").expect("eval");
+    assert_eq!(out.value, serde_json::json!(false));
+}
+
+#[test]
+fn window_length_is_zero() {
+    // Number of nested browsing contexts (iframes). heso has none.
+    let out = engine().eval("window.length").expect("eval");
+    assert_eq!(out.value, serde_json::json!(0));
+}
+
+#[test]
+fn window_name_is_writable_string() {
+    // Spec: DOMString, writable. Site code occasionally sets it for
+    // cross-window message passing.
+    let out = engine()
+        .eval(
+            r#"
+            const initial = window.name;
+            window.name = 'x';
+            const after = window.name;
+            [initial, after]
+            "#,
+        )
+        .expect("eval");
+    assert_eq!(out.value, serde_json::json!(["", "x"]));
+}
+
+#[test]
+fn window_opener_is_null() {
+    // Not a popup; opener is null per spec for a fresh top-level
+    // browsing context.
+    let out = engine().eval("window.opener").expect("eval");
+    assert!(out.value.is_null());
+}

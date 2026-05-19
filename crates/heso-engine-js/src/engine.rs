@@ -2300,12 +2300,91 @@ fn install_browser_apis(
 }
 
 /// JS bootstrap for the pure-JS half of [`install_browser_apis`]:
-/// `queueMicrotask`, `requestAnimationFrame` / `cancelAnimationFrame`,
-/// `matchMedia`, `localStorage`, `sessionStorage`, `heso.flush`, and
-/// noop observer ctors (`MutationObserver`, `IntersectionObserver`,
-/// `ResizeObserver`, `PerformanceObserver`).
+/// `self` / `frames` / `parent` / `top` global aliases for `globalThis`,
+/// `window.closed` / `length` / `name` / `opener` iframe-detection
+/// stubs, `queueMicrotask`, `requestAnimationFrame` /
+/// `cancelAnimationFrame`, `matchMedia`, `localStorage`,
+/// `sessionStorage`, `heso.flush`, and noop observer ctors
+/// (`MutationObserver`, `IntersectionObserver`, `ResizeObserver`,
+/// `PerformanceObserver`).
 const BROWSER_APIS_BOOTSTRAP: &str = r#"
 (function() {
+    // -------------------------------------------------------------
+    // Global self-aliases per the WHATWG `Window` interface and the
+    // `WindowOrWorkerGlobalScope` mixin
+    // (https://html.spec.whatwg.org/multipage/window-object.html#the-window-object,
+    //  https://html.spec.whatwg.org/multipage/nav-history-apis.html#the-window-object).
+    //
+    // In real browsers (and Web Workers via the mixin) these four
+    // globals all evaluate to the global object itself.  Bundler-emitted
+    // hydration code on React / Next.js / Vue / etc. reads `self` on
+    // its very first line (e.g. `(self.webpackChunk_N_E ??= []).push(...)`);
+    // when `self` is undefined the script throws on line 1 and the
+    // rest of hydration never runs.  Same goes for `frames`, `parent`,
+    // and `top` — top-level pages alias them to the window itself.
+    //
+    // V2 agent finding F3 saw 49 inline scripts on nextjs.org error
+    // with `ReferenceError: self is not defined`; this one-liner is
+    // the fix.  See AGENT_FINDINGS_V2.md (commit 039d006).
+    // -------------------------------------------------------------
+
+    // `self` — WindowOrWorkerGlobalScope.self: returns the global object.
+    if (typeof globalThis.self === 'undefined') {
+        globalThis.self = globalThis;
+    }
+    // `frames` — Window.frames: per spec returns `this` (a same-window
+    // proxy that exposes nested browsing contexts; we have none, so
+    // aliasing the window itself is the correct identity behavior).
+    if (typeof globalThis.frames === 'undefined') {
+        globalThis.frames = globalThis;
+    }
+    // `parent` — Window.parent: for a top-level browsing context (heso
+    // has no iframes yet) this returns the window itself.
+    if (typeof globalThis.parent === 'undefined') {
+        globalThis.parent = globalThis;
+    }
+    // `top` — Window.top: same rationale as `parent`. Top-level page
+    // means `top === window === self`.
+    if (typeof globalThis.top === 'undefined') {
+        globalThis.top = globalThis;
+    }
+
+    // -------------------------------------------------------------
+    // Iframe-detection POJO stubs on `window` (see WHATWG Window
+    // interface, "Browsing context related"):
+    //
+    // - `window.closed`  — false (the window isn't closed; this is
+    //                      a live engine instance).
+    // - `window.length`  — 0 (number of nested browsing contexts;
+    //                      heso has no <iframe> support yet).
+    // - `window.name`    — '' (writable per spec; site init code does
+    //                      `if (window.name === 'popup') {...}`).
+    // - `window.opener`  — null (no opener; we're not a popup).
+    //
+    // Reading any of these throws in some script init paths when the
+    // property is `undefined`.  Defaults below match the values a
+    // freshly-loaded top-level browsing context exposes.
+    // -------------------------------------------------------------
+    if (typeof globalThis.closed === 'undefined') {
+        globalThis.closed = false;
+    }
+    if (typeof globalThis.length === 'undefined') {
+        // `length` must be a plain writable data property — frameworks
+        // sometimes set it, and the bare `globalThis.length = 0` form
+        // doesn't trip QuickJS's strict-mode redefinition guards.
+        globalThis.length = 0;
+    }
+    if (typeof globalThis.name === 'undefined') {
+        // Spec: DOMString, writable. Site code occasionally writes it
+        // (e.g. cross-window message passing patterns).
+        globalThis.name = '';
+    }
+    if (typeof globalThis.opener === 'undefined') {
+        // Spec: any (object or null). null for a non-popup top-level
+        // browsing context, which is our only mode today.
+        globalThis.opener = null;
+    }
+
     // queueMicrotask(fn) — schedule `fn` after the current synchronous
     // block but before the next macrotask. Spec semantics are
     // `Promise.resolve().then(fn)`. QuickJS's microtask pump surfaces
