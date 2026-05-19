@@ -129,8 +129,27 @@ pub(crate) struct PendingFetch {
 pub(crate) struct PendingRequest {
     pub url: String,
     pub method: String,
-    pub body: Option<Vec<u8>>,
+    pub body: FetchBody,
     pub headers: Vec<(String, String)>,
+}
+
+/// The body half of a [`PendingRequest`]. Two flavors:
+///
+/// - `Bytes` — a raw byte buffer (string, JSON-serialized object,
+///   Blob/File bytes, ArrayBuffer / TypedArray bytes).
+/// - `Multipart` — a snapshot of FormData entries. Reconstructed into
+///   a `reqwest::multipart::Form` at request-issue time because
+///   `reqwest::multipart::Form` is not `Clone` and we need to be able
+///   to defensively copy the queue if needed.
+#[derive(Debug, Clone)]
+pub(crate) enum FetchBody {
+    /// No body (GET / HEAD with empty body).
+    None,
+    /// Raw bytes.
+    Bytes(Vec<u8>),
+    /// `multipart/form-data` — entries from a FormData snapshot.
+    /// reqwest generates the boundary at `multipart()` call time.
+    Multipart(Vec<(String, crate::web_apis::FormDataValue)>),
 }
 
 /// Per-engine pending-fetch queue. Pushed-into from the JS-side
@@ -282,9 +301,18 @@ fn make_fetch_deterministic<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Function<'j
 ///
 /// - `fetch(url)` → GET to `url`, no body.
 /// - `fetch(url, { method, headers, body })` → same with overrides.
-/// - `body` may be a string (sent as utf-8) or a JS object (the
-///   options bag itself, in which case it's serialized as JSON with
-///   `Content-Type: application/json` if not already set).
+/// - `headers` may be a plain object, a `string[][]` iterable, or a
+///   `Headers` instance.
+/// - `body` may be:
+///   - A string (sent as UTF-8).
+///   - A `Blob` / `File` (sent as raw bytes; Content-Type defaults to
+///     `blob.type` if not already set).
+///   - An `ArrayBuffer` / `Uint8Array` (sent as raw bytes).
+///   - A `FormData` (serialized as `multipart/form-data` with a
+///     generated boundary; reqwest auto-sets Content-Type, do NOT
+///     pre-set it).
+///   - A plain `{...}` object (serialized via `JSON.stringify` with
+///     `Content-Type: application/json` if not already set).
 ///
 /// Returns a human-readable error string on bad shape; the caller
 /// wraps it in a `TypeError` rejection.
@@ -297,44 +325,79 @@ fn extract_request<'js>(ctx: &Ctx<'js>, args: &[Value<'js>]) -> Result<PendingRe
         .map_err(|e| format!("fetch: read url: {e}"))?;
 
     let mut method = "GET".to_owned();
-    let mut body: Option<Vec<u8>> = None;
+    let mut body: FetchBody = FetchBody::None;
     let mut headers: Vec<(String, String)> = Vec::new();
     let mut body_is_json = false;
+    // Track whether the body itself dictates a Content-Type that we
+    // should NOT override. FormData multipart needs reqwest to set
+    // the boundary-bearing CT; Blob bodies use `blob.type` when not
+    // already set by the caller.
+    let mut blob_content_type: Option<String> = None;
+    let mut body_is_multipart = false;
 
     if let Some(opts) = args.get(1).and_then(|v| v.as_object()) {
         if let Some(m) = opts.get::<_, Option<String>>("method").ok().flatten() {
             method = m.to_ascii_uppercase();
         }
+        // Read headers BEFORE body so blob-default-content-type can
+        // honor an explicit override.
+        if let Ok(Some(hdr_val)) = opts.get::<_, Option<Value<'_>>>("headers") {
+            headers = extract_headers(&hdr_val)?;
+        }
         if let Ok(Some(b_val)) = opts.get::<_, Option<Value<'_>>>("body") {
-            if let Some(s) = b_val.as_string() {
-                body = Some(
+            // FormData first (more specific than "object").
+            if let Some(obj) = b_val.as_object() {
+                if let Some(class) = rquickjs::Class::<crate::web_apis::FormData>::from_object(obj) {
+                    let fd = class.borrow();
+                    body = FetchBody::Multipart(fd.snapshot());
+                    body_is_multipart = true;
+                } else if let Some(class) = rquickjs::Class::<crate::web_apis::File>::from_object(obj) {
+                    let f = class.borrow();
+                    blob_content_type = Some(f.mime_type().to_owned());
+                    body = FetchBody::Bytes(f.snapshot_bytes());
+                } else if let Some(class) = rquickjs::Class::<crate::web_apis::Blob>::from_object(obj) {
+                    let b = class.borrow();
+                    blob_content_type = Some(b.mime_type().to_owned());
+                    body = FetchBody::Bytes(b.snapshot_bytes());
+                } else if let Some(ab) = rquickjs::ArrayBuffer::from_object(obj.clone()) {
+                    if let Some(slice) = ab.as_bytes() {
+                        body = FetchBody::Bytes(slice.to_vec());
+                    } else {
+                        return Err("fetch: ArrayBuffer body has no underlying bytes".into());
+                    }
+                } else if let Ok(ta) = rquickjs::TypedArray::<u8>::from_object(obj.clone()) {
+                    if let Some(slice) = ta.as_bytes() {
+                        body = FetchBody::Bytes(slice.to_vec());
+                    } else {
+                        return Err("fetch: TypedArray body has no underlying bytes".into());
+                    }
+                } else if !b_val.is_function() {
+                    // Plain JSON-shaped object — serialize via JSON.stringify.
+                    let stringify: Function = ctx
+                        .globals()
+                        .get::<_, Object>("JSON")
+                        .and_then(|j| j.get("stringify"))
+                        .map_err(|e| format!("fetch: get JSON.stringify: {e}"))?;
+                    let s: String = stringify
+                        .call((b_val.clone(),))
+                        .map_err(|e| format!("fetch: JSON.stringify body: {e}"))?;
+                    body = FetchBody::Bytes(s.into_bytes());
+                    body_is_json = true;
+                } else {
+                    return Err(
+                        "fetch: body must be a string, Blob/File, FormData, ArrayBuffer, or JSON-shaped object".into(),
+                    );
+                }
+            } else if let Some(s) = b_val.as_string() {
+                body = FetchBody::Bytes(
                     s.to_string()
                         .map_err(|e| format!("fetch: read body string: {e}"))?
                         .into_bytes(),
                 );
-            } else if b_val.is_object() && !b_val.is_function() {
-                // JSON-shaped body — serialize via JSON.stringify.
-                let stringify: Function = ctx
-                    .globals()
-                    .get::<_, Object>("JSON")
-                    .and_then(|j| j.get("stringify"))
-                    .map_err(|e| format!("fetch: get JSON.stringify: {e}"))?;
-                let s: String = stringify
-                    .call((b_val,))
-                    .map_err(|e| format!("fetch: JSON.stringify body: {e}"))?;
-                body = Some(s.into_bytes());
-                body_is_json = true;
             } else if !b_val.is_undefined() && !b_val.is_null() {
-                return Err("fetch: body must be a string or JSON-shaped object".into());
-            }
-        }
-        if let Ok(Some(hdr_val)) = opts.get::<_, Option<Value<'_>>>("headers") {
-            if let Some(hdr_obj) = hdr_val.as_object() {
-                for k_val in hdr_obj.keys::<String>().flatten() {
-                    if let Ok(v) = hdr_obj.get::<_, String>(&k_val) {
-                        headers.push((k_val, v));
-                    }
-                }
+                return Err(
+                    "fetch: body must be a string, Blob/File, FormData, ArrayBuffer, or JSON-shaped object".into(),
+                );
             }
         }
     }
@@ -346,12 +409,52 @@ fn extract_request<'js>(ctx: &Ctx<'js>, args: &[Value<'js>]) -> Result<PendingRe
     {
         headers.push(("Content-Type".into(), "application/json".into()));
     }
+    // Auto Content-Type for Blob/File bodies if non-empty and caller
+    // didn't set one. Per WHATWG fetch §6.3 "extract a body" step 12.
+    if let Some(ct) = blob_content_type {
+        if !ct.is_empty()
+            && !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
+            headers.push(("Content-Type".into(), ct));
+        }
+    }
+    // For multipart bodies, drop any caller-set Content-Type — reqwest
+    // generates a boundary-bearing one at send time, and a stale CT
+    // header would clobber it.
+    if body_is_multipart {
+        headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
+    }
     Ok(PendingRequest {
         url,
         method,
         body,
         headers,
     })
+}
+
+/// Extract a `Vec<(String, String)>` from the `headers` option. Accepts:
+/// - A `Headers` class instance — flattened via [`crate::web_apis::Headers::flatten`].
+/// - A plain object — keys read as strings.
+/// - An iterable `[name, value]` pairs — TODO (not currently used by
+///   real-world callers; plain-object and Headers covers ~all).
+fn extract_headers<'js>(hdr_val: &Value<'js>) -> Result<Vec<(String, String)>, String> {
+    if let Some(hdr_obj) = hdr_val.as_object() {
+        // Headers class instance.
+        if let Some(class) = rquickjs::Class::<crate::web_apis::Headers>::from_object(hdr_obj) {
+            return Ok(class.borrow().flatten());
+        }
+        // Plain object.
+        let mut out: Vec<(String, String)> = Vec::new();
+        for k_val in hdr_obj.keys::<String>().flatten() {
+            if let Ok(v) = hdr_obj.get::<_, String>(&k_val) {
+                out.push((k_val, v));
+            }
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
 }
 
 /// Drain every pending fetch on `queue`: perform the HTTP request via
@@ -446,8 +549,15 @@ fn perform_request(
     for (k, v) in &req.headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
-    if let Some(body) = &req.body {
-        builder = builder.body(body.clone());
+    match &req.body {
+        FetchBody::None => {}
+        FetchBody::Bytes(b) => {
+            builder = builder.body(b.clone());
+        }
+        FetchBody::Multipart(entries) => {
+            let form = crate::web_apis::build_multipart_form_from_formdata(entries);
+            builder = builder.multipart(form);
+        }
     }
 
     // Use `block_in_place` so calling code inside an existing tokio

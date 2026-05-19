@@ -371,6 +371,14 @@ impl JsEngine {
         // [`crate::url_search_params`].
         crate::url_search_params::install_url(&context)?;
 
+        // Install `Blob`, `File`, `Headers`, `FormData` globals
+        // (WHATWG File API §3-4, Fetch §5, XHR §5). Closes the gap
+        // documented in `AGENT_FINDINGS_V2.md` task F1 + "Top NEW
+        // bugs" item 4: file uploads and modern fetch() patterns were
+        // dead because these four constructors were undefined. See
+        // [`crate::web_apis`].
+        crate::web_apis::install_web_apis(&context)?;
+
         // Optional: install the `fetch` global.
         let fetch_state = if let Some(mode) = fetch_mode {
             #[allow(clippy::arc_with_non_send_sync)]
