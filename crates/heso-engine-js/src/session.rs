@@ -51,6 +51,21 @@ use crate::dom::Document;
 use crate::engine::{EvalError, EvalOutcome, JsEngine};
 use crate::scripts::{ScriptFetchPolicy, ScriptOutcome};
 
+/// JS snippet that binds `submitter` (in the enclosing scope) to the
+/// first submit-typed descendant of `form`, or `null` if none. Shared
+/// by [`JsSession::submit`] and [`JsEngine::submit_form`] so the
+/// fallback chain (`button[type="submit"]` → `input[type="submit"]` →
+/// `button:not([type])`) stays defined in exactly one place.
+///
+/// The trailing `<button>` clause matches the HTML spec's "missing
+/// type attribute default" for `<button>` — implicit type is `submit`.
+pub(crate) const SUBMIT_DESCENDANT_FINDER_JS: &str = r#"
+const submitter =
+    form.querySelector('button[type="submit"]') ||
+    form.querySelector('input[type="submit"]') ||
+    form.querySelector('button:not([type])');
+"#;
+
 /// A long-lived page session bound to a single [`JsEngine`].
 ///
 /// Construct with [`Self::open`]; advance with [`Self::click`] /
@@ -164,8 +179,12 @@ impl JsSession {
     /// no `document` global is reinstalled — DOM mutations made by
     /// the click handler are observable on the next call.
     ///
-    /// Returns `value: true` if the selector matched and the click
-    /// was dispatched, `false` if no element matched.
+    /// Returns an [`EvalOutcome`] whose `value` is the JSON object
+    /// `{matched: bool, defaultPrevented: bool}`. `matched` is `false`
+    /// when the selector found no element (and `defaultPrevented` is
+    /// always `false` in that case). Otherwise the click is dispatched
+    /// via `dispatchEvent` of a cancelable `click` Event so callers
+    /// can observe whether a listener called `event.preventDefault()`.
     pub fn click(&self, selector: &str) -> Result<EvalOutcome, EvalError> {
         let selector_lit = serde_json::to_string(selector)
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
@@ -173,9 +192,10 @@ impl JsSession {
             r#"
             (() => {{
                 const el = document.querySelector({selector_lit});
-                if (!el) return false;
-                el.click();
-                return true;
+                if (!el) return {{ matched: false, defaultPrevented: false }};
+                const ev = new Event('click', {{ bubbles: true, cancelable: true }});
+                el.dispatchEvent(ev);
+                return {{ matched: true, defaultPrevented: ev.defaultPrevented }};
             }})()
             "#,
         );
@@ -185,6 +205,11 @@ impl JsSession {
     /// Set the input's value and dispatch `input` then `change`
     /// events on it. Stateful counterpart of
     /// [`JsEngine::set_input_value`].
+    ///
+    /// Returns `{matched: bool, defaultPrevented: bool}` — `matched`
+    /// is `false` if no element matched. `defaultPrevented` reports
+    /// whether `preventDefault()` was called during the `input` or
+    /// `change` dispatch (true if either was prevented).
     pub fn fill(&self, selector: &str, value: &str) -> Result<EvalOutcome, EvalError> {
         let selector_lit = serde_json::to_string(selector)
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
@@ -194,11 +219,16 @@ impl JsSession {
             r#"
             (() => {{
                 const el = document.querySelector({selector_lit});
-                if (!el) return false;
+                if (!el) return {{ matched: false, defaultPrevented: false }};
                 el.value = {value_lit};
-                el.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
-                return true;
+                const inp = new Event('input', {{ bubbles: true, cancelable: true }});
+                el.dispatchEvent(inp);
+                const chg = new Event('change', {{ bubbles: true, cancelable: true }});
+                el.dispatchEvent(chg);
+                return {{
+                    matched: true,
+                    defaultPrevented: inp.defaultPrevented || chg.defaultPrevented,
+                }};
             }})()
             "#,
         );
@@ -208,6 +238,11 @@ impl JsSession {
     /// Find the form at `selector`, find its first submit-typed
     /// descendant, dispatch a click on it. Stateful counterpart of
     /// [`JsEngine::submit_form`].
+    ///
+    /// Returns `{matched: bool, defaultPrevented: bool}`. `matched`
+    /// is `false` when the form selector didn't match OR when no
+    /// submit-typed descendant was found. `defaultPrevented` reports
+    /// whether the submit button's click event was canceled.
     pub fn submit(&self, selector: &str) -> Result<EvalOutcome, EvalError> {
         let selector_lit = serde_json::to_string(selector)
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
@@ -215,14 +250,12 @@ impl JsSession {
             r#"
             (() => {{
                 const form = document.querySelector({selector_lit});
-                if (!form) return false;
-                const submitter =
-                    form.querySelector('button[type="submit"]') ||
-                    form.querySelector('input[type="submit"]') ||
-                    form.querySelector('button:not([type])');
-                if (!submitter) return false;
-                submitter.click();
-                return true;
+                if (!form) return {{ matched: false, defaultPrevented: false }};
+                {SUBMIT_DESCENDANT_FINDER_JS}
+                if (!submitter) return {{ matched: false, defaultPrevented: false }};
+                const ev = new Event('click', {{ bubbles: true, cancelable: true }});
+                submitter.dispatchEvent(ev);
+                return {{ matched: true, defaultPrevented: ev.defaultPrevented }};
             }})()
             "#,
         );
@@ -262,7 +295,7 @@ mod tests {
             .unwrap();
         assert_eq!(before.value, serde_json::json!("untouched"));
         let clicked = sess.click("#b").unwrap();
-        assert_eq!(clicked.value, serde_json::json!(true));
+        assert_eq!(clicked.value["matched"], serde_json::json!(true));
         let after = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();
@@ -276,7 +309,7 @@ mod tests {
         </body></html>"#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
         let filled = sess.fill("#i", "hello").unwrap();
-        assert_eq!(filled.value, serde_json::json!(true));
+        assert_eq!(filled.value["matched"], serde_json::json!(true));
         let v = sess.eval("document.querySelector('#i').value").unwrap();
         assert_eq!(v.value, serde_json::json!("hello"));
     }
@@ -299,8 +332,8 @@ mod tests {
             </body></html>
         "#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
-        assert_eq!(sess.click("#b").unwrap().value, serde_json::json!(true));
-        assert_eq!(sess.fill("#i", "x").unwrap().value, serde_json::json!(true));
+        assert_eq!(sess.click("#b").unwrap().value["matched"], serde_json::json!(true));
+        assert_eq!(sess.fill("#i", "x").unwrap().value["matched"], serde_json::json!(true));
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();
@@ -361,7 +394,8 @@ mod tests {
         let html = "<!doctype html><html><body></body></html>";
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
         let res = sess.click("#nope").unwrap();
-        assert_eq!(res.value, serde_json::json!(false));
+        assert_eq!(res.value["matched"], serde_json::json!(false));
+        assert_eq!(res.value["defaultPrevented"], serde_json::json!(false));
     }
 
     // -----------------------------------------------------------------
@@ -388,7 +422,7 @@ mod tests {
         </body></html>"#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
         for _ in 0..5 {
-            assert_eq!(sess.click("#b").unwrap().value, serde_json::json!(true));
+            assert_eq!(sess.click("#b").unwrap().value["matched"], serde_json::json!(true));
         }
         let n = sess
             .eval("document.querySelector('#n').textContent")
@@ -410,7 +444,7 @@ mod tests {
             </script>
         </body></html>"#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
-        assert_eq!(sess.click("#b").unwrap().value, serde_json::json!(true));
+        assert_eq!(sess.click("#b").unwrap().value["matched"], serde_json::json!(true));
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();
@@ -497,7 +531,7 @@ mod tests {
         // And clicking it fires the listener that was attached at
         // creation time — which lives in the node-keyed registry the
         // same way as any other listener.
-        assert_eq!(sess.click("#dyn").unwrap().value, serde_json::json!(true));
+        assert_eq!(sess.click("#dyn").unwrap().value["matched"], serde_json::json!(true));
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();
@@ -712,7 +746,7 @@ mod tests {
             </script>
         </body></html>"#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
-        assert_eq!(sess.submit("#f").unwrap().value, serde_json::json!(true));
+        assert_eq!(sess.submit("#f").unwrap().value["matched"], serde_json::json!(true));
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();

@@ -254,6 +254,7 @@ impl FetchEngine {
         Ok(FetchPage {
             url: final_url,
             body_text,
+            body_html: html_text,
             tree,
             metadata,
             actions,
@@ -308,6 +309,12 @@ impl Default for FetchEngine {
 pub struct FetchPage {
     url: Url,
     body_text: String,
+    /// The raw HTML body of the response, exactly as it came over the
+    /// wire (post-decompression). Populated alongside `body_text` and
+    /// `actions` so callers that need to hand the same bytes to a JS
+    /// engine (for `<script>` execution, DOM mutation, etc.) don't
+    /// have to issue a second HTTP round-trip via [`FetchEngine::fetch_text`].
+    pub body_html: String,
     /// The page expressed as a navigable tree of sections, built from the
     /// HTML's heading structure. See [`crate::tree`].
     pub tree: HtmlTree,

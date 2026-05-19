@@ -1494,11 +1494,43 @@ async fn cmd_action_hash_verify(args: &[String]) -> ExitCode {
 ///   (`verb: open|click|fill|submit`). Schema-free fingerprints hash
 ///   fine but can't be auto-replayed; exit `2` with a clear message.
 async fn cmd_replay(args: &[String]) -> ExitCode {
-    let Some(path) = args.first() else {
-        eprintln!("usage: heso replay <fingerprint.json>");
+    // Parse optional `--seed N` flag (order-tolerant) and the
+    // positional fingerprint path.
+    let mut seed: Option<u64> = None;
+    let mut path: Option<&String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seed" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--seed needs a value");
+                    return ExitCode::from(2);
+                };
+                match v.parse::<u64>() {
+                    Ok(n) => seed = Some(n),
+                    Err(e) => {
+                        eprintln!("--seed: invalid u64 `{v}`: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("unexpected positional `{other}`");
+                    return ExitCode::from(2);
+                }
+                path = Some(&args[i]);
+                i += 1;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: heso replay [--seed N] <fingerprint.json>");
         eprintln!();
         eprintln!("Re-executes every action in a saved fingerprint against the live");
         eprintln!("site. Refuses tampered files. Schema must be {{verb: open|click|fill|submit, ...}}.");
+        eprintln!("--seed N seeds JsSession::open_with_seed for deterministic Math.random / crypto / timers.");
         return ExitCode::from(2);
     };
     let contents = match std::fs::read_to_string(path) {
@@ -1587,6 +1619,7 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
             &mut current_url,
             &mut current_actions,
             action,
+            seed,
         )
         .await;
         let step = match &res {
@@ -1647,21 +1680,26 @@ async fn ensure_session(
     session: &mut Option<heso_engine_js::JsSession>,
     current_actions: &mut Vec<ElementRef>,
     current_url: &Url,
+    seed: Option<u64>,
 ) -> Result<(), String> {
     if session.is_some() {
         return Ok(());
     }
-    let page = fetch
-        .open(current_url)
+    // One fetch: `body_html` is the raw bytes the JS engine wants,
+    // `actions` is the action graph for `@e7` resolution. Same response.
+    let page = <FetchEngine as EngineApi>::open(fetch, current_url)
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;
     *current_actions = page.actions;
-    let (_, html) = fetch
-        .fetch_text(current_url)
-        .await
-        .map_err(|e| format!("html fetch failed: {e}"))?;
-    let (sess, _outcome) = heso_engine_js::JsSession::open(&html, current_url.clone())
-        .map_err(|e| format!("js session open failed: {e}"))?;
+    let (sess, _outcome) = match seed {
+        Some(n) => heso_engine_js::JsSession::open_with_seed(
+            &page.body_html,
+            current_url.clone(),
+            n,
+        ),
+        None => heso_engine_js::JsSession::open(&page.body_html, current_url.clone()),
+    }
+    .map_err(|e| format!("js session open failed: {e}"))?;
     *session = Some(sess);
     Ok(())
 }
@@ -1678,92 +1716,165 @@ async fn execute_step_session(
     current_url: &mut Url,
     current_actions: &mut Vec<ElementRef>,
     action: &Action,
+    seed: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     match action {
         Action::Open { url } => {
             let new_url = Url::parse(url).map_err(|e| format!("invalid url `{url}`: {e}"))?;
-            let (final_url, html) = fetch
-                .fetch_text(&new_url)
-                .await
-                .map_err(|e| format!("html fetch failed: {e}"))?;
-            *current_url = final_url;
-            let page = fetch
-                .open(current_url)
+            // Single fetch: `body_html` is the raw HTML for the JS
+            // engine, `actions` is the action graph from the same
+            // response, `url` is post-redirect.
+            let page = <FetchEngine as EngineApi>::open(fetch, &new_url)
                 .await
                 .map_err(|e| format!("fetch failed: {e}"))?;
-            *current_actions = page.actions;
-            match session.as_mut() {
+            *current_url = page.url().clone();
+            *current_actions = page.actions.clone();
+            let script_outcome = match session.as_mut() {
                 None => {
-                    let (sess, _) = heso_engine_js::JsSession::open(&html, current_url.clone())
-                        .map_err(|e| format!("js session open failed: {e}"))?;
+                    let (sess, outcome) = match seed {
+                        Some(n) => heso_engine_js::JsSession::open_with_seed(
+                            &page.body_html,
+                            current_url.clone(),
+                            n,
+                        ),
+                        None => heso_engine_js::JsSession::open(
+                            &page.body_html,
+                            current_url.clone(),
+                        ),
+                    }
+                    .map_err(|e| format!("js session open failed: {e}"))?;
                     *session = Some(sess);
+                    outcome
                 }
-                Some(sess) => {
-                    sess.navigate(&html, current_url.clone())
-                        .map_err(|e| format!("js session navigate failed: {e}"))?;
-                }
-            }
+                Some(sess) => sess
+                    .navigate(&page.body_html, current_url.clone())
+                    .map_err(|e| format!("js session navigate failed: {e}"))?,
+            };
             Ok(serde_json::json!({
                 "op": "open",
                 "navigated_to": current_url.to_string(),
+                "scripts": script_outcome_json(&script_outcome),
             }))
         }
         Action::Click { target } => {
-            ensure_session(fetch, session, current_actions, current_url).await?;
+            ensure_session(fetch, session, current_actions, current_url, seed).await?;
             let want = normalize_replay_ref(target);
             let elem = resolve_action(current_actions, &want)
                 .ok_or_else(|| format!("no element at ref `{want}`"))?
                 .clone();
 
-            // Anchor-with-href: navigation, not a JS click.
-            if elem.tag == "a" {
-                if let Some(href) = elem.attrs.get("href") {
-                    let target_url = current_url
-                        .join(href)
-                        .map_err(|e| format!("href `{href}` is not a valid URL: {e}"))?;
-                    let from = current_url.to_string();
-                    let (final_url, html) = fetch
-                        .fetch_text(&target_url)
-                        .await
-                        .map_err(|e| format!("html fetch failed: {e}"))?;
-                    *current_url = final_url;
-                    let page = fetch
-                        .open(current_url)
-                        .await
-                        .map_err(|e| format!("fetch failed: {e}"))?;
-                    *current_actions = page.actions;
-                    let sess = session.as_mut().expect("session ensured above");
-                    sess.navigate(&html, current_url.clone())
-                        .map_err(|e| format!("js session navigate failed: {e}"))?;
-                    return Ok(serde_json::json!({
+            let selector = selector_for_action(&elem)
+                .ok_or_else(|| format!("no selector for ref `{want}`"))?;
+
+            // Anchor with href: dispatch the click into JS first so SPA
+            // routers (Next.js, Remix, React Router, vanilla
+            // `preventDefault()` + `history.pushState`) can intercept.
+            // Only when the script does NOT call preventDefault do we
+            // follow up with a real navigation to the href target.
+            if elem.tag == "a" && elem.attrs.contains_key("href") {
+                let href = elem.attrs.get("href").cloned().unwrap_or_default();
+                let sess_ref = session.as_ref().expect("session ensured above");
+                let click_outcome = sess_ref
+                    .click(&selector)
+                    .map_err(|e| format!("js click failed: {e}"))?;
+                let matched = click_outcome
+                    .value
+                    .get("matched")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let default_prevented = click_outcome
+                    .value
+                    .get("defaultPrevented")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let drift = ref_drift_field(sess_ref, &selector, &elem.tag);
+
+                if matched && default_prevented {
+                    // SPA router handled it — no real navigation.
+                    let mut obj = serde_json::json!({
                         "op": "click",
-                        "kind": "navigation",
+                        "kind": "dom-event",
                         "ref": want,
+                        "selector": selector,
                         "href": href,
-                        "from": from,
-                        "navigated_to": current_url.to_string(),
-                    }));
+                        "matched": matched,
+                        "defaultPrevented": true,
+                        "console": click_outcome.console,
+                    });
+                    if let Some(d) = drift {
+                        obj.as_object_mut().unwrap().insert("ref_drift".into(), d);
+                    }
+                    return Ok(obj);
                 }
+
+                // Not prevented (or selector didn't match the live DOM):
+                // do the real navigation. Falling through on unmatched
+                // preserves the prior behavior where an anchor's href
+                // always navigates.
+                let target_url = current_url
+                    .join(&href)
+                    .map_err(|e| format!("href `{href}` is not a valid URL: {e}"))?;
+                let from = current_url.to_string();
+                let page = <FetchEngine as EngineApi>::open(fetch, &target_url)
+                    .await
+                    .map_err(|e| format!("fetch failed: {e}"))?;
+                *current_url = page.url().clone();
+                *current_actions = page.actions.clone();
+                let sess = session.as_mut().expect("session ensured above");
+                let script_outcome = sess
+                    .navigate(&page.body_html, current_url.clone())
+                    .map_err(|e| format!("js session navigate failed: {e}"))?;
+                let mut obj = serde_json::json!({
+                    "op": "click",
+                    "kind": "navigation",
+                    "ref": want,
+                    "selector": selector,
+                    "href": href,
+                    "from": from,
+                    "navigated_to": current_url.to_string(),
+                    "matched": matched,
+                    "defaultPrevented": false,
+                    "console": click_outcome.console,
+                    "scripts": script_outcome_json(&script_outcome),
+                });
+                if let Some(d) = drift {
+                    obj.as_object_mut().unwrap().insert("ref_drift".into(), d);
+                }
+                return Ok(obj);
             }
 
             // Non-link click: dispatch a DOM event against the live session.
-            let selector = selector_for_action(&elem)
-                .ok_or_else(|| format!("no selector for ref `{want}`"))?;
             let sess = session.as_ref().expect("session ensured above");
             let outcome = sess
                 .click(&selector)
                 .map_err(|e| format!("js click failed: {e}"))?;
-            Ok(serde_json::json!({
+            let matched = outcome
+                .value
+                .get("matched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let default_prevented = outcome
+                .value
+                .get("defaultPrevented")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let drift = ref_drift_field(sess, &selector, &elem.tag);
+            let mut obj = serde_json::json!({
                 "op": "click",
                 "kind": "dom-event",
                 "ref": want,
                 "selector": selector,
-                "matched": outcome.value,
+                "matched": matched,
+                "defaultPrevented": default_prevented,
                 "console": outcome.console,
-            }))
+            });
+            if let Some(d) = drift {
+                obj.as_object_mut().unwrap().insert("ref_drift".into(), d);
+            }
+            Ok(obj)
         }
         Action::Fill { target, value } => {
-            ensure_session(fetch, session, current_actions, current_url).await?;
+            ensure_session(fetch, session, current_actions, current_url, seed).await?;
             let want = normalize_replay_ref(target);
             let elem = resolve_action(current_actions, &want)
                 .ok_or_else(|| format!("no element at ref `{want}`"))?
@@ -1774,17 +1885,33 @@ async fn execute_step_session(
             let outcome = sess
                 .fill(&selector, value)
                 .map_err(|e| format!("js fill failed: {e}"))?;
-            Ok(serde_json::json!({
+            let matched = outcome
+                .value
+                .get("matched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let default_prevented = outcome
+                .value
+                .get("defaultPrevented")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let drift = ref_drift_field(sess, &selector, &elem.tag);
+            let mut obj = serde_json::json!({
                 "op": "fill",
                 "ref": want,
                 "selector": selector,
                 "value": value,
-                "matched": outcome.value,
+                "matched": matched,
+                "defaultPrevented": default_prevented,
                 "console": outcome.console,
-            }))
+            });
+            if let Some(d) = drift {
+                obj.as_object_mut().unwrap().insert("ref_drift".into(), d);
+            }
+            Ok(obj)
         }
         Action::Submit { target } => {
-            ensure_session(fetch, session, current_actions, current_url).await?;
+            ensure_session(fetch, session, current_actions, current_url, seed).await?;
             let want = normalize_replay_ref(target);
             let elem = resolve_action(current_actions, &want)
                 .ok_or_else(|| format!("no element at ref `{want}`"))?
@@ -1795,14 +1922,68 @@ async fn execute_step_session(
             let outcome = sess
                 .submit(&selector)
                 .map_err(|e| format!("js submit failed: {e}"))?;
-            Ok(serde_json::json!({
+            let matched = outcome
+                .value
+                .get("matched")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let default_prevented = outcome
+                .value
+                .get("defaultPrevented")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let drift = ref_drift_field(sess, &selector, &elem.tag);
+            let mut obj = serde_json::json!({
                 "op": "submit",
                 "ref": want,
                 "selector": selector,
-                "matched": outcome.value,
+                "matched": matched,
+                "defaultPrevented": default_prevented,
                 "console": outcome.console,
-            }))
+            });
+            if let Some(d) = drift {
+                obj.as_object_mut().unwrap().insert("ref_drift".into(), d);
+            }
+            Ok(obj)
         }
+    }
+}
+
+/// Project a [`heso_engine_js::ScriptOutcome`] to the JSON shape the
+/// replay step embeds.
+fn script_outcome_json(o: &heso_engine_js::ScriptOutcome) -> serde_json::Value {
+    serde_json::json!({
+        "executed": o.executed,
+        "executed_with_error": o.executed_with_error,
+        "external_handled": o.external_handled,
+        "skipped_non_script_type": o.skipped_non_script_type,
+    })
+}
+
+/// Best-effort soft-signal check: after the action graph said the
+/// element at `selector` was a `<snapshot_tag>`, ask the live DOM
+/// what tag actually sits at that selector now. If they disagree,
+/// return a `ref_drift` JSON object; if they agree or the eval
+/// fails, return None (this is non-load-bearing diagnostic data).
+fn ref_drift_field(
+    sess: &heso_engine_js::JsSession,
+    selector: &str,
+    snapshot_tag: &str,
+) -> Option<serde_json::Value> {
+    let selector_lit = serde_json::to_string(selector).ok()?;
+    let script = format!(
+        "(() => {{ const el = document.querySelector({selector_lit}); \
+         return el ? el.tagName.toLowerCase() : null; }})()"
+    );
+    let outcome = sess.eval(&script).ok()?;
+    let live_tag = outcome.value.as_str()?;
+    if live_tag.eq_ignore_ascii_case(snapshot_tag) {
+        None
+    } else {
+        Some(serde_json::json!({
+            "snapshot_tag": snapshot_tag,
+            "live_tag": live_tag,
+        }))
     }
 }
 

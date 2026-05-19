@@ -805,15 +805,13 @@ impl JsEngine {
     pub fn submit_form(&self, html: &str, selector: &str) -> Result<EvalOutcome, EvalError> {
         let selector_lit = serde_json::to_string(selector)
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        let finder = crate::session::SUBMIT_DESCENDANT_FINDER_JS;
         let script = format!(
             r#"
             (() => {{
                 const form = document.querySelector({selector_lit});
                 if (!form) return false;
-                const submitter =
-                    form.querySelector('button[type="submit"]') ||
-                    form.querySelector('input[type="submit"]') ||
-                    form.querySelector('button:not([type])'); // <button> defaults to type=submit
+                {finder}
                 if (!submitter) return false;
                 submitter.click();
                 return true;
