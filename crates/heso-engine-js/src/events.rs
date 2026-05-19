@@ -927,10 +927,20 @@ pub(crate) fn dispatch_with_map<'js>(
         if view.state.immediate_propagation_stopped.get() {
             break;
         }
-        // Call with no `this` binding — match Deno's behavior of
-        // invoking listener as a plain function. "Report the
-        // exception" per spec: forward to console.error and continue.
-        let call_result: Result<Value<'js>, _> = callback.call((event.clone(),));
+        // Bind `this` to currentTarget per WHATWG DOM
+        // <https://dom.spec.whatwg.org/#concept-event-listener-invoke>:
+        // "Set listener's invocation target to event's currentTarget."
+        // Frameworks (Preact in particular) read `this.l` from inside
+        // their registered event proxy to look up the actual handler;
+        // calling with no `this` makes that lookup return undefined
+        // and the handler silently no-ops.
+        let call_result: Result<Value<'js>, _> = match target.as_ref() {
+            Some(t) => callback.call((
+                rquickjs::function::This(t.clone()),
+                event.clone(),
+            )),
+            None => callback.call((event.clone(),)),
+        };
         if let Err(err) = call_result {
             report_listener_exception(ctx, err);
         }
@@ -1035,7 +1045,7 @@ pub(crate) fn dispatch_with_node_path<'js>(
         if let Some(ref ev_obj) = ev_obj {
             ev_obj.set(PROP_CURRENT_TARGET, current_target.clone())?;
         }
-        fire_listeners_on_node(ctx, map.as_ref(), &view, &event, Some(true))?;
+        fire_listeners_on_node(ctx, map.as_ref(), &view, &event, Some(true), Some(current_target))?;
     }
 
     // --- At target: path[last], all listeners ---
@@ -1045,7 +1055,7 @@ pub(crate) fn dispatch_with_node_path<'js>(
         if let Some(ref ev_obj) = ev_obj {
             ev_obj.set(PROP_CURRENT_TARGET, current_target.clone())?;
         }
-        fire_listeners_on_node(ctx, map.as_ref(), &view, &event, None)?;
+        fire_listeners_on_node(ctx, map.as_ref(), &view, &event, None, Some(current_target))?;
     }
 
     // --- Bubble phase: path[last-1 ..= 0], non-capture only ---
@@ -1059,7 +1069,14 @@ pub(crate) fn dispatch_with_node_path<'js>(
             if let Some(ref ev_obj) = ev_obj {
                 ev_obj.set(PROP_CURRENT_TARGET, current_target.clone())?;
             }
-            fire_listeners_on_node(ctx, map.as_ref(), &view, &event, Some(false))?;
+            fire_listeners_on_node(
+                ctx,
+                map.as_ref(),
+                &view,
+                &event,
+                Some(false),
+                Some(current_target),
+            )?;
         }
     }
 
@@ -1098,6 +1115,7 @@ fn fire_listeners_on_node<'js>(
     view: &EventView,
     event: &Value<'js>,
     phase_capture_filter: Option<bool>,
+    current_target: Option<&Value<'js>>,
 ) -> rquickjs::Result<()> {
     let Some(map) = map else { return Ok(()) };
     let list: Option<Array<'js>> = map.get::<_, Option<Array<'js>>>(view.event_type.as_str())?;
@@ -1132,7 +1150,18 @@ fn fire_listeners_on_node<'js>(
         // We forward the exception's stringification to `console.error`
         // (best-effort; swallowed if console isn't installed) and
         // continue.
-        let call_result: Result<Value<'js>, _> = callback.call((event.clone(),));
+        // Bind `this` to currentTarget per WHATWG DOM
+        // <https://dom.spec.whatwg.org/#concept-event-listener-invoke>.
+        // Frameworks (Preact's E/H proxies in particular) read
+        // `this.l` to look up the actual handler; without the bind,
+        // `this` is undefined and the handler silently no-ops.
+        let call_result: Result<Value<'js>, _> = match current_target {
+            Some(t) => callback.call((
+                rquickjs::function::This(t.clone()),
+                event.clone(),
+            )),
+            None => callback.call((event.clone(),)),
+        };
         if let Err(err) = call_result {
             report_listener_exception(ctx, err);
         }

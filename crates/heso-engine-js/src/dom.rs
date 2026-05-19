@@ -95,6 +95,14 @@ use crate::events::{
 /// state hung off it lives as long as the session does.
 const PROP_NODE_LISTENERS: &str = "__nodeListeners";
 
+/// Hidden key on each per-node listener map storing the JS-side
+/// Element wrapper that the framework used as `this` when calling
+/// `addEventListener`. Dispatch reuses this wrapper as the per-node
+/// `currentTarget` so hidden-property mutations the framework
+/// stashed on the wrapper (e.g. Preact's `e.l[type+capture] = fn`)
+/// are visible inside its registered event proxy.
+const PROP_OWNER_WRAPPER: &str = "__owner";
+
 /// Name of the hidden registry on `globalThis.document` whose value is
 /// an object mapping per-element IDL state, keyed by a stable
 /// stringification of [`dom_query::NodeId`]. Holds the "dirty value
@@ -1922,6 +1930,24 @@ impl Element {
         let (capture, once, passive) = parse_listener_options(&ctx, options.0)?;
         let node_id = this.0.borrow().node_id;
         let map = element_listener_map(&ctx, node_id)?;
+        // Cache the JS-side Element wrapper that the caller used as
+        // `this` for this addEventListener call. Framework code
+        // (Preact in particular) mutates the wrapper directly
+        // (`e.l = {...}`) and the dispatcher must use the same JS
+        // object reference as `currentTarget` so those mutations
+        // are visible inside event proxies. Without this, every
+        // call to a query method synthesizes a fresh Element
+        // wrapper around the same NodeId and the framework's
+        // hidden state on the original wrapper is unreachable.
+        //
+        // First-wins: don't overwrite a previously-stored owner.
+        // If two different JS-side query results both register
+        // listeners on the same node, the first one becomes the
+        // canonical dispatch wrapper.
+        if map.get::<_, Option<Value<'js>>>(PROP_OWNER_WRAPPER)?.is_none() {
+            let owner_value: Value<'js> = this.0.clone().into_value();
+            map.set(PROP_OWNER_WRAPPER, owner_value)?;
+        }
         add_listener_to_map(&ctx, &map, &event_type, &listener, capture, once, passive)
     }
 
@@ -2273,12 +2299,20 @@ fn build_dispatch_path<'js>(
     path.push((doc_map, doc_value));
     for id in ids {
         let map = element_listener_map_opt(ctx, id)?;
-        let wrapper = Class::instance(ctx.clone(), Element::from_id(target.doc.clone(), id))?;
-        let wrapper_value: Value<'js> = wrapper.into_value();
-        // We need the JS Object form for `set(PROP_CURRENT_TARGET, ...)`,
-        // but the value the dispatcher pins is the JS Value (which can
-        // be the Class instance wrapped). Just pass the Value; the
-        // dispatcher stores it directly.
+        // Prefer the cached `__owner` wrapper if `addEventListener`
+        // has been called on this node. Frameworks (Preact) mutate
+        // the JS wrapper directly between addEventListener and the
+        // first dispatch (e.g. `el.l = {keydownfalse: handler}`),
+        // and the registered proxy reads `this.l` — so dispatch
+        // must use the same JS object reference, not a fresh one.
+        let wrapper_value: Value<'js> = match map
+            .as_ref()
+            .and_then(|m| m.get::<_, Option<Value<'js>>>(PROP_OWNER_WRAPPER).ok().flatten())
+        {
+            Some(v) => v,
+            None => Class::instance(ctx.clone(), Element::from_id(target.doc.clone(), id))?
+                .into_value(),
+        };
         path.push((map, wrapper_value));
     }
     Ok(path)

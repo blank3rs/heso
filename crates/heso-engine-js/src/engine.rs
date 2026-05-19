@@ -576,6 +576,12 @@ impl JsEngine {
             })
             .map_err(|e| EvalError::Engine(format!("install document global: {e}")))?;
 
+        // Now that `document` is installed (and `document.createElement`
+        // is callable), pre-define `on*` event-handler IDL properties
+        // on Element.prototype. Idempotent — only does work on the
+        // first install_document.
+        install_on_event_handlers(&self.context)?;
+
         let script_fetch_client = self.fetch_state.as_ref().and_then(|fs| match &fs.mode {
             FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
             FetchMode::DeterministicNoCassette => None,
@@ -683,6 +689,11 @@ impl JsEngine {
                 Ok(())
             })
             .map_err(|e| EvalError::Engine(format!("install document global: {e}")))?;
+
+        // See `install_document` — sets up `on*` IDL props on
+        // Element.prototype so Preact's `prop.toLowerCase() in el`
+        // feature-detect picks the lowercase event name.
+        install_on_event_handlers(&self.context)?;
 
         // Run every <script> against the shared context — mutations
         // land on the same `Arc<dom_query::Document>` the JS-side
@@ -995,6 +1006,124 @@ fn install_dom_classes(context: &Context) -> Result<(), EvalError> {
         .map_err(|e| EvalError::Engine(format!("register DOM classes: {e}")))?;
     Ok(())
 }
+
+/// Install `on*` event-handler IDL properties on
+/// `Element.prototype` as `null`. Real browsers expose all of
+/// them (`el.onclick`, `el.oninput`, `el.onkeydown`, ...) as
+/// null-by-default IDL properties; framework code (Preact in
+/// particular) feature-detects via
+/// `propName.toLowerCase() in el` to decide whether to register
+/// a listener under the lowercase event name ("keydown") or to
+/// fall back to the camelCase-stripped form ("KeyDown") which
+/// never matches a real keyboard event. Without these pre-defines,
+/// Preact ships a listener under "KeyDown" and the user's Enter
+/// keypress lands on "keydown" — nothing fires.
+///
+/// The properties only need to *exist* — Preact uses
+/// `addEventListener` to actually register handlers. We don't
+/// implement IDL-property-to-listener reflection here.
+///
+/// Runs on every [`JsEngine::install_document`] because we need
+/// `document.createElement('div')` to be available to reach the
+/// Element prototype (`rquickjs::Class::define` registers the
+/// class internally but doesn't put a constructor on globalThis,
+/// so JS-side `Element` is undefined). The bootstrap is idempotent
+/// via a one-shot sentinel.
+fn install_on_event_handlers(context: &Context) -> Result<(), EvalError> {
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            ctx.eval::<(), _>(ON_EVENT_HANDLERS_BOOTSTRAP)?;
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install on* event-handler IDL properties: {e}")))?;
+    Ok(())
+}
+
+/// JS source that pre-populates `on*` event-handler IDL properties
+/// on `Element.prototype` with `null`. Called once after
+/// `register_classes`.
+///
+/// The list is the union of:
+/// - WHATWG HTML GlobalEventHandlers mixin (~50 names — click, input,
+///   keydown, keyup, focus, blur, submit, change, mouse*, drag*,
+///   pointer*, touch*, animation*, transition*, ...)
+/// - HTMLElement and Document handlers that aren't on GEH
+///   (load, unload, beforeunload, hashchange, popstate, message,
+///   storage, online, offline, visibilitychange, fullscreenchange,
+///   readystatechange, DOMContentLoaded, error, abort, scroll, ...)
+///
+/// Source: <https://html.spec.whatwg.org/multipage/webappapis.html#globaleventhandlers>
+const ON_EVENT_HANDLERS_BOOTSTRAP: &str = r#"
+(function() {
+    // Idempotent — `install_document` calls this on every navigate.
+    if (globalThis.__hesoOnHandlersInstalled) return;
+
+    // `rquickjs::Class::define` registers Element internally but
+    // doesn't expose it as a `globalThis.Element` constructor. To
+    // reach `Element.prototype` we walk an actual instance.
+    if (typeof document === 'undefined') return;
+    const probe = document.createElement('div');
+    if (!probe) return;
+    const proto = Object.getPrototypeOf(probe);
+    if (!proto) return;
+
+    const names = [
+        // GlobalEventHandlers (WHATWG HTML §8)
+        'onabort', 'onauxclick', 'onbeforeinput', 'onbeforematch',
+        'onbeforetoggle', 'onblur', 'oncancel', 'oncanplay',
+        'oncanplaythrough', 'onchange', 'onclick', 'onclose',
+        'oncontextlost', 'oncontextmenu', 'oncontextrestored',
+        'oncopy', 'oncuechange', 'oncut', 'ondblclick', 'ondrag',
+        'ondragend', 'ondragenter', 'ondragleave', 'ondragover',
+        'ondragstart', 'ondrop', 'ondurationchange', 'onemptied',
+        'onended', 'onerror', 'onfocus', 'onformdata', 'oninput',
+        'oninvalid', 'onkeydown', 'onkeypress', 'onkeyup', 'onload',
+        'onloadeddata', 'onloadedmetadata', 'onloadstart',
+        'onmousedown', 'onmouseenter', 'onmouseleave', 'onmousemove',
+        'onmouseout', 'onmouseover', 'onmouseup', 'onpaste', 'onpause',
+        'onplay', 'onplaying', 'onpointercancel', 'onpointerdown',
+        'onpointerenter', 'onpointerleave', 'onpointermove',
+        'onpointerout', 'onpointerover', 'onpointerrawupdate',
+        'onpointerup', 'onprogress', 'onratechange', 'onreset',
+        'onresize', 'onscroll', 'onscrollend', 'onsecuritypolicyviolation',
+        'onseeked', 'onseeking', 'onselect', 'onselectionchange',
+        'onselectstart', 'onslotchange', 'onstalled', 'onsubmit',
+        'onsuspend', 'ontimeupdate', 'ontoggle', 'ontouchcancel',
+        'ontouchend', 'ontouchmove', 'ontouchstart', 'ontransitioncancel',
+        'ontransitionend', 'ontransitionrun', 'ontransitionstart',
+        'onvolumechange', 'onwaiting', 'onwebkitanimationend',
+        'onwebkitanimationiteration', 'onwebkitanimationstart',
+        'onwebkittransitionend', 'onwheel',
+        // Document/Window only — but real browsers also expose on
+        // Element to support `<body onload=...>` style attributes
+        'onafterprint', 'onbeforeprint', 'onbeforeunload',
+        'onhashchange', 'onlanguagechange', 'onmessage', 'onmessageerror',
+        'onoffline', 'ononline', 'onpagehide', 'onpageshow', 'onpopstate',
+        'onrejectionhandled', 'onstorage', 'onunhandledrejection',
+        'onunload', 'onvisibilitychange', 'onfullscreenchange',
+        'onfullscreenerror', 'onreadystatechange',
+        // Animation events (mixed-case Capture cousins handled by
+        // Preact's separate `.replace(/Capture$/, "")` step)
+        'onanimationcancel', 'onanimationend', 'onanimationiteration',
+        'onanimationstart'
+    ];
+    for (let i = 0; i < names.length; i++) {
+        const name = names[i];
+        // Only define if missing — never clobber a pre-existing prop.
+        if (!(name in proto)) {
+            Object.defineProperty(proto, name, {
+                value: null,
+                writable: true,
+                configurable: true,
+                enumerable: false
+            });
+        }
+    }
+    Object.defineProperty(globalThis, '__hesoOnHandlersInstalled', {
+        value: true, writable: false, configurable: false, enumerable: false
+    });
+})();
+"#;
 
 /// Install a `console` global on the given context that routes calls
 /// into `buffer`. Each method (`log`, `info`, `warn`, `error`,
