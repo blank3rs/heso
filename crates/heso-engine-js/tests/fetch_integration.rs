@@ -329,37 +329,31 @@ async fn engine_without_fetch_has_no_fetch_global() {
     assert_eq!(out.value, "undefined");
 }
 
-// ===== await top-level limitation (documented; expected to NOT resolve eagerly) =====
+// ===== top-level await: thenable returns are unwrapped via microtask pump =====
 
 #[tokio::test(flavor = "multi_thread")]
-async fn await_top_level_returns_pending_promise() {
-    // Documents the PR2 limitation: top-level `await fetch(...)` does
-    // not resolve eagerly under the sync `Runtime + Context` pair we
-    // use today. The promise the script returns is observable on
-    // `EvalOutcome::value`, but it shows up as an empty object
-    // because [`crate::engine::js_value_to_json`] doesn't unwrap
-    // pending Promises — and the host needs `.then(...)` to get the
-    // real body, until item K (microtask pump via AsyncRuntime) lands.
+async fn await_top_level_unwraps_fetch_via_microtask_pump() {
+    // Top-level `(async () => { await fetch(...); ... })()` returns a
+    // Promise; [`engine::JsEngine::eval_value_with_promise_await`]
+    // registers `.then(settle)` and drains microtasks via
+    // [`engine::JsEngine::run_pending_jobs`] before serializing —
+    // so the user observes the resolved body, not a Promise stub.
+    //
+    // Earlier this case asserted the opposite (a documented PR2
+    // limitation); the microtask pump that landed alongside the
+    // Preact-event-delegation work makes top-level await Just Work.
     let engine = engine_with_fetch();
     let out = engine
         .eval(
             r#"
             (async () => {
-                const r = await fetch("data:text/plain,async-not-pumped");
+                const r = await fetch("data:text/plain,async-now-pumped");
                 return r.text();
             })()
             "#,
         )
-        .expect("schedule");
-    // Should NOT contain "async-not-pumped" — the body isn't unwrapped
-    // by the current pump. `.then` is the working shape (covered
-    // above).
-    if let Some(s) = out.value.as_str() {
-        assert!(
-            !s.contains("async-not-pumped"),
-            "top-level await unexpectedly worked, microtask pump may already be wired: {s}"
-        );
-    }
+        .expect("eval");
+    assert_eq!(out.value, "async-now-pumped");
 }
 
 // ===== Page-script integration: <script src=> honored under Fetch policy =====

@@ -610,3 +610,183 @@ fn element_focus_blur_scroll_into_view_do_not_throw() {
         .expect("eval");
     assert_eq!(out.value, "ok");
 }
+
+// ===== heso.flush() + Promise-aware eval ==============================
+//
+// User JS that returns a thenable should be awaited via the microtask
+// pump and serialized as the resolved value, not as a Promise-shaped
+// object. This is what lets `await heso.flush()` patterns observe DOM
+// mutations queued by an earlier `dispatchEvent` (e.g. a Preact
+// re-render scheduled via `Promise.resolve().then(...)`).
+
+#[test]
+fn eval_resolves_top_level_promise_to_its_value() {
+    // A bare `Promise.resolve(42)` at top-level should serialize as
+    // 42, not as `{}` or a Promise-shaped object.
+    let out = engine().eval("Promise.resolve(42)").expect("eval");
+    assert_eq!(out.value, serde_json::json!(42));
+}
+
+#[test]
+fn eval_resolves_async_iife_to_its_returned_value() {
+    // The canonical "top-level await" pattern: wrap user code in an
+    // async IIFE.  `await heso.flush()` yields to the microtask
+    // queue, then the IIFE returns a value.  The Rust eval should
+    // serialize that value, not the wrapper Promise.
+    let out = engine()
+        .eval("(async () => { await heso.flush(); return 'hello'; })()")
+        .expect("eval");
+    assert_eq!(out.value, serde_json::json!("hello"));
+}
+
+#[test]
+fn heso_flush_lets_earlier_microtasks_run_before_resume() {
+    // Spec-shaped: `Promise.resolve().then(setter)` queues a
+    // microtask BEFORE `await heso.flush()`'s continuation, so by the
+    // time the await resumes, the setter has already run.  This is
+    // the exact pattern Preact uses to schedule re-renders.
+    let out = engine()
+        .eval(
+            r#"(async () => {
+                globalThis.__seen = 'before';
+                Promise.resolve().then(() => { globalThis.__seen = 'after'; });
+                await heso.flush();
+                return globalThis.__seen;
+            })()"#,
+        )
+        .expect("eval");
+    assert_eq!(out.value, serde_json::json!("after"));
+}
+
+#[test]
+fn eval_propagates_promise_rejection_as_thrown_value() {
+    // A rejected promise at top-level should surface as
+    // `EvalError::ThrownValue`, not as a silently-null result.
+    let err = engine()
+        .eval("Promise.reject('boom')")
+        .expect_err("expected rejection to propagate");
+    match err {
+        heso_engine_js::EvalError::ThrownValue { value } => {
+            assert_eq!(value, serde_json::json!("boom"));
+        }
+        other => panic!("expected ThrownValue; got {other:?}"),
+    }
+}
+
+#[test]
+fn heso_flush_is_one_microtask_checkpoint_per_call() {
+    // Spec-shaped contract: each `await heso.flush()` is exactly one
+    // microtask checkpoint.  If a microtask handler queues another
+    // microtask, that second one runs in the NEXT checkpoint, not
+    // the current one — same as in real browsers and Node.
+    //
+    // The pump loop in `execute_pending_jobs_until_idle` does run
+    // chained microtasks during a single pump call, but the await's
+    // continuation is queued BEFORE the inner .then, so the
+    // continuation observes only the outer tick (FIFO ordering of
+    // microtasks queued at the same checkpoint).
+    let out = engine()
+        .eval(
+            r#"(async () => {
+                globalThis.__ticks = 0;
+                Promise.resolve().then(() => {
+                    globalThis.__ticks += 1;
+                    Promise.resolve().then(() => { globalThis.__ticks += 1; });
+                });
+                await heso.flush();
+                const after_one = globalThis.__ticks;
+                await heso.flush();
+                const after_two = globalThis.__ticks;
+                return [after_one, after_two];
+            })()"#,
+        )
+        .expect("eval");
+    // Two flushes => two checkpoints => both ticks visible.
+    assert_eq!(out.value, serde_json::json!([1, 2]));
+}
+
+#[test]
+fn preact_shaped_dispatch_then_render_is_visible_after_flush() {
+    // The end-to-end scenario this whole change exists for:
+    // - DOM listener fires on dispatchEvent
+    // - Listener queues a "re-render" as a microtask (Preact pattern)
+    // - User code awaits a microtask checkpoint, then reads the DOM
+    // - The reads see the rendered mutation
+    //
+    // This pins the contract without needing the full Preact bundle.
+    let html = r#"<!doctype html><html><body>
+        <input id="i" />
+        <ul id="list"></ul>
+        <script>
+            // No `e.key` check because KeyboardEvent ctor isn't wired
+            // yet; the plain Event('keydown') we dispatch from the
+            // test is enough to drive the same code shape.
+            document.getElementById('i').addEventListener('keydown', (e) => {
+                const val = e.target.value;
+                e.target.value = '';
+                // "Preact-style" deferred render via microtask.
+                Promise.resolve().then(() => {
+                    const li = document.createElement('li');
+                    li.textContent = val;
+                    document.getElementById('list').appendChild(li);
+                });
+            });
+        </script>
+    </body></html>"#;
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess
+        .eval(
+            r#"(async () => {
+                const i = document.getElementById('i');
+                i.value = 'buy milk';
+                i.dispatchEvent(new Event('keydown'));
+                await heso.flush();
+                return document.getElementById('list').innerHTML;
+            })()"#,
+        )
+        .expect("eval");
+    // Without microtask drain this would be empty.  With `await
+    // heso.flush()` (implicit via the awaited top-level promise),
+    // the <li> is rendered before the read.
+    let html_str = out.value.as_str().expect("innerHTML is string");
+    // Trim is paranoia — engine may add no whitespace, but if it
+    // ever adds e.g. a trailing newline the asserts shouldn't fail.
+    let trimmed = html_str.trim();
+    assert!(
+        trimmed.contains("buy milk"),
+        "expected list to contain rendered item; got innerHTML = {trimmed:?}"
+    );
+    assert!(
+        trimmed.starts_with("<li") && trimmed.ends_with("</li>"),
+        "expected single <li>; got {trimmed:?}"
+    );
+}
+
+#[test]
+fn dispatch_without_flush_still_sees_synchronous_handler_effects() {
+    // Regression guard: synchronous handler effects (e.g. setting
+    // a property in place) must still be visible without any await,
+    // because we don't want the Promise-await path to change sync
+    // semantics for callers who didn't opt in.
+    let html = r#"<!doctype html><html><body>
+        <input id="i" />
+        <script>
+            document.getElementById('i').addEventListener('keydown', (e) => {
+                e.target.value = '';
+            });
+        </script>
+    </body></html>"#;
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval(
+        r#"
+        const i = document.getElementById('i');
+        i.value = 'x';
+        i.dispatchEvent(new Event('keydown'));
+        "#,
+    )
+    .expect("eval");
+    let out = sess
+        .eval("document.getElementById('i').value")
+        .expect("eval value");
+    assert_eq!(out.value, serde_json::json!(""));
+}

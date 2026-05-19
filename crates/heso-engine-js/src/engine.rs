@@ -19,7 +19,7 @@
 use std::sync::{Arc, Mutex};
 
 use rquickjs::{
-    prelude::{Func, Rest},
+    prelude::{Func, Rest, This},
     CatchResultExt, CaughtError, Class, Context, Ctx, Function, Object, Runtime, Value,
 };
 
@@ -532,6 +532,150 @@ impl JsEngine {
         )))
     }
 
+    /// Eval `code` and capture its completion value as JSON.
+    ///
+    /// If the value is a thenable (a Promise or a Promise-shaped
+    /// object), register `.then(resolve, reject)` callbacks that
+    /// stash the settled JSON into a shared slot, drive the
+    /// microtask pump via [`Self::run_pending_jobs`], and return
+    /// the slot's resolved value. Otherwise, serialize the value
+    /// synchronously.
+    ///
+    /// This is what lets a user expression `await heso.flush()`
+    /// observe DOM mutations queued by an earlier `dispatchEvent`
+    /// — Preact's re-render is queued as a microtask, and the
+    /// microtask checkpoint runs before our `.then(resolve)` fires.
+    ///
+    /// A thenable that never settles (e.g. waits on a macrotask we
+    /// don't advance) yields [`serde_json::Value::Null`]. We trust
+    /// the run loop to make the user's next call see the eventually
+    /// settled state via the virtual clock.
+    fn eval_value_with_promise_await(
+        &self,
+        code: &str,
+    ) -> Result<serde_json::Value, EvalError> {
+        type SettleSlot =
+            Arc<Mutex<Option<Result<serde_json::Value, EvalError>>>>;
+        let slot: SettleSlot = Arc::new(Mutex::new(None));
+        let needs_pump = self
+            .context
+            .with(|ctx| -> Result<bool, EvalError> {
+                let raw = match ctx.eval::<Value, _>(code).catch(&ctx) {
+                    Ok(v) => v,
+                    Err(CaughtError::Exception(exc)) => {
+                        return Err(EvalError::Exception {
+                            message: exc.message().unwrap_or_default(),
+                            stack: exc.stack(),
+                        })
+                    }
+                    Err(CaughtError::Value(v)) => {
+                        let repr = js_value_to_json(&ctx, v)
+                            .unwrap_or(serde_json::Value::Null);
+                        return Err(EvalError::ThrownValue { value: repr });
+                    }
+                    Err(CaughtError::Error(e)) => {
+                        return Err(EvalError::Engine(e.to_string()))
+                    }
+                };
+
+                // Thenable detection: an object whose `.then` is a
+                // function. Per Promises/A+ §1.1 that's a thenable.
+                let then_fn: Option<Function<'_>> = raw
+                    .as_object()
+                    .and_then(|o| o.get::<_, Value>("then").ok())
+                    .and_then(|v| v.into_function());
+
+                let Some(then_fn) = then_fn else {
+                    // Sync value — serialize and stash.
+                    let json = js_value_to_json(&ctx, raw)?;
+                    *slot.lock().expect("settle slot poisoned") =
+                        Some(Ok(json));
+                    return Ok(false);
+                };
+
+                // Register settle pair. Each callback captures one
+                // arg, converts it to JSON, and stashes it. We move a
+                // cloned `Arc` into each closure so they can outlive
+                // this `ctx.with` block (rquickjs holds the closures
+                // inside the Function until JS calls them).
+                let slot_ok = slot.clone();
+                let resolve = Function::new(
+                    ctx.clone(),
+                    move |args: Rest<Value>| {
+                        let json = match args.into_inner().into_iter().next()
+                        {
+                            Some(arg) => {
+                                let c = arg.ctx().clone();
+                                js_value_to_json(&c, arg)
+                                    .unwrap_or(serde_json::Value::Null)
+                            }
+                            None => serde_json::Value::Null,
+                        };
+                        if let Ok(mut g) = slot_ok.lock() {
+                            *g = Some(Ok(json));
+                        }
+                    },
+                )
+                .map_err(|e| {
+                    EvalError::Engine(format!("build resolve callback: {e}"))
+                })?;
+
+                let slot_err = slot.clone();
+                let reject = Function::new(
+                    ctx.clone(),
+                    move |args: Rest<Value>| {
+                        let json = match args.into_inner().into_iter().next()
+                        {
+                            Some(arg) => {
+                                let c = arg.ctx().clone();
+                                js_value_to_json(&c, arg)
+                                    .unwrap_or(serde_json::Value::Null)
+                            }
+                            None => serde_json::Value::Null,
+                        };
+                        if let Ok(mut g) = slot_err.lock() {
+                            *g = Some(Err(EvalError::ThrownValue {
+                                value: json,
+                            }));
+                        }
+                    },
+                )
+                .map_err(|e| {
+                    EvalError::Engine(format!("build reject callback: {e}"))
+                })?;
+
+                // promise.then(resolve, reject) — bind `this` to the
+                // promise so `then` sees its own internal slots.
+                then_fn
+                    .call::<_, ()>((This(raw.clone()), resolve, reject))
+                    .map_err(|e| {
+                        EvalError::Engine(format!("call .then: {e}"))
+                    })?;
+
+                Ok(true)
+            })?;
+
+        if needs_pump {
+            // Drive microtasks: the .then we registered runs here,
+            // settling the slot. Anything Preact / React queued
+            // before our await (re-renders, effects) also drains.
+            self.run_pending_jobs()?;
+        }
+
+        // Bind the take()'d value to a local so the MutexGuard from
+        // `.lock()` drops at the semicolon, not the end of the match.
+        let result = slot.lock().expect("settle slot poisoned").take();
+        match result {
+            Some(Ok(v)) => Ok(v),
+            Some(Err(e)) => Err(e),
+            // Thenable registered but never settled inside the
+            // microtask pump — could be a Promise waiting on a
+            // macrotask (a setTimeout we didn't advance). Return
+            // null rather than block.
+            None => Ok(serde_json::Value::Null),
+        }
+    }
+
     /// Drain and return the console buffer. Useful between calls to
     /// [`Self::advance_clock`] to observe what timer callbacks
     /// logged (or threw) since the last drain.
@@ -748,21 +892,7 @@ impl JsEngine {
         let value = if code.is_empty() {
             serde_json::Value::Null
         } else {
-            self.context
-                .with(|ctx| -> Result<serde_json::Value, EvalError> {
-                    match ctx.eval::<Value, _>(code).catch(&ctx) {
-                        Ok(v) => js_value_to_json(&ctx, v),
-                        Err(CaughtError::Exception(exc)) => Err(EvalError::Exception {
-                            message: exc.message().unwrap_or_default(),
-                            stack: exc.stack(),
-                        }),
-                        Err(CaughtError::Value(v)) => {
-                            let repr = js_value_to_json(&ctx, v).unwrap_or(serde_json::Value::Null);
-                            Err(EvalError::ThrownValue { value: repr })
-                        }
-                        Err(CaughtError::Error(e)) => Err(EvalError::Engine(e.to_string())),
-                    }
-                })?
+            self.eval_value_with_promise_await(code)?
         };
 
         // Drain pending fetches + microtasks before snapshotting the
@@ -923,22 +1053,7 @@ impl JsEngine {
             .expect("console buffer poisoned")
             .clear();
 
-        let value = self
-            .context
-            .with(|ctx| -> Result<serde_json::Value, EvalError> {
-                match ctx.eval::<Value, _>(code).catch(&ctx) {
-                    Ok(v) => js_value_to_json(&ctx, v),
-                    Err(CaughtError::Exception(exc)) => Err(EvalError::Exception {
-                        message: exc.message().unwrap_or_default(),
-                        stack: exc.stack(),
-                    }),
-                    Err(CaughtError::Value(v)) => {
-                        let repr = js_value_to_json(&ctx, v).unwrap_or(serde_json::Value::Null);
-                        Err(EvalError::ThrownValue { value: repr })
-                    }
-                    Err(CaughtError::Error(e)) => Err(EvalError::Engine(e.to_string())),
-                }
-            })?;
+        let value = self.eval_value_with_promise_await(code)?;
 
         // If the script queued any `fetch()` calls, drain them now so
         // `.then(...)` callbacks fire before we return. Side effects
@@ -2092,6 +2207,28 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     }
     if (typeof globalThis.sessionStorage === 'undefined') {
         globalThis.sessionStorage = makeStorage();
+    }
+
+    // heso.flush() — yield to the microtask queue. Lets user JS
+    // observe DOM mutations queued by earlier `dispatchEvent` calls
+    // (e.g. Preact re-renders).
+    //
+    //   await heso.flush();   // anything queued before this point runs
+    //
+    // Returning `Promise.resolve()` is enough because the engine's
+    // microtask pump runs FIFO and the Rust-side eval awaits the
+    // returned Promise via `.then(settle)` — that settle is queued
+    // *after* any microtask that ran while the user's `await` was
+    // suspended. Deeply-nested microtask chains drain in the same
+    // pump (`execute_pending_jobs_until_idle` loops until empty),
+    // so a single flush usually suffices.
+    if (typeof globalThis.heso !== 'object' || globalThis.heso === null) {
+        globalThis.heso = {};
+    }
+    if (typeof globalThis.heso.flush !== 'function') {
+        globalThis.heso.flush = function() {
+            return Promise.resolve();
+        };
     }
 })();
 "#;

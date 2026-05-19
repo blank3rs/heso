@@ -101,6 +101,21 @@ $ heso eval-dom https://example.com \
 → "<div><h1>Hijacked</h1><p>This domain is for use in documentation examples withou"
 ```
 
+**Top-level `await` + `heso.flush()` for framework re-renders:**
+```js
+// Pass this as the <js> arg to heso eval-dom. The IIFE returns a
+// Promise; heso awaits it via its microtask pump and serializes the
+// resolved value. `await heso.flush()` yields to whatever the
+// framework (Preact / React) queued for re-render.
+(async () => {
+    const input = document.querySelector('.new-todo');
+    input.value = 'buy milk';
+    input.dispatchEvent(new Event('keydown'));
+    await heso.flush();           // let the framework's render microtask run
+    return document.querySelector('.todo-list').innerHTML;
+})()
+```
+
 **Click a real link through the JS event model:**
 ```console
 $ heso find https://news.ycombinator.com --role link --name "more"
@@ -182,6 +197,7 @@ Not for: scraping data behind canvas, video, computed CSS layout, WebGL, or serv
 | `<script>`-on-load (SPA inline-script hydration), relative `<script src>` resolved against page URL | ✅ |
 | `fetch()` inside JS (shared `reqwest::Client`) | ✅ |
 | **Stateful `JsSession`** — one engine, one document, listeners persist across calls | ✅ |
+| **Top-level `await` + `heso.flush()`** — eval awaits returned Promises via microtask pump; user can yield to render scheduler | ✅ |
 | **Stateful replay** (`heso replay trace.json`) — anchor preventDefault, navigation tracking, `--seed N` | ✅ |
 | **Trace fingerprints** — keyless, algorithm-derived BLAKE3 Merkle chain | ✅ |
 | Seeded RNG (`--seed N`) — `Math.random`, `crypto.*` | ✅ |
@@ -195,7 +211,7 @@ Not for: scraping data behind canvas, video, computed CSS layout, WebGL, or serv
 | Content-hashed plats (BLAKE3) | ✅ |
 | Ed25519 signed receipts | ✅ |
 | **TodoMVC Preact renders end-to-end** through `heso eval-dom --js-fetch` | ✅ |
-| **565 workspace tests, 2 ignored** (TypeError-throw guards pending Ctx-bound merge with IDL paths) | ✅ |
+| **572 workspace tests, 2 ignored** (TypeError-throw guards pending Ctx-bound merge with IDL paths) | ✅ |
 | Recorded-network playback (cassettes) for byte-identical replay | 🚧 designed |
 | `MutationObserver` / `IntersectionObserver` / `ResizeObserver` (noop stubs) | 🚧 next |
 | SVG namespace tracking, full WHATWG URL mutation (`searchParams`), `history.pushState` → `popstate` | 🚧 next |
