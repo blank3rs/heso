@@ -1,0 +1,932 @@
+{
+  "actions": [
+    {
+      "attrs": {
+        "href": "https://github.com/tastejs/todomvc/archive/master.zip"
+      },
+      "name": "Download",
+      "ref": "@e0",
+      "role": "link",
+      "section": "/",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/tastejs/todomvc"
+      },
+      "name": "View on GitHub",
+      "ref": "@e1",
+      "role": "link",
+      "section": "/",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://medium.com/@tastejs"
+      },
+      "name": "Blog",
+      "ref": "@e2",
+      "role": "link",
+      "section": "/",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://browserbench.org/Speedometer3.0/",
+        "target": "_blank"
+      },
+      "name": "Speedometer",
+      "ref": "@e3",
+      "role": "link",
+      "section": "/introduction",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://twitter.com/tastejs"
+      },
+      "ref": "@e4",
+      "role": "link",
+      "section": "/introduction",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://twitter.com/share"
+      },
+      "ref": "@e5",
+      "role": "link",
+      "section": "/introduction",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/react/dist/"
+      },
+      "name": "React New",
+      "ref": "@e6",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/react-redux/dist"
+      },
+      "name": "React Redux New",
+      "ref": "@e7",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/vue/dist/"
+      },
+      "name": "Vue.js New",
+      "ref": "@e8",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/preact/dist/"
+      },
+      "name": "Preact New",
+      "ref": "@e9",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/backbone/dist/"
+      },
+      "name": "Backbone.js New",
+      "ref": "@e10",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/angular/dist/browser/"
+      },
+      "name": "Angular New",
+      "ref": "@e11",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/emberjs/todomvc/dist/"
+      },
+      "name": "Ember.js New",
+      "ref": "@e12",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/lit/dist/"
+      },
+      "name": "Lit New",
+      "ref": "@e13",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/knockoutjs/"
+      },
+      "name": "KnockoutJS",
+      "ref": "@e14",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/dojo/"
+      },
+      "name": "Dojo",
+      "ref": "@e15",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/knockback/"
+      },
+      "name": "Knockback.js",
+      "ref": "@e16",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/canjs/"
+      },
+      "name": "CanJS",
+      "ref": "@e17",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/polymer/index.html"
+      },
+      "name": "Polymer",
+      "ref": "@e18",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/mithril/"
+      },
+      "name": "Mithril",
+      "ref": "@e19",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/backbone_marionette/"
+      },
+      "name": "Marionette.js",
+      "ref": "@e20",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/svelte/dist/"
+      },
+      "name": "Svelte New",
+      "ref": "@e21",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/gwt/"
+      },
+      "name": "GWT",
+      "ref": "@e22",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/closure/"
+      },
+      "name": "Closure",
+      "ref": "@e23",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/elm/"
+      },
+      "name": "Elm",
+      "ref": "@e24",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/angular-dart/web/"
+      },
+      "name": "AngularDart",
+      "ref": "@e25",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/typescript-backbone/"
+      },
+      "name": "TypeScript + Backbone.js",
+      "ref": "@e26",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/typescript-angular/"
+      },
+      "name": "TypeScript + AngularJS",
+      "ref": "@e27",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/typescript-react/"
+      },
+      "name": "TypeScript + React",
+      "ref": "@e28",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/reagent/"
+      },
+      "name": "Reagent",
+      "ref": "@e29",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/binding-scala/"
+      },
+      "name": "Scala.js + Binding.scala",
+      "ref": "@e30",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/js_of_ocaml/"
+      },
+      "name": "js_of_ocaml",
+      "ref": "@e31",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/humble/"
+      },
+      "name": "Humble + GopherJS",
+      "ref": "@e32",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/backbone_require/"
+      },
+      "name": "Backbone.js + RequireJS",
+      "ref": "@e33",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/knockoutjs_require/"
+      },
+      "name": "KnockoutJS + RequireJS",
+      "ref": "@e34",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/angularjs_require/"
+      },
+      "name": "AngularJS + RequireJS",
+      "ref": "@e35",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/canjs_require/"
+      },
+      "name": "CanJS + RequireJS",
+      "ref": "@e36",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/lavaca_require/"
+      },
+      "name": "Lavaca + RequireJS",
+      "ref": "@e37",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/cujo/index.html"
+      },
+      "name": "cujoJS",
+      "ref": "@e38",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/somajs/"
+      },
+      "name": "soma.js",
+      "ref": "@e39",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/duel/www/"
+      },
+      "name": "DUEL",
+      "ref": "@e40",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/dijon/"
+      },
+      "name": "Dijon",
+      "ref": "@e41",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/enyo_backbone/"
+      },
+      "name": "Enyo + Backbone.js",
+      "ref": "@e42",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/exoskeleton/"
+      },
+      "name": "Exoskeleton",
+      "ref": "@e43",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/ractive/"
+      },
+      "name": "Ractive.js",
+      "ref": "@e44",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/aurelia/"
+      },
+      "name": "Aurelia",
+      "ref": "@e45",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/riotjs/"
+      },
+      "name": "Riot",
+      "ref": "@e46",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/jsblocks/"
+      },
+      "name": "JSBlocks",
+      "ref": "@e47",
+      "role": "link",
+      "section": "/examples",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/javascript-es5/dist/"
+      },
+      "name": "JavaScript ES5 New",
+      "ref": "@e48",
+      "role": "link",
+      "section": "/compare-these-to-a-non-framework-impleme",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/javascript-es6/dist/"
+      },
+      "name": "JavaScript ES6 New",
+      "ref": "@e49",
+      "role": "link",
+      "section": "/compare-these-to-a-non-framework-impleme",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/jquery/dist/"
+      },
+      "name": "jQuery New",
+      "ref": "@e50",
+      "role": "link",
+      "section": "/compare-these-to-a-non-framework-impleme",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/web-components/dist/"
+      },
+      "name": "Web Components New",
+      "ref": "@e51",
+      "role": "link",
+      "section": "/compare-these-to-a-non-framework-impleme",
+      "tag": "a"
+    },
+    {
+      "ref": "@e52",
+      "role": "link",
+      "section": "/compare-these-to-a-non-framework-impleme",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "id": "new-expander",
+        "type": "checkbox"
+      },
+      "ref": "@e53",
+      "role": "checkbox",
+      "section": "/new-in-1-4/new-additions",
+      "tag": "input"
+    },
+    {
+      "attrs": {
+        "href": "examples/angular/dist/browser/"
+      },
+      "name": "Angular 17",
+      "ref": "@e54",
+      "role": "link",
+      "section": "/new-in-1-4/new-additions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/lit/dist/"
+      },
+      "name": "Lit",
+      "ref": "@e55",
+      "role": "link",
+      "section": "/new-in-1-4/new-additions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/preact/dist/"
+      },
+      "name": "Preact",
+      "ref": "@e56",
+      "role": "link",
+      "section": "/new-in-1-4/new-additions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/react-redux/dist/"
+      },
+      "name": "React Redux",
+      "ref": "@e57",
+      "role": "link",
+      "section": "/new-in-1-4/new-additions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/svelte/dist/"
+      },
+      "name": "Svelte",
+      "ref": "@e58",
+      "role": "link",
+      "section": "/new-in-1-4/new-additions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/web-components/dist/"
+      },
+      "name": "Web Components",
+      "ref": "@e59",
+      "role": "link",
+      "section": "/new-in-1-4/new-additions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "id": "updated-expander",
+        "type": "checkbox"
+      },
+      "ref": "@e60",
+      "role": "checkbox",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "input"
+    },
+    {
+      "attrs": {
+        "href": "examples/backbone/dist/"
+      },
+      "name": "Backbone",
+      "ref": "@e61",
+      "role": "link",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/emberjs/todomvc/dist/"
+      },
+      "name": "Ember",
+      "ref": "@e62",
+      "role": "link",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/jquery/dist/"
+      },
+      "name": "jQuery",
+      "ref": "@e63",
+      "role": "link",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/react/dist/"
+      },
+      "name": "React",
+      "ref": "@e64",
+      "role": "link",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/vue/dist/"
+      },
+      "name": "Vue",
+      "ref": "@e65",
+      "role": "link",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/javascript-es5/"
+      },
+      "name": "JavaScript ES5",
+      "ref": "@e66",
+      "role": "link",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "examples/javascript-es6/"
+      },
+      "name": "JavaScript ES6",
+      "ref": "@e67",
+      "role": "link",
+      "section": "/new-in-1-4/updated-versions",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/tastejs/todomvc/wiki"
+      },
+      "name": "contribution guidelines",
+      "ref": "@e68",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/tastejs/todomvc-app-template"
+      },
+      "name": "template",
+      "ref": "@e69",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/tastejs/todomvc/blob/master/app-spec.md"
+      },
+      "name": "app specification",
+      "ref": "@e70",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/tastejs/todomvc/wiki"
+      },
+      "name": "Submit Pull Request »",
+      "ref": "@e71",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/addyosmani"
+      },
+      "name": "Addy",
+      "ref": "@e72",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/sindresorhus"
+      },
+      "name": "Sindre",
+      "ref": "@e73",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/passy"
+      },
+      "name": "Pascal",
+      "ref": "@e74",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/stephenplusplus"
+      },
+      "name": "Stephen",
+      "ref": "@e75",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/colineberhardt"
+      },
+      "name": "Colin",
+      "ref": "@e76",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/arthurvr"
+      },
+      "name": "Arthur",
+      "ref": "@e77",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/samccone"
+      },
+      "name": "Sam",
+      "ref": "@e78",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    },
+    {
+      "attrs": {
+        "href": "https://github.com/FadySamirSadek"
+      },
+      "name": "Fady",
+      "ref": "@e79",
+      "role": "link",
+      "section": "/getting-involved",
+      "tag": "a"
+    }
+  ],
+  "description": "Helping you select an MV* framework - Todo apps for Backbone.js, Ember.js, AngularJS and many more",
+  "metadata": {
+    "icons": [
+      "site-assets/favicon.ico"
+    ],
+    "lang": "en",
+    "meta": {
+      "description": "Helping you select an MV* framework - Todo apps for Backbone.js, Ember.js, AngularJS and many more",
+      "viewport": "width=device-width,initial-scale=1"
+    },
+    "opengraph": {
+      "description": "Helping you select an MV* framework - Todo apps for Backbone.js, Ember.js, AngularJS and many more",
+      "image": "https://raw.github.com/tastejs/todomvc/gh-pages/site-assets/screenshot.png",
+      "title": "TodoMVC",
+      "url": "http://todomvc.com"
+    },
+    "twitter": {
+      "card": "summary",
+      "description": "Helping you select an MV* framework - Todo apps for Backbone.js, Ember.js, AngularJS and many more",
+      "image": "https://raw.githubusercontent.com/tastejs/todomvc/gh-pages/site-assets/screenshot.png",
+      "site": "@TasteJS",
+      "title": "TodoMVC"
+    }
+  },
+  "plat_hash": "5e20aa5ed534497866b02a9b0b1b900f3144e9b68bc537e9efabf06294b39891",
+  "title": "TodoMVC",
+  "tree": {
+    "description": "Helping you select an MV* framework - Todo apps for Backbone.js, Ember.js, AngularJS and many more",
+    "root": {
+      "byte_count": 35,
+      "child_count": 6,
+      "children": [
+        {
+          "byte_count": 644,
+          "child_count": 0,
+          "children": [],
+          "heading": "Introduction",
+          "intro": "Developers have a number of choices today when it comes to selecting a JavaScript framework or UI library for building scalable web apps. React / Next.js, Vue / Nuxt, Angular…the list of solutions continues to grow, but just how do you decide on which to use in a sea of so many options? To help you understand the options, we created TodoMVC - a project which has offered the same Todo applications implemented in popular JavaScript frameworks for the last decade. TodoMVC is useful for comparing syntax and solutions, is officially used in cross-browser benchmarks (e.g. Speedometer ) and aims to stay up to date as trends change over time.",
+          "level": 2,
+          "path": "/introduction",
+          "slug": "introduction",
+          "summary": "Introduction — Developers have a number of choices today when it comes to selecting a JavaScript framework or UI li…"
+        },
+        {
+          "byte_count": 758,
+          "child_count": 0,
+          "children": [],
+          "heading": "Examples",
+          "intro": "JavaScript Compile-to-JS Labs These are examples written in pure JavaScript. React New React Redux New Vue.js New Preact New Backbone.js New Angular New Ember.js New Lit New KnockoutJS Dojo Knockback.js CanJS Polymer Mithril Marionette.js These are applications written in programming languages that compile to JavaScript. Svelte New GWT Closure Elm AngularDart TypeScript + Backbone.js TypeScript + AngularJS TypeScript + React Reagent Scala.js + Binding.scala js_of_ocaml Humble + GopherJS These are examples written in JavaScript that we are still evaluating. Backbone.js + RequireJS KnockoutJS + RequireJS AngularJS + RequireJS CanJS + RequireJS Lavaca + RequireJS cujoJS soma.js DUEL Dijon Enyo + Backbone.js Exoskeleton Ractive.js Aurelia Riot JSBlocks",
+          "level": 2,
+          "path": "/examples",
+          "slug": "examples",
+          "summary": "Examples — JavaScript Compile-to-JS Labs These are examples written in pure JavaScript. React New React Redux N…"
+        },
+        {
+          "byte_count": 92,
+          "child_count": 0,
+          "children": [],
+          "heading": "Compare these to a non-framework implementation",
+          "intro": "JavaScript ES5 New JavaScript ES6 New jQuery New Web Components New New = New or updated app",
+          "level": 2,
+          "path": "/compare-these-to-a-non-framework-impleme",
+          "slug": "compare-these-to-a-non-framework-impleme",
+          "summary": "Compare these to a non-framework implementation — JavaScript ES5 New JavaScript ES6 New jQuery New Web Components New New = New or updated app"
+        },
+        {
+          "byte_count": 0,
+          "child_count": 2,
+          "children": [
+            {
+              "byte_count": 175,
+              "child_count": 0,
+              "children": [],
+              "heading": "New Additions ✨",
+              "intro": "To stay representative of frameworks & language features used on the web, we added a few new example apps. Examples ▼ Angular 17 Lit Preact React Redux Svelte Web Components",
+              "level": 4,
+              "path": "/new-in-1-4/new-additions",
+              "slug": "new-additions",
+              "summary": "New Additions ✨ — To stay representative of frameworks & language features used on the web, we added a few new example…"
+            },
+            {
+              "byte_count": 187,
+              "child_count": 0,
+              "children": [],
+              "heading": "Updated Versions 🧹",
+              "intro": "Some updates to examples that were out-of-date, but still widely used on the web. Examples ▼ Backbone Ember jQuery React Vue JavaScript ES5 JavaScript ES6 Misc. updates to the homepage.",
+              "level": 4,
+              "path": "/new-in-1-4/updated-versions",
+              "slug": "updated-versions",
+              "summary": "Updated Versions 🧹 — Some updates to examples that were out-of-date, but still widely used on the web. Examples ▼ Backbon…"
+            }
+          ],
+          "heading": "New in 1.4",
+          "intro": "",
+          "level": 2,
+          "path": "/new-in-1-4",
+          "slug": "new-in-1-4",
+          "summary": "New in 1.4"
+        },
+        {
+          "byte_count": 606,
+          "child_count": 0,
+          "children": [],
+          "heading": "Selecting a Framework",
+          "intro": "Once you've downloaded the latest release and played around with the apps, you'll want to decide on a specific framework to try out. Study the syntax required for defining models, views and (where applicable) controllers and classes in the frameworks you're interested in and try your hand at editing the code to see how it feels using it first-hand. Please ensure that if you're happy with this, you do spend more time investigating the framework (including reading the official docs, the source and its complete feature list). There's often a lot more to a framework than what we present in our examples.",
+          "level": 2,
+          "path": "/selecting-a-framework",
+          "slug": "selecting-a-framework",
+          "summary": "Selecting a Framework — Once you've downloaded the latest release and played around with the apps, you'll want to decide on …"
+        },
+        {
+          "byte_count": 423,
+          "child_count": 0,
+          "children": [],
+          "heading": "Getting Involved",
+          "intro": "Is there a bug we haven't fixed or an MV* framework you feel would benefit from being included in TodoMVC? If so, feel free to fork the repo, read our contribution guidelines , and submit a pull request — we'll be happy to review it for inclusion. Make sure you use the template as a starting point and read the app specification . Submit Pull Request » Brought to you by Addy Sindre Pascal Stephen Colin Arthur Sam Fady",
+          "level": 2,
+          "path": "/getting-involved",
+          "slug": "getting-involved",
+          "summary": "Getting Involved — Is there a bug we haven't fixed or an MV* framework you feel would benefit from being included in To…"
+        }
+      ],
+      "heading": null,
+      "intro": "Helping you select an MV* framework",
+      "level": 0,
+      "path": "/",
+      "slug": "",
+      "summary": "Helping you select an MV* framework"
+    },
+    "title": "TodoMVC",
+    "url": "https://todomvc.com/"
+  },
+  "url": "https://todomvc.com/"
+}

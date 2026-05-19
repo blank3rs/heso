@@ -692,3 +692,71 @@ fn navigate_updates_base_url_so_relative_src_resolves_against_new_page() {
     sess.navigate(html_b, url_b.clone()).unwrap();
     assert_eq!(sess.engine().base_url().as_ref(), Some(&url_b));
 }
+
+// =====================================================================
+// window.location — readable from JS, reflects engine.set_base_url
+// =====================================================================
+
+#[test]
+fn location_global_defaults_to_about_blank_before_navigation() {
+    // A bare engine (no page loaded) still exposes `location` so
+    // page bootstraps that read `location.href` at module top-level
+    // don't ReferenceError.
+    let engine = JsEngine::new().unwrap();
+    let out = engine.eval("location.href").unwrap();
+    assert_eq!(out.value, serde_json::json!("about:blank"));
+}
+
+#[test]
+fn location_global_reflects_current_page_url() {
+    let html = "<!doctype html><html><body></body></html>";
+    let target = Url::parse("https://example.com/foo/bar?x=1#frag").unwrap();
+    let (sess, _) = JsSession::open(html, target).unwrap();
+    let out = sess.eval(
+        "JSON.stringify({h: location.href, p: location.pathname, s: location.search, hash: location.hash, host: location.host, proto: location.protocol, origin: location.origin})"
+    ).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["h"], "https://example.com/foo/bar?x=1#frag");
+    assert_eq!(parsed["p"], "/foo/bar");
+    assert_eq!(parsed["s"], "?x=1");
+    assert_eq!(parsed["hash"], "#frag");
+    assert_eq!(parsed["host"], "example.com");
+    assert_eq!(parsed["proto"], "https:");
+    assert_eq!(parsed["origin"], "https://example.com");
+}
+
+#[test]
+fn window_global_aliases_globalthis_so_window_location_resolves() {
+    // Preact / React-bootstrap pattern: read `window.location.href`.
+    let html = "<!doctype html><html><body></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("window.location.href === location.href && window === globalThis").unwrap();
+    assert_eq!(out.value, serde_json::json!(true));
+}
+
+#[test]
+fn navigate_updates_location_global() {
+    let html_a = "<!doctype html><html><body></body></html>";
+    let html_b = "<!doctype html><html><body></body></html>";
+    let url_a = Url::parse("https://a.example.com/one").unwrap();
+    let url_b = Url::parse("https://b.example.com/two?q=1").unwrap();
+    let (mut sess, _) = JsSession::open(html_a, url_a).unwrap();
+    let before = sess.eval("location.href").unwrap();
+    assert_eq!(before.value, serde_json::json!("https://a.example.com/one"));
+    sess.navigate(html_b, url_b).unwrap();
+    let after = sess.eval("location.href").unwrap();
+    assert_eq!(after.value, serde_json::json!("https://b.example.com/two?q=1"));
+}
+
+#[test]
+fn location_assign_replace_reload_are_callable_noops() {
+    // The mutation surface is stubbed — calling shouldn't throw.
+    // Script-driven navigation is the Phase 2 stubs PR.
+    let html = "<!doctype html><html><body></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval(
+        "location.assign('/foo'); location.replace('/bar'); location.reload(); location.toString()"
+    ).unwrap();
+    assert_eq!(out.value, serde_json::json!("https://example.com/"));
+}

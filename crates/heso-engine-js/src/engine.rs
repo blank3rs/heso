@@ -319,6 +319,12 @@ impl JsEngine {
         // and stay on the QuickJS built-in. See [`install_date`].
         install_date(&context, timers.clone())?;
 
+        // Install `globalThis.location` (and a `globalThis.window`
+        // self-reference so `window.location` resolves). Starts as
+        // `about:blank`; [`Self::set_base_url`] rewrites the fields
+        // when the host navigates the engine to a real page.
+        install_location(&context, None)?;
+
         // Optional: install the `fetch` global.
         let fetch_state = if let Some(mode) = fetch_mode {
             #[allow(clippy::arc_with_non_send_sync)]
@@ -349,7 +355,13 @@ impl JsEngine {
     /// path in [`crate::scripts::fetch_script_source`]. With it set,
     /// the pump resolves via [`Url::join`] before issuing the fetch.
     pub fn set_base_url(&self, url: Option<Url>) {
-        *self.base_url.lock().expect("base_url poisoned") = url;
+        *self.base_url.lock().expect("base_url poisoned") = url.clone();
+        // Reflect the URL into `globalThis.location` so page JS that
+        // reads `window.location.href` / `pathname` / etc. sees the
+        // new page. Swallow errors here — install_location is
+        // best-effort cosmetic and a failure shouldn't poison
+        // navigation.
+        let _ = install_location(&self.context, url.as_ref());
     }
 
     /// Current page URL, if any. See [`Self::set_base_url`].
@@ -1265,6 +1277,100 @@ fn install_date(
             Ok(())
         })
         .map_err(|e| EvalError::Engine(format!("install date: {e}")))?;
+    Ok(())
+}
+
+/// Install (or re-install) `globalThis.location` and the
+/// `globalThis.window` self-reference so page scripts that read
+/// `location.href` / `window.location.pathname` / `window.location`
+/// see the engine's current page URL.
+///
+/// We re-write the whole `location` object on each call (cheap —
+/// it's a tiny POJO) instead of reading via a getter, so plain
+/// property access stays synchronous and side-effect-free. The host
+/// calls this from [`JsEngine::set_base_url`] on every navigation.
+///
+/// `None` resolves to `about:blank`. Mutation surface (`assign`,
+/// `replace`, `reload`, `toString`) is installed but is a no-op for
+/// now — heso does not yet implement script-driven navigation
+/// (that's part of the Phase 2 stubs PR alongside `history.pushState`).
+fn install_location(context: &Context, url: Option<&Url>) -> Result<(), EvalError> {
+    let (href, protocol, host, hostname, port, pathname, search, hash, origin) = match url {
+        Some(u) => {
+            let port = u.port().map(|p| p.to_string()).unwrap_or_default();
+            let host = match u.port() {
+                Some(p) => format!("{}:{}", u.host_str().unwrap_or(""), p),
+                None => u.host_str().unwrap_or("").to_string(),
+            };
+            let origin = match (u.scheme(), u.host_str()) {
+                (s, Some(h)) if s == "http" || s == "https" => match u.port() {
+                    Some(p) => format!("{}://{}:{}", s, h, p),
+                    None => format!("{}://{}", s, h),
+                },
+                _ => "null".to_string(),
+            };
+            (
+                u.as_str().to_string(),
+                format!("{}:", u.scheme()),
+                host,
+                u.host_str().unwrap_or("").to_string(),
+                port,
+                u.path().to_string(),
+                u.query().map(|q| format!("?{}", q)).unwrap_or_default(),
+                u.fragment().map(|f| format!("#{}", f)).unwrap_or_default(),
+                origin,
+            )
+        }
+        None => (
+            "about:blank".to_string(),
+            "about:".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "blank".to_string(),
+            String::new(),
+            String::new(),
+            "null".to_string(),
+        ),
+    };
+
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            let globals = ctx.globals();
+            let loc = Object::new(ctx.clone())?;
+            loc.set("href", href.clone())?;
+            loc.set("protocol", protocol)?;
+            loc.set("host", host)?;
+            loc.set("hostname", hostname)?;
+            loc.set("port", port)?;
+            loc.set("pathname", pathname)?;
+            loc.set("search", search)?;
+            loc.set("hash", hash)?;
+            loc.set("origin", origin)?;
+            // Best-effort stubs. Real navigation isn't wired yet —
+            // see the Phase 2 stubs PR. `toString()` returns `href`
+            // per the WHATWG `Location` interface.
+            let href_for_to_string = href.clone();
+            loc.set(
+                "toString",
+                Func::from(move || -> String { href_for_to_string.clone() }),
+            )?;
+            loc.set("assign", Func::from(|_: String| {}))?;
+            loc.set("replace", Func::from(|_: String| {}))?;
+            loc.set("reload", Func::from(|| {}))?;
+            globals.set("location", loc)?;
+
+            // `window` aliases `globalThis` so `window.location`,
+            // `window.document`, `window.setTimeout`, etc. all
+            // resolve via the same prototype chain page scripts
+            // expect. Install once; subsequent calls re-bind which
+            // is a no-op.
+            ctx.eval::<(), _>(
+                "if (typeof globalThis.window === 'undefined') { globalThis.window = globalThis; }",
+            )?;
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install location: {e}")))?;
     Ok(())
 }
 
