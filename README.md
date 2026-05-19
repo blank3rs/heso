@@ -4,8 +4,8 @@
 
 **A browser for agents, not for humans.**
 
-One 9 MB Rust binary. No Chromium. No Node. No `npm install playwright`.
-Fetches, parses, runs JS, clicks, fills, submits — and hands back content-hashed JSON you can sign, diff, and replay.
+One ~7.8 MB Rust binary. No Chromium. No Node. No `npm install playwright`.
+Fetches, parses, runs JS, holds a stateful page session across clicks, hands back content-hashed JSON you can sign, diff, and **replay byte-for-byte**.
 
 </div>
 
@@ -47,7 +47,7 @@ $ heso eval-dom https://news.ycombinator.com \
 }
 ```
 
-Five real story titles, off the live wire, fetched + parsed + JS-evaluated, in **under 400 ms**, from a **9.1 MB single binary**.
+Five real story titles, off the live wire, fetched + parsed + JS-evaluated, in **under 400 ms**, from a **~7.8 MB single binary**.
 
 No Chromium. No Node. No browser download. Just `cargo build && ./heso`.
 
@@ -55,7 +55,7 @@ No Chromium. No Node. No browser download. Just `cargo build && ./heso`.
 
 |  | heso | Playwright + Chromium |
 |---|---|---|
-| Install size | **9.1 MB** | ~240 MB + Node + browser bundle |
+| Install size | **~7.8 MB** | ~240 MB + Node + browser bundle |
 | Cold start | **40 ms** | 1–2 seconds |
 | Idle RAM | tiny | 100+ MB per browser |
 | Deploy unit | one static binary | runtime + browser + driver |
@@ -130,6 +130,21 @@ heso cat  https://stripe.com /pricing/business
 
 The page is a tree of heading-defined sections. Navigate it like a directory.
 
+**Stateful replay — every action keyed, every page recoverable:**
+```console
+$ heso action-hash https://example.com '[{"verb":"open","url":"https://example.com/"},{"verb":"click","ref":"@e0"}]' > trace.json
+$ heso replay trace.json
+{
+  "algorithm": "heso-trace-fp/v1",
+  "trace_id": "632b9a3c…0ef3b2",
+  "fingerprint_valid": true,
+  "ok": true,
+  "steps": [ … ]
+}
+```
+
+The `trace_id` is a **BLAKE3 Merkle chain** over the URL + canonical actions. Anyone running the same trace anywhere gets the same hash — no keys, no central server, no central clock. Tampering breaks it. Replay carries one `JsSession` across every step: DOM mutations persist, `addEventListener` handlers fire, `setTimeout` chains progress through a virtual clock, `e.preventDefault()` on `<a href>` clicks stops navigation just like a real SPA router.
+
 **Drop-in for any agent framework:**
 ```sh
 heso serve     # JSON-RPC 2.0 over stdin/stdout, stateful page sessions
@@ -154,18 +169,22 @@ Not for: scraping data behind canvas, video, computed CSS layout, WebGL, or serv
 | HTTP/HTTPS, cookies, redirects | ✅ |
 | HTML parse (html5ever) | ✅ |
 | Sandboxed JS (QuickJS) | ✅ |
-| DOM read + mutate | ✅ |
-| Events, timers, `AbortController` | ✅ |
-| `click` / `fill` / `submit` wired through `dispatchEvent` | ✅ |
-| Seeded RNG (`--seed N`) | ✅ |
+| DOM read + mutate, `createElement` | ✅ |
+| Events with W3C capture/bubble walk, timers, `AbortController` | ✅ |
+| `click` / `fill` / `submit` through `dispatchEvent` (returns `defaultPrevented`) | ✅ |
+| `<script>`-on-load (SPA inline-script hydration) | ✅ |
+| `fetch()` inside JS (shared `reqwest::Client`) | ✅ |
+| **Stateful `JsSession`** — one engine, one document, listeners persist across calls | ✅ |
+| **Stateful replay** (`heso replay trace.json`) — anchor preventDefault, navigation tracking, `--seed N` | ✅ |
+| **Trace fingerprints** — keyless, algorithm-derived BLAKE3 Merkle chain | ✅ |
+| Seeded RNG (`--seed N`) — `Math.random`, `crypto.*` | ✅ |
 | Content-hashed plats (BLAKE3) | ✅ |
 | Ed25519 signed receipts | ✅ |
-| **291 lib tests passing** | ✅ |
-| `<script>`-on-load (SPA hydration) | 🚧 next |
-| `Date.now` seeding | 🚧 next |
-| `fetch()` inside JS | 🚧 weeks |
-| Sessions + listener persistence | 🚧 designed |
-| React / Vue compat harness | 📅 month 3 |
+| **464 workspace tests, 0 ignored** (including 31 SPA-pattern integration tests) | ✅ |
+| `Date.now` seeding / virtual `new Date()` | 🚧 next |
+| Recorded-network playback (cassettes) for byte-identical replay | 🚧 designed |
+| `MutationObserver`, `requestAnimationFrame`, layout APIs | 🚧 weeks |
+| React / Vue compat harness — live bundle hydration | 📅 month 3 |
 
 Honest about scope. Honest about gaps. No vapor.
 
