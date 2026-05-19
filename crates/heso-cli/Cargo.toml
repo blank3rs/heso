@@ -23,6 +23,12 @@ heso-trace-exec = { path = "../heso-trace-exec" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "io-std", "sync", "fs"] }
+# Global allocator: mimalloc beats Windows' UCRT allocator by
+# 20–50% on alloc-heavy workloads (reqwest body buffers, scraper
+# tree, serde_json, canonical-JSON writes) and has near-zero init
+# cost. For a one-shot CLI on Windows this is one of the largest
+# cold-start wins per line of code.
+mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

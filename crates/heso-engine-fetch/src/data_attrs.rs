@@ -48,7 +48,7 @@
 
 use std::collections::BTreeMap;
 
-use scraper::{Html, Node};
+use scraper::Html;
 
 /// One occurrence of a recognized `data-*` JSON attribute.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,13 +68,13 @@ pub struct DataAttrValue {
 pub fn extract(doc: &Html) -> BTreeMap<String, Vec<DataAttrValue>> {
     let mut out: BTreeMap<String, Vec<DataAttrValue>> = BTreeMap::new();
 
-    // Walk the underlying `ego_tree` directly rather than parsing a
-    // `*` selector and running selector-matching on every node — both
-    // the parse and the per-node selector match are pure overhead for
-    // a universal walk. The iteration order is the same (document
-    // order), and we still hit every `Node::Element`.
+    // Walk the underlying ego_tree directly — bypasses parsing a `*`
+    // selector and running selector matching on every node, which is
+    // pure overhead for a universal walk.
     for node in doc.tree.values() {
-        let Node::Element(elem) = node else { continue };
+        let scraper::Node::Element(elem) = node else {
+            continue;
+        };
         let mut tag: Option<&str> = None;
         for (attr_name, attr_value) in elem.attrs() {
             if !attr_name.starts_with("data-") {
@@ -84,6 +84,17 @@ pub fn extract(doc: &Html) -> BTreeMap<String, Vec<DataAttrValue>> {
             if trimmed.is_empty() {
                 continue;
             }
+            // Cheap byte pre-filter: a meaningful payload must be a
+            // JSON object or array, i.e. start with `{` or `[`. Real
+            // pages (GitHub especially) cover every element with
+            // `data-id="42"`, `data-toggle="modal"`, etc. — none of
+            // them parse as JSON objects/arrays, but the unfiltered
+            // path calls `serde_json::from_str` on every one.
+            // Rejecting them by first non-whitespace char is ~free.
+            let first = trimmed.as_bytes().first().copied();
+            if !matches!(first, Some(b'{') | Some(b'[')) {
+                continue;
+            }
             let parsed: serde_json::Value = match serde_json::from_str(trimmed) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -91,9 +102,6 @@ pub fn extract(doc: &Html) -> BTreeMap<String, Vec<DataAttrValue>> {
             if !is_meaningful_payload(&parsed) {
                 continue;
             }
-            // Lazy: only fetch the tag name when we know we'll keep
-            // the attr. Skips a `to_owned` per element on pages full
-            // of nodes with no `data-*` attrs.
             let tag_str = *tag.get_or_insert_with(|| elem.name());
             out.entry(attr_name.to_owned())
                 .or_default()

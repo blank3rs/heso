@@ -83,6 +83,14 @@
 
 mod serve;
 
+// Replace the system allocator with mimalloc. Windows' UCRT
+// allocator is the weakest standard allocator of any major platform;
+// mimalloc has near-zero init cost and outperforms it on every
+// alloc-heavy path heso runs (reqwest body buffers, scraper tree,
+// serde_json, canonical-JSON writes). One line, no ergonomic cost.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;

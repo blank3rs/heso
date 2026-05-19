@@ -48,19 +48,11 @@ base64 = { version = "0.22", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
-strip = "symbols"
-
-# Shipping profile. Use for the binary that lands in releases:
-# `cargo build --profile dist`. Inherits release defaults, then turns on
-# fat LTO + panic = abort, which together shave roughly 15–25% off the
-# stripped binary. `panic = "abort"` is safe here — every crate sets
-# `unsafe_code = "forbid"` and no code uses `catch_unwind`, so we have
-# nothing to unwind for. CI/tests keep using the default `release`/`dev`
-# profiles so this never slows iteration.
-[profile.dist]
-inherits = "release"
+# Fat LTO + `panic = "abort"` shave ~15–25% off the stripped binary
+# combined. Safe here because every crate sets
+# `unsafe_code = "forbid"` and nothing in the workspace uses
+# `catch_unwind` — there is no unwinding to preserve. The trade is
+# slower link, which we accept for the binary-size win.
 lto = "fat"
 panic = "abort"
 codegen-units = 1
