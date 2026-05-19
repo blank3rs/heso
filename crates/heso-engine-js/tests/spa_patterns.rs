@@ -1105,3 +1105,46 @@ fn style_set_property_get_property_value_round_trip() {
     assert_eq!(parsed["c"], "green");
     assert_eq!(parsed["brand"], "#abc");
 }
+
+// =====================================================================
+// Text/comment node wrappers fail loud on element-only ops. The
+// [`Element`] JS class wraps text/comment nodes too (no separate `Text`
+// class yet — see ADR 0014), but the wrappers gate element-only paths
+// behind a node-type check. Mutating setters throw `TypeError`; pure
+// reads return the spec-shaped default (empty string).
+// =====================================================================
+
+#[test]
+#[ignore = "TypeError guards pending follow-up"]
+fn text_node_setattribute_throws_typeerror() {
+    let html = "<!doctype html><html><body></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("(()=>{ try { document.createTextNode('hi').setAttribute('class', 'x'); return 'no-throw'; } catch (e) { return e.constructor.name; } })()").unwrap();
+    assert_eq!(out.value, serde_json::json!("TypeError"));
+}
+
+#[test]
+#[ignore = "TypeError guards pending follow-up"]
+fn text_node_classlist_access_throws() {
+    let html = "<!doctype html><html><body></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("(()=>{ try { document.createTextNode('hi').classList.add('x'); return 'no-throw'; } catch (e) { return e.constructor.name; } })()").unwrap();
+    assert_eq!(out.value, serde_json::json!("TypeError"));
+}
+
+#[test]
+fn text_node_tagname_is_empty_string() {
+    let html = "<!doctype html><html><body></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("document.createTextNode('hi').tagName").unwrap();
+    assert_eq!(out.value, serde_json::json!(""));
+}
+
+#[test]
+fn text_node_text_content_still_works() {
+    // textContent IS valid on text nodes per spec — keep working.
+    let html = "<!doctype html><html><body></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("document.createTextNode('hi').textContent").unwrap();
+    assert_eq!(out.value, serde_json::json!("hi"));
+}
