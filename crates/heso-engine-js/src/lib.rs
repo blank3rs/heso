@@ -88,6 +88,7 @@ pub mod dom;
 pub mod engine;
 pub mod events;
 pub mod fetch;
+pub(crate) mod form_submit;
 pub mod history;
 pub mod rng;
 pub mod scripts;

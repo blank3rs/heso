@@ -1,0 +1,707 @@
+//! Integration tests for the PR-1 form-submit surface:
+//! `JsSession::submit` actually issues HTTP requests per WHATWG HTML
+//! §4.10.22 — the bug `AGENT_FINDINGS.md` filed as the single biggest
+//! gap for write-shaped agent workloads.
+//!
+//! These tests use `wiremock::MockServer` for localhost HTTP exchanges
+//! so the workspace `cargo test` stays hermetic. Each test:
+//! 1. Stands up a mock server with the route(s) the form should hit.
+//! 2. Builds a `JsEngine` with `FetchMode::Live` pointed at the same
+//!    `reqwest::Client` the workspace uses (so the existing fetch
+//!    integration tests can serve as a sanity model).
+//! 3. Opens a `JsSession` on hand-written HTML and calls
+//!    `session.submit("#f")`.
+//! 4. Asserts both the JSON outcome from `submit` AND what the mock
+//!    server received (method, content-type, body content).
+//!
+//! The "live" variant against `httpbin.org/post` lives in
+//! `form_submit_live.rs` (gated by `#[ignore]` because the workspace
+//! test run shouldn't hit the public internet).
+
+use std::sync::Arc;
+
+use heso_engine_js::{JsEngine, JsSession, ScriptFetchPolicy};
+use url::Url;
+use wiremock::matchers::{header, method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Build a fresh `reqwest::Client`. Same shape as
+/// `fetch_integration.rs::shared_client`.
+fn shared_client() -> Arc<reqwest::Client> {
+    Arc::new(
+        reqwest::Client::builder()
+            .user_agent("heso-engine-js-tests/0.0.1")
+            .redirect(reqwest::redirect::Policy::limited(20))
+            .build()
+            .expect("client builds"),
+    )
+}
+
+/// Build a JS engine in `FetchMode::Live` with the current tokio
+/// handle. Opens a `JsSession` on `html` at `url`.
+fn open_session(html: &str, url: Url) -> JsSession {
+    let client = shared_client();
+    let rt = tokio::runtime::Handle::current();
+    let engine = JsEngine::new_with_fetch(client, rt).expect("engine builds");
+    let (sess, _outcome) =
+        JsSession::open_on_engine(engine, html, url, ScriptFetchPolicy::default())
+            .expect("session opens");
+    sess
+}
+
+// =====================================================================
+// urlencoded POST round-trip
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_post_urlencoded_sends_correct_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .and(header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<!doctype html><html><body><p id=\"r\">ok</p></body></html>",
+        ))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="custname" value="Jane Doe">
+            <input type="text" name="comments" value="hello &amp; world">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(outcome.value["method"], serde_json::json!("POST"));
+    assert_eq!(outcome.value["responseStatus"], serde_json::json!(200));
+
+    // Inspect the request the mock server received.
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1, "expected exactly one request");
+    let req = &reqs[0];
+    let body = String::from_utf8_lossy(&req.body).into_owned();
+    // The HTML entity decodes to `hello & world`; the urlencoded
+    // serialization should encode the space as `+` and the `&` as `%26`.
+    assert!(
+        body.contains("custname=Jane+Doe"),
+        "body missing custname: {body}"
+    );
+    assert!(
+        body.contains("comments=hello+%26+world"),
+        "body missing comments: {body}"
+    );
+
+    // The session URL updates to the response URL.
+    assert_eq!(sess.url().as_str(), format!("{}/echo", server.uri()));
+}
+
+// =====================================================================
+// GET method serializes to query string
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_get_serializes_entries_into_query_string() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/search", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="GET" action="{action_url}">
+            <input type="search" name="q" value="cats and dogs">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(outcome.value["method"], serde_json::json!("GET"));
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let req = &reqs[0];
+    // The mock server records the request URL post-redirect; the
+    // path component carries the query.
+    let url = req.url.to_string();
+    assert!(url.contains("/search?q=cats+and+dogs"), "got URL: {url}");
+    // GET requests must NOT have a body.
+    assert!(
+        req.body.is_empty(),
+        "GET request must have empty body, got {} bytes",
+        req.body.len()
+    );
+}
+
+// =====================================================================
+// GET with existing query — submission replaces it
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_get_replaces_existing_query_on_action() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/q"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    // action URL carries `?stale=1`; spec says the form data REPLACES
+    // any existing query when submitting GET.
+    let action_url = format!("{}/q?stale=1", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="get" action="{action_url}">
+            <input type="text" name="fresh" value="yes">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let url = reqs[0].url.to_string();
+    assert!(url.contains("/q?fresh=yes"), "got URL: {url}");
+    assert!(!url.contains("stale"), "stale=1 should be gone: {url}");
+}
+
+// =====================================================================
+// multipart POST round-trip
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_post_multipart_sends_correct_parts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/upload", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}" enctype="multipart/form-data">
+            <input type="text" name="title" value="my doc">
+            <input type="text" name="body" value="some body text">
+            <button type="submit">Upload</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["enctype"],
+        serde_json::json!("multipart/form-data")
+    );
+
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let req = &reqs[0];
+    // Content-Type should be multipart/form-data with a boundary
+    // chosen by reqwest. We check the prefix and that the boundary
+    // appears in the body.
+    let ct = req
+        .headers
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or(""))
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("multipart/form-data; boundary="),
+        "expected multipart content-type, got: {ct}"
+    );
+    let body = String::from_utf8_lossy(&req.body).into_owned();
+    assert!(
+        body.contains(r#"Content-Disposition: form-data; name="title""#),
+        "missing title part: {body}"
+    );
+    assert!(body.contains("my doc"), "missing title value: {body}");
+    assert!(
+        body.contains(r#"Content-Disposition: form-data; name="body""#),
+        "missing body part: {body}"
+    );
+    assert!(
+        body.contains("some body text"),
+        "missing body value: {body}"
+    );
+}
+
+// =====================================================================
+// text/plain enctype
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_post_text_plain_uses_crlf_pairs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/text"))
+        .and(header("content-type", "text/plain"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/text", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}" enctype="text/plain">
+            <input type="text" name="a" value="1">
+            <input type="text" name="b" value="hello world">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    // text/plain serialization: each pair `name=value\r\n` with
+    // no escaping. Spaces stay as spaces.
+    assert_eq!(body, "a=1\r\nb=hello world\r\n");
+}
+
+// =====================================================================
+// preventDefault on the submit event suppresses the request
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_preventdefault_on_form_suppresses_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="x" value="1">
+            <button type="submit">Go</button>
+        </form>
+        <script>
+          document.querySelector('#f').addEventListener('submit', (e) => {{
+            e.preventDefault();
+          }});
+        </script>
+        </body></html>"#,
+    );
+    let session_url = Url::parse(&server.uri()).unwrap();
+    let mut sess = open_session(&html, session_url.clone());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(false));
+    assert_eq!(outcome.value["defaultPrevented"], serde_json::json!(true));
+    assert_eq!(outcome.value["reason"], serde_json::json!("default_prevented"));
+
+    let reqs = server.received_requests().await.unwrap();
+    assert!(
+        reqs.is_empty(),
+        "preventDefault on submit should suppress HTTP; got {} reqs",
+        reqs.len()
+    );
+    // Session URL stays at the page we opened.
+    assert_eq!(sess.url(), &session_url);
+}
+
+// =====================================================================
+// preventDefault on the submit button click ALSO suppresses the request
+// (real-browser cascade rule — a cancelled click's default action,
+// which is the form submission, never runs)
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_preventdefault_on_button_click_suppresses_http() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="x" value="1">
+            <button type="submit" id="sb">Go</button>
+        </form>
+        <script>
+          document.querySelector('#sb').addEventListener('click', (e) => {{
+            e.preventDefault();
+          }});
+        </script>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(false));
+    assert_eq!(outcome.value["defaultPrevented"], serde_json::json!(true));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+// =====================================================================
+// Default enctype: a form with no enctype attribute uses urlencoded
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_post_without_enctype_attribute_defaults_to_urlencoded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/default"))
+        .and(header(
+            "content-type",
+            "application/x-www-form-urlencoded",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/default", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="k" value="v">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    assert_eq!(
+        outcome.value["enctype"],
+        serde_json::json!("application/x-www-form-urlencoded")
+    );
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    assert_eq!(body, "k=v");
+}
+
+// =====================================================================
+// Empty form: no inputs, no submit-typed activator-value either
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_empty_form_sends_empty_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/empty"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+
+    let action_url = format!("{}/empty", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <button type="submit">Send</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    // Submit button has no name → it does not contribute. Body is
+    // empty string.
+    assert!(body.is_empty(), "expected empty body, got: {body:?}");
+}
+
+// =====================================================================
+// Disabled fields are excluded
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_excludes_disabled_inputs() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/post"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/post", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="a" value="alpha">
+            <input type="text" name="b" value="beta" disabled>
+            <input type="text" name="" value="nameless">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    assert_eq!(body, "a=alpha");
+}
+
+// =====================================================================
+// Unchecked checkbox excluded; checked radio included
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_checkbox_and_radio_selection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/post"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/post", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="checkbox" name="opt1" value="on" checked>
+            <input type="checkbox" name="opt2" value="on">
+            <input type="radio" name="color" value="red">
+            <input type="radio" name="color" value="green" checked>
+            <input type="radio" name="color" value="blue">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    // opt1 is checked → included. opt2 unchecked → excluded.
+    // green is checked → included. red/blue → excluded.
+    assert!(body.contains("opt1=on"));
+    assert!(!body.contains("opt2"));
+    assert!(body.contains("color=green"));
+    assert!(!body.contains("color=red"));
+    assert!(!body.contains("color=blue"));
+}
+
+// =====================================================================
+// Relative action URL resolves against the session's current URL
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_relative_action_resolves_against_session_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/forms/submit"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    // Session URL has a trailing path segment; relative action
+    // "submit" should resolve to /forms/submit.
+    let session_url = Url::parse(&format!("{}/forms/", server.uri())).unwrap();
+    let html = r#"<!doctype html><html><body>
+        <form id="f" method="post" action="submit">
+            <input type="text" name="k" value="v">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#;
+    let mut sess = open_session(html, session_url);
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+}
+
+// =====================================================================
+// Missing action attribute uses the session URL
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_missing_action_uses_session_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/page"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let session_url = Url::parse(&format!("{}/page", server.uri())).unwrap();
+    let html = r#"<!doctype html><html><body>
+        <form id="f" method="post">
+            <input type="text" name="k" value="v">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#;
+    let mut sess = open_session(html, session_url);
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(reqs.len(), 1);
+}
+
+// =====================================================================
+// Response replaces the session document
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_response_replaces_session_document() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<!doctype html><html><body><div id=\"r\">welcome jane</div></body></html>",
+        ))
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/echo", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="name" value="jane">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    // The session's document is now the response page; querying
+    // it returns the response DOM, not the original form page.
+    let body = sess
+        .eval("document.querySelector('#r').textContent")
+        .expect("eval ok");
+    assert_eq!(body.value, serde_json::json!("welcome jane"));
+}
+
+// =====================================================================
+// window.location.href reflects the response URL after submit
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_updates_window_location_href_to_response_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/landed"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<!doctype html><html><body><div>landing</div></body></html>",
+        ))
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/landed", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="k" value="v">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    // location.href is installed as a globalThis-side property by
+    // `set_base_url`; the navigate() inside submit() drives it.
+    let loc = sess
+        .eval("globalThis.location.href")
+        .expect("eval location");
+    assert_eq!(
+        loc.value,
+        serde_json::json!(format!("{}/landed", server.uri()))
+    );
+}
+
+// =====================================================================
+// Activator submit button with name contributes its value
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_button_with_name_contributes_value_only_as_activator() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/post"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/post", server.uri());
+    let html = format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}">
+            <input type="text" name="k" value="v">
+            <button type="submit" name="action" value="save">Save</button>
+            <button type="submit" name="action" value="delete">Delete</button>
+        </form>
+        </body></html>"#,
+    );
+    let mut sess = open_session(&html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(true));
+    let reqs = server.received_requests().await.unwrap();
+    let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
+    // The first submit button is the activator; its name/value
+    // contribute, the second (non-activator) does not.
+    assert!(body.contains("k=v"), "body: {body}");
+    assert!(body.contains("action=save"), "body: {body}");
+    assert!(!body.contains("action=delete"), "body: {body}");
+}
+
+// =====================================================================
+// Engine without fetch client (no_fetch_client outcome)
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_without_fetch_client_returns_no_fetch_client() {
+    // JsEngine::new() builds an engine without a fetch client; the
+    // submit path should report "no_fetch_client" without panicking.
+    let engine = JsEngine::new().expect("engine builds");
+    let html = r#"<!doctype html><html><body>
+        <form id="f" method="post" action="/x">
+            <input type="text" name="k" value="v">
+            <button type="submit">Go</button>
+        </form>
+        </body></html>"#;
+    let (mut sess, _) =
+        JsSession::open_on_engine(engine, html, Url::parse("https://example.com/").unwrap(),
+            ScriptFetchPolicy::default())
+            .expect("session opens");
+    let outcome = sess.submit("#f").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(false));
+    assert_eq!(
+        outcome.value["reason"],
+        serde_json::json!("no_fetch_client")
+    );
+}
+
+// =====================================================================
+// Selector miss
+// =====================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn submit_unmatched_selector_reports_no_form() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let html = r#"<!doctype html><html><body><div>nothing here</div></body></html>"#;
+    let mut sess = open_session(html, Url::parse(&server.uri()).unwrap());
+    let outcome = sess.submit("#nope").expect("submit ok");
+    assert_eq!(outcome.value["submitted"], serde_json::json!(false));
+    assert_eq!(outcome.value["matched"], serde_json::json!(false));
+    assert_eq!(outcome.value["reason"], serde_json::json!("no_form"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

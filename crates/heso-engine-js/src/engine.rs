@@ -563,6 +563,16 @@ impl JsEngine {
             .unwrap_or(0)
     }
 
+    /// Crate-internal accessor for the engine's [`FetchState`]. Used by
+    /// [`crate::form_submit`] to borrow the same `reqwest::Client` /
+    /// `tokio::runtime::Handle` pair the `fetch()` global uses, so a
+    /// `<form>` POST shares cookies and TLS state with in-JS network
+    /// calls. Returns `None` when the engine was constructed without
+    /// fetch (i.e. via [`Self::new`] / [`Self::new_with_seed`]).
+    pub(crate) fn fetch_state_ref(&self) -> Option<&FetchState> {
+        self.fetch_state.as_ref()
+    }
+
     /// Run QuickJS's microtask queue until it reports idle.
     /// Internal helper; the public surface is
     /// [`Self::run_pending_jobs`] (which also drives fetches).

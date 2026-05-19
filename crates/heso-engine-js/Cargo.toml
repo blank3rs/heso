@@ -42,7 +42,12 @@ rand_chacha = "0.3"
 # static `heso-engine-fetch` path) so cookies and (when item M
 # lands) recorded-network playback stay coherent. See `src/fetch.rs`
 # and `decisions/0014` (Phase 2 stdlib subset row).
-reqwest = { workspace = true }
+#
+# `multipart` is enabled for PR-1 (real form submission per WHATWG
+# §4.10.22) so `JsSession::submit` can POST `multipart/form-data`
+# bodies via `reqwest::multipart::Form` instead of hand-rolling the
+# boundary + part headers. See `src/form_submit.rs`.
+reqwest = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
 # Session URL tracking (`crate::session::JsSession`): the page session
 # owns its current URL so navigation across steps is observable on the

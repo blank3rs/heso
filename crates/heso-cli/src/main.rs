@@ -1278,23 +1278,187 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
 }
 
 /// `heso submit <url> <@form-ref>` — fetch <url>, locate the form at
-/// `@form-ref`, then click its first submit-typed descendant
-/// (`button[type="submit"]` / `input[type="submit"]` / bare-typed
-/// `<button>`). See [`heso_engine_js::JsEngine::submit_form`] for the
-/// Phase 1B limitations (no real HTTP POST; relies on JS handlers).
+/// `@form-ref`, and submit it per [WHATWG HTML §4.10.22] — dispatch
+/// the `submit` event, serialize the entry list per `enctype`, issue a
+/// real HTTP request through the engine's shared `reqwest::Client`,
+/// follow redirects, and report the post-redirect URL + status.
 ///
-/// Output: `{ok, op, url, ref, selector, value, console}`. `value:
-/// true` iff a submit control was found and clicked; `false` if the
-/// form had no submit control. Exit codes match `heso click`.
+/// Pre-PR-1 behavior dispatched a click on the submit button without
+/// issuing any HTTP traffic — filed as the top write-side gap in
+/// `AGENT_FINDINGS.md`. PR-1 closes that gap.
+///
+/// Output: `{ok, op, url, ref, selector, value, console}`. `value` is
+/// the structured submission result:
+///
+/// - `{matched: false, submitted: false, reason: "no_form"}` —
+///   selector didn't match.
+/// - `{matched: true, defaultPrevented: true, submitted: false,
+///   reason: "default_prevented"}` — a listener called
+///   `event.preventDefault()`.
+/// - `{matched: true, submitted: true, method, enctype, action,
+///   responseStatus, responseUrl}` — the request went out, the
+///   response replaced the session document, and we landed at
+///   `responseUrl`.
+/// - `{matched: true, submitted: false, reason: "http_error", error}`
+///   — the request failed (DNS, TLS, timeout, 5xx-then-redirect-cap,
+///   etc.). The `error` field is the underlying reqwest message.
+///
+/// Exit codes: 0 if the request was either skipped (a real-browser
+/// outcome — `preventDefault` is legitimate) or succeeded; 1 on HTTP
+/// failure, 2 on usage error.
 async fn cmd_submit(args: &[String]) -> ExitCode {
     if args.len() < 2 {
         eprintln!("usage: heso submit <url> <@form-ref>");
         return ExitCode::from(2);
     }
-    run_dispatch(&args[0], &args[1], "submit", |eng, html, sel| {
-        eng.submit_form(html, sel)
-    })
-    .await
+    cmd_submit_inner(&args[0], &args[1]).await
+}
+
+/// Body of [`cmd_submit`] split out so the dispatch / fetch /
+/// selector-build / session-open / submit sequence is readable
+/// top-to-bottom. The shape mirrors [`run_dispatch`] but takes a
+/// stateful path (open a [`JsSession`], call its
+/// [`heso_engine_js::JsSession::submit`]) so the HTTP response can
+/// flow back into the document.
+async fn cmd_submit_inner(url_arg: &str, ref_arg: &str) -> ExitCode {
+    let want = if let Some(stripped) = ref_arg.strip_prefix('@') {
+        format!("@{stripped}")
+    } else {
+        format!("@{ref_arg}")
+    };
+
+    let url = match Url::parse(url_arg) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid URL `{url_arg}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let engine = match FetchEngine::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to build fetch engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let page = match engine.open(&url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fetch failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let action = match resolve_action(&page.actions, &want) {
+        Some(a) => a,
+        None => {
+            eprintln!("no element at ref `{want}`");
+            return ExitCode::from(2);
+        }
+    };
+    let selector = match selector_for_action(action) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
+                action.tag, action.attrs
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let (final_url, html) = match engine.fetch_text(&url).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fetch (html) failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Build a fetch-capable JS engine so the form submission can
+    // actually go out over the wire (per PR-1). Share the same
+    // `reqwest::Client` as the static path so cookies / TLS / UA
+    // stay coherent — same wiring pattern as `cmd_eval_dom` uses
+    // for `--js-fetch`.
+    let client = engine.client();
+    let rt_handle = tokio::runtime::Handle::current();
+    let js_engine = match heso_engine_js::JsEngine::new_with_fetch(client, rt_handle) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to create JS engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Open the page in a stateful session so the post-submit
+    // navigation lands somewhere observable. `--seed` / determinism
+    // is out of scope for PR-1; record/replay (item M) is the
+    // determinism path for live writes.
+    let (mut session, _open_outcome) = match heso_engine_js::JsSession::open_on_engine(
+        js_engine,
+        &html,
+        final_url.clone(),
+        heso_engine_js::ScriptFetchPolicy::default(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("session open failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let outcome = match session.submit(&selector) {
+        Ok(o) => o,
+        Err(e) => {
+            let err_body = match &e {
+                heso_engine_js::EvalError::Exception { message, stack } => serde_json::json!({
+                    "kind": "exception",
+                    "message": message,
+                    "stack": stack,
+                }),
+                heso_engine_js::EvalError::ThrownValue { value } => serde_json::json!({
+                    "kind": "thrown_value",
+                    "value": value,
+                }),
+                heso_engine_js::EvalError::Engine(msg) => serde_json::json!({
+                    "kind": "engine",
+                    "message": msg,
+                }),
+            };
+            let body = serde_json::json!({
+                "ok": false,
+                "op": "submit",
+                "url": final_url.to_string(),
+                "ref": want,
+                "selector": selector,
+                "error": err_body,
+            });
+            let _ = serde_json::to_string_pretty(&body).map(|s| println!("{s}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let body = serde_json::json!({
+        "ok": true,
+        "op": "submit",
+        "url": final_url.to_string(),
+        "ref": want,
+        "selector": selector,
+        "value": outcome.value,
+        "console": outcome.console,
+        // Post-submit URL: when the request succeeded, this is the
+        // response URL; otherwise the page we started on. Lets a
+        // subsequent `heso eval-dom $POST_URL` script the result.
+        "postUrl": session.url().to_string(),
+    });
+    match serde_json::to_string_pretty(&body) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            eprintln!("failed to serialize result: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 async fn cmd_plat_hash(args: &[String]) -> ExitCode {
@@ -1972,7 +2136,11 @@ async fn execute_step_session(
                 .clone();
             let selector = selector_for_action(&elem)
                 .ok_or_else(|| format!("no selector for ref `{want}`"))?;
-            let sess = session.as_ref().expect("session ensured above");
+            // `submit` is `&mut self` since PR-1 — the real-HTTP path
+            // can replace the session document on success. Take a
+            // `&mut` borrow up front; `ref_drift_field` below only
+            // needs `&` and runs after the submit returns.
+            let sess = session.as_mut().expect("session ensured above");
             let outcome = sess
                 .submit(&selector)
                 .map_err(|e| format!("js submit failed: {e}"))?;

@@ -49,6 +49,9 @@ use url::Url;
 
 use crate::dom::Document;
 use crate::engine::{EvalError, EvalOutcome, JsEngine};
+use crate::form_submit::{
+    build_snapshot_js, issue_request, live_fetch_handle, FormSnapshot, SubmitResponse, SubmitSkip,
+};
 use crate::scripts::{ScriptFetchPolicy, ScriptOutcome};
 
 /// JS snippet that binds `submitter` (in the enclosing scope) to the
@@ -241,31 +244,164 @@ impl JsSession {
         self.engine.eval(&script)
     }
 
-    /// Find the form at `selector`, find its first submit-typed
-    /// descendant, dispatch a click on it. Stateful counterpart of
-    /// [`JsEngine::submit_form`].
+    /// Submit the form at `selector` per [WHATWG HTML §4.10.22]
+    /// [spec] — dispatch the `submit` event, serialize the entry list,
+    /// issue a real HTTP request through the engine's shared
+    /// `reqwest::Client`, and replace this session's document with the
+    /// response body.
     ///
-    /// Returns `{matched: bool, defaultPrevented: bool}`. `matched`
-    /// is `false` when the form selector didn't match OR when no
-    /// submit-typed descendant was found. `defaultPrevented` reports
-    /// whether the submit button's click event was canceled.
-    pub fn submit(&self, selector: &str) -> Result<EvalOutcome, EvalError> {
-        let selector_lit = serde_json::to_string(selector)
-            .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
-        let script = format!(
-            r#"
-            (() => {{
-                const form = document.querySelector({selector_lit});
-                if (!form) return {{ matched: false, defaultPrevented: false }};
-                {SUBMIT_DESCENDANT_FINDER_JS}
-                if (!submitter) return {{ matched: false, defaultPrevented: false }};
-                const ev = new Event('click', {{ bubbles: true, cancelable: true }});
-                submitter.dispatchEvent(ev);
-                return {{ matched: true, defaultPrevented: ev.defaultPrevented }};
-            }})()
-            "#,
-        );
-        self.engine.eval(&script)
+    /// Replaces the pre-PR-1 dispatch-only path that was filed as the
+    /// single biggest agent-write bug in `AGENT_FINDINGS.md` (every
+    /// `heso submit` returned `ok=true` but issued no HTTP traffic).
+    ///
+    /// Behavior summary:
+    ///
+    /// - **No matching form / no submitter** → returns
+    ///   `{matched: false, defaultPrevented: false, submitted: false}`
+    ///   without firing the submit event.
+    /// - **Listener called `event.preventDefault()`** → returns
+    ///   `{matched: true, defaultPrevented: true, submitted: false}`
+    ///   without issuing the request. Real-browser parity.
+    /// - **Engine has no `FetchMode::Live` client** (built via
+    ///   [`JsEngine::new`] without `new_with_fetch`, or seeded into
+    ///   `DeterministicNoCassette`) → returns
+    ///   `{matched: true, submitted: false, reason: "no_fetch_client"}`.
+    ///   This is the legacy-compatible mode for tests that don't wire
+    ///   a real client; the dispatch part still fired.
+    /// - **HTTP error** → returns `{matched: true, submitted: false,
+    ///   reason: "http_error", error: "..."}` and propagates an
+    ///   [`EvalError`] only when the JS-side snapshot itself fails.
+    /// - **Success** → issues the request through the shared client,
+    ///   navigates this session to the response URL (cookies preserved
+    ///   on the underlying engine), and returns
+    ///   `{matched: true, submitted: true, requestUrl, responseStatus,
+    ///   responseUrl, enctype, method}`.
+    ///
+    /// Enctypes supported: `application/x-www-form-urlencoded`,
+    /// `multipart/form-data`, `text/plain`. File inputs in multipart
+    /// carry the filename only — `FormData`/`Blob` plumbing is filed
+    /// as a follow-up.
+    ///
+    /// Method handling: GET serializes the entry list to a `?query`
+    /// (replacing any existing query) on the action URL. POST sends
+    /// the entry list as the request body per enctype. The action URL
+    /// resolves against the session's current URL when relative.
+    ///
+    /// [spec]: https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm
+    pub fn submit(&mut self, selector: &str) -> Result<EvalOutcome, EvalError> {
+        // Phase 1: extract the snapshot (dispatches the submit event
+        // as a side effect, which is the spec-mandated checkpoint).
+        let snapshot_js = build_snapshot_js(selector);
+        let snapshot_outcome = self.engine.eval(&snapshot_js)?;
+        let snapshot_value = snapshot_outcome.value.clone();
+
+        // Re-deserialize the snapshot into a typed value. `eval` already
+        // round-trips through JSON, so this is just a Value → struct hop.
+        let snapshot: FormSnapshot = match serde_json::from_value(snapshot_value.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                // Snapshot wasn't well-shaped (selector miss without
+                // the right field, or a typo in the JS template).
+                // Return the raw outcome with an explanatory field.
+                let value = serde_json::json!({
+                    "matched": false,
+                    "defaultPrevented": false,
+                    "submitted": false,
+                    "reason": "snapshot_decode_error",
+                    "error": e.to_string(),
+                    "raw": snapshot_value,
+                });
+                return Ok(EvalOutcome {
+                    value,
+                    console: snapshot_outcome.console,
+                });
+            }
+        };
+
+        // No match / no submitter / cancelled → no HTTP traffic.
+        let outcome = self.classify_skip(&snapshot);
+        if let Some(skip) = outcome {
+            return Ok(EvalOutcome {
+                value: skip_value(&skip, &snapshot),
+                console: snapshot_outcome.console,
+            });
+        }
+
+        // Phase 2: issue the request. Falls back to a no-network
+        // outcome if the engine wasn't built with a fetch client.
+        let Some((client, rt_handle)) = live_fetch_handle(&self.engine) else {
+            let value = serde_json::json!({
+                "matched": true,
+                "defaultPrevented": false,
+                "submitted": false,
+                "reason": "no_fetch_client",
+                "method": snapshot.method,
+                "enctype": snapshot.enctype,
+                "action": snapshot.action,
+            });
+            return Ok(EvalOutcome {
+                value,
+                console: snapshot_outcome.console,
+            });
+        };
+
+        let response = match issue_request(&snapshot, &self.url, &client, &rt_handle) {
+            Ok(r) => r,
+            Err(e) => {
+                let value = serde_json::json!({
+                    "matched": true,
+                    "defaultPrevented": false,
+                    "submitted": false,
+                    "reason": "http_error",
+                    "error": e.to_string(),
+                    "method": snapshot.method,
+                    "enctype": snapshot.enctype,
+                    "action": snapshot.action,
+                });
+                return Ok(EvalOutcome {
+                    value,
+                    console: snapshot_outcome.console,
+                });
+            }
+        };
+
+        // Phase 3: install the response body as the new document.
+        // Navigation reuses the engine, so cookies / RNG / virtual
+        // clock survive. Inline scripts in the response page re-run.
+        let SubmitResponse {
+            final_url,
+            body,
+            status,
+        } = response;
+        let _nav_outcome = self.navigate(&body, final_url.clone())?;
+
+        let value = serde_json::json!({
+            "matched": true,
+            "defaultPrevented": false,
+            "submitted": true,
+            "method": snapshot.method,
+            "enctype": snapshot.enctype,
+            "action": snapshot.action,
+            "responseStatus": status,
+            "responseUrl": final_url.as_str(),
+        });
+        Ok(EvalOutcome {
+            value,
+            console: snapshot_outcome.console,
+        })
+    }
+
+    /// Decide whether `snapshot` corresponds to a no-network outcome
+    /// (selector miss or `preventDefault`). Returns `None` when the
+    /// HTTP request should proceed.
+    fn classify_skip(&self, snapshot: &FormSnapshot) -> Option<SubmitSkip> {
+        if !snapshot.matched {
+            return Some(SubmitSkip::NoForm);
+        }
+        if snapshot.default_prevented {
+            return Some(SubmitSkip::DefaultPrevented);
+        }
+        None
     }
 
     /// Evaluate arbitrary JS against the live `document` global.
@@ -273,6 +409,30 @@ impl JsSession {
         self.engine.eval(code)
     }
 }
+
+/// Build the JSON `value` returned to callers when submission skips
+/// the HTTP request (selector miss or `preventDefault`). Mirrors the
+/// success/skip vocabulary the `submitted: bool` field documents.
+fn skip_value(skip: &SubmitSkip, snapshot: &FormSnapshot) -> serde_json::Value {
+    match skip {
+        SubmitSkip::NoForm => serde_json::json!({
+            "matched": false,
+            "defaultPrevented": false,
+            "submitted": false,
+            "reason": "no_form",
+        }),
+        SubmitSkip::DefaultPrevented => serde_json::json!({
+            "matched": true,
+            "defaultPrevented": true,
+            "submitted": false,
+            "reason": "default_prevented",
+            "method": snapshot.method,
+            "enctype": snapshot.enctype,
+            "action": snapshot.action,
+        }),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -751,7 +911,7 @@ mod tests {
               });
             </script>
         </body></html>"#;
-        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        let (mut sess, _) = JsSession::open(html, test_url()).unwrap();
         assert_eq!(sess.submit("#f").unwrap().value["matched"], serde_json::json!(true));
         let out = sess
             .eval("document.querySelector('#out').textContent")
