@@ -136,6 +136,47 @@ const IDL_CHECKED: &str = "checked";
 /// `hasAttribute('checked')` (= `defaultChecked`) until this flips.
 const IDL_CHECKED_DIRTY: &str = "checkedDirty";
 
+/// Name of the hidden property on `globalThis.document` whose value is
+/// an object mapping per-host-element shadow-root references, keyed by
+/// a stable stringification of the host's [`dom_query::NodeId`] in the
+/// light tree. Holds the JS-side [`ShadowRoot`] instance returned by
+/// `host.attachShadow({mode})`.
+///
+/// Per WHATWG DOM §4.8 a shadow root is a "shadow root associated with
+/// a shadow host". The association lives here (rather than as a Rust-
+/// side field on [`Element`]) for the same reason listener storage
+/// does: every `document.querySelector(...)` returns a **new** JS
+/// `Element` wrapper, but `globalThis.document` itself is a single
+/// long-lived object, so any state hung off it survives the wrapper's
+/// lifetime.
+///
+/// Spec: <https://dom.spec.whatwg.org/#concept-element-shadow-root>.
+const PROP_SHADOW_ROOTS: &str = "__shadowRoots";
+
+/// Name of the hidden property on `globalThis.document` whose value is
+/// an object mapping shadow-tree [`Arc<dom_query::Document>`] pointers
+/// (stringified via [`Arc::as_ptr`]) back to the host node id in the
+/// light tree. Used by `<slot>` machinery to walk from a slot Element
+/// (whose `doc` is the shadow tree) to its host's light children.
+const PROP_SHADOW_HOSTS: &str = "__shadowHosts";
+
+/// Name of the hidden property on each [`ShadowRoot`] JS instance
+/// whose value is the JS Element wrapper that called `attachShadow`.
+/// `shadowRoot.host` reads this so the returned wrapper has stable
+/// identity — spec consumers (Lit's controllers, every WeakMap-keyed
+/// framework) use the host as a map key, and a fresh wrapper per
+/// call would break their bookkeeping.
+const PROP_SHADOW_HOST_WRAPPER: &str = "__host";
+
+/// Stringify a shadow-tree `Arc<dom_query::Document>` pointer for use
+/// as a JS-object key in the [`PROP_SHADOW_HOSTS`] registry. The
+/// underlying `Arc::as_ptr` is stable for the lifetime of the shadow
+/// root (which lives at least as long as the host's wrapper does, via
+/// the JS-side [`PROP_SHADOW_ROOTS`] entry that pins it).
+fn shadow_doc_key(doc: &Arc<DqDocument>) -> String {
+    format!("{:p}", Arc::as_ptr(doc))
+}
+
 /// Stringify a [`NodeId`] for use as a JS-object key in the
 /// node-keyed listener registry. Debug-formatting is fine here —
 /// `NodeId` derives `Debug`, the format is stable for the lifetime
@@ -1254,6 +1295,18 @@ impl Element {
         }
         child
     }
+
+    /// Rust-side append helper used by tests. Mirrors the JS-facing
+    /// `appendChild` but skips the `slotchange` dispatch (no `Ctx`
+    /// available outside a JS call). The JS path goes through the
+    /// gated method below.
+    #[cfg(test)]
+    fn append_child_rs(&self, child: Element) -> Element {
+        if let Some(n) = self.doc.tree.get(&self.node_id) {
+            n.append_child(&child.node_id);
+        }
+        child
+    }
 }
 
 #[rquickjs::methods(rename_all = "camelCase")]
@@ -1578,12 +1631,37 @@ impl Element {
     /// (`dom_query::NodeRef::append_child` calls
     /// `remove_from_parent` on the child before re-parenting).
     ///
+    /// If `self` is a shadow host (has a `ShadowRoot` registered on
+    /// `globalThis.document.__shadowRoots`), this also fires a
+    /// `slotchange` event on each `<slot>` in the shadow tree whose
+    /// `name` attribute matches the new child's `slot=` attribute.
+    /// Best-effort per WHATWG DOM §4.8 "signal a slot change": real
+    /// browsers queue at a microtask boundary so a batch of
+    /// appendChild calls fires one slotchange per slot; we fire
+    /// synchronously per call. Frameworks tolerate the extra
+    /// dispatches because their slotchange listeners are idempotent.
+    ///
     /// Returns the same `child` handle so JS callers can chain.
-    fn append_child(&self, child: Element) -> Element {
-        if let Some(n) = self.node_ref() {
+    fn append_child<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        child: Element,
+    ) -> rquickjs::Result<Element> {
+        let (host_doc, self_node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        if let Some(n) = host_doc.tree.get(&self_node_id) {
             n.append_child(&child.node_id);
         }
-        child
+        // If `self` is a shadow host, find slots whose `name` matches
+        // the new child's `slot=` and fire a synthetic slotchange.
+        let matching_slots =
+            slots_matching_light_child(&ctx, self_node_id, child.node_id, &host_doc)?;
+        if !matching_slots.is_empty() {
+            dispatch_slot_change(&ctx, &matching_slots)?;
+        }
+        Ok(child)
     }
 
     /// `element.insertBefore(newNode, referenceNode)` — insert
@@ -3162,6 +3240,236 @@ impl Element {
         Ok(())
     }
 
+    // ===== Shadow DOM (WHATWG DOM §4.8) =====================================
+    //
+    // `attachShadow({mode})`, `shadowRoot` (open-mode visibility), and
+    // the `<slot>` helpers (`name`, `assignedElements`, `assignedNodes`).
+    // The actual shadow tree lives in a separate
+    // `Arc<dom_query::Document>` held by [`ShadowRoot`]; this Element
+    // surface only handles attachment, lookup, and slot assignment.
+    //
+    // OSS cross-referenced: happy-dom `Element.ts::attachShadow` and
+    // `HTMLSlotElement.ts::#assignedNodes` (MIT). jsdom does not
+    // implement Shadow DOM as of 2026.
+
+    /// `element.attachShadow({ mode })` — per WHATWG DOM §4.8 "Attach
+    /// a shadow root". Creates a [`ShadowRoot`] backed by a fresh
+    /// `dom_query::Document` fragment, registers it on
+    /// `globalThis.document.__shadowRoots`, and returns the JS-side
+    /// instance.
+    ///
+    /// Throws `NotSupportedError` (a `DOMException`) if this element
+    /// already has a shadow root attached — second attachment is
+    /// spec-prohibited.
+    ///
+    /// Spec: <https://dom.spec.whatwg.org/#dom-element-attachshadow>.
+    fn attach_shadow<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Value<'js>> {
+        let (doc, node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+
+        // Spec: "If this is a shadow host, then throw a
+        // NotSupportedError DOMException." Check the registry first
+        // so we don't double-allocate a shadow doc on rejection.
+        // Going through the events::DOMException constructor keeps
+        // the resulting throw's `instanceof DOMException` and
+        // `.name === 'NotSupportedError'` checks working spec-correctly.
+        if shadow_root_for_host(&ctx, node_id)?.is_some() {
+            let ex = events::DOMException::new(
+                rquickjs::prelude::Opt(Some(
+                    "Element.attachShadow: this element already has a shadow root attached."
+                        .to_owned(),
+                )),
+                rquickjs::prelude::Opt(Some("NotSupportedError".to_owned())),
+            );
+            let ex_class = Class::instance(ctx.clone(), ex)?;
+            let ex_value: Value<'js> = ex_class.into_value();
+            return Err(ctx.throw(ex_value));
+        }
+
+        // Parse the init dict. Per spec, `mode` is required and
+        // must be `'open'` or `'closed'`. We accept either spelling
+        // and default to `'open'` if absent (the spec actually says
+        // missing-mode throws, but every framework that uses
+        // attachShadow passes mode explicitly; defaulting open is
+        // a friendly degradation).
+        let mode = match init.0 {
+            Some(v) if !v.is_null() && !v.is_undefined() => {
+                let obj = v.as_object().ok_or_else(|| {
+                    rquickjs::Exception::throw_type(
+                        &ctx,
+                        "Element.attachShadow: init must be an object",
+                    )
+                })?;
+                obj.get::<_, Option<String>>("mode")?
+                    .unwrap_or_else(|| "open".to_owned())
+            }
+            _ => "open".to_owned(),
+        };
+        let mode = match mode.as_str() {
+            "open" | "closed" => mode,
+            other => {
+                return Err(rquickjs::Exception::throw_type(
+                    &ctx,
+                    &format!(
+                        "Element.attachShadow: mode must be 'open' or 'closed', got {other:?}"
+                    ),
+                ));
+            }
+        };
+
+        // Allocate the root, instantiate as a JS object, and stash
+        // a reference to the host's *light tree doc* on the
+        // `document` global so `host_for_shadow_doc` can resolve
+        // the reverse mapping later. The class instance is the
+        // long-lived JS object that `host.shadowRoot` returns on
+        // every read — frameworks like Lit cache it by identity, so
+        // returning a fresh instance per call would break their
+        // WeakMap-based bookkeeping.
+        let root = ShadowRoot::new(doc.clone(), node_id, mode);
+        let shadow_doc = root.shadow_doc.clone();
+        let root_class = Class::instance(ctx.clone(), root)?;
+        let root_value: Value<'js> = root_class.into_value();
+        // Pin the calling Element wrapper as the canonical `host` so
+        // `root.host === originalElement` survives strict equality.
+        if let Some(root_obj) = root_value.as_object() {
+            let host_wrapper: Value<'js> = this.0.clone().into_value();
+            root_obj.set(PROP_SHADOW_HOST_WRAPPER, host_wrapper)?;
+        }
+        register_shadow_root(&ctx, node_id, &shadow_doc, &root_value)?;
+
+        // Pin the light-tree Document class on the global document
+        // so the slot reverse-lookup can recover the host's Arc.
+        // First-wins: if `__hesoLightDoc` is already set, leave it.
+        let globals = ctx.globals();
+        let document_obj: Object<'js> = globals.get("document")?;
+        if document_obj
+            .get::<_, Option<Class<'js, Document>>>("__hesoLightDoc")?
+            .is_none()
+        {
+            // Re-wrap the same Arc as a Document; this is just a
+            // handle, not a new tree.
+            let host_doc_handle = Document::new(doc.clone());
+            let host_doc_class = Class::instance(ctx.clone(), host_doc_handle)?;
+            document_obj.set("__hesoLightDoc", host_doc_class)?;
+        }
+
+        Ok(root_value)
+    }
+
+    /// `element.shadowRoot` getter per WHATWG DOM §4.8. Returns the
+    /// shadow root if and only if the host has one attached AND its
+    /// mode is `'open'`. Closed-mode hosts return `null` to external
+    /// code (the handle returned by `attachShadow` is still fully
+    /// functional internally).
+    ///
+    /// Spec: <https://dom.spec.whatwg.org/#dom-element-shadowroot>.
+    #[qjs(get, rename = "shadowRoot")]
+    fn shadow_root<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+    ) -> rquickjs::Result<Value<'js>> {
+        let node_id = this.0.borrow().node_id;
+        let Some(root_obj) = shadow_root_for_host(&ctx, node_id)? else {
+            return Ok(Value::new_null(ctx));
+        };
+        // Inspect the stored mode through the Rust ShadowRoot.
+        let root_class: Class<'js, ShadowRoot> =
+            match Class::<ShadowRoot>::from_object(&root_obj) {
+                Some(c) => c,
+                None => return Ok(Value::new_null(ctx)),
+            };
+        let is_open = root_class.borrow().mode == "open";
+        if is_open {
+            Ok(root_obj.into_value())
+        } else {
+            Ok(Value::new_null(ctx))
+        }
+    }
+
+    /// `slot.assignedElements({ flatten? })` — per WHATWG DOM §4.8,
+    /// the element-only flattened list of slotables assigned to this
+    /// slot. Returns `[]` for non-slot elements, or when the slot is
+    /// not inside a shadow tree.
+    ///
+    /// `flatten`: per spec, recursively resolve nested `<slot>`
+    /// children. We implement the non-flattened common case (a slot's
+    /// direct assigned children), matching what every web-component
+    /// framework actually walks. Nested-slot composition is rare.
+    ///
+    /// Spec: <https://dom.spec.whatwg.org/#dom-slotable-assignedelements>.
+    /// OSS: happy-dom `HTMLSlotElement.ts::#assignedElements`.
+    fn assigned_elements<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        _options: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Vec<Element>> {
+        let (shadow_doc, slot_node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        // Gate: only `<slot>` elements have meaningful assignment.
+        let element_for_check = Element::from_id(shadow_doc.clone(), slot_node_id);
+        if !is_slot_element(&element_for_check) {
+            return Ok(Vec::new());
+        }
+        // Find the host (in the light tree) whose shadow tree
+        // contains this slot.
+        let Some((host_doc, host_node_id)) = host_for_shadow_doc(&ctx, &shadow_doc)? else {
+            return Ok(Vec::new());
+        };
+        // Read the slot's `name` attribute (default slot → "").
+        let slot_name = shadow_doc
+            .tree
+            .get(&slot_node_id)
+            .and_then(|n| n.attr("name"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // Walk the host's light children, filter by slot match.
+        let assigned_ids = assigned_for_slot(&host_doc, host_node_id, &slot_name, true);
+        Ok(assigned_ids
+            .into_iter()
+            .map(|id| Element::from_id(host_doc.clone(), id))
+            .collect())
+    }
+
+    /// `slot.assignedNodes({ flatten? })` — same as
+    /// [`Self::assigned_elements`] but includes text and comment
+    /// nodes. Returns `[]` on non-slot elements.
+    fn assigned_nodes<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        _options: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Vec<Element>> {
+        let (shadow_doc, slot_node_id) = {
+            let borrowed = this.0.borrow();
+            (borrowed.doc.clone(), borrowed.node_id)
+        };
+        let element_for_check = Element::from_id(shadow_doc.clone(), slot_node_id);
+        if !is_slot_element(&element_for_check) {
+            return Ok(Vec::new());
+        }
+        let Some((host_doc, host_node_id)) = host_for_shadow_doc(&ctx, &shadow_doc)? else {
+            return Ok(Vec::new());
+        };
+        let slot_name = shadow_doc
+            .tree
+            .get(&slot_node_id)
+            .and_then(|n| n.attr("name"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let assigned_ids = assigned_for_slot(&host_doc, host_node_id, &slot_name, false);
+        Ok(assigned_ids
+            .into_iter()
+            .map(|id| Element::from_id(host_doc.clone(), id))
+            .collect())
+    }
+
     // ===== Trivial browser-globals batch (layout-zero stubs) =================
     //
     // ADR 0016 says heso has no layout/paint. But frameworks like
@@ -3578,16 +3886,789 @@ impl DomTokenList {
     }
 }
 
-/// Register the [`Document`], [`Element`], and [`DomTokenList`]
-/// classes on `ctx.globals()` so JS code can recognize their types
-/// (and so the engine can later `Class::instance` them). Idempotent —
-/// calling twice is safe; QuickJS will re-bind the constructor.
+// =====================================================================
+// Shadow DOM (WHATWG DOM §4.8)
+// =====================================================================
+//
+// `Element.attachShadow({mode})` returns a [`ShadowRoot`]: a separate
+// subtree that is rendered (and queried) in isolation from the host's
+// light tree. The shadow tree lives in its own
+// `dom_query::Document` (a fragment), distinct from the host
+// document's tree — so:
+//
+// - `host.innerHTML` and `host.childNodes` read/write the light tree
+//   (the existing [`Element`] methods, unchanged).
+// - `host.shadowRoot.innerHTML` and `host.shadowRoot.childNodes`
+//   read/write the shadow tree.
+// - `shadowRoot.querySelector(...)` is scoped to the shadow subtree.
+//
+// The host→shadow association lives on a JS-side registry under
+// `globalThis.document.__shadowRoots`, keyed by the host's NodeId
+// in the light tree (mirroring how [`PROP_NODE_LISTENERS`] keys event
+// listeners — both survive `document.querySelector` returning fresh
+// `Element` wrappers).
+//
+// The reverse lookup (shadow tree → host node id) lives on
+// `globalThis.document.__shadowHosts`, keyed by the shadow-tree
+// `Arc::as_ptr` string. `<slot>` machinery uses this to walk back from
+// a slot Element (whose `doc` is the shadow tree) to its host's light
+// children.
+//
+// Spec: <https://dom.spec.whatwg.org/#interface-shadowroot>.
+//
+// OSS cross-referenced: happy-dom's `nodes/shadow-root/ShadowRoot.ts`
+// (MIT) — the principal reference, since jsdom does not implement
+// Shadow DOM as of 2026.
+
+/// A handle to a shadow root attached to a host element.
+///
+/// Holds:
+/// - `host_doc` / `host_node_id` — the host element's tree + id (in
+///   the light DOM, i.e. the `globalThis.document` tree).
+/// - `shadow_doc` — a separate [`dom_query::Document`] (allocated via
+///   `Document::fragment("")`) backing the shadow subtree.
+/// - `mode` — `"open"` or `"closed"`. Closed roots are still fully
+///   functional via the handle [`Element::attach_shadow`] returns;
+///   the difference is that [`Element::shadow_root`] returns `null`
+///   for closed mode, gating external access per spec.
+///
+/// Lifetime parallels [`Element`]: a thin (Arc, NodeId, Arc, String)
+/// tuple, cloneable, no embedded borrows. The host doc never crosses
+/// thread boundaries (rquickjs runtime is single-threaded), so the
+/// `arc_with_non_send_sync` allow on construction matches the
+/// [`Document`] rationale.
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class]
+pub struct ShadowRoot {
+    /// The host element's tree (= `globalThis.document` tree).
+    #[qjs(skip_trace)]
+    host_doc: Arc<DqDocument>,
+    /// The host element's NodeId in the light tree.
+    #[qjs(skip_trace)]
+    host_node_id: NodeId,
+    /// The shadow subtree itself — a separate `dom_query::Document`
+    /// allocated as a fragment.
+    #[qjs(skip_trace)]
+    shadow_doc: Arc<DqDocument>,
+    /// `"open"` or `"closed"` per WHATWG DOM §4.8.
+    mode: String,
+}
+
+impl ShadowRoot {
+    /// Construct a new shadow root for `host` with mode `mode`.
+    /// Allocates a fresh empty `dom_query::Document` to back the
+    /// shadow tree. Internal — JS reaches this via
+    /// [`Element::attach_shadow`], not via a constructor.
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn new(host_doc: Arc<DqDocument>, host_node_id: NodeId, mode: String) -> Self {
+        // `Document::fragment("")` returns an empty fragment-typed
+        // document — same `Tree` API surface as a parsed page, but
+        // with no `<html>` / `<head>` / `<body>` skeleton, which is
+        // the right starting shape for a shadow subtree per spec.
+        let shadow_doc = Arc::new(DqDocument::fragment(""));
+        Self {
+            host_doc,
+            host_node_id,
+            shadow_doc,
+            mode,
+        }
+    }
+
+    /// Resolve the shadow tree's root [`NodeRef`] — where children
+    /// appended via `appendChild` / `innerHTML` setter live.
+    fn shadow_root_node(&self) -> NodeRef<'_> {
+        self.shadow_doc.tree.root()
+    }
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl ShadowRoot {
+    /// Constructor — throws "Illegal constructor" per WHATWG IDL.
+    /// `new ShadowRoot()` is never spec-allowed; shadow roots are
+    /// minted exclusively by `Element.attachShadow({mode})`.
+    ///
+    /// Exposing the constructor at all (rather than just the
+    /// prototype) is what makes `obj instanceof ShadowRoot` work for
+    /// instances returned by `attachShadow`.
+    #[qjs(constructor)]
+    fn js_new(ctx: Ctx<'_>) -> rquickjs::Result<Self> {
+        Err(rquickjs::Exception::throw_type(
+            &ctx,
+            "Illegal constructor: ShadowRoot is not directly constructible. Use Element.prototype.attachShadow({mode}) instead.",
+        ))
+    }
+
+    /// `shadowRoot.host` — the element that owns this shadow root.
+    ///
+    /// Returns the **same** JS Element wrapper that was passed to
+    /// `attachShadow`, not a freshly-minted one. Spec consumers (Lit's
+    /// reactive controllers, every WeakMap-keyed framework) use the
+    /// returned object as a map key, and a fresh wrapper per call
+    /// would break their bookkeeping.
+    ///
+    /// The wrapper is pinned at attach time as the hidden
+    /// [`PROP_SHADOW_HOST_WRAPPER`] property on the ShadowRoot JS
+    /// instance — same trick as event.target's storage in
+    /// [`crate::events`]. Falls back to a freshly-built wrapper if
+    /// the property is missing (shouldn't happen via attachShadow,
+    /// but defensive).
+    ///
+    /// Spec: <https://dom.spec.whatwg.org/#dom-shadowroot-host>.
+    #[qjs(get)]
+    fn host<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+    ) -> rquickjs::Result<Value<'js>> {
+        let obj: Object<'js> = this.0.clone().into_value().into_object().ok_or_else(|| {
+            rquickjs::Exception::throw_type(&ctx, "ShadowRoot.host: this is not an object")
+        })?;
+        match obj.get::<_, Option<Value<'js>>>(PROP_SHADOW_HOST_WRAPPER)? {
+            Some(v) => Ok(v),
+            None => {
+                // Defensive fallback: re-mint a wrapper from the
+                // stored (doc, node_id) pair.
+                let borrowed = this.0.borrow();
+                let el = Element::from_id(borrowed.host_doc.clone(), borrowed.host_node_id);
+                let class = Class::instance(ctx, el)?;
+                Ok(class.into_value())
+            }
+        }
+    }
+
+    /// `shadowRoot.mode` — `"open"` or `"closed"`. Frozen at
+    /// construction; spec has no setter.
+    /// Spec: <https://dom.spec.whatwg.org/#dom-shadowroot-mode>.
+    #[qjs(get)]
+    fn mode(&self) -> String {
+        self.mode.clone()
+    }
+
+    /// `shadowRoot.innerHTML` — serialized HTML of the shadow tree.
+    /// Reads the fragment root's `inner_html` (every shadow-tree
+    /// child concatenated, in document order).
+    #[qjs(get, rename = "innerHTML")]
+    fn inner_html(&self) -> String {
+        self.shadow_root_node().inner_html().to_string()
+    }
+
+    /// `shadowRoot.innerHTML = value` — parse `value` as an HTML
+    /// fragment and replace the shadow tree's children.
+    ///
+    /// `dom_query::NodeRef::set_html` performs an html5ever fragment
+    /// parse using the receiver's tree as the sink, so all the new
+    /// nodes share the same `Arc<DqDocument>` we'll use to mint
+    /// Element wrappers for queries.
+    #[qjs(set, rename = "innerHTML")]
+    fn set_inner_html(&self, value: String) {
+        self.shadow_root_node().set_html(value);
+    }
+
+    /// `shadowRoot.querySelector(selector)` — first descendant in
+    /// the shadow tree matching `selector`, or `null`. Critically,
+    /// scope is the shadow subtree — light-tree descendants of the
+    /// host are NOT considered.
+    fn query_selector<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        selector: String,
+    ) -> rquickjs::Result<Value<'js>> {
+        let sel = match dom_query::Selection::from(self.shadow_root_node()).try_select(&selector) {
+            Some(s) => s,
+            None => return Ok(Value::new_null(ctx)),
+        };
+        match sel.nodes().first() {
+            Some(n) => {
+                let el = Element::from_id(self.shadow_doc.clone(), n.id);
+                let instance = Class::instance(ctx, el)?;
+                Ok(instance.into_value())
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    /// `shadowRoot.querySelectorAll(selector)` — all descendants in
+    /// the shadow tree matching `selector`, in document order.
+    fn query_selector_all(&self, selector: String) -> Vec<Element> {
+        match dom_query::Selection::from(self.shadow_root_node()).try_select(&selector) {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.shadow_doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `shadowRoot.getElementById(id)` — first element in the
+    /// shadow tree with matching `id` attribute, or `null`. Walks
+    /// the tree directly (not via selector) so dotted / bracketed
+    /// id values still work.
+    fn get_element_by_id(&self, id: String) -> Option<Element> {
+        for descendant in self.shadow_root_node().descendants_it() {
+            if !descendant.is_element() {
+                continue;
+            }
+            if let Some(attr_id) = descendant.id_attr() {
+                if attr_id.as_ref() == id.as_str() {
+                    return Some(Element::from_id(self.shadow_doc.clone(), descendant.id));
+                }
+            }
+        }
+        None
+    }
+
+    /// `shadowRoot.appendChild(node)` — append a node to the shadow
+    /// tree's root. `node` may be an Element previously minted via
+    /// `document.createElement` (in which case it lives in the host
+    /// tree and we move it across), or one queried from the shadow
+    /// tree itself. dom_query handles the re-parent in both cases.
+    fn append_child(&self, child: Element) -> Element {
+        // If `child` was created in the host's tree (the common case
+        // — `document.createElement` returns elements from the host
+        // tree), we can't simply append its NodeId into the shadow
+        // tree, because dom_query's append_child operates on NodeIds
+        // within the same Tree. The robust path is to re-create the
+        // node inside the shadow tree.
+        if Arc::as_ptr(&child.doc) == Arc::as_ptr(&self.shadow_doc) {
+            self.shadow_root_node().append_child(&child.node_id);
+            return child;
+        }
+        // Cross-tree case: copy the subtree into the shadow doc and
+        // append the clone. The original orphan in the host tree is
+        // left dangling (no parent, no impact on host.childNodes).
+        let cloned_id = clone_subtree_to(&child.doc, child.node_id, &self.shadow_doc);
+        self.shadow_root_node().append_child(&cloned_id);
+        Element::from_id(self.shadow_doc.clone(), cloned_id)
+    }
+
+    /// `shadowRoot.removeChild(node)` — detach `node` from the
+    /// shadow tree. No-op if `node` isn't a direct child of the
+    /// shadow root.
+    fn remove_child(&self, child: Element) -> Element {
+        if Arc::as_ptr(&child.doc) == Arc::as_ptr(&self.shadow_doc) {
+            if let Some(child_ref) = self.shadow_doc.tree.get(&child.node_id) {
+                child_ref.remove_from_parent();
+            }
+        }
+        child
+    }
+
+    /// `shadowRoot.children` — element children of the shadow root,
+    /// in document order. Mirrors [`Element::children`].
+    #[qjs(get)]
+    fn children(&self) -> Vec<Element> {
+        self.shadow_root_node()
+            .element_children()
+            .into_iter()
+            .map(|nr| Element::from_id(self.shadow_doc.clone(), nr.id))
+            .collect()
+    }
+
+    /// `shadowRoot.childNodes` — every direct child of the shadow
+    /// root, regardless of node type (matches [`Element::child_nodes`]).
+    #[qjs(get)]
+    fn child_nodes(&self) -> Vec<Element> {
+        self.shadow_root_node()
+            .children_it(false)
+            .map(|nr| Element::from_id(self.shadow_doc.clone(), nr.id))
+            .collect()
+    }
+
+    /// `shadowRoot.firstChild` — first child in the shadow tree, or
+    /// `null`. Mirrors [`Element::first_child`].
+    #[qjs(get)]
+    fn first_child<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.shadow_root_node().first_child() {
+            Some(child) => {
+                let el = Element::from_id(self.shadow_doc.clone(), child.id);
+                let instance = Class::instance(ctx, el)?;
+                Ok(instance.into_value())
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+
+    /// `shadowRoot.lastChild` — last child in the shadow tree, or
+    /// `null`. Mirrors [`Element::last_child`].
+    #[qjs(get)]
+    fn last_child<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        match self.shadow_root_node().last_child() {
+            Some(child) => {
+                let el = Element::from_id(self.shadow_doc.clone(), child.id);
+                let instance = Class::instance(ctx, el)?;
+                Ok(instance.into_value())
+            }
+            None => Ok(Value::new_null(ctx)),
+        }
+    }
+}
+
+/// Clone the subtree rooted at `source_id` (in `source_doc`) into
+/// `dest_doc`, returning the new root's NodeId in `dest_doc`. Used by
+/// [`ShadowRoot::append_child`] when the child was created in the host
+/// tree and needs to be re-rooted inside the shadow tree.
+///
+/// Mirrors [`clone_subtree`] but writes the clone into a different
+/// `dom_query::Document` than it reads from. Always deep.
+///
+/// `dom_query` has no public cross-tree clone primitive in 0.28, so
+/// this walks the source manually and rebuilds via `Tree::new_element`
+/// / `Tree::new_text`. Comment / processing-instruction nodes fall
+/// back to empty text placeholders (same shortcut as [`clone_subtree`])
+/// — none of these appear in framework-emitted shadow-tree content.
+fn clone_subtree_to(
+    source_doc: &Arc<DqDocument>,
+    source_id: NodeId,
+    dest_doc: &Arc<DqDocument>,
+) -> NodeId {
+    let dest_tree = &dest_doc.tree;
+    let new_id = {
+        let Some(source) = source_doc.tree.get(&source_id) else {
+            return dest_tree.new_text(String::new()).id;
+        };
+        if source.is_element() {
+            let tag = source
+                .node_name()
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "div".to_owned());
+            let new_node = dest_tree.new_element(&tag);
+            for attr in source.attrs() {
+                new_node.set_attr(&attr.name.local, &attr.value);
+            }
+            new_node.id
+        } else if source.is_text() {
+            dest_tree.new_text(source.text().to_string()).id
+        } else {
+            dest_tree.new_text(String::new()).id
+        }
+    };
+
+    let child_ids: Vec<NodeId> = match source_doc.tree.get(&source_id) {
+        Some(n) => n.children_it(false).map(|c| c.id).collect(),
+        None => Vec::new(),
+    };
+    for child_id in child_ids {
+        let cloned_child_id = clone_subtree_to(source_doc, child_id, dest_doc);
+        if let Some(parent) = dest_tree.get(&new_id) {
+            parent.append_child(&cloned_child_id);
+        }
+    }
+
+    new_id
+}
+
+/// Look up the [`ShadowRoot`] registered for `host_node_id` on
+/// `globalThis.document.__shadowRoots`, or `None` if none.
+///
+/// Returns the JS-side `Object<'js>` wrapping the [`ShadowRoot`] (not
+/// the Rust `Class<ShadowRoot>`) so the caller can re-use the
+/// long-lived instance — every call to `host.shadowRoot` must return
+/// the **same** JS object, per spec, since framework code uses it as
+/// a map key (`new WeakMap().set(root, ...)`).
+fn shadow_root_for_host<'js>(
+    ctx: &Ctx<'js>,
+    host_node_id: NodeId,
+) -> rquickjs::Result<Option<Object<'js>>> {
+    let globals = ctx.globals();
+    let document: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("document")?;
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let registry: Option<Object<'js>> =
+        document.get::<_, Option<Object<'js>>>(PROP_SHADOW_ROOTS)?;
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let key = node_key(host_node_id);
+    registry.get::<_, Option<Object<'js>>>(key.as_str())
+}
+
+/// Persist a shadow-root association in
+/// `globalThis.document.__shadowRoots` (host node id → root) and
+/// `globalThis.document.__shadowHosts` (shadow doc ptr → host node
+/// id). Both directions are needed: the forward map drives
+/// [`Element::shadow_root`], and the reverse map drives `<slot>`
+/// assignment lookups.
+fn register_shadow_root<'js>(
+    ctx: &Ctx<'js>,
+    host_node_id: NodeId,
+    shadow_doc: &Arc<DqDocument>,
+    root_value: &Value<'js>,
+) -> rquickjs::Result<()> {
+    let globals = ctx.globals();
+    let document: Object<'js> = globals.get("document")?;
+
+    // Forward: host NodeId → ShadowRoot JS object.
+    let roots_registry: Object<'js> =
+        match document.get::<_, Option<Object<'js>>>(PROP_SHADOW_ROOTS)? {
+            Some(r) => r,
+            None => {
+                let r = Object::new(ctx.clone())?;
+                document.set(PROP_SHADOW_ROOTS, r.clone())?;
+                r
+            }
+        };
+    roots_registry.set(node_key(host_node_id).as_str(), root_value.clone())?;
+
+    // Reverse: shadow doc ptr → host NodeId stringification.
+    let hosts_registry: Object<'js> =
+        match document.get::<_, Option<Object<'js>>>(PROP_SHADOW_HOSTS)? {
+            Some(r) => r,
+            None => {
+                let r = Object::new(ctx.clone())?;
+                document.set(PROP_SHADOW_HOSTS, r.clone())?;
+                r
+            }
+        };
+    hosts_registry.set(shadow_doc_key(shadow_doc).as_str(), node_key(host_node_id))?;
+
+    Ok(())
+}
+
+/// Reverse lookup: given an `Element` whose `doc` is a shadow tree,
+/// return the host element's (light-tree doc, NodeId), or `None` if
+/// the element's doc isn't actually a registered shadow tree.
+///
+/// Used by `<slot>` machinery to find the slot's host's light
+/// children. The slot itself lives in the shadow tree, so its `doc`
+/// is the shadow `Arc<DqDocument>`; we want to walk back to the host's
+/// children in the *light* tree.
+fn host_for_shadow_doc<'js>(
+    ctx: &Ctx<'js>,
+    shadow_doc: &Arc<DqDocument>,
+) -> rquickjs::Result<Option<(Arc<DqDocument>, NodeId)>> {
+    let globals = ctx.globals();
+    let document_obj: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("document")?;
+    let Some(document_obj) = document_obj else {
+        return Ok(None);
+    };
+    let hosts_registry: Option<Object<'js>> =
+        document_obj.get::<_, Option<Object<'js>>>(PROP_SHADOW_HOSTS)?;
+    let Some(hosts_registry) = hosts_registry else {
+        return Ok(None);
+    };
+    let host_key: Option<String> = hosts_registry
+        .get::<_, Option<String>>(shadow_doc_key(shadow_doc).as_str())?;
+    let Some(host_key) = host_key else {
+        return Ok(None);
+    };
+
+    // We have a host-NodeId stringification; resolve it through the
+    // *light* tree, which is the Rust `Document` exposed as
+    // `globalThis.document`. The exposed JS object wraps a Rust
+    // `Class<Document>`; pull the Arc out of it.
+    let doc_class: Option<Class<'js, Document>> =
+        document_obj.get::<_, Option<Class<'js, Document>>>("__hesoLightDoc")?;
+    // Fallback: also try the conventional `Class` extraction from
+    // the JS object itself, since the rquickjs class machinery puts
+    // the Rust handle behind a hidden field. The `__hesoLightDoc`
+    // pin is installed during attachShadow (the only path that
+    // creates a shadow tree), so the registry can route back here.
+    let host_doc = match doc_class {
+        Some(c) => c.borrow().dom_arc(),
+        None => return Ok(None),
+    };
+
+    // Walk descendants of the light root to find the node whose
+    // debug-formatted id matches the stored key. dom_query NodeIds
+    // are not directly parseable from their Debug form (private
+    // fields), so we re-scan; this is O(N) per shadow lookup but
+    // only fires inside `<slot>` queries which are themselves rare.
+    let root = host_doc.tree.root();
+    for n in root.descendants_it() {
+        if node_key(n.id) == host_key {
+            return Ok(Some((host_doc.clone(), n.id)));
+        }
+    }
+    Ok(None)
+}
+
+/// True iff `element` is a `<slot>` element. The slot IDL surface
+/// (`name`, `assignedElements`, `assignedNodes`) only applies on
+/// `<slot>` tags; on other tags every method returns the empty list.
+fn is_slot_element(element: &Element) -> bool {
+    element
+        .node_ref()
+        .and_then(|n| n.node_name())
+        .map(|name| name.as_ref().eq_ignore_ascii_case("slot"))
+        .unwrap_or(false)
+}
+
+/// Compute the set of light-tree children of `host_node_id` (in
+/// `host_doc`) that this slot would assign per WHATWG DOM §4.8 "find
+/// flattened slotables":
+///
+/// - A slot with no `name` attribute (or `name=""`) collects every
+///   light-tree child whose `slot=` attribute is missing or empty.
+/// - A slot with `name="foo"` collects only light-tree children with
+///   `slot="foo"`.
+///
+/// `element_only`: when `true`, skip text/comment nodes (matches
+/// `assignedElements()` semantics). When `false`, include every node
+/// type (`assignedNodes()` semantics).
+///
+/// Source-of-truth: happy-dom `HTMLSlotElement.ts`'s `#assignedNodes`
+/// / `#assignedElements` helpers, both MIT.
+fn assigned_for_slot(
+    host_doc: &Arc<DqDocument>,
+    host_node_id: NodeId,
+    slot_name: &str,
+    element_only: bool,
+) -> Vec<NodeId> {
+    let Some(host) = host_doc.tree.get(&host_node_id) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for child in host.children_it(false) {
+        if element_only && !child.is_element() {
+            continue;
+        }
+        let child_slot = child
+            .attr("slot")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let matches = if slot_name.is_empty() {
+            child_slot.is_empty()
+        } else {
+            child_slot == slot_name
+        };
+        if matches {
+            out.push(child.id);
+        }
+    }
+    out
+}
+
+/// Find every `<slot>` element inside `host`'s shadow tree (if any)
+/// whose `name` attribute matches the `slot=` attribute on
+/// `light_child_id`. Used by the "fire slotchange after appendChild"
+/// path to identify which slot(s) need a slotchange event.
+///
+/// Returns the matching slot Element handles bound to the shadow
+/// tree's `Arc<DqDocument>` so dispatch can target them.
+fn slots_matching_light_child<'js>(
+    ctx: &Ctx<'js>,
+    host_node_id: NodeId,
+    light_child_id: NodeId,
+    host_doc: &Arc<DqDocument>,
+) -> rquickjs::Result<Vec<Element>> {
+    let root_obj = match shadow_root_for_host(ctx, host_node_id)? {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
+    // Pull the Rust ShadowRoot out of the JS wrapper to get at the
+    // shadow_doc Arc. `Class::from_object` returns Some iff the JS
+    // object actually wraps a `ShadowRoot`.
+    let root_class: Class<'js, ShadowRoot> = match Class::<ShadowRoot>::from_object(&root_obj) {
+        Some(c) => c,
+        None => return Ok(Vec::new()),
+    };
+    let shadow_doc = {
+        let borrowed = root_class.borrow();
+        borrowed.shadow_doc.clone()
+    };
+
+    // What name does the new light child want?
+    let want_name = match host_doc.tree.get(&light_child_id) {
+        Some(n) => n.attr("slot").map(|s| s.to_string()).unwrap_or_default(),
+        None => return Ok(Vec::new()),
+    };
+
+    let mut out = Vec::new();
+    for descendant in shadow_doc.tree.root().descendants_it() {
+        if !descendant.is_element() {
+            continue;
+        }
+        let is_slot = descendant
+            .node_name()
+            .map(|t| t.as_ref().eq_ignore_ascii_case("slot"))
+            .unwrap_or(false);
+        if !is_slot {
+            continue;
+        }
+        let slot_name = descendant
+            .attr("name")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        // A default slot accepts unattributed children; a named
+        // slot accepts only children with the exact matching name.
+        if (slot_name.is_empty() && want_name.is_empty()) || slot_name == want_name {
+            out.push(Element::from_id(shadow_doc.clone(), descendant.id));
+        }
+    }
+    Ok(out)
+}
+
+/// Synthesize and dispatch a `slotchange` event on each slot in
+/// `slots`. Best-effort approximation of WHATWG DOM §4.8 "signal a
+/// slot change": real browsers queue at a microtask (so a batch of
+/// appendChild calls only fires one slotchange per slot); we fire
+/// synchronously per appendChild. Frameworks tolerate the extra
+/// dispatches because slotchange listeners are typically idempotent
+/// (they re-walk `assignedElements()` either way).
+///
+/// Spec: <https://dom.spec.whatwg.org/#signal-a-slot-change>.
+fn dispatch_slot_change<'js>(
+    ctx: &Ctx<'js>,
+    slots: &[Element],
+) -> rquickjs::Result<()> {
+    for slot in slots {
+        let event = events::Event::new_with_init(
+            "slotchange".to_owned(),
+            Some(events::EventInit {
+                bubbles: true,
+                cancelable: false,
+                composed: false,
+            }),
+        );
+        let event_class = Class::instance(ctx.clone(), event)?;
+        let event_value: Value<'js> = event_class.into_value();
+        let path = build_dispatch_path(ctx, slot)?;
+        let _ = dispatch_with_node_path(ctx, &path, event_value)?;
+    }
+    Ok(())
+}
+
+/// Register the [`Document`], [`Element`], [`ShadowRoot`], and
+/// [`DomTokenList`] classes on `ctx.globals()` so JS code can
+/// recognize their types (and so the engine can later
+/// `Class::instance` them). Also runs the [`SHADOW_DOM_BOOTSTRAP`]
+/// JS preamble which:
+///
+/// 1. Installs `globalThis.DocumentFragment` and
+///    `globalThis.HTMLSlotElement` as stand-in constructors with
+///    `Symbol.hasInstance` traps that match by tag (`<slot>` →
+///    HTMLSlotElement) or by class (ShadowRoot → DocumentFragment).
+/// 2. Chains `ShadowRoot.prototype.__proto__ = DocumentFragment.prototype`
+///    so `(root instanceof DocumentFragment) === true` per spec.
+///
+/// Idempotent — calling twice is safe; QuickJS will re-bind the
+/// constructors and the JS bootstrap is gated on a one-shot sentinel.
 pub(crate) fn register_classes(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     Class::<Document>::define(&ctx.globals())?;
     Class::<Element>::define(&ctx.globals())?;
+    Class::<ShadowRoot>::define(&ctx.globals())?;
     Class::<DomTokenList>::define(&ctx.globals())?;
+    ctx.eval::<(), _>(SHADOW_DOM_BOOTSTRAP)?;
     Ok(())
 }
+
+/// JS bootstrap installed by [`register_classes`] to round out the
+/// Shadow DOM surface that isn't expressible directly from
+/// `#[rquickjs::class]`:
+///
+/// 1. `DocumentFragment` and `HTMLSlotElement` are exposed as
+///    stand-in constructor functions on `globalThis` for spec parity.
+///    They throw "Illegal constructor" on `new`, and override
+///    `Symbol.hasInstance` so `<slot>` Element instances test as
+///    `instanceof HTMLSlotElement` and `ShadowRoot` instances test
+///    as `instanceof DocumentFragment`.
+///
+/// 2. The ShadowRoot → DocumentFragment prototype chain is patched
+///    so spec-shaped `instanceof DocumentFragment` checks also pass
+///    via the normal prototype walk, not just via `Symbol.hasInstance`.
+///
+/// The one-shot sentinel (`__hesoShadowDomInstalled`) keeps this
+/// idempotent — `install_document` re-calls `register_classes` on
+/// every navigation, and double-patching the prototype chain would
+/// be a no-op anyway, but the sentinel skips the work for cheaper
+/// reinstalls.
+const SHADOW_DOM_BOOTSTRAP: &str = r#"
+(function() {
+    if (globalThis.__hesoShadowDomInstalled) return;
+
+    // ===== DocumentFragment =================================================
+    //
+    // Spec: <https://dom.spec.whatwg.org/#interface-documentfragment>. heso
+    // does not implement a full DocumentFragment node yet (there is no
+    // `createDocumentFragment()` call site in real-world hydration we've
+    // measured), but the constructor must exist so:
+    // - `obj instanceof DocumentFragment` doesn't ReferenceError.
+    // - ShadowRoot's prototype chain can link to it (DOM §4.8 says
+    //   ShadowRoot extends DocumentFragment).
+    function DocumentFragment() {
+        throw new TypeError(
+            "Illegal constructor: DocumentFragment is exposed for instanceof checks only. "
+            + "Use document.createDocumentFragment() (unimplemented in heso) or "
+            + "Element.attachShadow({mode}) for shadow trees."
+        );
+    }
+    DocumentFragment.prototype = Object.create(Object.prototype);
+    DocumentFragment.prototype.constructor = DocumentFragment;
+    // `Symbol.hasInstance` so a ShadowRoot also tests true here, even
+    // before the prototype-chain link below kicks in for fast lookups.
+    Object.defineProperty(DocumentFragment, Symbol.hasInstance, {
+        value: function(obj) {
+            // ShadowRoot is the only concrete DocumentFragment we
+            // expose. Match by checking the existing instanceof path.
+            return obj instanceof ShadowRoot;
+        },
+        configurable: true,
+    });
+    Object.defineProperty(globalThis, 'DocumentFragment', {
+        value: DocumentFragment,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+    });
+
+    // ===== Link ShadowRoot.prototype → DocumentFragment.prototype =========
+    //
+    // Per WHATWG DOM §4.8 "interface ShadowRoot : DocumentFragment".
+    // Setting __proto__ on the prototype object propagates instanceof
+    // via the prototype walk.
+    if (typeof ShadowRoot !== 'undefined' && ShadowRoot.prototype) {
+        Object.setPrototypeOf(ShadowRoot.prototype, DocumentFragment.prototype);
+    }
+
+    // ===== HTMLSlotElement ================================================
+    //
+    // Spec: <https://html.spec.whatwg.org/multipage/scripting.html#htmlslotelement>.
+    // The actual slot IDL methods (`name`, `assignedElements`,
+    // `assignedNodes`) live as gated methods on `Element` (similar to
+    // the HTMLHyperlinkElementUtils mixin on `<a>` / `<area>`); this
+    // constructor exists for `instanceof` checks.
+    function HTMLSlotElement() {
+        throw new TypeError(
+            "Illegal constructor: HTMLSlotElement is exposed for instanceof checks only. "
+            + "Slots are created by parsing or document.createElement('slot')."
+        );
+    }
+    HTMLSlotElement.prototype = Object.create(
+        // Walk through Element.prototype if available so the chain
+        // works for both `instanceof HTMLSlotElement` and
+        // `instanceof Element`.
+        (typeof Element !== 'undefined' && Element.prototype)
+            ? Element.prototype
+            : Object.prototype
+    );
+    HTMLSlotElement.prototype.constructor = HTMLSlotElement;
+    Object.defineProperty(HTMLSlotElement, Symbol.hasInstance, {
+        value: function(obj) {
+            // Any Element whose tag name is SLOT is an HTMLSlotElement.
+            // `tagName` on the heso Element is the uppercase tag name.
+            return obj != null
+                && typeof obj === 'object'
+                && typeof obj.tagName === 'string'
+                && obj.tagName === 'SLOT';
+        },
+        configurable: true,
+    });
+    Object.defineProperty(globalThis, 'HTMLSlotElement', {
+        value: HTMLSlotElement,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+    });
+
+    Object.defineProperty(globalThis, '__hesoShadowDomInstalled', {
+        value: true,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+    });
+})();
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -3827,7 +4908,7 @@ mod tests {
         assert_eq!(src.children().len(), 1);
         assert_eq!(dst.children().len(), 0);
 
-        let returned = dst.append_child(item.clone());
+        let returned = dst.append_child_rs(item.clone());
         assert_eq!(returned.id(), "item");
 
         // After: item is inside dst, gone from src.

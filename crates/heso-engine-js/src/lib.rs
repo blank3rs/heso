@@ -100,7 +100,7 @@ pub mod timers;
 pub mod url_search_params;
 pub mod web_apis;
 
-pub use dom::{Document, DomTokenList, Element};
+pub use dom::{Document, DomTokenList, Element, ShadowRoot};
 pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};
 pub use events::{AbortController, AbortSignal, CustomEvent, DOMException, Event, EventTarget};
 pub use fetch::FetchMode;
