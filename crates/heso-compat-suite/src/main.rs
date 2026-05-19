@@ -39,6 +39,7 @@ use std::time::Instant;
 use heso_engine_fetch::FetchEngine;
 use heso_engine_js::{JsEngine, ScriptFetchPolicy};
 use serde::Serialize;
+use sysinfo::{get_current_pid, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use url::Url;
 
 /// What a target's JS probe is asserting about the page.
@@ -104,6 +105,15 @@ struct TargetResult {
     ms_fetch: u128,
     /// Just the JS eval (post-fetch).
     ms_eval: u128,
+    /// This process's resident-set-size (in kilobytes) sampled
+    /// **after** this target finished. Because heso does not release
+    /// memory between targets, this value is monotonically
+    /// non-decreasing across the run, so it answers the question
+    /// "after running through these N pages, how much RAM does heso
+    /// hold?" — which is exactly the number we want to back the
+    /// README's "tiny idle RAM" claim. `0` means we couldn't sample
+    /// (e.g. unsupported platform).
+    peak_rss_kb: u64,
     /// The probe's returned value (truncated if huge).
     value: Option<serde_json::Value>,
     /// Failure message, if any.
@@ -352,6 +362,19 @@ async fn main() {
 
     let fetch_engine = FetchEngine::new().expect("build fetch engine");
 
+    // Per-process RSS sampler. We use `sysinfo` because it is the de-facto
+    // cross-platform process-info crate in the Rust ecosystem (active
+    // upstream, no unsafe in our code path, works on Windows where the
+    // user runs heso). We refresh only this process's memory entry
+    // between targets — `ProcessesToUpdate::Some(&[pid])` plus
+    // `ProcessRefreshKind::nothing().with_memory()` skips the
+    // workspace-wide process enumeration on every sample. `0` means
+    // we couldn't determine the current PID (unsupported platform),
+    // in which case every target row records `peak_rss_kb = 0` rather
+    // than aborting the run.
+    let mut sys = System::new();
+    let self_pid: Option<Pid> = get_current_pid().ok();
+
     let mut results: Vec<TargetResult> = Vec::with_capacity(TARGETS.len());
     for t in TARGETS {
         if let Some(f) = filter.as_deref() {
@@ -359,12 +382,14 @@ async fn main() {
                 continue;
             }
         }
-        let r = run_target(t, &fetch_engine).await;
+        let mut r = run_target(t, &fetch_engine).await;
+        r.peak_rss_kb = sample_rss_kb(&mut sys, self_pid);
         // Stream progress so the user sees something during long runs.
         eprintln!(
-            "{:6} {:>5}ms  {}",
+            "{:6} {:>5}ms  rss={:>7}KB  {}",
             r.status,
             r.ms_total,
+            r.peak_rss_kb,
             r.name,
         );
         results.push(r);
@@ -462,6 +487,7 @@ async fn run_target(t: &Target, fetch_engine: &FetchEngine) -> TargetResult {
                 ms_total,
                 ms_fetch,
                 ms_eval,
+                peak_rss_kb: 0,
                 value: None,
                 error: Some(format!("{e:?}")),
             };
@@ -477,9 +503,28 @@ async fn run_target(t: &Target, fetch_engine: &FetchEngine) -> TargetResult {
         ms_total,
         ms_fetch,
         ms_eval,
+        peak_rss_kb: 0,
         value: Some(truncate_value(outcome.value)),
         error,
     }
+}
+
+/// Sample this process's resident-set-size, in kilobytes.
+///
+/// Refreshes only **our own** process entry (not every PID on the
+/// system) and only the memory field — keeps the per-target cost in
+/// the sub-millisecond range. Returns `0` if we couldn't determine
+/// the current PID at startup (e.g. unsupported platform) or if the
+/// refresh couldn't see the process for some reason.
+fn sample_rss_kb(sys: &mut System, pid: Option<Pid>) -> u64 {
+    let Some(pid) = pid else { return 0 };
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    // `Process::memory()` is documented to return bytes; cast to KB.
+    sys.process(pid).map(|p| p.memory() / 1024).unwrap_or(0)
 }
 
 /// Inlined version of the probe assertion that doesn't carry the `js`
@@ -539,6 +584,7 @@ fn failure(t: &Target, status: &str, msg: String) -> TargetResult {
         ms_total: 0,
         ms_fetch: 0,
         ms_eval: 0,
+        peak_rss_kb: 0,
         value: None,
         error: Some(msg),
     }
@@ -563,6 +609,7 @@ fn failure_timed(
         ms_total,
         ms_fetch,
         ms_eval,
+        peak_rss_kb: 0,
         value: None,
         error: Some(msg),
     }
@@ -588,10 +635,16 @@ fn truncate_value(v: serde_json::Value) -> serde_json::Value {
 /// ```markdown
 /// # heso compatibility scorecard
 ///
-/// | Site | Category | Status | Total ms | Fetch ms | Eval ms |
-/// |---|---|---|---:|---:|---:|
-/// | example.com | smoke | ✅ ok | 47 | 41 | 6 |
+/// | Site | Category | Status | Total ms | Fetch ms | Eval ms | Peak RSS KB |
+/// |---|---|---|---:|---:|---:|---:|
+/// | example.com | smoke | ✅ ok | 47 | 41 | 6 | 24560 |
 /// ```
+///
+/// The `Peak RSS KB` column is sampled after each target finishes. heso
+/// does not release memory between targets, so the column is
+/// monotonically non-decreasing — the last row's value is the peak
+/// resident-set-size across the whole suite. This is the number the
+/// README's "tiny idle RAM" claim should be compared against.
 fn render_markdown(report: &Report) -> String {
     let mut out = String::new();
     let _ = writeln!(&mut out, "# heso compatibility scorecard");
@@ -604,15 +657,27 @@ fn render_markdown(report: &Report) -> String {
     let _ = writeln!(&mut out);
     let _ = writeln!(
         &mut out,
-        "| Site | Category | Status | Total ms | Fetch ms | Eval ms |"
+        "`Peak RSS KB` is this process's resident-set-size sampled after each target. heso does not release memory between targets, so values are monotonically non-decreasing across the run."
     );
-    let _ = writeln!(&mut out, "|---|---|---|---:|---:|---:|");
+    let _ = writeln!(&mut out);
+    let _ = writeln!(
+        &mut out,
+        "| Site | Category | Status | Total ms | Fetch ms | Eval ms | Peak RSS KB |"
+    );
+    let _ = writeln!(&mut out, "|---|---|---|---:|---:|---:|---:|");
     for r in &report.results {
         let icon = if r.status == "ok" { "✅" } else { "❌" };
         let _ = writeln!(
             &mut out,
-            "| {} | {} | {} {} | {} | {} | {} |",
-            r.name, r.category, icon, r.status, r.ms_total, r.ms_fetch, r.ms_eval
+            "| {} | {} | {} {} | {} | {} | {} | {} |",
+            r.name,
+            r.category,
+            icon,
+            r.status,
+            r.ms_total,
+            r.ms_fetch,
+            r.ms_eval,
+            r.peak_rss_kb,
         );
     }
     out

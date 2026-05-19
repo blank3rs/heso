@@ -18,6 +18,14 @@ heso-engine-fetch = { path = "../heso-engine-fetch" }
 heso-engine-js = { path = "../heso-engine-js" }
 serde = { workspace = true }
 serde_json.workspace = true
+# `sysinfo` is the de-facto cross-platform process-info crate in the
+# Rust ecosystem (high reputation on crates.io, actively maintained by
+# guillaumegomez, works on Windows/macOS/Linux). Used here to read this
+# process's resident-set-size after each compat target so the scorecard
+# can document peak RAM. Default features pull in disk/network/component
+# probes we don't need; `default-features = false` + the `system`
+# feature keeps just the process/memory APIs.
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "io-std", "fs"] }
 url.workspace = true
 
