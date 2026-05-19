@@ -598,6 +598,33 @@ impl Element {
             .unwrap_or_default()
     }
 
+    /// `element.className = value` — write the element's `class`
+    /// content attribute verbatim, per the [DOM spec][spec].
+    ///
+    /// Framework code reaches for this constantly: Tailwind's `apply`
+    /// directive, Vue's `:class` static-path, jQuery's `addClass`, and
+    /// every utility-CSS pattern writes `el.className = '...'`. Without
+    /// a setter, those assignments silently no-op'd and styling broke.
+    ///
+    /// `Coerced<String>` (rather than `String`) is load-bearing:
+    /// frameworks pass numbers, bools, and template-literal results
+    /// whose coercion isn't always a `string` typeof — strict typing
+    /// throws mid-render. `Coerced` applies WebIDL `DOMString`
+    /// semantics, so `null` / `undefined` stringify to `"null"` /
+    /// `"undefined"`. Don't special-case those; that matches the spec.
+    ///
+    /// Setting `""` writes an empty `class` attribute rather than
+    /// removing it — `removeAttribute('class')` is a different
+    /// concern, and the empty-string form is allowable per spec.
+    ///
+    /// [spec]: https://dom.spec.whatwg.org/#dom-element-classname
+    #[qjs(set, rename = "className")]
+    fn set_class_name(&self, value: rquickjs::Coerced<String>) {
+        if let Some(n) = self.node_ref() {
+            n.set_attr("class", &value.0);
+        }
+    }
+
     /// `element.textContent` — concatenated text of this element and
     /// all descendants, in document order.
     #[qjs(get, rename = "textContent")]

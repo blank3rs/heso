@@ -855,3 +855,54 @@ fn insert_before_with_null_ref_appends_to_end() {
     ).unwrap();
     assert_eq!(out.value, serde_json::json!("a,b"));
 }
+
+// =====================================================================
+// Element.className setter — Tailwind/Vue/jQuery rely on this.
+// Before the setter landed, `el.className = '...'` silently no-op'd
+// and every utility-CSS framework lost styles on hydration.
+// =====================================================================
+
+#[test]
+fn class_name_setter_writes_class_attribute() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('d').className = 'foo bar baz';").unwrap();
+    let out = sess.eval("document.getElementById('d').getAttribute('class')").unwrap();
+    assert_eq!(out.value, serde_json::json!("foo bar baz"));
+}
+
+#[test]
+fn class_name_setter_replaces_existing_classes() {
+    let html = "<!doctype html><html><body><div id='d' class='old1 old2'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('d').className = 'new';").unwrap();
+    let out = sess.eval("document.getElementById('d').className").unwrap();
+    assert_eq!(out.value, serde_json::json!("new"));
+}
+
+#[test]
+fn class_name_setter_accepts_empty_string() {
+    let html = "<!doctype html><html><body><div id='d' class='old'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('d').className = '';").unwrap();
+    let out = sess.eval("document.getElementById('d').getAttribute('class')").unwrap();
+    assert_eq!(out.value, serde_json::json!(""));
+}
+
+#[test]
+fn class_name_setter_coerces_non_strings() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('d').className = 42;").unwrap();
+    let out = sess.eval("document.getElementById('d').className").unwrap();
+    assert_eq!(out.value, serde_json::json!("42"));
+}
+
+#[test]
+fn class_name_setter_and_classlist_stay_in_sync() {
+    let html = "<!doctype html><html><body><div id='d'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval("document.getElementById('d').className = 'a b'; document.getElementById('d').classList.add('c');").unwrap();
+    let out = sess.eval("document.getElementById('d').className").unwrap();
+    assert_eq!(out.value, serde_json::json!("a b c"));
+}
