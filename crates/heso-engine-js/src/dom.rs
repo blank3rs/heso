@@ -80,7 +80,8 @@ use rquickjs::{
 };
 
 use crate::events::{
-    self, add_listener_to_map, dispatch_with_map, parse_listener_options, remove_listener_from_map,
+    self, add_listener_to_map, dispatch_with_node_path, parse_listener_options,
+    remove_listener_from_map,
 };
 
 /// Name of the hidden property on `globalThis.document` whose value
@@ -309,6 +310,26 @@ impl Document {
         }
     }
 
+    /// `document.createElement(tagName)` — create a fresh orphan
+    /// element with the given tag, no parent, no children, no
+    /// attributes.
+    ///
+    /// The new node is allocated in the **same** `dom_query::Tree`
+    /// as the rest of the document, so its `NodeId` is coherent with
+    /// the node-keyed event-listener registry (see [`PROP_NODE_LISTENERS`]).
+    /// `addEventListener` calls on the returned [`Element`] register
+    /// against that registry, and dispatch via `element.click()` or
+    /// `element.dispatchEvent(...)` after the node has been
+    /// `appendChild`'d into the tree will find those listeners.
+    ///
+    /// Uses [`dom_query::Tree::new_element`] which creates an orphan
+    /// element node (no parent, empty attribute list) and returns its
+    /// stable [`NodeId`].
+    fn create_element(&self, tag_name: String) -> Element {
+        let node_ref = self.doc.tree.new_element(&tag_name);
+        Element::from_id(self.doc.clone(), node_ref.id)
+    }
+
     /// `document.title = value` — set the text content of the existing
     /// `<title>` element, or create one inside `<head>` if missing.
     ///
@@ -438,6 +459,15 @@ impl Element {
             .and_then(|n| n.id_attr())
             .map(|t| t.to_string())
             .unwrap_or_default()
+    }
+
+    /// `element.id = value` — set the element's `id` attribute.
+    /// Standard DOM IDL: `id` is a reflected attribute.
+    #[qjs(set, rename = "id")]
+    fn set_id(&self, value: String) {
+        if let Some(n) = self.node_ref() {
+            n.set_attr("id", &value);
+        }
     }
 
     /// `element.className` — the element's `class` attribute, or
@@ -701,20 +731,18 @@ impl Element {
         Ok(())
     }
 
-    /// `element.dispatchEvent(event)` — fire `event` on this element,
-    /// invoking every listener registered for `event.type`. Returns
+    /// `element.dispatchEvent(event)` — fire `event` on this element
+    /// using a W3C capture / at-target / bubble path walk. Returns
     /// `false` iff the event is cancelable and a listener called
-    /// `preventDefault()`. Flat dispatch (no capture/bubble walk) per
-    /// the Phase 1B punts documented in [`crate::events`].
+    /// `preventDefault()`. See [`dispatch_with_node_path`].
     fn dispatch_event<'js>(
         this: This<Class<'js, Self>>,
         ctx: Ctx<'js>,
         event: Value<'js>,
     ) -> rquickjs::Result<bool> {
-        let node_id = this.0.borrow().node_id;
-        let target: Value<'js> = this.0.clone().into_value();
-        let map = element_listener_map_opt(&ctx, node_id)?;
-        dispatch_with_map(&ctx, map.as_ref(), Some(target), event)
+        let element = this.0.borrow().clone();
+        let path = build_dispatch_path(&ctx, &element)?;
+        dispatch_with_node_path(&ctx, &path, event)
     }
 
     /// `element.click()` — synthesize and dispatch a cancelable
@@ -737,12 +765,57 @@ impl Element {
         );
         let event_class = Class::instance(ctx.clone(), event)?;
         let event_value: Value<'js> = event_class.into_value();
-        let node_id = this.0.borrow().node_id;
-        let target: Value<'js> = this.0.clone().into_value();
-        let map = element_listener_map_opt(&ctx, node_id)?;
-        let _ = dispatch_with_map(&ctx, map.as_ref(), Some(target), event_value)?;
+        let element = this.0.borrow().clone();
+        let path = build_dispatch_path(&ctx, &element)?;
+        let _ = dispatch_with_node_path(&ctx, &path, event_value)?;
         Ok(())
     }
+}
+
+/// Build the W3C event-dispatch path for `target` — `[root, ...,
+/// target]`. Each entry pairs the node's listener map (looked up
+/// read-only on the long-lived `__nodeListeners` registry; `None` if
+/// no listeners were ever registered) with a freshly-instantiated JS
+/// [`Element`] wrapper to populate `event.currentTarget` while that
+/// node's listeners fire.
+///
+/// The walk follows [`Element::parent_element`] semantics: skip non-
+/// element parents (text/comment nodes are not in the dispatch path
+/// per the DOM spec). Termination is the first node with no element
+/// parent (i.e. the document element or an orphan node still being
+/// constructed by `createElement`).
+fn build_dispatch_path<'js>(
+    ctx: &Ctx<'js>,
+    target: &Element,
+) -> rquickjs::Result<Vec<(Option<Object<'js>>, Value<'js>)>> {
+    // Collect node ids from target → root.
+    let mut ids: Vec<NodeId> = Vec::new();
+    ids.push(target.node_id);
+    if let Some(start) = target.node_ref() {
+        let mut cur = start.parent();
+        while let Some(n) = cur {
+            if n.is_element() {
+                ids.push(n.id);
+            }
+            cur = n.parent();
+        }
+    }
+    // Reverse so root is first, target last (matches
+    // `dispatch_with_node_path`'s expected ordering).
+    ids.reverse();
+
+    let mut path: Vec<(Option<Object<'js>>, Value<'js>)> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let map = element_listener_map_opt(ctx, id)?;
+        let wrapper = Class::instance(ctx.clone(), Element::from_id(target.doc.clone(), id))?;
+        let wrapper_value: Value<'js> = wrapper.into_value();
+        // We need the JS Object form for `set(PROP_CURRENT_TARGET, ...)`,
+        // but the value the dispatcher pins is the JS Value (which can
+        // be the Class instance wrapped). Just pass the Value; the
+        // dispatcher stores it directly.
+        path.push((map, wrapper_value));
+    }
+    Ok(path)
 }
 
 /// `element.classList` — a [DOMTokenList][spec] over the element's

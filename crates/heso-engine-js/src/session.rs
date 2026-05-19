@@ -397,8 +397,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "no bubble/capture walk yet — events.rs dispatch is flat (see events.rs:69). \
-                Required for React/Vue-style delegation. Next bar."]
     fn event_delegation_on_body_routes_clicks_from_children() {
         // React-style delegation: a listener on a high ancestor handles
         // clicks on children. Bubbling must reach the body listener.
@@ -470,8 +468,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "document.createElement not implemented in dom.rs. \
-                Required for any script that builds nodes at runtime. Next bar."]
     fn dynamically_appended_element_is_clickable() {
         // Click a button that creates a new button at runtime; the new
         // button must be selectable AND its listener must fire when

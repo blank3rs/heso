@@ -122,6 +122,12 @@ const PROP_LISTENERS: &str = "__listeners";
 const PROP_REASON: &str = "__reason";
 const PROP_DETAIL: &str = "__detail";
 const PROP_TARGET: &str = "__target";
+/// Hidden JS-side property tracking the per-node `currentTarget` during
+/// a tree-aware dispatch walk. Updated on every node visited by
+/// [`dispatch_with_node_path`]; cleared back to the original target at
+/// the end of dispatch. Reading `event.currentTarget` from JS prefers
+/// this property and falls back to [`PROP_TARGET`].
+const PROP_CURRENT_TARGET: &str = "__currentTarget";
 
 // ===== DOMException =============================================================
 
@@ -395,11 +401,14 @@ impl Event {
         target_property(this.0.clone().into_value())
     }
 
-    /// `e.currentTarget` — in our flat-dispatch model this is the
-    /// same as `target` (no propagation walk).
+    /// `e.currentTarget` — the node whose listeners are currently
+    /// being invoked. Updated per-node by the path-walking dispatcher
+    /// ([`dispatch_with_node_path`]). Falls back to `target` for the
+    /// flat-dispatch path (EventTarget / AbortSignal), which never
+    /// updates `__currentTarget`.
     #[qjs(get)]
     fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
-        target_property(this.0.clone().into_value())
+        current_target_property(this.0.clone().into_value())
     }
 
     /// `e.preventDefault()` — sets `defaultPrevented` to true if the
@@ -533,7 +542,7 @@ impl CustomEvent {
     /// `e.currentTarget` — see [`Event::current_target`].
     #[qjs(get)]
     fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
-        target_property(this.0.clone().into_value())
+        current_target_property(this.0.clone().into_value())
     }
 
     /// `e.detail` — reads the JS-side hidden property installed by
@@ -943,6 +952,184 @@ pub(crate) fn dispatch_with_map<'js>(
     Ok(!(view.cancelable && dp))
 }
 
+/// Tree-aware dispatch: walk a path of `(listener_map, currentTarget)`
+/// pairs through the standard W3C capture → at-target → bubble phases.
+///
+/// `path[0]` is the root, `path[path.len()-1]` is the target. Each
+/// entry is `(map, current_target_js)` where `map` is the node's
+/// listener map (or `None` if it has none) and `current_target_js` is
+/// the JS [`Element`](crate::dom::Element) wrapper that
+/// `event.currentTarget` should report while listeners on that node
+/// fire.
+///
+/// Semantics:
+/// - **Capture phase** (`eventPhase = 1`): walk `path[0 .. len-1]` and
+///   fire listeners registered with `capture: true`.
+/// - **At target** (`eventPhase = 2`): fire **all** listeners on
+///   `path[len-1]` in registration order, regardless of capture flag.
+/// - **Bubble phase** (`eventPhase = 3`): only if `event.bubbles`.
+///   Walk `path[len-2 ..= 0]` and fire listeners with `capture: false`.
+/// - `stopPropagation()` halts movement to the next node (but lets the
+///   current node's remaining listeners finish).
+/// - `stopImmediatePropagation()` halts the current node's remaining
+///   listeners AND further nodes.
+/// - `event.target` is the at-target node throughout the walk.
+/// - `once: true` listeners are auto-removed from their map after
+///   firing.
+///
+/// Returns `false` iff the event is cancelable and a listener called
+/// `preventDefault()`.
+pub(crate) fn dispatch_with_node_path<'js>(
+    ctx: &Ctx<'js>,
+    path: &[(Option<Object<'js>>, Value<'js>)],
+    event: Value<'js>,
+) -> rquickjs::Result<bool> {
+    let view = view_from_value(&event).ok_or_else(|| {
+        Exception::throw_type(
+            ctx,
+            "dispatchEvent: argument must be an Event or CustomEvent",
+        )
+    })?;
+
+    if view.state.dispatching.get() {
+        return Err(Exception::throw_type(
+            ctx,
+            "dispatchEvent: event is already being dispatched",
+        ));
+    }
+    if path.is_empty() {
+        return Ok(true);
+    }
+
+    view.state.dispatching.set(true);
+    view.state.propagation_stopped.set(false);
+    view.state.immediate_propagation_stopped.set(false);
+    view.state.default_prevented.set(false);
+
+    // Pin `event.target` to the at-target node (last entry).
+    let target_value = path[path.len() - 1].1.clone();
+    let ev_obj = event.as_object().cloned();
+    if let Some(ref ev_obj) = ev_obj {
+        ev_obj.set(PROP_TARGET, target_value.clone())?;
+    }
+
+    // bubbles flag — read from the JS-side Event object, not the view,
+    // because view doesn't carry it. Cheap: one JS getter call.
+    let bubbles: bool = ev_obj
+        .as_ref()
+        .and_then(|o| o.get::<_, Option<bool>>("bubbles").ok().flatten())
+        .unwrap_or(false);
+
+    let last = path.len() - 1;
+
+    // --- Capture phase: path[0 .. last], capture-only ---
+    view.state.event_phase.set(EVENT_PHASE_CAPTURING);
+    for (map, current_target) in path.iter().take(last) {
+        if view.state.propagation_stopped.get() {
+            break;
+        }
+        if let Some(ref ev_obj) = ev_obj {
+            ev_obj.set(PROP_CURRENT_TARGET, current_target.clone())?;
+        }
+        fire_listeners_on_node(ctx, map.as_ref(), &view, &event, Some(true))?;
+    }
+
+    // --- At target: path[last], all listeners ---
+    if !view.state.propagation_stopped.get() {
+        view.state.event_phase.set(EVENT_PHASE_AT_TARGET);
+        let (map, current_target) = &path[last];
+        if let Some(ref ev_obj) = ev_obj {
+            ev_obj.set(PROP_CURRENT_TARGET, current_target.clone())?;
+        }
+        fire_listeners_on_node(ctx, map.as_ref(), &view, &event, None)?;
+    }
+
+    // --- Bubble phase: path[last-1 ..= 0], non-capture only ---
+    if bubbles && last > 0 {
+        view.state.event_phase.set(EVENT_PHASE_BUBBLING);
+        for i in (0..last).rev() {
+            if view.state.propagation_stopped.get() {
+                break;
+            }
+            let (map, current_target) = &path[i];
+            if let Some(ref ev_obj) = ev_obj {
+                ev_obj.set(PROP_CURRENT_TARGET, current_target.clone())?;
+            }
+            fire_listeners_on_node(ctx, map.as_ref(), &view, &event, Some(false))?;
+        }
+    }
+
+    let dp = view.state.default_prevented.get();
+    view.state.dispatching.set(false);
+    view.state.event_phase.set(EVENT_PHASE_NONE);
+    // Restore currentTarget to the at-target node so any post-dispatch
+    // reads see the original target rather than whichever node was
+    // visited last (matches the spec: currentTarget is null after
+    // dispatch, but our flat-fallback semantics return target).
+    if let Some(ref ev_obj) = ev_obj {
+        let _ = ev_obj.remove(PROP_CURRENT_TARGET);
+    }
+
+    Ok(!(view.cancelable && dp))
+}
+
+/// Fire listeners on a single node's listener map during a phase walk.
+///
+/// `phase_capture_filter`:
+/// - `Some(true)`: only listeners registered with `capture: true`
+///   (capture phase).
+/// - `Some(false)`: only listeners registered with `capture: false`
+///   (bubble phase).
+/// - `None`: fire every listener (at-target phase).
+///
+/// Honors `stopImmediatePropagation`. Removes spent `once` listeners.
+fn fire_listeners_on_node<'js>(
+    ctx: &Ctx<'js>,
+    map: Option<&Object<'js>>,
+    view: &EventView,
+    event: &Value<'js>,
+    phase_capture_filter: Option<bool>,
+) -> rquickjs::Result<()> {
+    let Some(map) = map else { return Ok(()) };
+    let list: Option<Array<'js>> = map.get::<_, Option<Array<'js>>>(view.event_type.as_str())?;
+    let Some(list) = list else { return Ok(()) };
+
+    // Snapshot up-front: mutating the live array mid-iteration is UB
+    // per spec. Records are `(callback, capture, once)`.
+    let mut snapshot: Vec<(Function<'js>, bool, bool)> = Vec::new();
+    let len = list.len();
+    for i in 0..len {
+        let rec: Option<Object<'js>> = list.get(i)?;
+        let Some(rec) = rec else { continue };
+        let cb: Option<Function<'js>> = rec.get("callback")?;
+        let Some(cb) = cb else { continue };
+        let capture: bool = rec.get::<_, Option<bool>>("capture")?.unwrap_or(false);
+        let once: bool = rec.get::<_, Option<bool>>("once")?.unwrap_or(false);
+        snapshot.push((cb, capture, once));
+    }
+
+    let mut once_to_remove: Vec<(Function<'js>, bool)> = Vec::new();
+    for (callback, capture, once) in &snapshot {
+        if view.state.immediate_propagation_stopped.get() {
+            break;
+        }
+        if let Some(want) = phase_capture_filter {
+            if *capture != want {
+                continue;
+            }
+        }
+        let _: Value<'js> = callback.call((event.clone(),))?;
+        if *once {
+            once_to_remove.push((callback.clone(), *capture));
+        }
+    }
+
+    for (cb, cap) in &once_to_remove {
+        remove_listener_from_map(ctx, map, &view.event_type, cb, *cap)?;
+    }
+    Ok(())
+}
+
 /// Shared getter body for `event.target` / `event.currentTarget` on
 /// both [`Event`] and [`CustomEvent`]: reads the hidden JS-side
 /// [`PROP_TARGET`] property set by [`dispatch_with_map`]. Returns JS
@@ -956,6 +1143,21 @@ fn target_property<'js>(event_value: Value<'js>) -> rquickjs::Result<Value<'js>>
         Some(v) => Ok(v),
         None => obj.ctx().clone().eval::<Value<'js>, _>("null"),
     }
+}
+
+/// Shared getter for `event.currentTarget`. Prefers
+/// [`PROP_CURRENT_TARGET`] (set per-node by the path-walking
+/// dispatcher); falls back to [`PROP_TARGET`] so the flat-dispatch path
+/// keeps its old semantics (currentTarget == target for non-DOM
+/// EventTargets like `AbortSignal`).
+fn current_target_property<'js>(event_value: Value<'js>) -> rquickjs::Result<Value<'js>> {
+    let obj = event_value.as_object().cloned().ok_or_else(|| {
+        JsError::new_from_js_message("this", "Event", "not an object")
+    })?;
+    if let Some(v) = obj.get::<_, Option<Value<'js>>>(PROP_CURRENT_TARGET)? {
+        return Ok(v);
+    }
+    target_property(event_value)
 }
 
 /// Two-callback strict-equality check using a tiny JS helper.
