@@ -374,6 +374,64 @@ impl Document {
         Element::from_id(self.doc.clone(), node_ref.id)
     }
 
+    /// `document.createElementNS(namespace, qualifiedName)` — create an
+    /// orphan element with the given qualified name. The namespace
+    /// argument is currently **ignored**: heso renders an
+    /// agent-shaped DOM, not an SVG/MathML rendering surface, so the
+    /// element behaves as if it were `createElement(qualifiedName)`.
+    ///
+    /// Why expose this at all: framework bundlers (Preact, React,
+    /// Vue) call `createElementNS` for SVG roots even on pages that
+    /// don't actually use SVG visually, and a `not a function` throw
+    /// halts the diff. Returning a plain element is correct enough
+    /// for agents: the tag is preserved, attributes round-trip, the
+    /// tree shape stays consistent.
+    #[qjs(rename = "createElementNS")]
+    fn create_element_ns(&self, _namespace: String, qualified_name: String) -> Element {
+        let node_ref = self.doc.tree.new_element(&qualified_name);
+        Element::from_id(self.doc.clone(), node_ref.id)
+    }
+
+    /// `document.createTextNode(data)` — create an orphan text node
+    /// wrapping `data`. The returned value is an [`Element`] wrapper
+    /// around the text-node's [`NodeId`] so it can be `appendChild`'d
+    /// into the live tree alongside element nodes; `textContent` /
+    /// `nodeValue` reads the data back.
+    ///
+    /// Phase 1B: the wrapper is the same [`Element`] type used for
+    /// element nodes. Element-only properties (`tagName`, `id`,
+    /// `classList`) return empty / no-op on a text-node wrapper.
+    /// This is enough for the Preact / React / Vue render path,
+    /// which only ever calls `appendChild` and `textContent`-style
+    /// updates on text nodes.
+    fn create_text_node(&self, data: String) -> Element {
+        let node_ref = self.doc.tree.new_text(data);
+        Element::from_id(self.doc.clone(), node_ref.id)
+    }
+
+    /// `document.getElementsByTagName(name)` — return every element
+    /// whose tag matches `name`, in document order. `"*"` matches
+    /// every element.
+    ///
+    /// The DOM spec says this returns a live `HTMLCollection`; here
+    /// we return a plain array because (a) `querySelectorAll`
+    /// already returns a plain array, (b) liveness is rarely the
+    /// load-bearing property — callers iterate immediately — and
+    /// (c) the GA snippet that prompted this method
+    /// (`document.getElementsByTagName('script')[0]`) only ever
+    /// indexes once.
+    fn get_elements_by_tag_name(&self, name: String) -> Vec<Element> {
+        let selector = if name == "*" { "*".to_owned() } else { name };
+        match self.doc.try_select(&selector) {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// `document.title = value` — set the text content of the existing
     /// `<title>` element, or create one inside `<head>` if missing.
     ///
@@ -607,9 +665,27 @@ impl Element {
     /// `element.setAttribute(name, value)` — set or replace the
     /// attribute named `name` with `value`. Silently no-ops on a stale
     /// element handle.
-    fn set_attribute(&self, name: String, value: String) {
+    fn set_attribute(
+        &self,
+        name: String,
+        value: Option<rquickjs::Coerced<String>>,
+    ) {
+        // Framework renderers (Preact, React, Vue, lit-html) routinely
+        // call `setAttribute(name, value)` with non-string `value`
+        // arguments — `true` / `false` for boolean attrs, numbers for
+        // `tabindex` / `width`, `null` to mean "remove this attr".
+        // Strict-typing the second argument as `String` throws
+        // mid-render, which halts hydration on otherwise-clean pages.
+        // `Coerced<String>` accepts whatever JS hands us and applies
+        // `String(value)` semantics (so `true` → "true", `42` → "42");
+        // wrapping in `Option` lets `null` and `undefined` route to
+        // `removeAttribute` to match the spec's "if value is null,
+        // remove the named attribute" branch.
         if let Some(n) = self.node_ref() {
-            n.set_attr(&name, &value);
+            match value {
+                Some(s) => n.set_attr(&name, &s.0),
+                None => n.remove_attr(&name),
+            }
         }
     }
 
@@ -667,6 +743,24 @@ impl Element {
             .collect()
     }
 
+    /// `element.parentNode` — the direct parent in the tree
+    /// regardless of node type (element / document fragment / etc.),
+    /// or `null` for the root. Distinct from
+    /// [`Self::parent_element`], which skips non-element ancestors.
+    ///
+    /// Returned as an [`Element`] wrapper because Phase 1B doesn't
+    /// have a separate `Node` class — callers that only need
+    /// `appendChild` / `removeChild` / `insertBefore` can use the
+    /// shared wrapper. Element-only properties (`tagName`, `id`)
+    /// will look odd on document-typed parents but are not
+    /// load-bearing for the render path.
+    #[qjs(get)]
+    fn parent_node(&self) -> Option<Element> {
+        let n = self.node_ref()?;
+        n.parent()
+            .map(|p| Element::from_id(self.doc.clone(), p.id))
+    }
+
     /// `element.parentElement` — closest element ancestor, or `null`
     /// for the root.
     #[qjs(get)]
@@ -695,6 +789,36 @@ impl Element {
             n.append_child(&child.node_id);
         }
         child
+    }
+
+    /// `element.insertBefore(newNode, referenceNode)` — insert
+    /// `newNode` as a child of `self` immediately before
+    /// `referenceNode`. If `referenceNode` is `null` / `undefined`,
+    /// behaves like [`Self::append_child`] (appends to the end), per
+    /// the DOM spec.
+    ///
+    /// If `referenceNode` is not a child of `self`, this is currently
+    /// a no-op (the spec says `NotFoundError`; aligning with that is
+    /// a Phase 1C follow-up). If `newNode` is already in the tree,
+    /// `dom_query` re-parents it cleanly.
+    fn insert_before(&self, new_node: Element, reference_node: Option<Element>) -> Element {
+        match reference_node {
+            Some(reference) => {
+                if let Some(ref_n) = self.doc.tree.get(&reference.node_id) {
+                    if let Some(parent) = ref_n.parent() {
+                        if parent.id == self.node_id {
+                            ref_n.insert_before(&new_node.node_id);
+                        }
+                    }
+                }
+            }
+            None => {
+                if let Some(n) = self.node_ref() {
+                    n.append_child(&new_node.node_id);
+                }
+            }
+        }
+        new_node
     }
 
     /// `element.removeChild(child)` — detach `child` from `self`.
@@ -1189,10 +1313,10 @@ mod tests {
     fn set_attribute_round_trips_through_get_attribute() {
         let d = doc(r#"<html><body><a href="/old">x</a></body></html>"#);
         let a = d.query_selector_inner("a").expect("a");
-        a.set_attribute("href".to_owned(), "/new".to_owned());
+        a.set_attribute("href".to_owned(), Some(rquickjs::Coerced("/new".to_owned())));
         assert_eq!(a.get_attribute("href".to_owned()), Some("/new".to_owned()));
         // A new attribute name should also be writable.
-        a.set_attribute("data-x".to_owned(), "42".to_owned());
+        a.set_attribute("data-x".to_owned(), Some(rquickjs::Coerced("42".to_owned())));
         assert_eq!(a.get_attribute("data-x".to_owned()), Some("42".to_owned()));
         // outer_html reflects the change.
         assert!(a.outer_html().contains("data-x=\"42\""));

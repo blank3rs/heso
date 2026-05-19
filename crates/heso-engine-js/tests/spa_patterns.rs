@@ -760,3 +760,98 @@ fn location_assign_replace_reload_are_callable_noops() {
     ).unwrap();
     assert_eq!(out.value, serde_json::json!("https://example.com/"));
 }
+
+// =====================================================================
+// createTextNode / createElementNS / getElementsByTagName / parentNode
+// / insertBefore / setAttribute-coerce — Preact-shakedown bars
+// =====================================================================
+
+#[test]
+fn create_text_node_appendable_and_reads_back_via_textcontent() {
+    let html = "<!doctype html><html><body><div id='r'></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval(
+        "const t = document.createTextNode('hello'); document.getElementById('r').appendChild(t); document.getElementById('r').textContent"
+    ).unwrap();
+    assert_eq!(out.value, serde_json::json!("hello"));
+}
+
+#[test]
+fn create_element_ns_returns_element_with_correct_tag() {
+    let html = "<!doctype html><html><body></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval(
+        "const e = document.createElementNS('http://www.w3.org/2000/svg', 'svg'); e.tagName"
+    ).unwrap();
+    assert_eq!(out.value, serde_json::json!("SVG"));
+}
+
+#[test]
+fn get_elements_by_tag_name_returns_array_in_document_order() {
+    let html = "<!doctype html><html><body><p>a</p><p>b</p><p>c</p></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval(
+        "Array.from(document.getElementsByTagName('p')).map(e => e.textContent).join(',')"
+    ).unwrap();
+    assert_eq!(out.value, serde_json::json!("a,b,c"));
+}
+
+#[test]
+fn parent_node_resolves_for_nested_element() {
+    let html = "<!doctype html><html><body><div id='outer'><span id='inner'>x</span></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    let out = sess.eval("document.getElementById('inner').parentNode.id").unwrap();
+    assert_eq!(out.value, serde_json::json!("outer"));
+}
+
+#[test]
+fn set_attribute_coerces_bool_and_number_and_null_removes() {
+    let html = "<!doctype html><html><body><input id='i'></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval(
+        "const i = document.getElementById('i'); \
+         i.setAttribute('disabled', true); \
+         i.setAttribute('tabindex', 3); \
+         i.setAttribute('placeholder', 'a'); \
+         i.setAttribute('placeholder', null);"
+    ).unwrap();
+    let out = sess.eval(
+        "JSON.stringify({d: document.getElementById('i').getAttribute('disabled'), t: document.getElementById('i').getAttribute('tabindex'), p: document.getElementById('i').getAttribute('placeholder')})"
+    ).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(out.value.as_str().unwrap()).unwrap();
+    assert_eq!(parsed["d"], "true");
+    assert_eq!(parsed["t"], "3");
+    assert_eq!(parsed["p"], serde_json::Value::Null);
+}
+
+#[test]
+fn insert_before_places_new_child_in_correct_position() {
+    let html = "<!doctype html><html><body><div id='r'><span id='a'>a</span><span id='c'>c</span></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval(
+        "const r = document.getElementById('r'); \
+         const b = document.createElement('span'); \
+         b.id = 'b'; b.textContent = 'b'; \
+         r.insertBefore(b, document.getElementById('c'));"
+    ).unwrap();
+    let out = sess.eval(
+        "Array.from(document.getElementById('r').children).map(e => e.id).join(',')"
+    ).unwrap();
+    assert_eq!(out.value, serde_json::json!("a,b,c"));
+}
+
+#[test]
+fn insert_before_with_null_ref_appends_to_end() {
+    let html = "<!doctype html><html><body><div id='r'><span id='a'>a</span></div></body></html>";
+    let (sess, _) = JsSession::open(html, u()).unwrap();
+    sess.eval(
+        "const r = document.getElementById('r'); \
+         const b = document.createElement('span'); b.id = 'b'; \
+         r.insertBefore(b, null);"
+    ).unwrap();
+    let out = sess.eval(
+        "Array.from(document.getElementById('r').children).map(e => e.id).join(',')"
+    ).unwrap();
+    assert_eq!(out.value, serde_json::json!("a,b"));
+}
