@@ -498,11 +498,19 @@ pub(crate) fn advance_clock(
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
     delta_ms: u64,
 ) -> rquickjs::Result<u64> {
-    // Step 1: advance the virtual clock.
-    {
-        let mut s = scheduler.lock().expect("scheduler poisoned");
-        s.clock.advance(delta_ms);
-    }
+    // Step 1: compute the target virtual time. We do NOT immediately
+    // jump the clock to `target_ms` — instead, the pump below advances
+    // the virtual clock to each due timer's `fire_at_ms` *before*
+    // firing it. That way, a callback that schedules another timer
+    // sees `now == fire_at_ms` and the inner timer's deadline is
+    // computed relative to that, not to the post-advance `target_ms`.
+    // Without this, `setTimeout(() => setTimeout(inner, 10), 10)` with
+    // `advance_clock(100)` schedules the inner at fire_time 110, past
+    // the requested window, and the inner never fires this round.
+    let target_ms: u64 = {
+        let s = scheduler.lock().expect("scheduler poisoned");
+        s.clock.now_ms().saturating_add(delta_ms)
+    };
 
     // Step 2: drain due timers, firing each. Interval re-scheduling
     // happens between fires so a runaway interval that fires N times
@@ -515,9 +523,43 @@ pub(crate) fn advance_clock(
     // scheduler — its new entry shows up in the heap before the next
     // peek.
     loop {
-        // Pop one due timer under the scheduler lock.
+        // Pop one due timer under the scheduler lock. Before
+        // checking, advance the virtual clock to either the top
+        // timer's `fire_at_ms` (if <= target) or the final
+        // `target_ms` (if the top is in the future or the heap is
+        // empty). This keeps `now` monotonic and ensures inner
+        // `setTimeout` calls from within a callback see a sane
+        // `now` for relative scheduling.
         let popped = {
             let mut s = scheduler.lock().expect("scheduler poisoned");
+            // Find the next live due fire-time (skipping cleared /
+            // stale heap entries) without consuming them.
+            let next_due_fire_at = loop {
+                let Some(Reverse(top)) = s.heap.peek().copied() else {
+                    break None;
+                };
+                // Is this heap entry still live + canonical?
+                let live = s
+                    .entries
+                    .get(&top.id)
+                    .map(|e| e.fire_at_ms == top.fire_at_ms && e.insertion_seq == top.insertion_seq)
+                    .unwrap_or(false);
+                if !live {
+                    s.heap.pop();
+                    continue;
+                }
+                break Some(top.fire_at_ms);
+            };
+            // Advance the clock either to the next due timer (capped
+            // at target) or all the way to target if no due timer
+            // remains within range.
+            let new_now = match next_due_fire_at {
+                Some(t) if t <= target_ms => t,
+                _ => target_ms,
+            };
+            if new_now > s.clock.now_ms() {
+                s.clock.now_ms = new_now;
+            }
             s.pop_due()
         };
         let Some((id, entry)) = popped else { break };

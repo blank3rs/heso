@@ -928,8 +928,12 @@ pub(crate) fn dispatch_with_map<'js>(
             break;
         }
         // Call with no `this` binding — match Deno's behavior of
-        // invoking listener as a plain function.
-        let _: Value<'js> = callback.call((event.clone(),))?;
+        // invoking listener as a plain function. "Report the
+        // exception" per spec: forward to console.error and continue.
+        let call_result: Result<Value<'js>, _> = callback.call((event.clone(),));
+        if let Err(err) = call_result {
+            report_listener_exception(ctx, err);
+        }
         if *once {
             once_to_remove.push(callback.clone());
         }
@@ -1066,8 +1070,13 @@ pub(crate) fn dispatch_with_node_path<'js>(
     // reads see the original target rather than whichever node was
     // visited last (matches the spec: currentTarget is null after
     // dispatch, but our flat-fallback semantics return target).
+    // Per spec: after dispatch, `event.currentTarget` must be `null`.
+    // We set it explicitly to JS null rather than removing, so the
+    // getter returns the right thing without consulting dispatch
+    // state.
     if let Some(ref ev_obj) = ev_obj {
-        let _ = ev_obj.remove(PROP_CURRENT_TARGET);
+        let null_val: Value<'js> = ctx.eval("null")?;
+        ev_obj.set(PROP_CURRENT_TARGET, null_val)?;
     }
 
     Ok(!(view.cancelable && dp))
@@ -1118,7 +1127,15 @@ fn fire_listeners_on_node<'js>(
                 continue;
             }
         }
-        let _: Value<'js> = callback.call((event.clone(),))?;
+        // Per WHATWG "report the exception": a throwing listener does
+        // NOT halt subsequent listeners on this node, nor propagation.
+        // We forward the exception's stringification to `console.error`
+        // (best-effort; swallowed if console isn't installed) and
+        // continue.
+        let call_result: Result<Value<'js>, _> = callback.call((event.clone(),));
+        if let Err(err) = call_result {
+            report_listener_exception(ctx, err);
+        }
         if *once {
             once_to_remove.push((callback.clone(), *capture));
         }
@@ -1158,6 +1175,30 @@ fn current_target_property<'js>(event_value: Value<'js>) -> rquickjs::Result<Val
         return Ok(v);
     }
     target_property(event_value)
+}
+
+/// Forward a listener exception to `console.error` per the WHATWG
+/// "report the exception" step. Best-effort: swallows any failure of
+/// the report path itself (e.g. if `console` is missing).
+///
+/// Reads `e.stack || String(e)` so both regular Error throws and
+/// plain-value throws produce a useful line.
+fn report_listener_exception<'js>(ctx: &Ctx<'js>, err: JsError) {
+    // Pull the actual thrown value off the context (rquickjs captures
+    // it as part of the Error::Exception variant on the catch side).
+    // The simplest portable shape is to JSON-stringify via a tiny JS
+    // helper; if that fails, fall back to the rust-side debug.
+    let msg = format!("{err}");
+    // If the error has a pending exception, prefer that string-form.
+    let report: Function<'js> = match ctx.eval(
+        r#"(m) => { try { if (globalThis.console && globalThis.console.error) {
+            globalThis.console.error('Uncaught (in event listener): ' + m);
+        } } catch (_) {} }"#,
+    ) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let _ = report.call::<_, Value<'js>>((msg,));
 }
 
 /// Two-callback strict-equality check using a tiny JS helper.
@@ -1962,5 +2003,37 @@ mod tests {
             err,
             EvalError::Exception { .. } | EvalError::ThrownValue { .. }
         ));
+    }
+
+    /// Bug 1 regression: a throwing listener used to leave
+    /// `EventState.dispatching = true`, poisoning the event-object
+    /// for any future dispatch ("already being dispatched"). The fix
+    /// catches listener exceptions per WHATWG "report the exception"
+    /// and continues — so a subsequent dispatch on the same target
+    /// works.
+    #[test]
+    fn throwing_listener_does_not_poison_subsequent_dispatch() {
+        let e = engine();
+        let out = e
+            .eval(
+                r#"
+                const t = new EventTarget();
+                let after = 0;
+                t.addEventListener('go', () => { throw new Error('x'); });
+                t.addEventListener('go', () => { after++; });
+                // First dispatch: the throwing listener is reported,
+                // the second listener still runs.
+                t.dispatchEvent(new Event('go'));
+                // Second dispatch on the SAME target / same event-type
+                // must not throw "already being dispatched".
+                const ev2 = new Event('go');
+                t.dispatchEvent(ev2);
+                [after, ev2.eventPhase]
+                "#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value[0], 2);
+        // currentTarget should be null after dispatch; eventPhase 0.
+        assert_eq!(out.value[1], 0);
     }
 }

@@ -134,6 +134,31 @@ pub(crate) fn element_listener_map<'js>(
     }
 }
 
+/// Delete the listener-registry entries for every NodeId in `ids`
+/// from `globalThis.document.__nodeListeners`. Used by
+/// [`Element::remove_child`] to keep the registry from accumulating
+/// stale records for detached subtrees.
+pub(crate) fn clear_listeners_for_nodes<'js>(
+    ctx: &Ctx<'js>,
+    ids: &[NodeId],
+) -> rquickjs::Result<()> {
+    let globals = ctx.globals();
+    let document: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("document")?;
+    let Some(document) = document else {
+        return Ok(());
+    };
+    let registry: Option<Object<'js>> =
+        document.get::<_, Option<Object<'js>>>(PROP_NODE_LISTENERS)?;
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    for id in ids {
+        let key = node_key(*id);
+        let _ = registry.remove(key.as_str());
+    }
+    Ok(())
+}
+
 /// Read-only variant of [`element_listener_map`] — returns `None` if
 /// no listeners have been registered for this node yet. Used by the
 /// dispatch path so it doesn't litter the registry with empty maps
@@ -194,6 +219,17 @@ impl Document {
         Self::new(Arc::new(DqDocument::from(html)))
     }
 
+    /// Rust-side helper for selector lookup that returns an
+    /// `Option<Element>` directly. The JS-facing `querySelector`
+    /// wraps this so it can return JS `null` (rather than rquickjs's
+    /// default `undefined` for `None`) on no-match.
+    pub fn query_selector_inner(&self, selector: &str) -> Option<Element> {
+        let sel = self.doc.try_select(selector)?;
+        let nodes = sel.nodes();
+        let first = nodes.first()?;
+        Some(Element::from_id(self.doc.clone(), first.id))
+    }
+
     /// Borrow the underlying [`dom_query::Document`] (useful for the
     /// engine to introspect the parse alongside the JS, e.g. to wire
     /// in the action graph).
@@ -221,11 +257,19 @@ impl Document {
     /// matching `selector`, or `null`. An invalid selector returns
     /// `null` rather than panicking (DOM technically throws
     /// `SyntaxError`; alignment with that is a Phase 1C follow-up).
-    fn query_selector(&self, selector: String) -> Option<Element> {
-        let sel = self.doc.try_select(&selector)?;
-        let nodes = sel.nodes();
-        let first = nodes.first()?;
-        Some(Element::from_id(self.doc.clone(), first.id))
+    fn query_selector<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        selector: String,
+    ) -> rquickjs::Result<Value<'js>> {
+        match self.query_selector_inner(&selector) {
+            Some(el) => {
+                let instance = Class::instance(ctx.clone(), el)?;
+                Ok(instance.into_value())
+            }
+            // DOM spec: querySelector returns null when no match.
+            None => ctx.eval::<Value<'js>, _>("null"),
+        }
     }
 
     /// `document.querySelectorAll(selector)` — return all matching
@@ -427,6 +471,22 @@ impl Element {
     /// shouldn't happen via our constructors, but is defensive.
     fn node_ref(&self) -> Option<NodeRef<'_>> {
         self.doc.tree.get(&self.node_id)
+    }
+
+    /// Rust-side detach helper used by tests. Mirrors the JS-facing
+    /// `remove_child` but skips the listener-registry cleanup (no
+    /// `Ctx` available outside a JS call). Use `Document::query_selector_inner`
+    /// to obtain handles in tests.
+    #[cfg(test)]
+    fn remove_child_rs(&self, child: Element) -> Element {
+        if let Some(child_ref) = self.doc.tree.get(&child.node_id) {
+            if let Some(parent) = child_ref.parent() {
+                if parent.id == self.node_id {
+                    child_ref.remove_from_parent();
+                }
+            }
+        }
+        child
     }
 }
 
@@ -644,15 +704,37 @@ impl Element {
     /// that is a Phase 1C follow-up).
     ///
     /// Returns the same `child` handle so JS callers can chain.
-    fn remove_child(&self, child: Element) -> Element {
-        if let Some(child_ref) = self.doc.tree.get(&child.node_id) {
+    fn remove_child<'js>(
+        this: This<Class<'js, Self>>,
+        ctx: Ctx<'js>,
+        child: Element,
+    ) -> rquickjs::Result<Element> {
+        let self_id = this.0.borrow().node_id;
+        let doc = this.0.borrow().doc.clone();
+        // Collect descendant ids (incl. child itself) BEFORE detaching,
+        // so we can clean their listener registry entries.
+        let mut to_clear: Vec<NodeId> = Vec::new();
+        if let Some(child_ref) = doc.tree.get(&child.node_id) {
             if let Some(parent) = child_ref.parent() {
-                if parent.id == self.node_id {
+                if parent.id == self_id {
+                    to_clear.push(child.node_id);
+                    for descendant in child_ref.descendants_it() {
+                        to_clear.push(descendant.id);
+                    }
                     child_ref.remove_from_parent();
                 }
             }
         }
-        child
+        // Drop registry entries for every NodeId in the removed
+        // subtree, so stale listener records don't (a) leak across
+        // long-lived sessions, and (b) contaminate a future element
+        // that happens to receive the same NodeId. (dom_query 0.28
+        // does not currently recycle NodeIds, but the cleanup is
+        // cheap and protects against that becoming load-bearing.)
+        if !to_clear.is_empty() {
+            clear_listeners_for_nodes(&ctx, &to_clear)?;
+        }
+        Ok(child)
     }
 
     /// `element.classList` — a freshly-constructed [`DomTokenList`]
@@ -947,7 +1029,7 @@ mod tests {
     #[test]
     fn document_query_selector_finds_element() {
         let d = doc(r#"<html><body><h1 id="hi">Hello</h1><p>world</p></body></html>"#);
-        let h1 = d.query_selector("h1".to_owned()).expect("h1 present");
+        let h1 = d.query_selector_inner("h1").expect("h1 present");
         assert_eq!(h1.tag_name(), "H1");
         assert_eq!(h1.id(), "hi");
         assert_eq!(h1.text_content(), "Hello");
@@ -956,7 +1038,7 @@ mod tests {
     #[test]
     fn document_query_selector_returns_none_when_no_match() {
         let d = doc("<html><body><p>hi</p></body></html>");
-        assert!(d.query_selector("nav".to_owned()).is_none());
+        assert!(d.query_selector_inner("nav").is_none());
     }
 
     #[test]
@@ -1006,7 +1088,7 @@ mod tests {
     fn element_get_attribute_returns_some_and_none() {
         let d =
             doc(r#"<html><body><a href="https://example.com" class="btn">go</a></body></html>"#);
-        let a = d.query_selector("a".to_owned()).expect("a");
+        let a = d.query_selector_inner("a").expect("a");
         assert_eq!(
             a.get_attribute("href".to_owned()),
             Some("https://example.com".to_owned())
@@ -1018,7 +1100,7 @@ mod tests {
     #[test]
     fn element_has_attribute() {
         let d = doc(r#"<html><body><input type="text" required></body></html>"#);
-        let input = d.query_selector("input".to_owned()).expect("input");
+        let input = d.query_selector_inner("input").expect("input");
         assert!(input.has_attribute("type".to_owned()));
         assert!(input.has_attribute("required".to_owned()));
         assert!(!input.has_attribute("nope".to_owned()));
@@ -1027,7 +1109,7 @@ mod tests {
     #[test]
     fn element_inner_html_and_outer_html() {
         let d = doc(r#"<html><body><div class="wrap"><p>hi</p></div></body></html>"#);
-        let div = d.query_selector(".wrap".to_owned()).expect("div");
+        let div = d.query_selector_inner(".wrap").expect("div");
         assert!(div.inner_html().contains("<p>hi</p>"));
         let outer = div.outer_html();
         assert!(outer.contains(r#"<div class="wrap">"#));
@@ -1037,14 +1119,14 @@ mod tests {
     #[test]
     fn element_text_content_concatenates_descendants() {
         let d = doc("<html><body><div>foo <b>bar</b> baz</div></body></html>");
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         assert_eq!(div.text_content(), "foo bar baz");
     }
 
     #[test]
     fn element_query_selector_is_scoped_to_subtree() {
         let d = doc("<html><body><div class=a><p>inside</p></div><p>outside</p></body></html>");
-        let a = d.query_selector(".a".to_owned()).expect("div.a");
+        let a = d.query_selector_inner(".a").expect("div.a");
         let p = a.query_selector("p".to_owned()).expect("p inside");
         // Should find "inside", not "outside" — scope is the subtree.
         assert_eq!(p.text_content(), "inside");
@@ -1053,7 +1135,7 @@ mod tests {
     #[test]
     fn element_children_skips_text_nodes() {
         let d = doc("<html><body><ul>text<li>one</li>more text<li>two</li></ul></body></html>");
-        let ul = d.query_selector("ul".to_owned()).expect("ul");
+        let ul = d.query_selector_inner("ul").expect("ul");
         let kids = ul.children();
         assert_eq!(kids.len(), 2);
         assert_eq!(kids[0].text_content(), "one");
@@ -1063,7 +1145,7 @@ mod tests {
     #[test]
     fn element_parent_element_walks_up() {
         let d = doc("<html><body><div><section><p>x</p></section></div></body></html>");
-        let p = d.query_selector("p".to_owned()).expect("p");
+        let p = d.query_selector_inner("p").expect("p");
         let section = p.parent_element().expect("section");
         assert_eq!(section.tag_name(), "SECTION");
         let div = section.parent_element().expect("div");
@@ -1074,7 +1156,7 @@ mod tests {
     fn element_tag_name_is_uppercase() {
         let d = doc("<html><body><Section><Article></Article></Section></body></html>");
         // The parser lowercases tag names; we re-uppercase per DOM spec.
-        let s = d.query_selector("section".to_owned()).expect("section");
+        let s = d.query_selector_inner("section").expect("section");
         assert_eq!(s.tag_name(), "SECTION");
         assert_eq!(s.local_name(), "section");
     }
@@ -1082,7 +1164,7 @@ mod tests {
     #[test]
     fn element_class_name_property() {
         let d = doc(r#"<html><body><div class="a b c">x</div></body></html>"#);
-        let dv = d.query_selector("div".to_owned()).expect("div");
+        let dv = d.query_selector_inner("div").expect("div");
         assert_eq!(dv.class_name(), "a b c");
     }
 
@@ -1097,7 +1179,7 @@ mod tests {
     fn invalid_selector_yields_empty_results_not_panic() {
         let d = doc("<html><body><p>x</p></body></html>");
         // ":::::" is not a parseable CSS selector.
-        assert!(d.query_selector(":::::".to_owned()).is_none());
+        assert!(d.query_selector_inner(":::::").is_none());
         assert!(d.query_selector_all(":::::".to_owned()).is_empty());
     }
 
@@ -1106,7 +1188,7 @@ mod tests {
     #[test]
     fn set_attribute_round_trips_through_get_attribute() {
         let d = doc(r#"<html><body><a href="/old">x</a></body></html>"#);
-        let a = d.query_selector("a".to_owned()).expect("a");
+        let a = d.query_selector_inner("a").expect("a");
         a.set_attribute("href".to_owned(), "/new".to_owned());
         assert_eq!(a.get_attribute("href".to_owned()), Some("/new".to_owned()));
         // A new attribute name should also be writable.
@@ -1119,7 +1201,7 @@ mod tests {
     #[test]
     fn remove_attribute_drops_the_attribute() {
         let d = doc(r#"<html><body><input type="text" required disabled></body></html>"#);
-        let i = d.query_selector("input".to_owned()).expect("input");
+        let i = d.query_selector_inner("input").expect("input");
         assert!(i.has_attribute("required".to_owned()));
         i.remove_attribute("required".to_owned());
         assert!(!i.has_attribute("required".to_owned()));
@@ -1131,7 +1213,7 @@ mod tests {
     #[test]
     fn inner_html_setter_parses_and_replaces_children() {
         let d = doc("<html><body><div><p>old</p></div></body></html>");
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         div.set_inner_html("<span>new1</span><span>new2</span>".to_owned());
         // Old child is gone.
         assert!(!div.inner_html().contains("<p>old</p>"));
@@ -1148,7 +1230,7 @@ mod tests {
     #[test]
     fn text_content_setter_replaces_children_with_text_node() {
         let d = doc("<html><body><div><p>old</p><span>more</span></div></body></html>");
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         div.set_text_content("Just a string with <not a tag>".to_owned());
         // textContent reflects the new value.
         assert_eq!(div.text_content(), "Just a string with <not a tag>");
@@ -1192,12 +1274,12 @@ mod tests {
         let p3 = d.get_element_by_id("p3".to_owned()).expect("p3");
 
         // Remove p1 from a: succeeds.
-        a.remove_child(p1);
+        a.remove_child_rs(p1);
         let remaining: Vec<String> = a.children().into_iter().map(|c| c.id()).collect();
         assert_eq!(remaining, vec!["p2".to_owned()]);
 
         // Try to remove p3 (child of b) from a: no-op.
-        a.remove_child(p3);
+        a.remove_child_rs(p3);
         assert_eq!(b.children().len(), 1);
         assert_eq!(b.children()[0].id(), "p3");
     }
@@ -1205,7 +1287,7 @@ mod tests {
     #[test]
     fn class_list_add_adds_and_dedups() {
         let d = doc(r#"<html><body><div class="a">x</div></body></html>"#);
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         let cl = div.class_list();
         cl.add("b".to_owned());
         cl.add("c".to_owned());
@@ -1224,7 +1306,7 @@ mod tests {
     #[test]
     fn class_list_remove_drops_token() {
         let d = doc(r#"<html><body><div class="a b c">x</div></body></html>"#);
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         let cl = div.class_list();
         cl.remove("b".to_owned());
         assert!(!cl.contains("b".to_owned()));
@@ -1238,7 +1320,7 @@ mod tests {
     #[test]
     fn class_list_toggle_flips_presence() {
         let d = doc(r#"<html><body><div class="a">x</div></body></html>"#);
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         let cl = div.class_list();
         // a is present → toggle removes; returns false.
         assert!(!cl.toggle("a".to_owned()));
@@ -1254,7 +1336,7 @@ mod tests {
     #[test]
     fn class_list_contains_distinguishes_substring_from_token() {
         let d = doc(r#"<html><body><div class="alpha beta">x</div></body></html>"#);
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         let cl = div.class_list();
         assert!(cl.contains("alpha".to_owned()));
         assert!(cl.contains("beta".to_owned()));
@@ -1265,7 +1347,7 @@ mod tests {
     #[test]
     fn class_list_remove_last_clears_attribute() {
         let d = doc(r#"<html><body><div class="solo">x</div></body></html>"#);
-        let div = d.query_selector("div".to_owned()).expect("div");
+        let div = d.query_selector_inner("div").expect("div");
         let cl = div.class_list();
         cl.remove("solo".to_owned());
         // After removing the sole token, the `class` attribute is
