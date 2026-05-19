@@ -89,6 +89,17 @@ struct Target {
     js_fetch: bool,
     /// What the probe asserts.
     probe: Probe,
+    /// Targets that are **expected** to fail today and will pass once a
+    /// known dependency lands (typically a feature slice still in
+    /// flight, e.g. ES Module loader for the `esm` category). Their
+    /// probe failures are reported as `expected_fail` instead of
+    /// `assertion_failed` so the suite can keep them in the run as a
+    /// regression lock without turning the scorecard red — and
+    /// `--strict` only fails on *unexpected* failures.
+    ///
+    /// When you flip a probe from expected-fail to passing, remove the
+    /// flag in the same change so we notice if it regresses again.
+    expected_fail: bool,
 }
 
 /// Result for one target.
@@ -97,7 +108,14 @@ struct TargetResult {
     name: String,
     category: String,
     url: String,
-    /// One of: `ok`, `assertion_failed`, `fetch_error`, `js_error`.
+    /// One of: `ok`, `assertion_failed`, `fetch_error`, `js_error`,
+    /// `expected_fail`. `expected_fail` only appears when the target
+    /// is flagged [`Target::expected_fail`] AND its probe didn't
+    /// satisfy the assertion — the suite reports it as informational
+    /// instead of red so `--strict` stays clean while the gating slice
+    /// is still in flight. If an `expected_fail` target *does* satisfy
+    /// the probe, it's reported as plain `ok` (and the operator should
+    /// flip the flag off).
     status: String,
     /// Total wall-clock for this target (fetch + parse + eval).
     ms_total: u128,
@@ -133,6 +151,20 @@ struct Summary {
     total: usize,
     passed: usize,
     failed: usize,
+    /// Targets that failed their probe but were flagged
+    /// [`Target::expected_fail`]. Reported separately from `failed`
+    /// so `--strict` and the markdown scorecard's headline number
+    /// stay clean while gating slices (e.g. M-A ES Module loader)
+    /// are still in flight.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    expected_fails: usize,
+}
+
+/// Helper so `Summary.expected_fails` skips serialization when zero —
+/// keeps the JSON shape backward-compatible for downstream consumers
+/// that don't yet know about the field.
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
 }
 
 // ============================================================================
@@ -163,6 +195,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Example Domain",
         },
+        expected_fail: false,
     },
     Target {
         name: "news.ycombinator.com",
@@ -175,6 +208,7 @@ const TARGETS: &[Target] = &[
         probe: Probe::NonEmptyString {
             js: "document.querySelectorAll('.titleline > a')[0]?.textContent ?? ''",
         },
+        expected_fail: false,
     },
     Target {
         name: "news.ycombinator.com (count)",
@@ -185,6 +219,7 @@ const TARGETS: &[Target] = &[
             js: "document.querySelectorAll('.titleline > a').length",
             min: 20,
         },
+        expected_fail: false,
     },
     Target {
         name: "wikipedia.org",
@@ -195,6 +230,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Wikipedia",
         },
+        expected_fail: false,
     },
     Target {
         name: "httpbin.org/html",
@@ -205,6 +241,7 @@ const TARGETS: &[Target] = &[
             js: "document.querySelector('h1')?.textContent ?? ''",
             needle: "Herman Melville",
         },
+        expected_fail: false,
     },
     Target {
         name: "developer.mozilla.org div",
@@ -215,6 +252,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "<div>",
         },
+        expected_fail: false,
     },
     Target {
         name: "rust-lang.org",
@@ -225,6 +263,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Rust",
         },
+        expected_fail: false,
     },
     Target {
         name: "docs.rs",
@@ -235,6 +274,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "serde",
         },
+        expected_fail: false,
     },
     // TodoMVC framework targets — JS-rendered SPAs that ship a static
     // <title>TodoMVC: <Framework></title> in the HTML, so the probe is
@@ -254,6 +294,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "TodoMVC",
         },
+        expected_fail: false,
     },
     Target {
         name: "TodoMVC React",
@@ -264,6 +305,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "TodoMVC",
         },
+        expected_fail: false,
     },
     Target {
         name: "TodoMVC Vue",
@@ -274,6 +316,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "TodoMVC",
         },
+        expected_fail: false,
     },
     // ---- Heavier SPA / marketing targets ----
     //
@@ -297,6 +340,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "microsoft/playwright",
         },
+        expected_fail: false,
     },
     Target {
         name: "stripe.com/pricing",
@@ -311,6 +355,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Pricing",
         },
+        expected_fail: false,
     },
     Target {
         name: "vercel.com",
@@ -322,6 +367,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Vercel",
         },
+        expected_fail: false,
     },
     // ---- Framework docs / SPA-router sites ----
     //
@@ -342,6 +388,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "React",
         },
+        expected_fail: false,
     },
     Target {
         name: "vuejs.org",
@@ -353,6 +400,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Vue.js",
         },
+        expected_fail: false,
     },
     Target {
         name: "svelte.dev",
@@ -364,6 +412,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Svelte",
         },
+        expected_fail: false,
     },
     Target {
         name: "nextjs.org",
@@ -375,6 +424,7 @@ const TARGETS: &[Target] = &[
             js: "document.title",
             needle: "Next.js",
         },
+        expected_fail: false,
     },
     // ---- Feature smoke probes ----
     //
@@ -393,6 +443,7 @@ const TARGETS: &[Target] = &[
             js: "(() => { const u = new URL('https://x/?a=1'); u.searchParams.set('b', '2'); return u.toString(); })()",
             needle: "a=1&b=2",
         },
+        expected_fail: false,
     },
     Target {
         name: "feature: history.pushState updates location",
@@ -404,6 +455,7 @@ const TARGETS: &[Target] = &[
             js: "(() => { history.pushState({x:1}, '', '/probe-path'); return location.pathname; })()",
             needle: "/probe-path",
         },
+        expected_fail: false,
     },
     Target {
         name: "feature: MutationObserver init does not throw",
@@ -416,6 +468,155 @@ const TARGETS: &[Target] = &[
             js: "(() => { const o = new MutationObserver(() => {}); o.observe(document.body, {childList: true}); o.disconnect(); return 'observer-ok'; })()",
             needle: "observer-ok",
         },
+        expected_fail: false,
+    },
+    // ---- ESM-heavy targets (expected to fail until M-A lands) -----------
+    //
+    // These pages depend on real ES Module loading for either their
+    // primary content or a load-bearing inline behavior, so today they
+    // fail in instructive ways under heso's "treat module as classic"
+    // shim (see `scripts.rs` header — "Three deliberate Phase-1C
+    // simplifications"). They are flagged `expected_fail: true` so the
+    // suite keeps them in the run as a regression lock — `--strict`
+    // exits 0 while they fail, and once M-A lands the flag flips off
+    // (or the target's expected-fail flips off) so we notice if any of
+    // them regresses again later.
+    //
+    // Three slices land ESM support in parallel: M-A (loader core, the
+    // classic-vs-module compile split), M-B (import maps —
+    // `<script type="importmap">` resolves bare specifiers), and M-C
+    // (dynamic `import()` for route-level code-splitting). Each target
+    // below pins at least one of those.
+    //
+    // Selection criteria (per task M-D):
+    //   - Probe is observable from a single JS expression. Bare DOM
+    //     state, never console state — the probe contract doesn't see
+    //     the console buffer.
+    //   - Target stays alive a year: framework docs / first-party
+    //     example pages, not community starter URLs.
+    //   - Probe value flips from failing-today to passing once the
+    //     gating slice lands. A pre-rendered page where the probe
+    //     would pass anyway is NOT useful here even if the page is
+    //     "module-heavy".
+    Target {
+        name: "esm: lit.dev (?mods= class injection)",
+        category: "esm",
+        // `?mods=` is a feature of lit.dev's `<script type="module">`
+        // #2 inline block: it reads `searchParams.get("mods")`, splits
+        // on space, and calls `document.body.classList.add(...)`. We
+        // pin a marker class so the probe is exact.
+        //
+        // Why this fails today: lit.dev ships 8 inline
+        // `<script type="module">` blocks. Several of them declare
+        // top-level `let e = ...` or `const e = ...`. Under heso's
+        // classic-script shim, every script shares one lexical scope,
+        // so module #2's `const e = new URL(...)` fails to parse with
+        // `redeclaration of 'e'` (module #1 declared `let e`), and the
+        // `classList.add(...)` never runs. After M-A, each module gets
+        // its own scope and the redeclaration goes away. Today: probe
+        // returns `false`. Post-M-A: probe returns `true`.
+        url: "https://lit.dev/?mods=heso-esm-loaded",
+        js_fetch: false,
+        probe: Probe::Contains {
+            js: "String(document.body.classList.contains('heso-esm-loaded'))",
+            needle: "true",
+        },
+        expected_fail: true,
+    },
+    Target {
+        name: "esm: solidjs.com (title set by router)",
+        category: "esm",
+        // Solid's site is purely client-rendered: the static HTML has
+        // an empty `<head>` (no `<title>` element at all) and a
+        // single-element `<body>` with just `<div id="app">`. All
+        // content — title, nav, hero, doc cards — is produced by the
+        // Vite-bundled module at `/assets/index-*.js`, which uses
+        // top-level `export` and dynamic `import()` for route
+        // code-splitting.
+        //
+        // Why this fails today: the external module is fetched as a
+        // classic script under `--js-fetch`, so it throws
+        // `unsupported keyword: export` at parse time and the Solid
+        // runtime never mounts. `document.title` stays empty. After
+        // M-A (real module compile) AND M-C (dynamic `import()`), the
+        // bundle mounts, Solid Router calls `document.title = "..."`,
+        // and the probe returns a non-empty string. Note `js_fetch:
+        // true` is required — the module is external.
+        url: "https://www.solidjs.com/",
+        js_fetch: true,
+        probe: Probe::NonEmptyString {
+            js: "document.title",
+        },
+        expected_fail: true,
+    },
+    Target {
+        name: "esm: threejs example (importmap + bare specifier)",
+        category: "esm",
+        // The canonical `<script type="importmap">` test in the wild:
+        // the page maps `"three"` and `"three/addons/"` to relative
+        // bundle paths, then an inline `<script type="module">` does
+        // `import * as THREE from 'three'` plus a chain of named
+        // imports off `three/addons/`. The module's first synchronous
+        // side effect is `container.appendChild( stats.dom )` — Stats
+        // is a small JS-only library (no WebGL needed), so the
+        // appendChild happens before any WebGL setup that heso
+        // couldn't run anyway.
+        //
+        // Why this fails today: heso's script pump classifies
+        // `<script type="importmap">` as a data block (no-op), and
+        // evaluates the module as classic, so `import * as THREE from
+        // 'three'` throws `Unexpected token '*'`. After M-A (modules)
+        // AND M-B (importmap-resolves `"three"` to the bundle URL),
+        // the module compiles, the bare specifier resolves, Stats is
+        // imported, and `#container` gains a child. Today:
+        // `#container.children.length == 0`. Post-M-A+M-B: `>= 1`.
+        //
+        // Why this specific example URL: the keyframes demo is the
+        // most heavily linked example on three.js's landing page (it
+        // ships as the default href in the examples-link `<a>`), so
+        // it's unlikely to be removed for housekeeping reasons.
+        url: "https://threejs.org/examples/webgl_animation_keyframes.html",
+        js_fetch: false,
+        probe: Probe::NumberAtLeast {
+            js: "document.getElementById('container')?.children?.length ?? 0",
+            min: 1,
+        },
+        expected_fail: true,
+    },
+    Target {
+        name: "esm: threejs manual (inline module + relative import)",
+        category: "esm",
+        // The simplest possible ESM probe in the wild: the three.js
+        // manual page ships exactly one tiny inline
+        // `<script type="module">` in the head:
+        //
+        //   import * as THREE from '../build/three.module.js';
+        //   window.THREE = THREE;
+        //
+        // No importmap, no bare specifier, no external module. Just
+        // an inline module with a relative-path `import *`. The body
+        // is a one-liner that publishes the namespace object on
+        // `window` for the manual's interactive console.
+        //
+        // Why this fails today: QuickJS evaluating the body as a
+        // classic script throws `Unexpected token '*'` at the
+        // `import * as` line. `window.THREE` stays undefined. Once
+        // M-A treats the script as a real module — relative-path
+        // resolution against the page's base URL is already in the
+        // engine via `set_base_url` — `THREE` resolves, the namespace
+        // is published, and the probe returns the string `"object"`.
+        //
+        // This is the cleanest M-A regression lock in the set:
+        // failure mode is purely "module did not compile," success
+        // condition is purely "module ran end-to-end." No hydration
+        // ambiguity, no second-order dependencies.
+        url: "https://threejs.org/manual/",
+        js_fetch: false,
+        probe: Probe::Contains {
+            js: "typeof window.THREE",
+            needle: "object",
+        },
+        expected_fail: true,
     },
 ];
 
@@ -477,10 +678,18 @@ async fn main() {
             }
         }
         let mut r = run_target(t, &fetch_engine).await;
+        // Apply the `expected_fail` reclassification *after* the
+        // probe runs: a real fail on an expected-fail target is just
+        // "expected_fail" (informational, not red), while a pass on
+        // an expected-fail target stays plain "ok" — the operator
+        // should then flip the flag off.
+        if t.expected_fail && r.status != "ok" {
+            r.status = "expected_fail".to_string();
+        }
         r.peak_rss_kb = sample_rss_kb(&mut sys, self_pid);
         // Stream progress so the user sees something during long runs.
         eprintln!(
-            "{:6} {:>5}ms  rss={:>7}KB  {}",
+            "{:14} {:>5}ms  rss={:>7}KB  {}",
             r.status,
             r.ms_total,
             r.peak_rss_kb,
@@ -490,13 +699,18 @@ async fn main() {
     }
 
     let passed = results.iter().filter(|r| r.status == "ok").count();
+    let expected_fails = results
+        .iter()
+        .filter(|r| r.status == "expected_fail")
+        .count();
     let total = results.len();
     let report = Report {
         results,
         summary: Summary {
             total,
             passed,
-            failed: total - passed,
+            failed: total - passed - expected_fails,
+            expected_fails,
         },
     };
 
@@ -748,6 +962,13 @@ fn render_markdown(report: &Report) -> String {
         "Generated by `heso-compat-suite`. {} / {} targets ok.",
         report.summary.passed, report.summary.total
     );
+    if report.summary.expected_fails > 0 {
+        let _ = writeln!(
+            &mut out,
+            "{} target(s) flagged `expected_fail` (gated on a slice still in flight — informational, not red).",
+            report.summary.expected_fails
+        );
+    }
     let _ = writeln!(&mut out);
     let _ = writeln!(
         &mut out,
@@ -760,7 +981,15 @@ fn render_markdown(report: &Report) -> String {
     );
     let _ = writeln!(&mut out, "|---|---|---|---:|---:|---:|---:|");
     for r in &report.results {
-        let icon = if r.status == "ok" { "✅" } else { "❌" };
+        // Three-state icon: green for `ok`, yellow for `expected_fail`
+        // (probe didn't satisfy but we already knew that), red for any
+        // other failure. Keeping `expected_fail` visually distinct
+        // means a casual scorecard reader doesn't read it as "broken."
+        let icon = match r.status.as_str() {
+            "ok" => "✅",
+            "expected_fail" => "⏳",
+            _ => "❌",
+        };
         let _ = writeln!(
             &mut out,
             "| {} | {} | {} {} | {} | {} | {} | {} |",
