@@ -1023,7 +1023,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
 /// Returns `None` only if `el` lacks both a tag name AND any of the
 /// fallback attrs — in practice, every action-graph entry has a tag
 /// so this is unreachable.
-fn selector_for_action(el: &ElementRef) -> Option<String> {
+pub(crate) fn selector_for_action(el: &ElementRef) -> Option<String> {
     // (1) prefer a clean id selector.
     if let Some(id) = el.attrs.get("id") {
         if !id.is_empty() && is_css_plain_ident(id) {
@@ -1460,7 +1460,7 @@ async fn cmd_submit(args: &[String]) -> ExitCode {
 /// supplied via `--field`), then all `--field` flags in CLI order.
 /// Last-write-wins still holds inside the JS-side apply, but pruning
 /// the overridden `--data` entry keeps `fieldsApplied` clean.
-fn merge_submit_fields(
+pub(crate) fn merge_submit_fields(
     data_fields: &[(String, String)],
     fields_cli: &[(String, String)],
 ) -> Vec<(String, String)> {
