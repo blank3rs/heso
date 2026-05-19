@@ -92,6 +92,7 @@ pub mod rng;
 pub mod scripts;
 pub mod session;
 pub mod timers;
+pub mod url_search_params;
 
 pub use dom::{Document, DomTokenList, Element};
 pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};
@@ -101,3 +102,4 @@ pub use rng::SeededRng;
 pub use scripts::{ScriptFetchPolicy, ScriptOutcome};
 pub use session::JsSession;
 pub use timers::VirtualClock;
+pub use url_search_params::{UrlClass, UrlSearchParamsClass};

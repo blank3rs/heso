@@ -338,6 +338,13 @@ impl JsEngine {
         // missing global. See [`install_browser_apis`].
         install_browser_apis(&context, timers.clone())?;
 
+        // Install `URL` and `URLSearchParams` globals (WHATWG). The
+        // `url.searchParams` view shares a refcell-backed `Url` with
+        // its parent so mutations on the view reflect back into
+        // `url.toString()` / `url.search`. See
+        // [`crate::url_search_params`].
+        crate::url_search_params::install_url(&context)?;
+
         // Optional: install the `fetch` global.
         let fetch_state = if let Some(mode) = fetch_mode {
             #[allow(clippy::arc_with_non_send_sync)]
