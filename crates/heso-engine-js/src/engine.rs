@@ -2117,7 +2117,9 @@ fn install_browser_apis(
 
 /// JS bootstrap for the pure-JS half of [`install_browser_apis`]:
 /// `queueMicrotask`, `requestAnimationFrame` / `cancelAnimationFrame`,
-/// `matchMedia`, `localStorage`, `sessionStorage`.
+/// `matchMedia`, `localStorage`, `sessionStorage`, `heso.flush`, and
+/// noop observer ctors (`MutationObserver`, `IntersectionObserver`,
+/// `ResizeObserver`, `PerformanceObserver`).
 const BROWSER_APIS_BOOTSTRAP: &str = r#"
 (function() {
     // queueMicrotask(fn) — schedule `fn` after the current synchronous
@@ -2229,6 +2231,81 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         globalThis.heso.flush = function() {
             return Promise.resolve();
         };
+    }
+
+    // MutationObserver / IntersectionObserver / ResizeObserver /
+    // PerformanceObserver — noop constructors that match the spec
+    // surface so SPA hydration code that does `new MutationObserver(cb)`
+    // doesn't ReferenceError before the rest of the page runs. We don't
+    // actually observe anything; the callback is retained per spec but
+    // never invoked, and `takeRecords()` always returns []. Shape
+    // cross-referenced against happy-dom's intersection-observer /
+    // resize-observer stubs (MIT, capricorn86/happy-dom).
+    //
+    // Spec notes:
+    // - Each ctor takes `(callback, options?)`. We store `callback` on
+    //   the instance (spec doesn't require it be enumerable, so we use
+    //   a non-enumerable own property to avoid leaking through
+    //   JSON.stringify of the observer).
+    // - `observe(target, options)` / `unobserve(target)` / `disconnect()`
+    //   return undefined; `takeRecords()` returns [].
+    // - PerformanceObserver additionally exposes a static
+    //   `supportedEntryTypes` (FrozenArray<DOMString>). We return [] so
+    //   code that does `PerformanceObserver.supportedEntryTypes.includes('foo')`
+    //   gets `false` instead of throwing.
+    function defineNoopObserver(name) {
+        if (typeof globalThis[name] !== 'undefined') return;
+        function Observer(callback) {
+            if (!(this instanceof Observer)) {
+                throw new TypeError(
+                    "Constructor " + name + " requires 'new'"
+                );
+            }
+            // Per spec, the callback is required for these ctors. Real
+            // browsers throw TypeError when it's missing or not callable;
+            // we mirror that so feature-detection via try/catch behaves
+            // the same.
+            if (typeof callback !== 'function') {
+                throw new TypeError(
+                    name + " constructor: argument 1 is not a function"
+                );
+            }
+            Object.defineProperty(this, '_callback', {
+                value: callback,
+                writable: false,
+                enumerable: false,
+                configurable: false
+            });
+        }
+        Observer.prototype.observe = function() {};
+        Observer.prototype.unobserve = function() {};
+        Observer.prototype.disconnect = function() {};
+        Observer.prototype.takeRecords = function() { return []; };
+        // Name the function so `obs.constructor.name` and
+        // `new MutationObserver(cb).toString()` show the real spec name
+        // instead of "Observer". Object.defineProperty since Function's
+        // `name` is non-writable but configurable.
+        Object.defineProperty(Observer, 'name', { value: name });
+        globalThis[name] = Observer;
+    }
+    defineNoopObserver('MutationObserver');
+    defineNoopObserver('IntersectionObserver');
+    defineNoopObserver('ResizeObserver');
+    defineNoopObserver('PerformanceObserver');
+
+    // PerformanceObserver.supportedEntryTypes — spec-defined static
+    // FrozenArray<DOMString>. Empty because we don't actually record
+    // any entries; feature-detection (e.g.
+    // `PerformanceObserver.supportedEntryTypes.includes('longtask')`)
+    // will correctly return false instead of throwing.
+    if (typeof globalThis.PerformanceObserver === 'function' &&
+        typeof globalThis.PerformanceObserver.supportedEntryTypes === 'undefined') {
+        Object.defineProperty(globalThis.PerformanceObserver, 'supportedEntryTypes', {
+            value: Object.freeze([]),
+            writable: false,
+            enumerable: true,
+            configurable: false
+        });
     }
 })();
 "#;

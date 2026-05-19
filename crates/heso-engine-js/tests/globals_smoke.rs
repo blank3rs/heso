@@ -18,6 +18,8 @@
 //! - `element.getBoundingClientRect()` / `getClientRects()` /
 //!   `clientWidth` / `offsetParent` / `scrollTop` / `focus()` /
 //!   `blur()` / `scrollIntoView()`
+//! - `MutationObserver` / `IntersectionObserver` / `ResizeObserver` /
+//!   `PerformanceObserver` — noop ctors with spec method surface
 
 use heso_engine_js::{JsEngine, JsSession};
 use url::Url;
@@ -760,6 +762,183 @@ fn preact_shaped_dispatch_then_render_is_visible_after_flush() {
         trimmed.starts_with("<li") && trimmed.ends_with("</li>"),
         "expected single <li>; got {trimmed:?}"
     );
+}
+
+// ===== noop observer ctors ============================================
+//
+// MutationObserver / IntersectionObserver / ResizeObserver /
+// PerformanceObserver — installed as noop stubs that match the spec
+// constructor shape. Hydration code in SPAs frequently does
+// `new MutationObserver(cb)` at the top of a module; without these
+// ctors the page ReferenceErrors before any observable effects can
+// run. We don't actually observe anything; the callback is retained
+// per spec but never invoked, and `takeRecords()` always returns [].
+
+#[test]
+fn mutation_observer_ctor_and_method_surface_exists() {
+    let out = engine()
+        .eval(
+            r#"
+            const cb = (records, obs) => {};
+            const m = new MutationObserver(cb);
+            // Pass plain objects as the target: the ctors are noops so
+            // they don't care what gets passed, and using bare objects
+            // keeps this test independent of any DOM setup.
+            const fakeTarget = {};
+            m.observe(fakeTarget, { childList: true, subtree: true });
+            m.observe(fakeTarget, { attributes: true });
+            m.unobserve(fakeTarget);
+            const records = m.takeRecords();
+            m.disconnect();
+            ({
+                ctor: typeof MutationObserver,
+                instance: typeof m,
+                hasObserve: typeof m.observe,
+                hasUnobserve: typeof m.unobserve,
+                hasDisconnect: typeof m.disconnect,
+                hasTakeRecords: typeof m.takeRecords,
+                takeRecordsIsArray: Array.isArray(records),
+                takeRecordsLength: records.length,
+                ctorName: MutationObserver.name,
+                instanceOf: m instanceof MutationObserver
+            })
+            "#,
+        )
+        .expect("eval");
+    assert_eq!(out.value["ctor"], "function");
+    assert_eq!(out.value["instance"], "object");
+    assert_eq!(out.value["hasObserve"], "function");
+    assert_eq!(out.value["hasUnobserve"], "function");
+    assert_eq!(out.value["hasDisconnect"], "function");
+    assert_eq!(out.value["hasTakeRecords"], "function");
+    assert_eq!(out.value["takeRecordsIsArray"], true);
+    assert_eq!(out.value["takeRecordsLength"], 0);
+    assert_eq!(out.value["ctorName"], "MutationObserver");
+    assert_eq!(out.value["instanceOf"], true);
+}
+
+#[test]
+fn intersection_observer_ctor_and_method_surface_exists() {
+    let out = engine()
+        .eval(
+            r#"
+            const cb = (entries, obs) => {};
+            const m = new IntersectionObserver(cb, { threshold: 0.5 });
+            const fakeTarget = {};
+            m.observe(fakeTarget);
+            m.unobserve(fakeTarget);
+            const records = m.takeRecords();
+            m.disconnect();
+            ({
+                ctor: typeof IntersectionObserver,
+                instance: typeof m,
+                hasObserve: typeof m.observe,
+                hasUnobserve: typeof m.unobserve,
+                hasDisconnect: typeof m.disconnect,
+                hasTakeRecords: typeof m.takeRecords,
+                takeRecordsIsArray: Array.isArray(records),
+                takeRecordsLength: records.length,
+                ctorName: IntersectionObserver.name,
+                instanceOf: m instanceof IntersectionObserver
+            })
+            "#,
+        )
+        .expect("eval");
+    assert_eq!(out.value["ctor"], "function");
+    assert_eq!(out.value["instance"], "object");
+    assert_eq!(out.value["hasObserve"], "function");
+    assert_eq!(out.value["hasUnobserve"], "function");
+    assert_eq!(out.value["hasDisconnect"], "function");
+    assert_eq!(out.value["hasTakeRecords"], "function");
+    assert_eq!(out.value["takeRecordsIsArray"], true);
+    assert_eq!(out.value["takeRecordsLength"], 0);
+    assert_eq!(out.value["ctorName"], "IntersectionObserver");
+    assert_eq!(out.value["instanceOf"], true);
+}
+
+#[test]
+fn resize_observer_ctor_and_method_surface_exists() {
+    let out = engine()
+        .eval(
+            r#"
+            const cb = (entries, obs) => {};
+            const m = new ResizeObserver(cb);
+            const fakeTarget = {};
+            m.observe(fakeTarget);
+            m.observe(fakeTarget, { box: 'content-box' });
+            m.unobserve(fakeTarget);
+            const records = m.takeRecords();
+            m.disconnect();
+            ({
+                ctor: typeof ResizeObserver,
+                instance: typeof m,
+                hasObserve: typeof m.observe,
+                hasUnobserve: typeof m.unobserve,
+                hasDisconnect: typeof m.disconnect,
+                hasTakeRecords: typeof m.takeRecords,
+                takeRecordsIsArray: Array.isArray(records),
+                takeRecordsLength: records.length,
+                ctorName: ResizeObserver.name,
+                instanceOf: m instanceof ResizeObserver
+            })
+            "#,
+        )
+        .expect("eval");
+    assert_eq!(out.value["ctor"], "function");
+    assert_eq!(out.value["instance"], "object");
+    assert_eq!(out.value["hasObserve"], "function");
+    assert_eq!(out.value["hasUnobserve"], "function");
+    assert_eq!(out.value["hasDisconnect"], "function");
+    assert_eq!(out.value["hasTakeRecords"], "function");
+    assert_eq!(out.value["takeRecordsIsArray"], true);
+    assert_eq!(out.value["takeRecordsLength"], 0);
+    assert_eq!(out.value["ctorName"], "ResizeObserver");
+    assert_eq!(out.value["instanceOf"], true);
+}
+
+#[test]
+fn performance_observer_ctor_and_supported_entry_types_exposed() {
+    let out = engine()
+        .eval(
+            r#"
+            const cb = (list, obs) => {};
+            const m = new PerformanceObserver(cb);
+            m.observe({ entryTypes: ['longtask', 'measure'] });
+            m.observe({ type: 'mark', buffered: true });
+            const records = m.takeRecords();
+            m.disconnect();
+            ({
+                ctor: typeof PerformanceObserver,
+                instance: typeof m,
+                hasObserve: typeof m.observe,
+                hasDisconnect: typeof m.disconnect,
+                hasTakeRecords: typeof m.takeRecords,
+                takeRecordsIsArray: Array.isArray(records),
+                takeRecordsLength: records.length,
+                ctorName: PerformanceObserver.name,
+                instanceOf: m instanceof PerformanceObserver,
+                supportedEntryTypesIsArray: Array.isArray(PerformanceObserver.supportedEntryTypes),
+                supportedEntryTypesLength: PerformanceObserver.supportedEntryTypes.length,
+                supportedEntryTypesIncludesLongtask:
+                    PerformanceObserver.supportedEntryTypes.includes('longtask')
+            })
+            "#,
+        )
+        .expect("eval");
+    assert_eq!(out.value["ctor"], "function");
+    assert_eq!(out.value["instance"], "object");
+    assert_eq!(out.value["hasObserve"], "function");
+    assert_eq!(out.value["hasDisconnect"], "function");
+    assert_eq!(out.value["hasTakeRecords"], "function");
+    assert_eq!(out.value["takeRecordsIsArray"], true);
+    assert_eq!(out.value["takeRecordsLength"], 0);
+    assert_eq!(out.value["ctorName"], "PerformanceObserver");
+    assert_eq!(out.value["instanceOf"], true);
+    // The static property: empty FrozenArray means feature-detection
+    // (`.includes('longtask')`) cleanly reports false instead of throwing.
+    assert_eq!(out.value["supportedEntryTypesIsArray"], true);
+    assert_eq!(out.value["supportedEntryTypesLength"], 0);
+    assert_eq!(out.value["supportedEntryTypesIncludesLongtask"], false);
 }
 
 #[test]
