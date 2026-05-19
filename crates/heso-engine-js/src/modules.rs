@@ -65,6 +65,27 @@ use rquickjs::{Ctx, Error, Module};
 
 use url::Url;
 
+use crate::import_map::ImportMap;
+
+/// Shared, single-threaded handle to the engine's [`ImportMap`].
+///
+/// Same `Rc<RefCell<_>>` story as [`ModuleCache`]: the QuickJS runtime
+/// is `!Send`, the import map lives only as long as the engine, and
+/// the three readers (static [`HttpResolver`], dynamic-`import()`
+/// default resolver, and the [`crate::scripts`] pump that *writes* the
+/// map when it discovers a `<script type="importmap">` data block) all
+/// share the same handle. Cloning bumps the refcount; the underlying
+/// `ImportMap` starts as [`ImportMap::empty`] on fresh engines.
+pub type SharedImportMap = Rc<RefCell<ImportMap>>;
+
+/// Build a fresh [`SharedImportMap`] holding an empty map. Convenience
+/// for the engine constructor and tests that want a "no import map"
+/// baseline. The empty map short-circuits to plain URL-relative
+/// resolution per [`ImportMap::resolve`]'s contract.
+pub fn empty_shared_import_map() -> SharedImportMap {
+    Rc::new(RefCell::new(ImportMap::empty()))
+}
+
 /// Shared, single-threaded cache of `module URL → source` entries.
 ///
 /// Populated three ways:
@@ -154,77 +175,125 @@ pub fn inline_module_specifier(base_url: Option<&Url>, index: usize) -> String {
 }
 
 /// HTTP-backed module resolver. Implements
-/// [`rquickjs::loader::Resolver`] by joining relative specifiers
-/// against the importing module's URL (`base`) via
-/// [`url::Url::join`], so the spec's "resolve a module specifier"
-/// step (§8.1.3.5) lines up with QuickJS's own resolver protocol.
+/// [`rquickjs::loader::Resolver`] by walking the WHATWG HTML §8.1.5
+/// "resolve a module specifier" algorithm against the engine's
+/// shared [`SharedImportMap`] and then falling through to plain
+/// [`url::Url::join`] for relative specifiers and pass-through for
+/// already-absolute URLs.
 ///
-/// Bare specifiers (those that don't start with `./`, `../`, `/`,
-/// or contain `://`) are returned unchanged. That's the M-A "do
-/// the relative-import path; leave bare specifiers for M-B's
-/// import map" contract — M-B can wrap this resolver and intercept
-/// the bare-specifier case before delegating to us.
+/// All three layers ([`ImportMap::resolve`]'s scope match, top-level
+/// imports match, URL-shaped passthrough) live inside the import-map
+/// crate's `resolve` method — see [`crate::import_map`] for the
+/// canonical algorithm. This resolver is the QuickJS-facing wrapper
+/// that:
 ///
-/// Errors only when both `base` and `name` are unparseable as URLs
-/// — in practice that only happens if the engine never set its
-/// page URL and the script attempted a relative import (which can't
-/// resolve anyway). The returned [`Error::new_loading`] propagates
-/// back through `Module::evaluate` so callers see a clear "loader
-/// rejected this specifier" exception.
-#[derive(Clone, Default)]
+/// - Parses `base` (the importing module's URL) into a [`Url`] —
+///   falling back to `about:blank` when the engine has no associated
+///   page, which makes every bare specifier reject cleanly rather
+///   than silently mapping against a nonsensical referrer.
+/// - Calls into the shared [`resolve_specifier_through_import_map`]
+///   helper so the dynamic-`import()` default resolver (installed by
+///   [`crate::engine::JsEngine::new_inner`]) and this static path
+///   stay byte-for-byte identical in their resolution behavior.
+/// - Wraps errors in [`rquickjs::Error::new_resolving_message`] so
+///   QuickJS surfaces a "Resolving '…' from '…' failed: …" exception
+///   at the import site (much more useful than a downstream
+///   "module not found" with no specifier-name).
+#[derive(Clone)]
 pub struct HttpResolver {
-    // Resolver carries no state of its own today — `ModuleCache`
-    // is the load-bearing handle. We keep the type a struct (not a
-    // unit) so M-B can attach an import-map filter without breaking
-    // the Resolver impl's `&mut self` shape.
-    _marker: (),
+    import_map: SharedImportMap,
+}
+
+impl Default for HttpResolver {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HttpResolver {
-    /// Build a fresh resolver. Stateless today; reserve the
-    /// constructor so M-B can attach an import-map field later
-    /// without breaking callers.
+    /// Build a fresh resolver bound to a freshly-allocated empty
+    /// [`SharedImportMap`]. Convenience for callers (e.g. unit tests)
+    /// that don't care about import-map plumbing.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            import_map: empty_shared_import_map(),
+        }
+    }
+
+    /// Build a resolver bound to an existing [`SharedImportMap`].
+    /// The engine uses this so the resolver, the dynamic-`import()`
+    /// default resolver, and the [`crate::scripts`] pump (which
+    /// installs the parsed `<script type="importmap">` body into the
+    /// map) all share one `Rc<RefCell<ImportMap>>`.
+    pub fn new_with_import_map(import_map: SharedImportMap) -> Self {
+        Self { import_map }
     }
 }
 
 impl Resolver for HttpResolver {
     fn resolve(&mut self, _ctx: &Ctx<'_>, base: &str, name: &str) -> Result<String, Error> {
-        // Already-absolute URL — pass through verbatim. Covers the
-        // top-level `<script type="module" src="https://...">`
-        // case (the engine resolves the src against the page URL
-        // before calling Module::evaluate; this branch fires when
-        // the user passes an absolute URL directly).
-        if name.contains("://") {
-            return Ok(name.to_owned());
-        }
+        // Parse `base` as the referrer URL for the import-map call.
+        // QuickJS hands us a string (because module names are strings
+        // in its internal map); `ImportMap::resolve` wants a `Url`.
+        // If the base doesn't parse (no page URL was set, or the host
+        // synthesized something exotic), fall back to `about:blank`
+        // — the map's bare-specifier branch then rejects, which is
+        // the correct behavior for an engine with no associated page.
+        let referrer = Url::parse(base).unwrap_or_else(|_| {
+            Url::parse("about:blank").expect("about:blank parses")
+        });
+        resolve_specifier_through_import_map(&self.import_map.borrow(), name, &referrer)
+            .map(|u| u.to_string())
+            .map_err(|msg| Error::new_resolving_message(base, name, msg))
+    }
+}
 
-        // Bare-specifier short-circuit. Per WHATWG HTML §8.1.3.5
-        // "Resolve a module specifier", a specifier that does not
-        // start with `./`, `../`, or `/` is a *bare* specifier and
-        // can only be resolved via an import map. We don't have
-        // one yet (that's M-B). Return the bare name unchanged so
-        // the loader can surface a "module not found" rather than
-        // silently mapping `"lodash"` to `<base>/lodash`. M-B will
-        // layer on top by intercepting this case before delegating.
-        if !name.starts_with("./") && !name.starts_with("../") && !name.starts_with('/') {
-            return Ok(name.to_owned());
+/// Run the spec's resolve-a-module-specifier algorithm against
+/// `import_map`, then fall back to direct URL resolution when the
+/// map cannot answer.
+///
+/// Three outcomes, matching the resolve layering described on
+/// [`HttpResolver`]:
+///
+/// 1. The map produces an absolute URL (either by mapping a bare
+///    specifier, or by passing a URL-shaped specifier through after
+///    no scope/import-key hit) → return it.
+/// 2. The map errors with [`crate::import_map::ImportMapError::UnmappedBareSpecifier`]
+///    on a genuinely bare specifier → return a string-shaped URL that
+///    the loader will reject; preserve the pre-import-map error
+///    surface so tests pinning that message still pass.
+/// 3. Any other map error (null-block, prefix backtrack, malformed
+///    address) → surface the error verbatim. These are spec-defined
+///    rejections, not implementation bugs.
+///
+/// Shared by the static [`HttpResolver`] (driven by QuickJS's own
+/// module evaluator) and by the dynamic-`import()` default resolver
+/// closure installed by [`JsEngine::new_inner`]. Centralizing the
+/// algorithm in one function is the load-bearing wire — without it,
+/// the two paths can drift in subtle ways (e.g. one applies the map
+/// for absolute URLs, the other doesn't), which is exactly the bug
+/// the M-B wireup brief calls out.
+pub fn resolve_specifier_through_import_map(
+    import_map: &ImportMap,
+    specifier: &str,
+    referrer: &Url,
+) -> Result<Url, String> {
+    use crate::import_map::ImportMapError;
+    match import_map.resolve(specifier, referrer) {
+        Ok(url) => Ok(url),
+        Err(ImportMapError::UnmappedBareSpecifier { .. }) => {
+            // Same shape as pre-import-map behavior: bare specifiers
+            // with no map hit surface a clear error. We don't try to
+            // synthesize a fake URL — the loader (or the dynamic-
+            // import shim) takes it from here.
+            Err(format!(
+                "unmapped bare specifier {specifier:?} \
+                 (referrer {referrer}); declare it in a \
+                 <script type=\"importmap\"> block, or use a relative \
+                 (./, ../, /) or absolute (https://…) specifier"
+            ))
         }
-
-        // Relative / root-relative specifier — join against base
-        // via [`url::Url::join`]. If `base` parses, this handles
-        // both `./dep.js` and `/dep.js` per the spec. If the base
-        // doesn't parse (no page URL was set), fall back to
-        // returning the specifier as-is; the loader will then fail
-        // with a clear error since there's no resolvable URL.
-        if let Ok(base_url) = Url::parse(base) {
-            if let Ok(joined) = base_url.join(name) {
-                return Ok(joined.to_string());
-            }
-        }
-
-        Ok(name.to_owned())
+        Err(other) => Err(other.to_string()),
     }
 }
 
@@ -285,41 +354,70 @@ impl HttpLoader {
     }
 
     /// Synchronously fetch `url` via the loader's `reqwest::Client`,
-    /// store it in the cache, and return the body. Helper used by
-    /// both [`Self::load`] (the cache-miss path) and by the engine's
-    /// pre-fetch of an external `<script type="module" src="...">`
-    /// (which keeps the first hop on the sync path before handing
-    /// the rest to QuickJS).
+    /// store it in the cache, and return the body. Internal wrapper
+    /// over the free [`fetch_module_source`] helper so [`Self::load`]
+    /// stays a one-liner. The free helper is what the dynamic-import
+    /// default resolver in [`crate::engine`] also calls — both paths
+    /// share one cache + one fetch path.
     fn fetch_and_cache(&self, url: &str) -> Result<String, String> {
-        let Some(f) = self.fetch.as_ref() else {
-            return Err(format!(
-                "heso: cannot fetch module `{url}` — engine has no fetch client (build with JsEngine::new_with_fetch)"
-            ));
-        };
-        // `block_in_place` lets us run a sync HTTP call from the
-        // CLI's `#[tokio::main]` flow without tripping the
-        // "runtime from within a runtime" panic — same trick as
-        // `crate::fetch::perform_request` and
-        // `crate::scripts::fetch_script_source`.
-        let result = tokio::task::block_in_place(|| {
-            f.rt.block_on(async {
-                let resp = f
-                    .client
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|e| format!("send: {e}"))?;
-                let status = resp.status();
-                if !status.is_success() {
-                    return Err(format!("HTTP {}", status.as_u16()));
-                }
-                resp.text().await.map_err(|e| format!("read body: {e}"))
-            })
-        });
-        let body = result?;
-        self.cache.insert(url.to_owned(), body.clone());
-        Ok(body)
+        fetch_module_source(&self.cache, self.fetch.as_ref(), url)
     }
+}
+
+/// Look `url` up in `cache`. On hit, return the stored source. On
+/// miss, synchronously fetch via `fetcher` (when present), store in
+/// `cache`, and return the fresh body. When `fetcher` is `None` and
+/// the URL is not in cache, returns a clear error explaining the
+/// engine wasn't built with a fetch client.
+///
+/// This is the seam that lets the static [`HttpLoader`] (driven by
+/// QuickJS's module evaluator) and the dynamic-`import()` default
+/// resolver (installed by [`crate::engine::JsEngine::new_inner`]) hit
+/// the same cache and the same network path. Two consequences:
+///
+/// 1. A page that loads `./foo.js` once via static `<script
+///    type="module">` and later via `await import('./foo.js')` only
+///    issues one HTTP request — the cache hit on the second path is
+///    automatic.
+/// 2. The two paths' error surfaces are identical, so an agent
+///    debugging a missing module sees the same string regardless of
+///    which call site faulted.
+pub fn fetch_module_source(
+    cache: &ModuleCache,
+    fetcher: Option<&HttpFetcher>,
+    url: &str,
+) -> Result<String, String> {
+    if let Some(source) = cache.get(url) {
+        return Ok(source);
+    }
+    let Some(f) = fetcher else {
+        return Err(format!(
+            "heso: cannot fetch module `{url}` — engine has no fetch client (build with JsEngine::new_with_fetch)"
+        ));
+    };
+    // `block_in_place` lets us run a sync HTTP call from the
+    // CLI's `#[tokio::main]` flow without tripping the
+    // "runtime from within a runtime" panic — same trick as
+    // `crate::fetch::perform_request` and
+    // `crate::scripts::fetch_script_source`.
+    let result = tokio::task::block_in_place(|| {
+        f.rt.block_on(async {
+            let resp = f
+                .client
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| format!("send: {e}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(format!("HTTP {}", status.as_u16()));
+            }
+            resp.text().await.map_err(|e| format!("read body: {e}"))
+        })
+    });
+    let body = result?;
+    cache.insert(url.to_owned(), body.clone());
+    Ok(body)
 }
 
 impl Loader for HttpLoader {
@@ -462,18 +560,83 @@ mod tests {
     }
 
     #[test]
-    fn resolver_passes_bare_specifiers_unchanged() {
-        // M-B is import-map territory; we keep the resolver honest
-        // by leaving the bare name in place so the loader can
-        // surface a clear "no source available" error.
+    fn resolver_rejects_bare_specifier_without_import_map() {
+        // With no import map declared, a bare specifier should
+        // surface a clear Resolving error rather than silently
+        // map to `<base>/lodash` (the pre-import-map "leave it
+        // alone" behavior would defer the error to the loader,
+        // which is a worse UX — the error message there doesn't
+        // mention that the agent needs an import map).
         let rt = rquickjs::Runtime::new().unwrap();
         let ctx = rquickjs::Context::full(&rt).unwrap();
         ctx.with(|ctx| {
             let mut r = HttpResolver::new();
+            let err = r
+                .resolve(&ctx, "https://example.com/a.js", "lodash")
+                .unwrap_err();
+            // Resolving error variant — surfaced by rquickjs as
+            // "Resolving 'lodash' from 'https://…' failed: …".
+            let msg = err.to_string();
+            assert!(
+                msg.contains("lodash") && msg.contains("importmap"),
+                "expected error to mention specifier and importmap; got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn resolver_consults_import_map_for_bare_specifiers() {
+        // The Wire 2 payoff: an import map declares `"lodash" →
+        // "https://cdn/lodash.js"`; the resolver returns the mapped
+        // URL instead of erroring.
+        use crate::import_map::parse_import_map;
+        let json = r#"{
+            "imports": { "lodash": "https://cdn.example/lodash.js" }
+        }"#;
+        let base = Url::parse("https://app.example/").unwrap();
+        let map = parse_import_map(json, &base).unwrap();
+        let shared: SharedImportMap = Rc::new(RefCell::new(map));
+
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let mut r = HttpResolver::new_with_import_map(shared);
             assert_eq!(
-                r.resolve(&ctx, "https://example.com/a.js", "lodash")
+                r.resolve(&ctx, "https://app.example/page.js", "lodash")
                     .unwrap(),
-                "lodash"
+                "https://cdn.example/lodash.js"
+            );
+        });
+    }
+
+    #[test]
+    fn resolver_import_map_applies_to_absolute_url_keys_too() {
+        // An import-map key may be a full URL — used to substitute
+        // a remote module's URL (e.g. swap one CDN for another).
+        // The static resolver honors this the same way the dynamic
+        // path does.
+        use crate::import_map::parse_import_map;
+        let json = r#"{
+            "imports": {
+                "https://old.example/x.js": "https://new.example/x.js"
+            }
+        }"#;
+        let base = Url::parse("https://app.example/").unwrap();
+        let map = parse_import_map(json, &base).unwrap();
+        let shared: SharedImportMap = Rc::new(RefCell::new(map));
+
+        let rt = rquickjs::Runtime::new().unwrap();
+        let ctx = rquickjs::Context::full(&rt).unwrap();
+        ctx.with(|ctx| {
+            let mut r = HttpResolver::new_with_import_map(shared);
+            assert_eq!(
+                r.resolve(
+                    &ctx,
+                    "https://app.example/page.js",
+                    "https://old.example/x.js"
+                )
+                .unwrap(),
+                "https://new.example/x.js"
             );
         });
     }

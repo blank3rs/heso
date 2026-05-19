@@ -45,7 +45,10 @@ use url::Url;
 
 use crate::dom::{self, Document};
 use crate::fetch::{self, FetchMode, FetchQueue};
-use crate::modules::{HttpFetcher, HttpLoader, HttpResolver, ModuleCache};
+use crate::modules::{
+    empty_shared_import_map, fetch_module_source, resolve_specifier_through_import_map,
+    HttpFetcher, HttpLoader, HttpResolver, ModuleCache, SharedImportMap,
+};
 use crate::rng::SeededRng;
 use crate::scripts::{self, ScriptFetchPolicy, ScriptOutcome};
 use crate::timers::{self, TimerScheduler};
@@ -206,22 +209,45 @@ pub struct JsEngine {
     /// dependency. See [`crate::modules`].
     module_cache: ModuleCache,
     /// Per-engine module resolver used by the `globalThis.import(...)`
-    /// shim (WHATWG HTML §8.1.3.7 "Import calls"). `None` until the
-    /// host installs one via [`Self::install_module_resolver`]; while
-    /// `None`, every dynamic `import()` rejects with a clear error.
+    /// shim (WHATWG HTML §8.1.3.7 "Import calls").
     ///
-    /// The resolver is a `Fn(specifier, referrer) -> Result<(absolute_url,
-    /// source), error_message>`; it is the seam M-A (the static module
-    /// loader) wires into when it lands. M-C ships only the shim plus
-    /// the seam — the engine itself ships no real resolver, because
-    /// "what counts as a module" (file resolver? import map? bundler?)
-    /// is M-A's call. See agent regression testing (M-C task).
+    /// On a freshly-constructed engine, this is **pre-populated** with
+    /// a default resolver that bridges the dynamic-`import()` path to
+    /// the same machinery the static `<script type="module">` path
+    /// uses — see the closure built in [`Self::new_inner`]. The
+    /// default reads the engine's [`SharedImportMap`], hits
+    /// [`ModuleCache`] (same instance as the static loader), and
+    /// falls back to a synchronous HTTP fetch through the engine's
+    /// shared [`reqwest::Client`].
+    ///
+    /// Hosts can replace the default by calling
+    /// [`Self::install_module_resolver`] — useful for tests that
+    /// want a stub resolver, or for embedders that want to point
+    /// dynamic `import()` at a different source of truth than the
+    /// static path. While the slot is `None` (only possible if a
+    /// host explicitly clears it), every dynamic `import()` rejects
+    /// with "no module loader installed".
     ///
     /// `Arc<Mutex<…>>` (not just `Mutex<…>`) because the JS-side shim
     /// holds an `Arc` clone for as long as the engine is alive —
     /// otherwise we'd have to keep the resolver itself inside the
     /// closure and lose the ability to re-install at runtime.
     module_resolver: Arc<Mutex<Option<ModuleResolveFn>>>,
+    /// Per-engine import map (WHATWG HTML §8.1.5). Starts as
+    /// [`crate::import_map::ImportMap::empty`]; replaced when the
+    /// [`crate::scripts`] pump finds a `<script type="importmap">`
+    /// data block on a page.
+    ///
+    /// Shared (via [`Rc::clone`]) with the static module
+    /// [`HttpResolver`] installed on the runtime AND with the default
+    /// dynamic-`import()` resolver closure. All three readers see the
+    /// same map at the same time, so an import map declared on a
+    /// page applies to both `<script type="module">` static imports
+    /// AND `await import('…')` calls from agent code.
+    ///
+    /// `Rc<RefCell<_>>` (not `Arc<Mutex<_>>`) because the QuickJS
+    /// runtime is single-threaded by construction.
+    import_map: SharedImportMap,
 }
 
 /// Signature of the module resolver installed via
@@ -241,8 +267,17 @@ pub struct JsEngine {
 ///
 /// On failure, the resolver returns a human-readable error message
 /// that surfaces as a `TypeError` on the rejected `import()` promise.
-pub type ModuleResolveFn =
-    Box<dyn Fn(&str, &Url) -> Result<(Url, String), String> + Send + Sync>;
+///
+/// The trait object intentionally does **not** require `Send + Sync`.
+/// The engine's QuickJS runtime is single-threaded (`!Send`), and the
+/// default resolver installed by [`JsEngine::new_inner`] captures
+/// `Rc<RefCell<…>>` handles to the shared [`ModuleCache`] and
+/// [`SharedImportMap`] — adding the bounds would force those handles
+/// to become `Arc<Mutex<…>>` for no determinism or performance
+/// benefit. The [`Arc<Mutex<Option<ModuleResolveFn>>>`] wrapping on
+/// the engine ([`JsEngine::module_resolver`]) is purely for shared
+/// interior mutability across the long-lived JS-side closure.
+pub type ModuleResolveFn = Box<dyn Fn(&str, &Url) -> Result<(Url, String), String>>;
 
 /// Bundles a per-engine fetch queue with the mode that drives it.
 pub(crate) struct FetchState {
@@ -360,7 +395,16 @@ impl JsEngine {
         // every uncached module URL as a hard error (consistent with
         // ADR 0008's determinism gate; once item M lands the loader
         // will route through the recorded-network shim instead).
+        //
+        // The resolver is bound to the engine's `SharedImportMap`
+        // (Wire 2): the [`crate::scripts`] pump replaces the map's
+        // contents when it parses a `<script type="importmap">` data
+        // block on the page, and the resolver's next call observes
+        // the new map. This is what makes `import "lodash"` from a
+        // `<script type="module">` resolve via the page's declared
+        // import map.
         let module_cache = ModuleCache::new();
+        let import_map = empty_shared_import_map();
         let http_fetcher: Option<HttpFetcher> = match fetch_mode.as_ref() {
             Some(FetchMode::Live { client, rt_handle }) => Some(HttpFetcher {
                 client: client.clone(),
@@ -369,8 +413,8 @@ impl JsEngine {
             Some(FetchMode::DeterministicNoCassette) | None => None,
         };
         runtime.set_loader(
-            HttpResolver::new(),
-            HttpLoader::new(module_cache.clone(), http_fetcher),
+            HttpResolver::new_with_import_map(import_map.clone()),
+            HttpLoader::new(module_cache.clone(), http_fetcher.clone()),
         );
 
         let context = Context::full(&runtime).map_err(|e| EvalError::Engine(e.to_string()))?;
@@ -506,13 +550,70 @@ impl JsEngine {
         // the spec's HostImportModuleDynamically callback.
         //
         // The resolver hangs off `Arc<Mutex<Option<…>>>` so the host
-        // can swap it in after construction (M-A wires its module
-        // loader here). Without a resolver, every `import()` rejects
-        // with a clear "no module loader installed" message.
+        // can swap it after construction (tests replace the default
+        // with a stub; embedders can point dynamic `import()` at a
+        // different source than the static path). The default
+        // resolver — installed below — bridges to the same machinery
+        // the static `<script type="module">` path uses.
+        #[allow(clippy::arc_with_non_send_sync)]
         let module_resolver: Arc<Mutex<Option<ModuleResolveFn>>> =
             Arc::new(Mutex::new(None));
         let base_url: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
         install_dynamic_import(&context, module_resolver.clone(), base_url.clone())?;
+
+        // Wire 1: install the default module resolver. This is the
+        // load-bearing bridge that makes `globalThis.import('./x.js')`
+        // work out of the box — same import map, same module cache,
+        // same `reqwest::Client` as the static `<script type="module">`
+        // path. Without this, every dynamic `import()` would reject
+        // with "no module loader installed".
+        //
+        // The closure captures clones of three handles:
+        //   - `import_map`: same `Rc<RefCell<ImportMap>>` the static
+        //     resolver and the scripts pump share.
+        //   - `module_cache`: same `Rc<RefCell<HashMap<…>>>` the
+        //     static loader populates.
+        //   - `http_fetcher`: same `reqwest::Client` + tokio handle
+        //     pair the static loader uses.
+        //
+        // The closure is `'static + Fn` (no `Send + Sync` — see the
+        // `ModuleResolveFn` type-alias docstring for why).
+        {
+            let import_map_for_resolver = import_map.clone();
+            let module_cache_for_resolver = module_cache.clone();
+            let fetcher_for_resolver = http_fetcher;
+            let default_resolver: ModuleResolveFn = Box::new(move |specifier, referrer| {
+                // Step 1: spec resolve-a-module-specifier. The shared
+                // helper handles all three layers (import-map exact
+                // match, scope match, prefix match) and then falls
+                // through to plain `Url::join` for URL-shaped
+                // specifiers. Bare specifiers with no map hit error
+                // here with a clear message.
+                let resolved = resolve_specifier_through_import_map(
+                    &import_map_for_resolver.borrow(),
+                    specifier,
+                    referrer,
+                )?;
+                // Step 2: fetch (or hit cache). Same path as the
+                // static loader — cache hits avoid a network round
+                // trip; cache misses go through the shared
+                // `reqwest::Client`. The body is cached on success
+                // so the *next* importer of this URL — static or
+                // dynamic — hits the cache too. That's the property
+                // the `dynamic_import_and_static_import_share_module_
+                // cache` integration test pins.
+                let source = fetch_module_source(
+                    &module_cache_for_resolver,
+                    fetcher_for_resolver.as_ref(),
+                    resolved.as_str(),
+                )?;
+                Ok((resolved, source))
+            });
+            *module_resolver
+                .lock()
+                .expect("module resolver lock poisoned at construction") =
+                Some(default_resolver);
+        }
 
         Ok(Self {
             _runtime: runtime,
@@ -524,6 +625,7 @@ impl JsEngine {
             base_url,
             module_cache,
             module_resolver,
+            import_map,
         })
     }
 
@@ -564,16 +666,21 @@ impl JsEngine {
     /// Install (or replace) the module resolver used by the
     /// `globalThis.import(...)` shim.
     ///
-    /// This is the integration seam for M-A (the static module loader):
-    /// M-A's loader will call this at engine setup to register a
-    /// resolver that knows how to fetch `./foo.js`, `https://…`, and
-    /// bare-specifier modules from an import map. M-C (this slice)
-    /// ships only the shim and the seam — without a resolver
-    /// installed, every dynamic `import()` rejects with a clear "no
-    /// module loader installed" message.
+    /// Engines start with a **default resolver** wired by
+    /// [`Self::new_inner`] that bridges to the static module loader's
+    /// machinery — same import map, same module cache, same
+    /// `reqwest::Client`. Calling this method replaces that default
+    /// with a host-supplied resolver; typical use cases:
     ///
-    /// Replacing an already-installed resolver is supported and takes
-    /// effect immediately for the next `import(...)` call; in-flight
+    /// - **Tests** that want a deterministic stub resolver returning
+    ///   pre-canned sources for a known set of specifiers (no
+    ///   network, no parsing).
+    /// - **Embedders** with their own module-resolution policy
+    ///   (sandbox-only, bundler-driven, etc.) that diverges from
+    ///   `<script type="module">` resolution.
+    ///
+    /// Replacing an already-installed resolver takes effect
+    /// immediately for the next `import(...)` call; in-flight
     /// imports keep using the resolver that was active when they
     /// started.
     pub fn install_module_resolver(&self, resolver: ModuleResolveFn) {
@@ -581,6 +688,23 @@ impl JsEngine {
             .module_resolver
             .lock()
             .expect("module resolver poisoned") = Some(resolver);
+    }
+
+    /// Clear the module resolver used by the `globalThis.import(...)`
+    /// shim. After this call, every dynamic `import()` rejects with a
+    /// `TypeError` whose message contains "no module loader installed".
+    ///
+    /// Test-only escape hatch: production code never wants the "no
+    /// resolver" state — [`Self::new`] / [`Self::new_with_fetch`]
+    /// install a default that works for the agent-shaped page model.
+    /// The use case is verifying the absence-of-resolver error path
+    /// (the contract the doc on [`install_dynamic_import`]'s rejection
+    /// message documents).
+    pub fn clear_module_resolver(&self) {
+        *self
+            .module_resolver
+            .lock()
+            .expect("module resolver poisoned") = None;
     }
 
     /// The seed-backed RNG installed into the JS context. Useful for
@@ -597,6 +721,22 @@ impl JsEngine {
     /// resulted in one HTTP fetch.
     pub fn module_cache(&self) -> ModuleCache {
         self.module_cache.clone()
+    }
+
+    /// The shared [`crate::import_map::ImportMap`] consulted by both
+    /// the static `<script type="module">` resolver and the
+    /// `globalThis.import(...)` shim's default resolver.
+    ///
+    /// Returns a clone of the `Rc<RefCell<ImportMap>>` handle — tests
+    /// use `.borrow()` to inspect the parsed map, and the
+    /// [`crate::scripts`] pump uses `.borrow_mut()` to install a
+    /// freshly-parsed map when it finds a `<script type="importmap">`
+    /// data block on the page.
+    ///
+    /// On a fresh engine, the map is [`crate::import_map::ImportMap::empty`]
+    /// — every bare specifier rejects until a page installs one.
+    pub fn import_map(&self) -> SharedImportMap {
+        self.import_map.clone()
     }
 
     /// Advance the deterministic virtual clock by `delta_ms`
@@ -1044,6 +1184,7 @@ impl JsEngine {
             script_fetch_client.as_ref(),
             base_url.as_ref(),
             &self.module_cache,
+            &self.import_map,
         )?;
 
         self.run_pending_jobs()?;
@@ -1168,6 +1309,7 @@ impl JsEngine {
             script_fetch_client.as_ref(),
             base_url.as_ref(),
             &self.module_cache,
+            &self.import_map,
         )?;
 
         // Drive any fetches the page scripts queued before running
@@ -4623,13 +4765,15 @@ mod tests {
 
     #[test]
     fn dynamic_import_without_resolver_rejects_with_specific_error() {
-        // Until `install_module_resolver` is called, every dynamic
-        // `import()` must reject. The error message must mention "no
-        // module loader installed" — that exact phrase is the
-        // contract M-A's docs point agents at when they get a missing
-        // module, so a paraphrase here would silently break that
-        // cross-doc reference.
+        // The default resolver installed by `JsEngine::new_inner`
+        // (Wire 1 of the module-loader wireup) gives every engine a
+        // working `globalThis.import(...)` out of the box. Hosts that
+        // explicitly clear it — via `clear_module_resolver` — fall
+        // back to the "no module loader installed" rejection path,
+        // and the error message phrasing remains the cross-document
+        // contract callers rely on for diagnostics.
         let e = engine();
+        e.clear_module_resolver();
         let out = e
             .eval(
                 r#"

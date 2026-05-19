@@ -81,7 +81,8 @@ use std::sync::{Arc, Mutex};
 use rquickjs::{CatchResultExt, CaughtError, Context, Module, Value};
 
 use crate::engine::{ConsoleEntry, ConsoleLevel, EvalError};
-use crate::modules::{inline_module_specifier, ModuleCache};
+use crate::import_map::parse_import_map;
+use crate::modules::{inline_module_specifier, ModuleCache, SharedImportMap};
 
 /// Policy for handling external `<script src="...">` references.
 ///
@@ -168,6 +169,7 @@ pub struct ScriptOutcome {
 /// the two borrow scopes independent: extract source under `dom_query`,
 /// then enter rquickjs to execute. Cost is one extra context
 /// acquisition per script — cheap.
+#[allow(clippy::too_many_arguments)]
 pub fn run_scripts(
     context: &Context,
     document: &dom_query::Document,
@@ -176,6 +178,7 @@ pub fn run_scripts(
     fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
     base_url: Option<&url::Url>,
     module_cache: &ModuleCache,
+    import_map: &SharedImportMap,
 ) -> Result<ScriptOutcome, EvalError> {
     let scripts = collect_scripts(document);
     let mut outcome = ScriptOutcome::default();
@@ -183,6 +186,30 @@ pub fn run_scripts(
     // gets a distinct synthetic specifier so the runtime's module map
     // doesn't collide them. See [`inline_module_specifier`].
     let mut inline_module_index: usize = 0;
+
+    // Wire 2 — pre-pass: scan for the first `<script type="importmap">`
+    // and install its parsed map into the engine's `SharedImportMap`
+    // BEFORE any module script runs.
+    //
+    // Per WHATWG HTML §8.1.5, the import map must be installed before
+    // any "fetch a single module script" call evaluates against it.
+    // In our pump, that's equivalent to "before any
+    // ScriptKind::InlineModule / ExternalModule runs." We don't need
+    // to honor document-order *within* the importmap-vs-module
+    // sequencing because the spec actually requires the import map
+    // to be ready first regardless of where it appears in the
+    // source — a future spec edit moving toward strict
+    // before-first-module-fetch ordering is what shipping browsers
+    // do today.
+    //
+    // The `collect_scripts` pre-pass already enforces "only the first
+    // importmap counts"; we just walk the classified vector here.
+    for script in &scripts {
+        if let ScriptKind::ImportMap { source } = &script.kind {
+            install_import_map(import_map, source, base_url, console_buffer);
+            break;
+        }
+    }
 
     for script in scripts {
         match script.kind {
@@ -239,6 +266,12 @@ pub fn run_scripts(
                     &mut outcome,
                 )?;
             }
+            ScriptKind::ImportMap { .. } => {
+                // Already installed in the pre-pass above. We still
+                // count it as a data block (same bucket as
+                // `application/ld+json` etc. — non-runnable code).
+                outcome.skipped_non_script_type += 1;
+            }
             ScriptKind::NonScriptType => {
                 outcome.skipped_non_script_type += 1;
             }
@@ -246,6 +279,49 @@ pub fn run_scripts(
     }
 
     Ok(outcome)
+}
+
+/// Parse the body of a `<script type="importmap">` data block and
+/// install the result into the engine's [`SharedImportMap`]. Failures
+/// (malformed JSON, structurally invalid map) are appended to the
+/// console buffer as `console.error` — same containment story as a
+/// throwing inline script.
+///
+/// The engine's `SharedImportMap` is replaced in-place (not merged)
+/// so a navigation onto a new page that declares its own importmap
+/// drops the previous page's map atomically.
+fn install_import_map(
+    import_map: &SharedImportMap,
+    source: &str,
+    base_url: Option<&url::Url>,
+    console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+) {
+    // `parse_import_map` needs a base URL to normalize keys + scope
+    // prefixes. Without a page URL (bare `eval-js` / similar), fall
+    // back to `about:blank`. An importmap on a page with no URL is
+    // unusual but the parser is robust: bare-name keys stay bare,
+    // and any "./relative" address fails to parse against the cannot-
+    // be-a-base `about:blank`, becoming `None` (per
+    // `normalize_specifier_map`'s spec rule).
+    let base = match base_url {
+        Some(u) => u.clone(),
+        None => match url::Url::parse("about:blank") {
+            Ok(u) => u,
+            Err(_) => return,
+        },
+    };
+    match parse_import_map(source, &base) {
+        Ok(map) => {
+            *import_map.borrow_mut() = map;
+        }
+        Err(e) => {
+            push_console(
+                console_buffer,
+                ConsoleLevel::Error,
+                format!("heso: <script type=\"importmap\"> failed to parse: {e}"),
+            );
+        }
+    }
 }
 
 /// External classic `<script src="...">` — fetch synchronously, then
@@ -476,6 +552,15 @@ enum ScriptKind {
     /// (recursively calling our `HttpLoader::load` for every nested
     /// `import` it finds).
     ExternalModule { src: String },
+    /// `<script type="importmap">…JSON…</script>` — WHATWG HTML §4.12.1
+    /// data block carrying the page's import map. Per HTML §8.1.5,
+    /// only the first such block on the page is honored; subsequent
+    /// ones are silently ignored (the pre-pass in [`collect_scripts`]
+    /// uses `seen_import_map` to enforce this). The body is parsed via
+    /// [`parse_import_map`] and installed into the engine's
+    /// [`SharedImportMap`] *before* any module script runs, so even
+    /// the first `<script type="module">` on the page sees the map.
+    ImportMap { source: String },
     /// `<script type="...">` whose type is not a JavaScript MIME nor
     /// `"module"` — a data block per HTML spec §4.12.1. Counted but
     /// not executed.
@@ -501,6 +586,13 @@ struct ClassifiedScript {
 fn collect_scripts(document: &dom_query::Document) -> Vec<ClassifiedScript> {
     let mut out = Vec::new();
     let root = document.tree.root();
+    // Per HTML §8.1.5, *only the first* `<script type="importmap">`
+    // on the page is honored. Later importmap blocks are silently
+    // ignored (the spec also lets a UA print a console warning;
+    // we skip that for now). We track `seen_import_map` so the
+    // second-and-onward importmap blocks fall through to
+    // [`ScriptKind::NonScriptType`] (counted but ignored).
+    let mut seen_import_map = false;
     for descendant in root.descendants_it() {
         if !descendant.is_element() {
             continue;
@@ -517,10 +609,36 @@ fn collect_scripts(document: &dom_query::Document) -> Vec<ClassifiedScript> {
         //    - absent / empty / JS MIME essence-match → classic
         //    - "module" (ASCII case-insensitive) → real ES module
         //      (item M-A — see [`crate::modules`])
-        //    - anything else (incl. "application/json", "importmap",
-        //      "speculationrules", "text/html") → data block / null →
-        //      not executed.
+        //    - "importmap" (ASCII case-insensitive) → WHATWG HTML
+        //      §8.1.5 data block (item M-B + this wireup) — first
+        //      one wins, later ones become NonScriptType.
+        //    - anything else (incl. "application/json",
+        //      "speculationrules", "text/html") → data block / null
+        //      → not executed.
         let type_attr = descendant.attr("type").map(|s| s.to_string());
+        if is_import_map_script_type(type_attr.as_deref()) {
+            if seen_import_map {
+                // Second-and-later importmap blocks — spec says
+                // ignore. We classify as NonScriptType so the
+                // outcome tally counts it correctly.
+                out.push(ClassifiedScript {
+                    kind: ScriptKind::NonScriptType,
+                });
+                continue;
+            }
+            seen_import_map = true;
+            // Per spec, importmap data blocks are inline-only — a
+            // `<script type="importmap" src="...">` is invalid (the
+            // spec says "the src attribute must not be specified");
+            // browsers treat such a block as if the `src` were
+            // absent (parse the inline text) but the realistic
+            // shape we see in the wild is inline JSON.
+            let source = descendant.text().to_string();
+            out.push(ClassifiedScript {
+                kind: ScriptKind::ImportMap { source },
+            });
+            continue;
+        }
         if !is_runnable_script_type(type_attr.as_deref()) {
             out.push(ClassifiedScript {
                 kind: ScriptKind::NonScriptType,
@@ -624,6 +742,17 @@ fn is_module_script_type(type_attr: Option<&str>) -> bool {
     match type_attr {
         None => false,
         Some(s) => s.trim().eq_ignore_ascii_case("module"),
+    }
+}
+
+/// Return `true` only when `type_attr` classifies the script as an
+/// import-map data block (per WHATWG HTML §4.12.1 + §8.1.5). The
+/// spec value is the exact literal `"importmap"` (case-insensitive).
+/// Missing / empty / module / JS-MIME types all return `false`.
+fn is_import_map_script_type(type_attr: Option<&str>) -> bool {
+    match type_attr {
+        None => false,
+        Some(s) => s.trim().eq_ignore_ascii_case("importmap"),
     }
 }
 

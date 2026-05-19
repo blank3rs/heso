@@ -104,7 +104,7 @@ pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};
 pub use events::{AbortController, AbortSignal, CustomEvent, DOMException, Event, EventTarget};
 pub use fetch::FetchMode;
 pub use import_map::{parse_import_map, ImportMap, ImportMapError};
-pub use modules::{HttpFetcher, HttpLoader, HttpResolver, ModuleCache};
+pub use modules::{HttpFetcher, HttpLoader, HttpResolver, ModuleCache, SharedImportMap};
 pub use rng::SeededRng;
 pub use scripts::{ScriptFetchPolicy, ScriptOutcome};
 pub use session::JsSession;
