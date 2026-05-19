@@ -422,6 +422,14 @@ impl JsEngine {
 
         install_console(&context, console_buffer.clone())?;
         install_dom_classes(&context)?;
+        // Install `customElements` / `HTMLElement` / `globalThis.
+        // Element` / `Document` / etc. Must run AFTER
+        // [`install_dom_classes`] because it reaches into the
+        // rquickjs-managed prototypes of [`Document`] / [`Element`] /
+        // [`DomTokenList`] to wire up `instanceof`. WHATWG HTML §4.13
+        // (custom elements) + DOM §4.4 (Element constructor). See
+        // [`crate::custom_elements`].
+        crate::custom_elements::install_custom_elements(&context)?;
         // Install the JS-side `__hesoMakeStyleProxy` factory before
         // any Element wrapper is created — `Element.style` reaches
         // for the global on every access.

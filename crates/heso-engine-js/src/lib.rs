@@ -84,6 +84,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub(crate) mod custom_elements;
 pub mod dom;
 pub mod engine;
 pub mod events;
