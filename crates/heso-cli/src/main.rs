@@ -67,12 +67,11 @@
 //!   ONE child process and pipe newline-delimited requests in, responses
 //!   out, instead of spawning per-call. Stateful page cache by `page_id`.
 //!   See [`crate::serve`].
-//! - `heso run <url> <request>` — **STUB.** Today this builds a one-op
-//!   trace `[Cd(url)]` and stashes `request` in `planner_id`; the request
-//!   text is NOT interpreted. Returns a Receipt for a navigate-only trace.
-//!   Will become the real one-tool surface once the planner (T-022) lands;
-//!   until then, agents should call `heso open` and walk the page
-//!   themselves, not pretend `heso run` does anything intelligent.
+//! - `heso action-hash <url> [actions-json | -]` — Algorithm-derived
+//!   identity for a `(URL, actions)` pair. BLAKE3 over canonical JSON of
+//!   the normalized URL + a caller-supplied JSON array of actions. No
+//!   fetch, no storage — same inputs always produce the same hash. Useful
+//!   as a cache key or a content-free trace fingerprint.
 //!
 //! Per [ADR 0012], the static engine is `heso-engine-fetch`. Per [ADR 0014],
 //! the JS engine is `heso-engine-js` (QuickJS via `rquickjs`, Phase 1A
@@ -85,7 +84,7 @@
 mod serve;
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use heso_core::{IdentityKey, Url};
@@ -94,12 +93,13 @@ use heso_engine_fetch::{
     linked_pages_to_json, resolve_action, ElementRef, ExploreOptions, FetchEngine,
     DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
-use heso_primitives::{CdInput, CdTarget, PrimitiveOp, Trace};
-use heso_trace::{verify_receipt, Mode, Receipt, VerifyOutcome};
-use heso_trace_exec::{run, run_signed, SessionConfig};
+use heso_trace::{
+    parse_actions, trace_fingerprint, verify_fingerprint, verify_receipt, Action,
+    FingerprintOutcome, Receipt, TraceFingerprint, VerifyOutcome,
+};
 
-/// Default identity-key path. Created by `heso identity init`; auto-loaded
-/// by `heso run` when present. Lives under the gitignored
+/// Default identity-key path used by `heso identity init` / `show` when
+/// the caller doesn't pass `--path`. Lives under the gitignored
 /// `heso-local-data/` directory.
 const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
 
@@ -133,8 +133,19 @@ fn print_banner() {
     println!("                                via the same `reqwest::Client` used for the page load (cookies + receipts coherent).");
     println!("                                Under --seed N + --js-fetch, fetch() rejects with a clear cassette error (ADR 0008).");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
-    println!("  heso run   <url> <request>    [STUB] navigates to <url> only; request is ignored. Planner not yet wired.");
-    println!("    [--identity <path>]            Sign the receipt with the Ed25519 key at <path>; defaults to heso-local-data/identity.key when present");
+    println!("  heso action-hash <url> [actions-json | -]");
+    println!("                                Keyless, deterministic fingerprint over (URL, actions). Two");
+    println!("                                strangers doing the same actions on the same site get the same");
+    println!("                                hash — no key, no server, no clock. Output is a tamper-evident");
+    println!("                                JSON with site_id / action_ids[] / trace_id (the headline hash).");
+    println!("  heso action-hash-verify <file>");
+    println!("                                Verify a saved fingerprint file (exit 0 valid, 1 invalid, 2 malformed)");
+    println!("  heso replay <fingerprint.json>");
+    println!("                                Re-execute every action in a saved fingerprint against the live");
+    println!("                                site. Refuses tampered files. Actions must use the canonical");
+    println!("                                schema ({{verb: open|click|fill|submit, ...}}). Outputs a per-step");
+    println!("                                session log. Stateless: each step re-fetches; URL navigation");
+    println!("                                IS tracked across steps, in-page DOM mutations are not.");
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
     println!(
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
@@ -1308,139 +1319,500 @@ async fn cmd_plat_verify(args: &[String]) -> ExitCode {
     }
 }
 
-/// **STUB.** `heso run` is the planned single-tool surface (`heso.run(url,
-/// request) → Receipt`) per ADR 0009, but the planner (T-022) is not yet
-/// wired. Today this:
-///   1. parses `url`,
-///   2. builds a one-op trace `[Cd(url)]` — i.e. it just navigates,
-///   3. stashes the user's `request` string in `planner_id` only so the
-///      receipt can be correlated back; **the request is NOT interpreted**.
+/// `heso action-hash <url> [actions-json | -]` — derive a keyless,
+/// tamper-evident fingerprint for an intended `(URL, actions)` pair.
 ///
-/// Optional flags:
-/// - `--identity <path>` — sign the receipt with the Ed25519 key at `<path>`.
-///   When omitted, `heso-local-data/identity.key` is loaded if it exists;
-///   otherwise the receipt is unsigned.
+/// **Two strangers doing the same actions on the same site get the same
+/// hash.** Deterministic, no key, no clock, no server. See
+/// [`heso_trace::trace_fingerprint`] for the algorithm (versioned
+/// `heso-trace-fp/v1` — domain-separated site / action / chain steps).
 ///
-/// A genuine `heso.run` arrives when T-022 lands. Until then, agents that
-/// want page content should use `heso open` (full agent-shaped payload) or
-/// `heso fetch` / `heso tree` / `heso ls` / `heso cat`.
-async fn cmd_run(args: &[String]) -> ExitCode {
-    // Walk the args: an `--identity <path>` flag (optional) anywhere, then
-    // a positional URL, then the request string (everything else joined).
-    let mut identity_path: Option<PathBuf> = None;
-    let mut explicit_identity = false;
-    let mut positional: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--identity" => {
-                let Some(v) = args.get(i + 1) else {
-                    eprintln!("--identity needs a path");
-                    return ExitCode::from(2);
-                };
-                identity_path = Some(PathBuf::from(v));
-                explicit_identity = true;
-                i += 2;
-            }
-            other if other.starts_with("--") && other != "--" => {
-                eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso run [--identity <path>] <url> <request...>");
-                return ExitCode::from(2);
-            }
-            _ => {
-                positional.push(args[i].clone());
-                i += 1;
-            }
-        }
-    }
-    if positional.len() < 2 {
-        eprintln!("usage: heso run [--identity <path>] <url> <request...>");
-        eprintln!("note: today `heso run` only navigates to <url>; the");
-        eprintln!("      request text is recorded on the Receipt but not");
-        eprintln!("      interpreted. Planner is T-022 (pending).");
+/// Actions are a JSON array, schema-free — callers choose how to encode
+/// their intent (e.g. `[{"verb":"click","ref":"@e3"}]`). Pass the array
+/// inline as the second positional argument, pass `-` to read it from
+/// stdin, or omit it entirely for a URL-only fingerprint.
+///
+/// Output: a serialized [`TraceFingerprint`] — every component (the
+/// algorithm tag, normalized URL, action array, per-action `action_ids`,
+/// `site_id`, and headline `trace_id`) so callers can save the JSON and
+/// re-verify it later with `heso action-hash-verify`. The save is
+/// tamper-evident: changing any field invalidates the recompute.
+async fn cmd_action_hash(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: heso action-hash <url> [actions-json | -]");
+        eprintln!();
+        eprintln!("Computes a keyless, deterministic fingerprint over (URL, actions).");
+        eprintln!("No key, no server, no clock — two strangers doing the same actions");
+        eprintln!("on the same site get the same hash.");
+        eprintln!();
+        eprintln!("Actions: a JSON array. Pass inline as the second arg, or `-` for stdin.");
+        eprintln!("Omit it for a URL-only fingerprint (actions = []).");
         return ExitCode::from(2);
     }
-    let url_arg = &positional[0];
-    let request = positional[1..].join(" ");
 
-    let url = match Url::parse(url_arg) {
+    let url = match Url::parse(&args[0]) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{url_arg}`: {e}");
+            eprintln!("invalid URL `{}`: {e}", args[0]);
             return ExitCode::from(2);
         }
     };
 
-    // Identity resolution:
-    //   --identity <path> explicit → must exist, hard error on miss.
-    //   no flag → try DEFAULT_IDENTITY_PATH; absent is fine (unsigned).
-    let resolved_identity: Option<IdentityKey> = match identity_path {
-        Some(ref p) => match IdentityKey::load(p) {
-            Ok(k) => Some(k),
-            Err(e) => {
-                eprintln!("failed to load identity at `{}`: {e}", p.display());
+    let raw: Option<String> = match args.get(1).map(String::as_str) {
+        None => None,
+        Some("-") => {
+            use std::io::Read;
+            let mut buf = String::new();
+            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                eprintln!("failed reading stdin: {e}");
                 return ExitCode::FAILURE;
             }
-        },
-        None => {
-            let default_path = Path::new(DEFAULT_IDENTITY_PATH);
-            if default_path.exists() {
-                match IdentityKey::load(default_path) {
-                    Ok(k) => Some(k),
-                    Err(e) => {
-                        eprintln!(
-                            "default identity at `{}` exists but failed to load: {e}",
-                            default_path.display()
-                        );
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                None
+            Some(buf)
+        }
+        Some(s) => Some(s.to_owned()),
+    };
+
+    let actions: serde_json::Value = match raw {
+        Some(t) => match serde_json::from_str(&t) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("actions is not valid JSON: {e}");
+                return ExitCode::from(2);
             }
+        },
+        None => serde_json::Value::Array(Vec::new()),
+    };
+    if !actions.is_array() {
+        eprintln!("actions must be a JSON array");
+        return ExitCode::from(2);
+    }
+
+    let fp = trace_fingerprint(&url, &actions);
+    let val = match serde_json::to_value(&fp) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to serialize fingerprint: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print_json(&val)
+}
+
+/// `heso action-hash-verify <file>` — re-derive every ID in a saved
+/// fingerprint file and confirm it matches.
+///
+/// **No key needed.** Tamper-evidence comes from the algorithm being a
+/// pure function of `url` + `actions`; any drift between the stored IDs
+/// and the recompute means the file was modified after it was produced.
+///
+/// Exit codes mirror `receipt-verify`:
+/// - `0` — every component matches (`Valid`).
+/// - `1` — at least one component disagrees, or the algorithm tag is
+///   unknown to this version (`Mismatch` / `WrongAlgorithm`).
+/// - `2` — file missing, unreadable, or not a valid fingerprint JSON
+///   (`Malformed`).
+async fn cmd_action_hash_verify(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: heso action-hash-verify <file>");
+        return ExitCode::from(2);
+    };
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("MISSING `{path}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let fp: TraceFingerprint = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("MALFORMED `{path}`: not a valid fingerprint JSON: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match verify_fingerprint(&fp) {
+        FingerprintOutcome::Valid => {
+            println!("OK {} {}", fp.algorithm, fp.trace_id);
+            ExitCode::SUCCESS
+        }
+        FingerprintOutcome::Mismatch => {
+            eprintln!(
+                "INVALID `{path}`: recompute disagrees — file was modified after creation"
+            );
+            ExitCode::from(1)
+        }
+        FingerprintOutcome::WrongAlgorithm(tag) => {
+            eprintln!("INVALID `{path}`: unknown algorithm tag `{tag}` (this build supports only `heso-trace-fp/v1`)");
+            ExitCode::from(1)
+        }
+        FingerprintOutcome::Malformed(reason) => {
+            eprintln!("MALFORMED `{path}`: {reason}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+// ============================================================================
+// Replay — execute the actions in a fingerprint against the live site
+// ============================================================================
+
+/// `heso replay <fingerprint.json>` — re-execute every action in a saved
+/// fingerprint, in order, against the live site.
+///
+/// **Reconstruction, with caveats.** The saved fingerprint JSON already
+/// records *what* the agent intended (`url` + `actions[]`). This command
+/// re-runs that intent through the same engine paths `heso click` /
+/// `heso fill` / `heso submit` use today. The output is a "session
+/// record" — per-step intent + outcome + URL transitions — saved as one
+/// JSON document the caller can diff, archive, or hand to a downstream
+/// tool.
+///
+/// ## What's preserved across steps
+///
+/// - **URL navigation.** A click on `<a href>` follows the link; the
+///   next action runs against the new URL. `Open` actions navigate
+///   explicitly.
+///
+/// ## What's NOT preserved across steps
+///
+/// - **In-page DOM mutations.** Each click / fill / submit re-fetches
+///   the current URL and rebuilds the DOM. A `fill` that JS-handlers
+///   would react to is fired, but the next step starts from a fresh
+///   fetch — so if a click depends on the fill's mutation persisting,
+///   that's lost. Stateful multi-action replay against one engine is a
+///   follow-up.
+/// - **Byte-identical results.** The live site may have changed since
+///   the fingerprint was created. For byte-identical replay (record the
+///   network on first run, replay against the cassette on later runs),
+///   see ADR 0008 — designed, not yet implemented.
+///
+/// ## Refusal modes
+///
+/// - **Integrity:** `verify_fingerprint` runs first. A tampered file is
+///   refused, exit `1`.
+/// - **Schema:** actions must use the canonical [`Action`] schema
+///   (`verb: open|click|fill|submit`). Schema-free fingerprints hash
+///   fine but can't be auto-replayed; exit `2` with a clear message.
+async fn cmd_replay(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: heso replay <fingerprint.json>");
+        eprintln!();
+        eprintln!("Re-executes every action in a saved fingerprint against the live");
+        eprintln!("site. Refuses tampered files. Schema must be {{verb: open|click|fill|submit, ...}}.");
+        return ExitCode::from(2);
+    };
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read `{path}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let fp: TraceFingerprint = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{path}` is not a fingerprint JSON: {e}");
+            return ExitCode::from(2);
         }
     };
 
-    // Honor ADR 0008: identity must not sign in `live` mode. Today
-    // `heso run` always runs in `deterministic` mode (the planner stub
-    // hard-codes it), so this branch is here for when modes get a flag.
-    let _ = explicit_identity; // currently informational only
+    // Refuse to replay a fingerprint that doesn't pass its own integrity
+    // check — we don't want to be a tool that re-executes tampered traces.
+    match verify_fingerprint(&fp) {
+        FingerprintOutcome::Valid => {}
+        FingerprintOutcome::Mismatch => {
+            eprintln!(
+                "refusing to replay: fingerprint integrity check failed (file was modified after creation)"
+            );
+            return ExitCode::from(1);
+        }
+        FingerprintOutcome::WrongAlgorithm(tag) => {
+            eprintln!("refusing to replay: unknown algorithm tag `{tag}`");
+            return ExitCode::from(1);
+        }
+        FingerprintOutcome::Malformed(reason) => {
+            eprintln!("refusing to replay: {reason}");
+            return ExitCode::from(2);
+        }
+    }
 
-    let engine = match FetchEngine::new() {
-        Ok(e) => e,
+    let actions = match parse_actions(&fp.actions) {
+        Ok(a) => a,
         Err(e) => {
-            eprintln!("failed to build engine: {e}");
+            eprintln!("cannot replay: {e}");
+            eprintln!();
+            eprintln!("Replay handles only fingerprints whose actions use the canonical");
+            eprintln!("schema: {{\"verb\": \"open|click|fill|submit\", ...}}. Hashing accepts");
+            eprintln!("any JSON; replay does not.");
+            return ExitCode::from(2);
+        }
+    };
+
+    let mut current_url = match Url::parse(&fp.url) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("fingerprint url unparseable: {e}");
             return ExitCode::FAILURE;
         }
     };
 
-    // M0/M1: planner v0 (T-022) isn't wired yet, so we hand-build a minimal
-    // trace that just navigates to the start URL. The user's request is
-    // stashed in `planner_id` so callers can correlate the receipt back to
-    // what was asked. Replace this with a planner call once T-022 lands.
-    let trace: Trace = vec![PrimitiveOp::Cd(CdInput {
-        target: CdTarget::Url { url },
-    })];
-
-    let cfg = SessionConfig {
-        seed: 0,
-        mode: Mode::Deterministic,
-        planner_id: format!("stub-cli:{request}"),
-    };
-
-    let receipt = match resolved_identity.as_ref() {
-        Some(id) => run_signed(&engine, &trace, &cfg, id).await,
-        None => run(&engine, &trace, &cfg).await,
-    };
-    match serde_json::to_string_pretty(&receipt) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
-        }
+    let fetch = match FetchEngine::new() {
+        Ok(e) => e,
         Err(e) => {
-            eprintln!("failed to serialize receipt: {e}");
-            ExitCode::FAILURE
+            eprintln!("engine init failed: {e}");
+            return ExitCode::FAILURE;
         }
+    };
+
+    let mut steps: Vec<serde_json::Value> = Vec::with_capacity(actions.len());
+    let mut all_ok = true;
+
+    // One JsSession is carried across every step so that imperative DOM
+    // mutations from earlier clicks/fills/submits remain visible to
+    // later ones. Initialized lazily — on first `Open`, or on the first
+    // non-Open action (by fetching `current_url` and `open`-ing it).
+    let mut session: Option<heso_engine_js::JsSession> = None;
+    // `current_actions` is the action graph captured at the most-recent
+    // navigation. It's used to resolve `@e7`-style refs. Between
+    // navigations, the live in-memory DOM has been mutated by JS, so a
+    // ref may point at something whose attributes have changed — that's
+    // an inherent limitation of stateless refs.
+    let mut current_actions: Vec<ElementRef> = Vec::new();
+
+    for (i, action) in actions.iter().enumerate() {
+        let url_before = current_url.clone();
+        let res = execute_step_session(
+            &fetch,
+            &mut session,
+            &mut current_url,
+            &mut current_actions,
+            action,
+        )
+        .await;
+        let step = match &res {
+            Ok(detail) => serde_json::json!({
+                "index": i,
+                "verb": action.verb(),
+                "action": action,
+                "url_before": url_before.to_string(),
+                "url_after": current_url.to_string(),
+                "ok": true,
+                "result": detail,
+            }),
+            Err(err) => serde_json::json!({
+                "index": i,
+                "verb": action.verb(),
+                "action": action,
+                "url_before": url_before.to_string(),
+                "url_after": current_url.to_string(),
+                "ok": false,
+                "error": err,
+            }),
+        };
+        steps.push(step);
+        if res.is_err() {
+            all_ok = false;
+            break;
+        }
+    }
+
+    let session = serde_json::json!({
+        "algorithm": fp.algorithm,
+        "trace_id": fp.trace_id,
+        "fingerprint_valid": true,
+        "start_url": fp.url,
+        "final_url": current_url.to_string(),
+        "steps_run": steps.len(),
+        "steps_total": actions.len(),
+        "ok": all_ok,
+        "note": "stateful replay — one JsSession carries DOM mutations, RNG, virtual clock, and cookies (via shared reqwest::Client) across all steps. Navigation (Open, or an <a href> click) replaces the document but keeps the engine. Refs (`@e7`) are resolved against the action graph captured at the most-recent navigation — between navigations the live DOM has been mutated, so a ref may point to an element whose attributes have shifted. Submit still has the no-real-POST limitation: JsSession::submit dispatches a click on the form's submit button rather than issuing an HTTP POST. For byte-identical replay against recorded network responses, see ADR 0008 (not yet implemented).",
+        "steps": steps,
+    });
+    if !all_ok {
+        // Print the session log on stdout even on failure (the caller
+        // wants to see WHICH step failed and why), but exit non-zero.
+        let _ = print_json(&session);
+        return ExitCode::FAILURE;
+    }
+    print_json(&session)
+}
+
+/// Ensure `*session` is `Some` before a non-Open action runs. If the
+/// trace's first canonical action is a click/fill/submit (rather than
+/// an explicit `Open`), we still need an engine + a document to dispatch
+/// against — so fetch `current_url`, parse its actions, and open a fresh
+/// [`JsSession`] on it. If a session already exists, this is a no-op.
+async fn ensure_session(
+    fetch: &FetchEngine,
+    session: &mut Option<heso_engine_js::JsSession>,
+    current_actions: &mut Vec<ElementRef>,
+    current_url: &Url,
+) -> Result<(), String> {
+    if session.is_some() {
+        return Ok(());
+    }
+    let page = fetch
+        .open(current_url)
+        .await
+        .map_err(|e| format!("fetch failed: {e}"))?;
+    *current_actions = page.actions;
+    let (_, html) = fetch
+        .fetch_text(current_url)
+        .await
+        .map_err(|e| format!("html fetch failed: {e}"))?;
+    let (sess, _outcome) = heso_engine_js::JsSession::open(&html, current_url.clone())
+        .map_err(|e| format!("js session open failed: {e}"))?;
+    *session = Some(sess);
+    Ok(())
+}
+
+/// One step of stateful replay. Lazily initializes `session` on first
+/// use, advances `current_url` / `current_actions` on every navigation
+/// (`Open` or an `<a href>` click), and dispatches click/fill/submit
+/// through the live [`heso_engine_js::JsSession`] — so DOM mutations
+/// between steps persist (within the limits documented on
+/// [`heso_engine_js::JsSession`]).
+async fn execute_step_session(
+    fetch: &FetchEngine,
+    session: &mut Option<heso_engine_js::JsSession>,
+    current_url: &mut Url,
+    current_actions: &mut Vec<ElementRef>,
+    action: &Action,
+) -> Result<serde_json::Value, String> {
+    match action {
+        Action::Open { url } => {
+            let new_url = Url::parse(url).map_err(|e| format!("invalid url `{url}`: {e}"))?;
+            let (final_url, html) = fetch
+                .fetch_text(&new_url)
+                .await
+                .map_err(|e| format!("html fetch failed: {e}"))?;
+            *current_url = final_url;
+            let page = fetch
+                .open(current_url)
+                .await
+                .map_err(|e| format!("fetch failed: {e}"))?;
+            *current_actions = page.actions;
+            match session.as_mut() {
+                None => {
+                    let (sess, _) = heso_engine_js::JsSession::open(&html, current_url.clone())
+                        .map_err(|e| format!("js session open failed: {e}"))?;
+                    *session = Some(sess);
+                }
+                Some(sess) => {
+                    sess.navigate(&html, current_url.clone())
+                        .map_err(|e| format!("js session navigate failed: {e}"))?;
+                }
+            }
+            Ok(serde_json::json!({
+                "op": "open",
+                "navigated_to": current_url.to_string(),
+            }))
+        }
+        Action::Click { target } => {
+            ensure_session(fetch, session, current_actions, current_url).await?;
+            let want = normalize_replay_ref(target);
+            let elem = resolve_action(current_actions, &want)
+                .ok_or_else(|| format!("no element at ref `{want}`"))?
+                .clone();
+
+            // Anchor-with-href: navigation, not a JS click.
+            if elem.tag == "a" {
+                if let Some(href) = elem.attrs.get("href") {
+                    let target_url = current_url
+                        .join(href)
+                        .map_err(|e| format!("href `{href}` is not a valid URL: {e}"))?;
+                    let from = current_url.to_string();
+                    let (final_url, html) = fetch
+                        .fetch_text(&target_url)
+                        .await
+                        .map_err(|e| format!("html fetch failed: {e}"))?;
+                    *current_url = final_url;
+                    let page = fetch
+                        .open(current_url)
+                        .await
+                        .map_err(|e| format!("fetch failed: {e}"))?;
+                    *current_actions = page.actions;
+                    let sess = session.as_mut().expect("session ensured above");
+                    sess.navigate(&html, current_url.clone())
+                        .map_err(|e| format!("js session navigate failed: {e}"))?;
+                    return Ok(serde_json::json!({
+                        "op": "click",
+                        "kind": "navigation",
+                        "ref": want,
+                        "href": href,
+                        "from": from,
+                        "navigated_to": current_url.to_string(),
+                    }));
+                }
+            }
+
+            // Non-link click: dispatch a DOM event against the live session.
+            let selector = selector_for_action(&elem)
+                .ok_or_else(|| format!("no selector for ref `{want}`"))?;
+            let sess = session.as_ref().expect("session ensured above");
+            let outcome = sess
+                .click(&selector)
+                .map_err(|e| format!("js click failed: {e}"))?;
+            Ok(serde_json::json!({
+                "op": "click",
+                "kind": "dom-event",
+                "ref": want,
+                "selector": selector,
+                "matched": outcome.value,
+                "console": outcome.console,
+            }))
+        }
+        Action::Fill { target, value } => {
+            ensure_session(fetch, session, current_actions, current_url).await?;
+            let want = normalize_replay_ref(target);
+            let elem = resolve_action(current_actions, &want)
+                .ok_or_else(|| format!("no element at ref `{want}`"))?
+                .clone();
+            let selector = selector_for_action(&elem)
+                .ok_or_else(|| format!("no selector for ref `{want}`"))?;
+            let sess = session.as_ref().expect("session ensured above");
+            let outcome = sess
+                .fill(&selector, value)
+                .map_err(|e| format!("js fill failed: {e}"))?;
+            Ok(serde_json::json!({
+                "op": "fill",
+                "ref": want,
+                "selector": selector,
+                "value": value,
+                "matched": outcome.value,
+                "console": outcome.console,
+            }))
+        }
+        Action::Submit { target } => {
+            ensure_session(fetch, session, current_actions, current_url).await?;
+            let want = normalize_replay_ref(target);
+            let elem = resolve_action(current_actions, &want)
+                .ok_or_else(|| format!("no element at ref `{want}`"))?
+                .clone();
+            let selector = selector_for_action(&elem)
+                .ok_or_else(|| format!("no selector for ref `{want}`"))?;
+            let sess = session.as_ref().expect("session ensured above");
+            let outcome = sess
+                .submit(&selector)
+                .map_err(|e| format!("js submit failed: {e}"))?;
+            Ok(serde_json::json!({
+                "op": "submit",
+                "ref": want,
+                "selector": selector,
+                "matched": outcome.value,
+                "console": outcome.console,
+            }))
+        }
+    }
+}
+
+/// Accept both `@e7` and `e7` for the ref argument — matches the
+/// ergonomics of `heso click` / `heso fill` / `heso submit`.
+fn normalize_replay_ref(s: &str) -> String {
+    if let Some(stripped) = s.strip_prefix('@') {
+        format!("@{stripped}")
+    } else {
+        format!("@{s}")
     }
 }
 
@@ -1624,7 +1996,9 @@ async fn main() -> ExitCode {
         Some("fill") => cmd_fill(&args[1..]).await,
         Some("submit") => cmd_submit(&args[1..]).await,
         Some("serve") => serve::run().await,
-        Some("run") => cmd_run(&args[1..]).await,
+        Some("action-hash") => cmd_action_hash(&args[1..]).await,
+        Some("action-hash-verify") => cmd_action_hash_verify(&args[1..]).await,
+        Some("replay") => cmd_replay(&args[1..]).await,
         Some("identity") => cmd_identity(&args[1..]),
         Some("receipt-verify") => cmd_receipt_verify(&args[1..]).await,
         Some(other) => {

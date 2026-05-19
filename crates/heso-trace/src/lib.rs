@@ -29,7 +29,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use heso_core::{IdentityError, IdentityKey, Signature, SignaturePayload};
+use heso_core::{IdentityError, IdentityKey, Signature, SignaturePayload, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -175,8 +175,433 @@ impl SignaturePayload for Receipt {
 /// assert_eq!(h1.len(), 64); // BLAKE3 256-bit digest, hex-encoded
 /// ```
 pub fn trace_hash(trace: &Trace) -> String {
-    let json = serde_json::to_string(trace).expect("trace serializes");
-    blake3::hash(json.as_bytes()).to_hex().to_string()
+    // Stream serde_json's emitted bytes straight into BLAKE3 — avoids
+    // building a `String` that's immediately thrown away. Output is
+    // identical to `blake3::hash(serde_json::to_string(trace).as_bytes())`.
+    struct BlakeWriter(blake3::Hasher);
+    impl std::io::Write for BlakeWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.update(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = BlakeWriter(blake3::Hasher::new());
+    serde_json::to_writer(&mut w, trace).expect("trace serializes");
+    w.0.finalize().to_hex().to_string()
+}
+
+// ============================================================================
+// Trace fingerprint — keyless, deterministic identity for (URL, actions)
+// ============================================================================
+
+/// Algorithm tag baked into every [`TraceFingerprint`]. Verifiers refuse
+/// fingerprints with a different tag instead of silently re-hashing under
+/// the wrong rules — so v2 can ship without breaking v1 receipts.
+pub const FINGERPRINT_ALGO: &str = "heso-trace-fp/v1";
+
+const DST_SITE: &str = "heso-trace-fp/v1/site";
+const DST_ACTION: &str = "heso-trace-fp/v1/action";
+const DST_TRACE_INIT: &str = "heso-trace-fp/v1/trace-init";
+const DST_TRACE_STEP: &str = "heso-trace-fp/v1/trace-step";
+
+/// One step of BLAKE3 with a domain-separator prefix.
+///
+/// The prefix is an ASCII string identifying *which* hash this is —
+/// site, action, trace-init, trace-step. Different prefixes make it
+/// impossible for, say, an action hash to accidentally collide with a
+/// site hash even if they were fed the same bytes. The `\0` separator is
+/// safe because canonical JSON never emits a raw NUL (it escapes as
+/// ` `).
+fn dst_hash(domain: &str, payload: &[u8]) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(payload);
+    hasher.finalize()
+}
+
+/// A structured, tamper-evident identity for a `(URL, actions)` pair.
+///
+/// **No keys, no clocks, no per-user state.** Two callers anywhere — on
+/// different machines, with no coordination — recomputing the
+/// fingerprint over the same URL and the same action sequence get the
+/// same `site_id`, the same `action_ids`, and the same `trace_id`. That
+/// equality is the entire point: identity is derived from *what* was
+/// intended, not from *who* asked for it or *when*.
+///
+/// ## Why three IDs instead of one
+///
+/// `trace_id` is the headline — one 64-hex string that names a complete
+/// `(site, action_sequence)` intent. The structural pieces underneath
+/// (`site_id`, `action_ids[]`) buy three concrete properties:
+///
+/// - **Tamper-evidence at every layer.** A consumer holding a saved
+///   [`TraceFingerprint`] can recompute every ID from `url` + `actions`.
+///   If *any* byte in `url`, `actions`, `site_id`, `action_ids[i]`,
+///   `trace_id`, or `canonical` has been touched, the recompute won't
+///   line up. Saved files are change-detectable end-to-end without a key.
+/// - **Prefix verification.** The first `k` `action_ids` together with
+///   `site_id` deterministically fix the chain state after step `k`.
+///   So if you publish a prefix of a trace and the chain hash after it,
+///   anyone can verify that prefix without seeing the rest of the trace.
+/// - **Aggregation across traces on one site.** The same `site_id`
+///   appears under every fingerprint produced for that URL — useful as a
+///   cache / dedup key when an agent runs many traces against one page.
+///
+/// ## Saving and verifying
+///
+/// `Serialize` / `Deserialize` are derived. Write the fingerprint to a
+/// file with `serde_json::to_writer_pretty`; verify later with
+/// [`verify_fingerprint`]. The verify step needs nothing but the file —
+/// no key, no network, no clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceFingerprint {
+    /// Algorithm tag. Compared exactly on verify; future versions get a
+    /// new tag (e.g. `"heso-trace-fp/v2"`) so v1 readers refuse to
+    /// silently re-hash under the wrong rules.
+    pub algorithm: String,
+    /// The normalized URL that went into `site_id`. See
+    /// [`normalize_url_for_hash`] for the exact rules.
+    pub url: String,
+    /// The action array, verbatim. Callers choose the schema — heso
+    /// canonicalizes the JSON (sorted keys, compact) before hashing, so
+    /// two callers using the same schema get matching `action_ids`.
+    pub actions: Value,
+    /// BLAKE3 over the normalized URL with the site domain separator.
+    /// 64 hex chars.
+    pub site_id: String,
+    /// One BLAKE3 per action, in the action's original index order.
+    /// Each is 64 hex chars; the `i`-th element is the hash of
+    /// `actions[i]`'s canonical JSON with the action domain separator.
+    pub action_ids: Vec<String>,
+    /// Chain hash: starts from `site_id` under the trace-init domain,
+    /// then folds each `action_ids[i]` in order under the trace-step
+    /// domain. 64 hex chars. The headline identity.
+    pub trace_id: String,
+    /// The canonical-JSON form of `{actions, url}` that backs the
+    /// fingerprint. Exposed so consumers can see *exactly* what got
+    /// hashed without re-deriving the canonicalization rules.
+    pub canonical: String,
+}
+
+/// Compute a [`TraceFingerprint`] for a `(URL, actions)` pair.
+///
+/// Deterministic and keyless: same inputs, same output, byte-for-byte,
+/// on any machine. See [`TraceFingerprint`] for the algorithm details
+/// and the meaning of each output field.
+///
+/// `actions` must be a JSON array; anything else is treated as an empty
+/// trace (URL-only fingerprint). This is intentional — it lets callers
+/// pass `serde_json::Value::Null` to mean "no actions" without a special
+/// branch.
+///
+/// ```
+/// use heso_trace::trace_fingerprint;
+/// use heso_core::Url;
+/// use serde_json::json;
+///
+/// let url = Url::parse("https://Example.com:443/foo?b=2&a=1#frag").unwrap();
+/// let actions = json!([{"verb": "click", "ref": "@e3"}]);
+/// let fp1 = trace_fingerprint(&url, &actions);
+///
+/// // Same intent, cosmetically different URL → same trace_id.
+/// let same = Url::parse("https://example.com/foo?a=1&b=2").unwrap();
+/// let fp2 = trace_fingerprint(&same, &actions);
+/// assert_eq!(fp1.trace_id, fp2.trace_id);
+/// assert_eq!(fp1.site_id, fp2.site_id);
+/// assert_eq!(fp1.action_ids, fp2.action_ids);
+/// assert_eq!(fp1.trace_id.len(), 64);
+/// ```
+pub fn trace_fingerprint(url: &Url, actions: &Value) -> TraceFingerprint {
+    let normalized = normalize_url_for_hash(url);
+
+    let site_hash = dst_hash(DST_SITE, normalized.as_bytes());
+
+    let empty: Vec<Value> = Vec::new();
+    let action_slice: &[Value] = actions.as_array().unwrap_or(&empty);
+
+    let action_hashes: Vec<blake3::Hash> = action_slice
+        .iter()
+        .map(|a| {
+            let mut canon = String::new();
+            write_canonical(a, &mut canon);
+            dst_hash(DST_ACTION, canon.as_bytes())
+        })
+        .collect();
+
+    let mut state = dst_hash(DST_TRACE_INIT, site_hash.as_bytes());
+    for a_hash in &action_hashes {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(DST_TRACE_STEP.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(state.as_bytes());
+        hasher.update(a_hash.as_bytes());
+        state = hasher.finalize();
+    }
+
+    let mut canonical = String::new();
+    let payload_val = serde_json::json!({
+        "actions": actions,
+        "url": normalized,
+    });
+    write_canonical(&payload_val, &mut canonical);
+
+    TraceFingerprint {
+        algorithm: FINGERPRINT_ALGO.to_owned(),
+        url: normalized,
+        actions: actions.clone(),
+        site_id: site_hash.to_hex().to_string(),
+        action_ids: action_hashes
+            .iter()
+            .map(|h| h.to_hex().to_string())
+            .collect(),
+        trace_id: state.to_hex().to_string(),
+        canonical,
+    }
+}
+
+/// Outcome of [`verify_fingerprint`]. Distinguishes the categories of
+/// failure a caller might want to surface differently:
+/// - `Valid` — every recomputed ID matches.
+/// - `Mismatch` — at least one ID disagrees with the stored value. The
+///   file was tampered with, or produced from different inputs.
+/// - `WrongAlgorithm` — file claims a different algorithm tag. Don't
+///   silently re-hash; the rules might have changed.
+/// - `Malformed` — couldn't even parse what the file claims (e.g. `url`
+///   isn't a URL). Almost certainly corruption, not tampering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FingerprintOutcome {
+    /// Every recomputed component matches the stored fingerprint.
+    Valid,
+    /// At least one component recomputed differently.
+    Mismatch,
+    /// The fingerprint's algorithm tag isn't one this verifier knows.
+    WrongAlgorithm(String),
+    /// A structural field is unparseable; can't even attempt verification.
+    Malformed(&'static str),
+}
+
+/// Recompute the fingerprint from `fp.url` and `fp.actions`, compare
+/// against every stored ID, return the outcome.
+///
+/// **Keyless.** Anyone holding the saved fingerprint can run this — no
+/// secret involved. Tamper-evidence comes from the algorithm being a
+/// pure function of its inputs: a single byte changed anywhere in
+/// `url` / `actions` / `site_id` / `action_ids[]` / `trace_id` /
+/// `canonical` causes the recompute to disagree.
+///
+/// ```
+/// use heso_trace::{trace_fingerprint, verify_fingerprint, FingerprintOutcome};
+/// use heso_core::Url;
+/// use serde_json::json;
+///
+/// let url = Url::parse("https://example.com/").unwrap();
+/// let actions = json!([{"verb": "click", "ref": "@e3"}]);
+/// let fp = trace_fingerprint(&url, &actions);
+///
+/// assert_eq!(verify_fingerprint(&fp), FingerprintOutcome::Valid);
+///
+/// // Tamper with the trace_id → mismatch.
+/// let mut bad = fp.clone();
+/// bad.trace_id = "0".repeat(64);
+/// assert_eq!(verify_fingerprint(&bad), FingerprintOutcome::Mismatch);
+/// ```
+pub fn verify_fingerprint(fp: &TraceFingerprint) -> FingerprintOutcome {
+    if fp.algorithm != FINGERPRINT_ALGO {
+        return FingerprintOutcome::WrongAlgorithm(fp.algorithm.clone());
+    }
+    let url = match Url::parse(&fp.url) {
+        Ok(u) => u,
+        Err(_) => return FingerprintOutcome::Malformed("url is not parseable"),
+    };
+    let recomputed = trace_fingerprint(&url, &fp.actions);
+    if recomputed.site_id == fp.site_id
+        && recomputed.action_ids == fp.action_ids
+        && recomputed.trace_id == fp.trace_id
+        && recomputed.canonical == fp.canonical
+        && recomputed.url == fp.url
+    {
+        FingerprintOutcome::Valid
+    } else {
+        FingerprintOutcome::Mismatch
+    }
+}
+
+// ============================================================================
+// Action vocabulary — the canonical schema for replayable traces
+// ============================================================================
+
+/// The canonical, replayable action vocabulary.
+///
+/// JSON shape: `{"verb": "<name>", ...rest}` — a tag-dispatched enum.
+/// Fingerprints whose `actions` array conforms to this schema can be
+/// re-executed by `heso replay`; fingerprints with arbitrary other JSON
+/// shapes still hash fine but cannot be auto-replayed.
+///
+/// The four verbs map 1:1 to existing heso CLI verbs (`heso fetch` /
+/// `heso click` / `heso fill` / `heso submit`), so a trace is exactly
+/// the same intent the agent would produce by calling those.
+///
+/// ## Examples
+///
+/// ```
+/// use heso_trace::Action;
+/// use serde_json::json;
+///
+/// let open: Action = serde_json::from_value(
+///     json!({"verb": "open", "url": "https://example.com/"})
+/// ).unwrap();
+/// match &open {
+///     Action::Open { url } => assert_eq!(url, "https://example.com/"),
+///     _ => panic!(),
+/// }
+///
+/// let click: Action = serde_json::from_value(
+///     json!({"verb": "click", "ref": "@e3"})
+/// ).unwrap();
+/// assert_eq!(click.verb(), "click");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "lowercase")]
+pub enum Action {
+    /// Navigate to a URL — equivalent to typing into the address bar.
+    /// Fetches + parses + replaces the active page state.
+    Open {
+        /// Target URL string. Parsed at replay time so the canonical
+        /// shape stays a plain string.
+        url: String,
+    },
+    /// Click an element identified by its `@ref` in the current page's
+    /// action graph. If the resolved element is an `<a href>`, the
+    /// click follows the link (re-fetch the target URL); otherwise it
+    /// dispatches a real `click` event through the JS engine.
+    Click {
+        /// Element ref like `@e3`. Resolved at replay time against the
+        /// page that's currently active.
+        #[serde(rename = "ref")]
+        target: String,
+    },
+    /// Set the value of an `<input>` / `<textarea>` and dispatch
+    /// `input` + `change` events, matching what a real browser fires
+    /// when a user types.
+    Fill {
+        /// Element ref like `@e7`.
+        #[serde(rename = "ref")]
+        target: String,
+        /// New `.value`. Round-trips through `JSON.stringify` so any
+        /// Unicode / quoting works.
+        value: String,
+    },
+    /// Click the first submit-typed control inside the form at `@ref`.
+    /// Same shape as a click on a submit button; modeled separately
+    /// because that's how planners think about it.
+    Submit {
+        /// Form ref like `@form1`.
+        #[serde(rename = "ref")]
+        target: String,
+    },
+}
+
+impl Action {
+    /// The wire-level `verb` field — the same string the JSON uses.
+    /// Useful for replay logs, debugging, and switch-on-verb code that
+    /// doesn't want to deconstruct the enum.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::Open { .. } => "open",
+            Self::Click { .. } => "click",
+            Self::Fill { .. } => "fill",
+            Self::Submit { .. } => "submit",
+        }
+    }
+}
+
+/// Parse a fingerprint's `actions: Value` array into [`Action`]s.
+///
+/// Returns a list of canonical actions ready for replay. Errors point
+/// to the specific index that failed and why — so a partially-bad trace
+/// surfaces a clear message instead of a generic "deserialize failed."
+///
+/// ```
+/// use heso_trace::{parse_actions, Action};
+/// use serde_json::json;
+///
+/// let arr = json!([
+///     {"verb": "open", "url": "https://example.com/"},
+///     {"verb": "click", "ref": "@e3"},
+/// ]);
+/// let actions = parse_actions(&arr).unwrap();
+/// assert_eq!(actions.len(), 2);
+/// assert_eq!(actions[0].verb(), "open");
+/// ```
+pub fn parse_actions(actions: &Value) -> Result<Vec<Action>, ActionParseError> {
+    let arr = actions.as_array().ok_or(ActionParseError::NotAnArray)?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let a: Action = serde_json::from_value(v.clone()).map_err(|e| ActionParseError::Item {
+            index: i,
+            source: e,
+        })?;
+        out.push(a);
+    }
+    Ok(out)
+}
+
+/// Failure modes for [`parse_actions`].
+#[derive(Debug, thiserror::Error)]
+pub enum ActionParseError {
+    /// `actions` wasn't a JSON array at all.
+    #[error("actions must be a JSON array")]
+    NotAnArray,
+    /// A specific action element didn't match the canonical schema.
+    #[error("action[{index}] doesn't match the canonical schema: {source}")]
+    Item {
+        /// 0-based index into the actions array.
+        index: usize,
+        /// The underlying deserialize error.
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// URL normalization used by [`trace_fingerprint`]. Public so tooling that
+/// wants to display "the URL we hashed" can show the same string the
+/// algorithm saw, without re-deriving the rules.
+pub fn normalize_url_for_hash(url: &Url) -> String {
+    let mut u = url.clone();
+    u.set_fragment(None);
+    if let Some(explicit) = u.port() {
+        let scheme_default = match u.scheme() {
+            "http" | "ws" => Some(80),
+            "https" | "wss" => Some(443),
+            "ftp" => Some(21),
+            _ => None,
+        };
+        if scheme_default == Some(explicit) {
+            let _ = u.set_port(None);
+        }
+    }
+    if u.query().is_some() {
+        let mut pairs: Vec<(String, String)> = u
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
+        {
+            let mut qp = u.query_pairs_mut();
+            qp.clear();
+            for (k, v) in &pairs {
+                qp.append_pair(k, v);
+            }
+        }
+        if u.query() == Some("") {
+            u.set_query(None);
+        }
+    }
+    u.to_string()
 }
 
 // ============================================================================
@@ -220,43 +645,86 @@ pub fn canonical_receipt_json(receipt: &Receipt) -> String {
     out
 }
 
-fn write_canonical(v: &Value, out: &mut String) {
+fn write_canonical<W: std::fmt::Write>(v: &Value, out: &mut W) {
     match v {
-        Value::Null => out.push_str("null"),
-        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::Null => {
+            let _ = out.write_str("null");
+        }
+        Value::Bool(b) => {
+            let _ = out.write_str(if *b { "true" } else { "false" });
+        }
+        Value::Number(n) => {
+            let _ = write!(out, "{n}");
+        }
         Value::String(s) => {
-            let escaped = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_owned());
-            out.push_str(&escaped);
+            // Inline escape (no per-string allocation). Same output as
+            // `serde_json::to_string(s)` for the value shapes receipts
+            // carry.
+            write_json_string(out, s);
         }
         Value::Array(arr) => {
-            out.push('[');
+            let _ = out.write_char('[');
             for (i, item) in arr.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    let _ = out.write_char(',');
                 }
                 write_canonical(item, out);
             }
-            out.push(']');
+            let _ = out.write_char(']');
         }
         Value::Object(map) => {
             let mut keys: Vec<&String> = map.keys().collect();
             keys.sort();
-            out.push('{');
+            let _ = out.write_char('{');
             for (i, key) in keys.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    let _ = out.write_char(',');
                 }
-                let escaped = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_owned());
-                out.push_str(&escaped);
-                out.push(':');
+                write_json_string(out, key);
+                let _ = out.write_char(':');
                 // SAFETY: `keys` came from `map.keys()`, so the lookup
                 // can't fail.
                 write_canonical(&map[*key], out);
             }
-            out.push('}');
+            let _ = out.write_char('}');
         }
     }
+}
+
+fn write_json_string<W: std::fmt::Write>(out: &mut W, s: &str) {
+    let _ = out.write_char('"');
+    for c in s.chars() {
+        match c {
+            '"' => {
+                let _ = out.write_str("\\\"");
+            }
+            '\\' => {
+                let _ = out.write_str("\\\\");
+            }
+            '\n' => {
+                let _ = out.write_str("\\n");
+            }
+            '\r' => {
+                let _ = out.write_str("\\r");
+            }
+            '\t' => {
+                let _ = out.write_str("\\t");
+            }
+            '\x08' => {
+                let _ = out.write_str("\\b");
+            }
+            '\x0c' => {
+                let _ = out.write_str("\\f");
+            }
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => {
+                let _ = out.write_char(c);
+            }
+        }
+    }
+    let _ = out.write_char('"');
 }
 
 // ============================================================================
@@ -276,6 +744,20 @@ pub fn sign_receipt(key: &IdentityKey, receipt: &mut Receipt) {
     receipt.signature = Some(sig);
 }
 
+/// Compute the canonical-JSON bytes of a receipt **as if its
+/// `signature` field were `null`**, without mutating or cloning the
+/// caller's receipt. Used by [`verify_receipt`] to skip the `Receipt`
+/// clone that the previous implementation paid on every verify.
+fn canonical_receipt_unsigned_bytes(receipt: &Receipt) -> Vec<u8> {
+    let mut v = serde_json::to_value(receipt).expect("receipt serializes");
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("signature".to_owned(), Value::Null);
+    }
+    let mut out = String::new();
+    write_canonical(&v, &mut out);
+    out.into_bytes()
+}
+
 /// Verify a receipt's embedded signature against its canonical form.
 /// Returns:
 ///
@@ -289,10 +771,11 @@ pub fn verify_receipt(receipt: &Receipt) -> VerifyOutcome {
     let Some(sig) = receipt.signature.as_ref() else {
         return VerifyOutcome::Missing;
     };
-    // Recompute canonical form with `signature` cleared.
-    let mut probe = receipt.clone();
-    probe.signature = None;
-    let payload = canonical_receipt_json(&probe).into_bytes();
+    // Recompute canonical form with `signature` cleared. Previously
+    // this `.clone()`d the whole receipt (every PrimitiveResult, every
+    // pages_seen entry, every String) just to set signature=None; the
+    // helper writes the canonical bytes from a borrow.
+    let payload = canonical_receipt_unsigned_bytes(receipt);
     match sig.verify(&payload) {
         Ok(()) => VerifyOutcome::Valid,
         Err(e) => VerifyOutcome::Invalid(e),
@@ -400,6 +883,336 @@ mod tests {
         let a = url("https://example.com/");
         let b = url("https://example.org/");
         assert_ne!(trace_hash(&a), trace_hash(&b));
+    }
+
+    fn parse_url(s: &str) -> Url {
+        Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn fingerprint_is_stable_byte_for_byte() {
+        let u = parse_url("https://example.com/foo");
+        let actions = serde_json::json!([{"verb": "click", "ref": "@e3"}]);
+        let a = trace_fingerprint(&u, &actions);
+        let b = trace_fingerprint(&u, &actions);
+        assert_eq!(a, b);
+        assert_eq!(a.algorithm, FINGERPRINT_ALGO);
+        assert_eq!(a.site_id.len(), 64);
+        assert_eq!(a.trace_id.len(), 64);
+        assert_eq!(a.action_ids.len(), 1);
+        assert_eq!(a.action_ids[0].len(), 64);
+    }
+
+    #[test]
+    fn fingerprint_normalizes_cosmetic_url_differences() {
+        let actions = serde_json::json!([]);
+        // Default port, mixed case host, query reorder, fragment — all
+        // should fold to the same canonical URL → same fingerprint.
+        let a = parse_url("https://Example.com:443/path?b=2&a=1#frag");
+        let b = parse_url("https://example.com/path?a=1&b=2");
+        let fa = trace_fingerprint(&a, &actions);
+        let fb = trace_fingerprint(&b, &actions);
+        assert_eq!(fa.site_id, fb.site_id);
+        assert_eq!(fa.trace_id, fb.trace_id);
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_distinct_intents() {
+        let u = parse_url("https://example.com/");
+        let click = serde_json::json!([{"verb": "click", "ref": "@e3"}]);
+        let fill = serde_json::json!([{"verb": "fill", "ref": "@e3", "value": "hi"}]);
+        assert_ne!(
+            trace_fingerprint(&u, &click).trace_id,
+            trace_fingerprint(&u, &fill).trace_id,
+        );
+    }
+
+    #[test]
+    fn fingerprint_same_actions_different_order_diverge() {
+        let u = parse_url("https://example.com/");
+        let ab = serde_json::json!([
+            {"verb": "click", "ref": "@e1"},
+            {"verb": "click", "ref": "@e2"},
+        ]);
+        let ba = serde_json::json!([
+            {"verb": "click", "ref": "@e2"},
+            {"verb": "click", "ref": "@e1"},
+        ]);
+        let fa = trace_fingerprint(&u, &ab);
+        let fb = trace_fingerprint(&u, &ba);
+        // Same action_ids exist on both, just in different order.
+        let mut a_ids = fa.action_ids.clone();
+        let mut b_ids = fb.action_ids.clone();
+        a_ids.sort();
+        b_ids.sort();
+        assert_eq!(a_ids, b_ids, "the same two action_ids appear in both");
+        // But the chained trace_id MUST differ — order is intent.
+        assert_ne!(fa.trace_id, fb.trace_id);
+    }
+
+    #[test]
+    fn fingerprint_url_only_when_actions_empty() {
+        let u = parse_url("https://example.com/");
+        let empty = serde_json::json!([]);
+        let fp = trace_fingerprint(&u, &empty);
+        assert_eq!(fp.action_ids.len(), 0);
+        assert_eq!(
+            fp.canonical,
+            r#"{"actions":[],"url":"https://example.com/"}"#,
+        );
+    }
+
+    #[test]
+    fn fingerprint_action_key_order_does_not_matter() {
+        let u = parse_url("https://example.com/");
+        // Same logical action, keys in different order.
+        let a = serde_json::json!([{"verb": "fill", "ref": "@e7", "value": "hi"}]);
+        let b = serde_json::json!([{"value": "hi", "ref": "@e7", "verb": "fill"}]);
+        assert_eq!(
+            trace_fingerprint(&u, &a).trace_id,
+            trace_fingerprint(&u, &b).trace_id,
+        );
+    }
+
+    #[test]
+    fn fingerprint_site_id_is_independent_of_actions() {
+        let u = parse_url("https://example.com/");
+        let click = serde_json::json!([{"verb": "click", "ref": "@e1"}]);
+        let fill = serde_json::json!([{"verb": "fill", "ref": "@e1", "value": "x"}]);
+        // Different actions, same URL → same site_id, different trace_id.
+        let a = trace_fingerprint(&u, &click);
+        let b = trace_fingerprint(&u, &fill);
+        assert_eq!(a.site_id, b.site_id);
+        assert_ne!(a.trace_id, b.trace_id);
+    }
+
+    #[test]
+    fn fingerprint_verify_accepts_a_fresh_fingerprint() {
+        let u = parse_url("https://example.com/foo");
+        let actions = serde_json::json!([{"verb": "click", "ref": "@e3"}]);
+        let fp = trace_fingerprint(&u, &actions);
+        assert_eq!(verify_fingerprint(&fp), FingerprintOutcome::Valid);
+    }
+
+    #[test]
+    fn fingerprint_verify_detects_tampered_trace_id() {
+        let u = parse_url("https://example.com/");
+        let actions = serde_json::json!([]);
+        let mut fp = trace_fingerprint(&u, &actions);
+        fp.trace_id = "0".repeat(64);
+        assert_eq!(verify_fingerprint(&fp), FingerprintOutcome::Mismatch);
+    }
+
+    #[test]
+    fn fingerprint_verify_detects_tampered_url() {
+        let u = parse_url("https://example.com/");
+        let actions = serde_json::json!([]);
+        let mut fp = trace_fingerprint(&u, &actions);
+        // Change url to a different (but parseable) site; IDs were computed
+        // for the original, so recompute disagrees.
+        fp.url = "https://other.example/".to_owned();
+        assert_eq!(verify_fingerprint(&fp), FingerprintOutcome::Mismatch);
+    }
+
+    #[test]
+    fn fingerprint_verify_detects_tampered_action() {
+        let u = parse_url("https://example.com/");
+        let actions = serde_json::json!([{"verb": "click", "ref": "@e3"}]);
+        let mut fp = trace_fingerprint(&u, &actions);
+        // Mutate the actions array on the saved fp; IDs become inconsistent.
+        fp.actions = serde_json::json!([{"verb": "click", "ref": "@e99"}]);
+        assert_eq!(verify_fingerprint(&fp), FingerprintOutcome::Mismatch);
+    }
+
+    #[test]
+    fn fingerprint_verify_refuses_unknown_algorithm_tag() {
+        let u = parse_url("https://example.com/");
+        let actions = serde_json::json!([]);
+        let mut fp = trace_fingerprint(&u, &actions);
+        fp.algorithm = "heso-trace-fp/v999".into();
+        match verify_fingerprint(&fp) {
+            FingerprintOutcome::WrongAlgorithm(s) => assert_eq!(s, "heso-trace-fp/v999"),
+            other => panic!("expected WrongAlgorithm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fingerprint_verify_flags_malformed_url() {
+        let u = parse_url("https://example.com/");
+        let actions = serde_json::json!([]);
+        let mut fp = trace_fingerprint(&u, &actions);
+        fp.url = "not a url".into();
+        match verify_fingerprint(&fp) {
+            FingerprintOutcome::Malformed(_) => {}
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fingerprint_json_roundtrips_intact() {
+        let u = parse_url("https://example.com/foo");
+        let actions = serde_json::json!([{"verb": "fill", "ref": "@e7", "value": "hi"}]);
+        let fp = trace_fingerprint(&u, &actions);
+        let json = serde_json::to_string(&fp).unwrap();
+        let back: TraceFingerprint = serde_json::from_str(&json).unwrap();
+        assert_eq!(fp, back);
+        assert_eq!(verify_fingerprint(&back), FingerprintOutcome::Valid);
+    }
+
+    #[test]
+    fn fingerprint_domain_separators_prevent_collision() {
+        // Two payloads that happen to canonicalize to the same string
+        // under different domains MUST hash to different values. A site
+        // URL "foo" and an action {"foo": null} obviously don't collide
+        // canonically, so we use a more direct test: derive a hash under
+        // each domain over the same bytes and assert all three differ.
+        let bytes = b"identical payload";
+        let site = dst_hash(DST_SITE, bytes);
+        let action = dst_hash(DST_ACTION, bytes);
+        let init = dst_hash(DST_TRACE_INIT, bytes);
+        let step = dst_hash(DST_TRACE_STEP, bytes);
+        assert_ne!(site.as_bytes(), action.as_bytes());
+        assert_ne!(site.as_bytes(), init.as_bytes());
+        assert_ne!(site.as_bytes(), step.as_bytes());
+        assert_ne!(action.as_bytes(), init.as_bytes());
+        assert_ne!(action.as_bytes(), step.as_bytes());
+        assert_ne!(init.as_bytes(), step.as_bytes());
+    }
+
+    #[test]
+    fn action_open_serializes_with_verb_and_url() {
+        let a = Action::Open {
+            url: "https://example.com/".into(),
+        };
+        let j = serde_json::to_value(&a).unwrap();
+        assert_eq!(j["verb"], "open");
+        assert_eq!(j["url"], "https://example.com/");
+        let back: Action = serde_json::from_value(j).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn action_click_serializes_with_ref_field_not_target() {
+        let a = Action::Click {
+            target: "@e3".into(),
+        };
+        let j = serde_json::to_value(&a).unwrap();
+        // The JSON uses `ref` (matches the rest of heso's shell vocab),
+        // not the Rust field name `target`.
+        assert_eq!(j["verb"], "click");
+        assert_eq!(j["ref"], "@e3");
+        assert!(j.get("target").is_none(), "rust field name must not leak");
+    }
+
+    #[test]
+    fn action_fill_carries_value() {
+        let a = Action::Fill {
+            target: "@e7".into(),
+            value: "hello world".into(),
+        };
+        let j = serde_json::to_value(&a).unwrap();
+        assert_eq!(j["verb"], "fill");
+        assert_eq!(j["ref"], "@e7");
+        assert_eq!(j["value"], "hello world");
+    }
+
+    #[test]
+    fn parse_actions_accepts_canonical_array() {
+        let arr = serde_json::json!([
+            {"verb": "open", "url": "https://example.com/"},
+            {"verb": "click", "ref": "@e3"},
+            {"verb": "fill", "ref": "@e7", "value": "x"},
+            {"verb": "submit", "ref": "@form1"},
+        ]);
+        let actions = parse_actions(&arr).unwrap();
+        assert_eq!(actions.len(), 4);
+        assert_eq!(actions[0].verb(), "open");
+        assert_eq!(actions[1].verb(), "click");
+        assert_eq!(actions[2].verb(), "fill");
+        assert_eq!(actions[3].verb(), "submit");
+    }
+
+    #[test]
+    fn parse_actions_rejects_non_array() {
+        let v = serde_json::json!({"verb": "click", "ref": "@e3"});
+        match parse_actions(&v) {
+            Err(ActionParseError::NotAnArray) => {}
+            other => panic!("expected NotAnArray, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_actions_points_to_failing_index() {
+        let arr = serde_json::json!([
+            {"verb": "open", "url": "https://example.com/"},
+            {"verb": "fly", "ref": "@e3"}, // unknown verb
+        ]);
+        match parse_actions(&arr) {
+            Err(ActionParseError::Item { index, .. }) => assert_eq!(index, 1),
+            other => panic!("expected Item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_actions_rejects_fill_without_value() {
+        let arr = serde_json::json!([{"verb": "fill", "ref": "@e7"}]);
+        match parse_actions(&arr) {
+            Err(ActionParseError::Item { index, .. }) => assert_eq!(index, 0),
+            other => panic!("expected Item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fingerprint_round_trips_through_canonical_action_schema() {
+        // Build a fingerprint from Action enum values; verify it hashes
+        // identically to one built from equivalent raw JSON. The whole
+        // point of the canonical schema is that *the schema is the
+        // fingerprint*: replay and hash agree on what an action is.
+        let u = parse_url("https://example.com/");
+        let typed = vec![
+            Action::Open {
+                url: "https://example.com/".into(),
+            },
+            Action::Click {
+                target: "@e3".into(),
+            },
+        ];
+        let typed_json = serde_json::to_value(&typed).unwrap();
+        let raw_json = serde_json::json!([
+            {"verb": "open", "url": "https://example.com/"},
+            {"verb": "click", "ref": "@e3"},
+        ]);
+        assert_eq!(
+            trace_fingerprint(&u, &typed_json).trace_id,
+            trace_fingerprint(&u, &raw_json).trace_id,
+        );
+    }
+
+    #[test]
+    fn normalize_url_strips_default_https_port() {
+        let u = parse_url("https://example.com:443/path");
+        assert_eq!(normalize_url_for_hash(&u), "https://example.com/path");
+    }
+
+    #[test]
+    fn normalize_url_keeps_nondefault_port() {
+        let u = parse_url("https://example.com:8443/path");
+        assert_eq!(normalize_url_for_hash(&u), "https://example.com:8443/path");
+    }
+
+    #[test]
+    fn normalize_url_drops_fragment() {
+        let u = parse_url("https://example.com/foo#section");
+        assert_eq!(normalize_url_for_hash(&u), "https://example.com/foo");
+    }
+
+    #[test]
+    fn normalize_url_sorts_query_params() {
+        let u = parse_url("https://example.com/?z=9&a=1&m=5");
+        assert_eq!(
+            normalize_url_for_hash(&u),
+            "https://example.com/?a=1&m=5&z=9",
+        );
     }
 
     #[test]

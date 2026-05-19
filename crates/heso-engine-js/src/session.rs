@@ -1,0 +1,725 @@
+//! # session
+//!
+//! Stateful page sessions: one [`JsEngine`], one [`Document`], one
+//! [`Url`], persisted across many actions.
+//!
+//! The Phase 1B convenience methods on [`JsEngine`] —
+//! [`JsEngine::dispatch_click`], [`JsEngine::set_input_value`],
+//! [`JsEngine::submit_form`] — re-parse HTML and reinstall the
+//! `document` global on **every** call. That is the right contract
+//! for the one-shot CLI verbs `heso click` / `heso fill` /
+//! `heso submit`: each invocation is its own short-lived process and
+//! sees the page fresh.
+//!
+//! It is the wrong contract for a multi-step trace where an earlier
+//! click mutates the page that a later step expects to operate on
+//! (`cmd_replay` in `heso-cli`). The first pass of `cmd_replay`
+//! shipped with `JsEngine::new()` per step + a re-fetch between
+//! steps, which threw away every JS-side mutation in between.
+//!
+//! [`JsSession`] is the fix. It:
+//!
+//! - Installs the `document` global once at [`Self::open`] time via
+//!   [`JsEngine::install_document`].
+//! - Routes [`Self::click`] / [`Self::fill`] / [`Self::submit`] /
+//!   [`Self::eval`] through [`JsEngine::eval`] against that same
+//!   long-lived global — no re-parse, no reinstall, mutations
+//!   accumulate.
+//! - Exposes [`Self::navigate`] for genuine page transitions (an
+//!   `<a href>` click that should navigate, or an explicit
+//!   `Action::Open`) — the only path that *should* swap the document.
+//!
+//! Cookies (via the shared `reqwest::Client`), timers, RNG, and the
+//! `fetch` shim all live on the underlying [`JsEngine`] and survive
+//! [`Self::navigate`] as well — matching real-browser behavior where
+//! only the document resets on navigation.
+//!
+//! ## Listener persistence
+//!
+//! Event listeners registered via `addEventListener` survive across
+//! [`Self::click`] / [`Self::fill`] / [`Self::eval`] calls because
+//! [`crate::events`] keys them by `dom_query::NodeId` on a registry
+//! attached to the long-lived `document` global, not on per-call
+//! Element wrappers. This is the property that makes
+//! `addEventListener('click', …)` patterns work — including
+//! React-style synthetic-event delegation in principle, though the
+//! synthetic-event system itself isn't wired yet.
+
+use url::Url;
+
+use crate::dom::Document;
+use crate::engine::{EvalError, EvalOutcome, JsEngine};
+use crate::scripts::{ScriptFetchPolicy, ScriptOutcome};
+
+/// A long-lived page session bound to a single [`JsEngine`].
+///
+/// Construct with [`Self::open`]; advance with [`Self::click`] /
+/// [`Self::fill`] / [`Self::submit`] / [`Self::eval`]; transition to a
+/// new page with [`Self::navigate`]. The current URL is tracked
+/// independently of the engine — JS has no way to mutate it because
+/// `window.location` is not wired yet.
+pub struct JsSession {
+    engine: JsEngine,
+    url: Url,
+    // Rust-side handle to the same `Arc<dom_query::Document>` the JS
+    // `document` global wraps. Lets us serialize the post-mutation DOM
+    // (see `Self::document_html`) without a JS round-trip.
+    document: Document,
+}
+
+impl JsSession {
+    /// Open `html` at `url` as a fresh session. Builds a default
+    /// [`JsEngine`] (no seed, no fetch shim), parses `html`, installs
+    /// the resulting [`Document`] as the JS `document` global, and
+    /// runs every inline `<script>` once.
+    pub fn open(html: &str, url: Url) -> Result<(Self, ScriptOutcome), EvalError> {
+        let engine = JsEngine::new()?;
+        Self::open_on_engine(engine, html, url, ScriptFetchPolicy::default())
+    }
+
+    /// Like [`Self::open`] but seeds the engine's RNG and virtual
+    /// clock so `Math.random` / `crypto.*` / `setTimeout` ordering is
+    /// reproducible across runs.
+    pub fn open_with_seed(
+        html: &str,
+        url: Url,
+        seed: u64,
+    ) -> Result<(Self, ScriptOutcome), EvalError> {
+        let engine = JsEngine::new_with_seed(seed)?;
+        Self::open_on_engine(engine, html, url, ScriptFetchPolicy::default())
+    }
+
+    /// Lowest-level constructor: caller supplies a fully-built
+    /// [`JsEngine`] (so they can pre-attach a fetch shim, custom RNG,
+    /// or a non-default memory cap) plus the
+    /// [`ScriptFetchPolicy`] for inline `<script src=...>` references.
+    pub fn open_on_engine(
+        engine: JsEngine,
+        html: &str,
+        url: Url,
+        policy: ScriptFetchPolicy,
+    ) -> Result<(Self, ScriptOutcome), EvalError> {
+        let document = Document::from_html(html);
+        let outcome = engine.install_document(document.clone(), policy)?;
+        Ok((
+            Self {
+                engine,
+                url,
+                document,
+            },
+            outcome,
+        ))
+    }
+
+    /// Replace the page: parse `html`, swap in a fresh [`Document`]
+    /// as the `document` global, run its `<script>` tags. The engine
+    /// itself (and therefore RNG / virtual clock / cookies via
+    /// `fetch_state`) survives — only the DOM resets, matching
+    /// browser behavior on real navigation.
+    pub fn navigate(&mut self, html: &str, url: Url) -> Result<ScriptOutcome, EvalError> {
+        self.navigate_with_policy(html, url, ScriptFetchPolicy::default())
+    }
+
+    /// [`Self::navigate`] with a caller-chosen [`ScriptFetchPolicy`].
+    pub fn navigate_with_policy(
+        &mut self,
+        html: &str,
+        url: Url,
+        policy: ScriptFetchPolicy,
+    ) -> Result<ScriptOutcome, EvalError> {
+        let document = Document::from_html(html);
+        let outcome = self.engine.install_document(document.clone(), policy)?;
+        self.document = document;
+        self.url = url;
+        Ok(outcome)
+    }
+
+    /// The session's current URL. Updated by [`Self::navigate`];
+    /// not currently observable to JS.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// Borrow the [`JsEngine`] backing this session.
+    pub fn engine(&self) -> &JsEngine {
+        &self.engine
+    }
+
+    /// Borrow the current document. Mutations made by JS are visible
+    /// here because both sides share the same `Arc<dom_query::Document>`.
+    pub fn document(&self) -> &Document {
+        &self.document
+    }
+
+    /// Serialize the current DOM back to HTML. Reflects every
+    /// mutation JS has made since [`Self::open`] / the last
+    /// [`Self::navigate`].
+    pub fn document_html(&self) -> String {
+        self.document.dom().html().to_string()
+    }
+
+    /// Dispatch a `click` event on the element matched by `selector`.
+    ///
+    /// Unlike [`JsEngine::dispatch_click`], no HTML is re-parsed and
+    /// no `document` global is reinstalled — DOM mutations made by
+    /// the click handler are observable on the next call.
+    ///
+    /// Returns `value: true` if the selector matched and the click
+    /// was dispatched, `false` if no element matched.
+    pub fn click(&self, selector: &str) -> Result<EvalOutcome, EvalError> {
+        let selector_lit = serde_json::to_string(selector)
+            .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        let script = format!(
+            r#"
+            (() => {{
+                const el = document.querySelector({selector_lit});
+                if (!el) return false;
+                el.click();
+                return true;
+            }})()
+            "#,
+        );
+        self.engine.eval(&script)
+    }
+
+    /// Set the input's value and dispatch `input` then `change`
+    /// events on it. Stateful counterpart of
+    /// [`JsEngine::set_input_value`].
+    pub fn fill(&self, selector: &str, value: &str) -> Result<EvalOutcome, EvalError> {
+        let selector_lit = serde_json::to_string(selector)
+            .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        let value_lit = serde_json::to_string(value)
+            .map_err(|e| EvalError::Engine(format!("encode value: {e}")))?;
+        let script = format!(
+            r#"
+            (() => {{
+                const el = document.querySelector({selector_lit});
+                if (!el) return false;
+                el.value = {value_lit};
+                el.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
+                return true;
+            }})()
+            "#,
+        );
+        self.engine.eval(&script)
+    }
+
+    /// Find the form at `selector`, find its first submit-typed
+    /// descendant, dispatch a click on it. Stateful counterpart of
+    /// [`JsEngine::submit_form`].
+    pub fn submit(&self, selector: &str) -> Result<EvalOutcome, EvalError> {
+        let selector_lit = serde_json::to_string(selector)
+            .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        let script = format!(
+            r#"
+            (() => {{
+                const form = document.querySelector({selector_lit});
+                if (!form) return false;
+                const submitter =
+                    form.querySelector('button[type="submit"]') ||
+                    form.querySelector('input[type="submit"]') ||
+                    form.querySelector('button:not([type])');
+                if (!submitter) return false;
+                submitter.click();
+                return true;
+            }})()
+            "#,
+        );
+        self.engine.eval(&script)
+    }
+
+    /// Evaluate arbitrary JS against the live `document` global.
+    pub fn eval(&self, code: &str) -> Result<EvalOutcome, EvalError> {
+        self.engine.eval(code)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_url() -> Url {
+        Url::parse("https://example.com/").unwrap()
+    }
+
+    #[test]
+    fn click_persists_dom_mutation_for_next_eval() {
+        let html = r#"
+            <!doctype html><html><body>
+              <button id="b">click me</button>
+              <div id="out">untouched</div>
+              <script>
+                document.querySelector('#b').addEventListener('click', () => {
+                  document.querySelector('#out').textContent = 'clicked!';
+                });
+              </script>
+            </body></html>
+        "#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        let before = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(before.value, serde_json::json!("untouched"));
+        let clicked = sess.click("#b").unwrap();
+        assert_eq!(clicked.value, serde_json::json!(true));
+        let after = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(after.value, serde_json::json!("clicked!"));
+    }
+
+    #[test]
+    fn fill_persists_value_for_next_eval() {
+        let html = r#"<!doctype html><html><body>
+            <input id="i" type="text" value="">
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        let filled = sess.fill("#i", "hello").unwrap();
+        assert_eq!(filled.value, serde_json::json!(true));
+        let v = sess.eval("document.querySelector('#i').value").unwrap();
+        assert_eq!(v.value, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn click_then_fill_then_eval_sees_all_mutations() {
+        let html = r#"
+            <!doctype html><html><body>
+              <button id="b">b</button>
+              <input id="i" type="text" value="">
+              <div id="out"></div>
+              <script>
+                document.querySelector('#b').addEventListener('click', () => {
+                  document.querySelector('#out').textContent = 'clicked';
+                });
+                document.querySelector('#i').addEventListener('input', (e) => {
+                  document.querySelector('#out').textContent += ':' + e.target.value;
+                });
+              </script>
+            </body></html>
+        "#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        assert_eq!(sess.click("#b").unwrap().value, serde_json::json!(true));
+        assert_eq!(sess.fill("#i", "x").unwrap().value, serde_json::json!(true));
+        let out = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(out.value, serde_json::json!("clicked:x"));
+    }
+
+    #[test]
+    fn navigate_resets_dom_but_keeps_engine_state() {
+        let html_a = r#"
+            <!doctype html><html><body>
+              <div id="x">a</div>
+              <script>globalThis.persisted = 'from-a';</script>
+            </body></html>
+        "#;
+        let html_b = r#"<!doctype html><html><body><div id="x">b</div></body></html>"#;
+        let (mut sess, _) = JsSession::open(html_a, test_url()).unwrap();
+        let a = sess
+            .eval("document.querySelector('#x').textContent")
+            .unwrap();
+        assert_eq!(a.value, serde_json::json!("a"));
+        let new_url = Url::parse("https://example.com/b").unwrap();
+        sess.navigate(html_b, new_url.clone()).unwrap();
+        let b = sess
+            .eval("document.querySelector('#x').textContent")
+            .unwrap();
+        assert_eq!(b.value, serde_json::json!("b"));
+        let p = sess.eval("globalThis.persisted").unwrap();
+        assert_eq!(p.value, serde_json::json!("from-a"));
+        assert_eq!(sess.url(), &new_url);
+    }
+
+    #[test]
+    fn document_html_reflects_post_click_mutations() {
+        let html = r#"<!doctype html><html><body>
+            <button id="b">b</button>
+            <div id="out">orig</div>
+            <script>
+              document.querySelector('#b').addEventListener('click', () => {
+                document.querySelector('#out').textContent = 'mut';
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#b").unwrap();
+        let serialized = sess.document_html();
+        assert!(
+            serialized.contains("mut"),
+            "expected serialized HTML to contain mutation; got: {serialized}"
+        );
+        assert!(
+            !serialized.contains(">orig<"),
+            "expected serialized HTML to NOT contain original value; got: {serialized}"
+        );
+    }
+
+    #[test]
+    fn click_returns_false_on_unmatched_selector() {
+        let html = "<!doctype html><html><body></body></html>";
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        let res = sess.click("#nope").unwrap();
+        assert_eq!(res.value, serde_json::json!(false));
+    }
+
+    // -----------------------------------------------------------------
+    // Real-world-ish patterns: counter, event delegation,
+    // removeEventListener, innerHTML / appendChild / classList mutation
+    // from handlers, multi-listener order, setTimeout-scheduled
+    // mutations, navigation clearing listeners, preventDefault.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn counter_accumulates_across_many_clicks() {
+        // The simplest SPA pattern: a click handler increments shared
+        // state. After N clicks the DOM should show N.
+        let html = r#"<!doctype html><html><body>
+            <button id="b">+1</button>
+            <span id="n">0</span>
+            <script>
+              let n = 0;
+              document.querySelector('#b').addEventListener('click', () => {
+                n += 1;
+                document.querySelector('#n').textContent = String(n);
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        for _ in 0..5 {
+            assert_eq!(sess.click("#b").unwrap().value, serde_json::json!(true));
+        }
+        let n = sess
+            .eval("document.querySelector('#n').textContent")
+            .unwrap();
+        assert_eq!(n.value, serde_json::json!("5"));
+    }
+
+    #[test]
+    #[ignore = "no bubble/capture walk yet — events.rs dispatch is flat (see events.rs:69). \
+                Required for React/Vue-style delegation. Next bar."]
+    fn event_delegation_on_body_routes_clicks_from_children() {
+        // React-style delegation: a listener on a high ancestor handles
+        // clicks on children. Bubbling must reach the body listener.
+        let html = r#"<!doctype html><html><body>
+            <div><button id="b">click</button></div>
+            <div id="out">none</div>
+            <script>
+              document.body.addEventListener('click', (e) => {
+                document.querySelector('#out').textContent = 'caught:' + e.target.id;
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        assert_eq!(sess.click("#b").unwrap().value, serde_json::json!(true));
+        let out = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(out.value, serde_json::json!("caught:b"));
+    }
+
+    #[test]
+    fn remove_event_listener_actually_removes_across_evals() {
+        // addEventListener then removeEventListener with the same
+        // callback identity should leave the element with no listener
+        // — a subsequent click must NOT fire the handler.
+        let html = r#"<!doctype html><html><body>
+            <button id="b">b</button>
+            <span id="n">0</span>
+            <script>
+              let n = 0;
+              const handler = () => {
+                n += 1;
+                document.querySelector('#n').textContent = String(n);
+              };
+              const el = document.querySelector('#b');
+              el.addEventListener('click', handler);
+              globalThis.__detach = () => el.removeEventListener('click', handler);
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#b").unwrap();
+        sess.eval("globalThis.__detach()").unwrap();
+        sess.click("#b").unwrap();
+        let n = sess
+            .eval("document.querySelector('#n').textContent")
+            .unwrap();
+        assert_eq!(n.value, serde_json::json!("1"));
+    }
+
+    #[test]
+    fn innerhtml_setter_from_handler_persists() {
+        let html = r#"<!doctype html><html><body>
+            <button id="b">b</button>
+            <div id="out"><span>old</span></div>
+            <script>
+              document.querySelector('#b').addEventListener('click', () => {
+                document.querySelector('#out').innerHTML = '<em>new</em>';
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#b").unwrap();
+        let inner = sess
+            .eval("document.querySelector('#out').innerHTML")
+            .unwrap();
+        assert_eq!(inner.value, serde_json::json!("<em>new</em>"));
+        // Serialized DOM also reflects the swap.
+        assert!(sess.document_html().contains("<em>new</em>"));
+    }
+
+    #[test]
+    #[ignore = "document.createElement not implemented in dom.rs. \
+                Required for any script that builds nodes at runtime. Next bar."]
+    fn dynamically_appended_element_is_clickable() {
+        // Click a button that creates a new button at runtime; the new
+        // button must be selectable AND its listener must fire when
+        // clicked in a SUBSEQUENT session.click() call.
+        let html = r#"<!doctype html><html><body>
+            <div id="root"><button id="seed">seed</button></div>
+            <div id="out">none</div>
+            <script>
+              document.querySelector('#seed').addEventListener('click', () => {
+                const b = document.createElement('button');
+                b.id = 'dyn';
+                b.textContent = 'dyn';
+                b.addEventListener('click', () => {
+                  document.querySelector('#out').textContent = 'dyn-fired';
+                });
+                document.querySelector('#root').appendChild(b);
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#seed").unwrap();
+        // The dynamically-appended button now exists in the live DOM.
+        let exists = sess
+            .eval("document.querySelector('#dyn') !== null")
+            .unwrap();
+        assert_eq!(exists.value, serde_json::json!(true));
+        // And clicking it fires the listener that was attached at
+        // creation time — which lives in the node-keyed registry the
+        // same way as any other listener.
+        assert_eq!(sess.click("#dyn").unwrap().value, serde_json::json!(true));
+        let out = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(out.value, serde_json::json!("dyn-fired"));
+    }
+
+    #[test]
+    fn classlist_toggle_from_handler_persists() {
+        let html = r#"<!doctype html><html><body>
+            <button id="b" class="off">b</button>
+            <script>
+              document.querySelector('#b').addEventListener('click', () => {
+                document.querySelector('#b').classList.toggle('off');
+                document.querySelector('#b').classList.add('on');
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#b").unwrap();
+        let cls = sess
+            .eval("document.querySelector('#b').className")
+            .unwrap();
+        // Class string should have lost "off", gained "on".
+        let cls_s = cls.value.as_str().unwrap_or_default().to_owned();
+        assert!(
+            cls_s.contains("on") && !cls_s.contains("off"),
+            "expected class to include 'on' and exclude 'off'; got: {cls_s}"
+        );
+    }
+
+    #[test]
+    fn multiple_listeners_fire_in_registration_order() {
+        let html = r#"<!doctype html><html><body>
+            <button id="b">b</button>
+            <script>
+              globalThis.log = [];
+              const el = document.querySelector('#b');
+              el.addEventListener('click', () => globalThis.log.push('a'));
+              el.addEventListener('click', () => globalThis.log.push('b'));
+              el.addEventListener('click', () => globalThis.log.push('c'));
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#b").unwrap();
+        let log = sess.eval("globalThis.log").unwrap();
+        assert_eq!(log.value, serde_json::json!(["a", "b", "c"]));
+    }
+
+    #[test]
+    fn once_listener_only_fires_once() {
+        // addEventListener with `{ once: true }` must auto-remove after
+        // firing — and the auto-removal must work across the node-keyed
+        // registry, not just the per-wrapper map.
+        let html = r#"<!doctype html><html><body>
+            <button id="b">b</button>
+            <span id="n">0</span>
+            <script>
+              let n = 0;
+              document.querySelector('#b').addEventListener('click', () => {
+                n += 1;
+                document.querySelector('#n').textContent = String(n);
+              }, { once: true });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#b").unwrap();
+        sess.click("#b").unwrap();
+        sess.click("#b").unwrap();
+        let n = sess
+            .eval("document.querySelector('#n').textContent")
+            .unwrap();
+        assert_eq!(n.value, serde_json::json!("1"));
+    }
+
+    #[test]
+    fn navigation_drops_old_listeners() {
+        // After navigate(), listeners registered on the old document
+        // must NOT fire when we click selectors on the new document.
+        // Tests that the per-document node-listener registry doesn't
+        // leak across navigations.
+        let html_a = r#"<!doctype html><html><body>
+            <button id="b">a</button>
+            <script>
+              globalThis.fired = false;
+              document.querySelector('#b').addEventListener('click', () => {
+                globalThis.fired = true;
+              });
+            </script>
+        </body></html>"#;
+        let html_b = r#"<!doctype html><html><body>
+            <button id="b">b</button>
+        </body></html>"#;
+        let (mut sess, _) = JsSession::open(html_a, test_url()).unwrap();
+        let new_url = Url::parse("https://example.com/b").unwrap();
+        sess.navigate(html_b, new_url).unwrap();
+        // Click the button on page B — same selector, but the listener
+        // was on page A's document. globalThis.fired survives because
+        // the engine survives nav, but the listener should NOT fire.
+        sess.click("#b").unwrap();
+        let fired = sess.eval("globalThis.fired").unwrap();
+        assert_eq!(fired.value, serde_json::json!(false));
+    }
+
+    #[test]
+    fn settimeout_scheduled_mutation_persists() {
+        // setTimeout body mutates the DOM; after engine.advance_clock
+        // the mutation should be visible via the session.
+        let html = r#"<!doctype html><html><body>
+            <div id="out">orig</div>
+            <script>
+              setTimeout(() => {
+                document.querySelector('#out').textContent = 'late';
+              }, 50);
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        // Before the timer fires.
+        let before = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(before.value, serde_json::json!("orig"));
+        // Fire the timer.
+        sess.engine().advance_clock(100).unwrap();
+        let after = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(after.value, serde_json::json!("late"));
+    }
+
+    #[test]
+    fn preventdefault_observable_to_caller_script() {
+        // A click handler can call e.preventDefault(); a separate eval
+        // observing the same event via a globalThis flag should see it.
+        let html = r#"<!doctype html><html><body>
+            <button id="b">b</button>
+            <script>
+              globalThis.prevented = null;
+              document.querySelector('#b').addEventListener('click', (e) => {
+                e.preventDefault();
+                globalThis.prevented = e.defaultPrevented;
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#b").unwrap();
+        let prevented = sess.eval("globalThis.prevented").unwrap();
+        assert_eq!(prevented.value, serde_json::json!(true));
+    }
+
+    #[test]
+    fn fill_fires_handler_that_reads_event_target_value() {
+        // Tests the e.target.value path that real form code relies on.
+        let html = r#"<!doctype html><html><body>
+            <input id="i" type="text" value="">
+            <span id="echo"></span>
+            <script>
+              document.querySelector('#i').addEventListener('input', (e) => {
+                document.querySelector('#echo').textContent = 'got:' + e.target.value;
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.fill("#i", "abc").unwrap();
+        let echo = sess
+            .eval("document.querySelector('#echo').textContent")
+            .unwrap();
+        assert_eq!(echo.value, serde_json::json!("got:abc"));
+    }
+
+    #[test]
+    fn nested_clicks_one_handler_triggers_another() {
+        // Click A's handler programmatically clicks B; B's handler
+        // mutates the DOM. Cross-element handler chaining must work
+        // through the node-keyed registry.
+        let html = r#"<!doctype html><html><body>
+            <button id="a">a</button>
+            <button id="b">b</button>
+            <div id="out">orig</div>
+            <script>
+              document.querySelector('#a').addEventListener('click', () => {
+                document.querySelector('#b').click();
+              });
+              document.querySelector('#b').addEventListener('click', () => {
+                document.querySelector('#out').textContent = 'b-fired';
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        sess.click("#a").unwrap();
+        let out = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(out.value, serde_json::json!("b-fired"));
+    }
+
+    #[test]
+    fn submit_fires_form_handler_via_button_click() {
+        // The Phase 1B submit path: locate <form>, find its submit
+        // button, dispatch a click. A click listener on the submit
+        // button must fire — and DOM mutations from it must persist.
+        let html = r#"<!doctype html><html><body>
+            <form id="f">
+              <input id="i" name="i" value="">
+              <button type="submit" id="sb">go</button>
+            </form>
+            <div id="out">orig</div>
+            <script>
+              document.querySelector('#sb').addEventListener('click', (e) => {
+                e.preventDefault();
+                document.querySelector('#out').textContent = 'submitted';
+              });
+            </script>
+        </body></html>"#;
+        let (sess, _) = JsSession::open(html, test_url()).unwrap();
+        assert_eq!(sess.submit("#f").unwrap().value, serde_json::json!(true));
+        let out = sess
+            .eval("document.querySelector('#out').textContent")
+            .unwrap();
+        assert_eq!(out.value, serde_json::json!("submitted"));
+    }
+}

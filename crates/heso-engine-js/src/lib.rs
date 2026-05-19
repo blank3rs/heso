@@ -79,6 +79,7 @@ pub mod events;
 pub mod fetch;
 pub mod rng;
 pub mod scripts;
+pub mod session;
 pub mod timers;
 
 pub use dom::{Document, DomTokenList, Element};
@@ -87,4 +88,5 @@ pub use events::{AbortController, AbortSignal, CustomEvent, DOMException, Event,
 pub use fetch::FetchMode;
 pub use rng::SeededRng;
 pub use scripts::{ScriptFetchPolicy, ScriptOutcome};
+pub use session::JsSession;
 pub use timers::VirtualClock;

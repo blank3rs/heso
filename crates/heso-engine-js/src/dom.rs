@@ -76,13 +76,84 @@ use dom_query::{Document as DqDocument, NodeId, NodeRef};
 use rquickjs::{
     class::Trace,
     prelude::{Opt, This},
-    Class, Ctx, Error as JsError, Function, JsLifetime, Object, Value,
+    Class, Ctx, Function, JsLifetime, Object, Value,
 };
 
 use crate::events::{
-    self, add_listener_to_instance, dispatch_on_instance, parse_listener_options,
-    remove_listener_from_instance,
+    self, add_listener_to_map, dispatch_with_map, parse_listener_options, remove_listener_from_map,
 };
+
+/// Name of the hidden property on `globalThis.document` whose value
+/// is an object mapping per-element listener maps, keyed by a stable
+/// stringification of [`dom_query::NodeId`].
+///
+/// This indirection is the reason `addEventListener` survives across
+/// `eval` boundaries: every `document.querySelector(...)` returns a
+/// **new** JS `Element` wrapper, but `globalThis.document` itself is
+/// a single long-lived object installed at session-open time, so any
+/// state hung off it lives as long as the session does.
+const PROP_NODE_LISTENERS: &str = "__nodeListeners";
+
+/// Stringify a [`NodeId`] for use as a JS-object key in the
+/// node-keyed listener registry. Debug-formatting is fine here —
+/// `NodeId` derives `Debug`, the format is stable for the lifetime
+/// of the parse tree, and the resulting string is only ever compared
+/// for equality against other strings produced the same way.
+fn node_key(node_id: NodeId) -> String {
+    format!("{:?}", node_id)
+}
+
+/// Look up (or lazily create) the per-element listener map for
+/// `node_id` on the long-lived `globalThis.document.__nodeListeners`
+/// registry. Returns the inner map object whose keys are event types
+/// and whose values are arrays of listener records — the same shape
+/// [`crate::events`] expects.
+pub(crate) fn element_listener_map<'js>(
+    ctx: &Ctx<'js>,
+    node_id: NodeId,
+) -> rquickjs::Result<Object<'js>> {
+    let globals = ctx.globals();
+    let document: Object<'js> = globals.get("document")?;
+    let registry: Object<'js> = match document.get::<_, Option<Object<'js>>>(PROP_NODE_LISTENERS)? {
+        Some(r) => r,
+        None => {
+            let r = Object::new(ctx.clone())?;
+            document.set(PROP_NODE_LISTENERS, r.clone())?;
+            r
+        }
+    };
+    let key = node_key(node_id);
+    match registry.get::<_, Option<Object<'js>>>(key.as_str())? {
+        Some(m) => Ok(m),
+        None => {
+            let m = Object::new(ctx.clone())?;
+            registry.set(key.as_str(), m.clone())?;
+            Ok(m)
+        }
+    }
+}
+
+/// Read-only variant of [`element_listener_map`] — returns `None` if
+/// no listeners have been registered for this node yet. Used by the
+/// dispatch path so it doesn't litter the registry with empty maps
+/// for every element that's ever had `dispatchEvent` called on it
+/// without listeners.
+pub(crate) fn element_listener_map_opt<'js>(
+    ctx: &Ctx<'js>,
+    node_id: NodeId,
+) -> rquickjs::Result<Option<Object<'js>>> {
+    let globals = ctx.globals();
+    let document: Option<Object<'js>> = globals.get::<_, Option<Object<'js>>>("document")?;
+    let Some(document) = document else {
+        return Ok(None);
+    };
+    let registry: Option<Object<'js>> = document.get::<_, Option<Object<'js>>>(PROP_NODE_LISTENERS)?;
+    let Some(registry) = registry else {
+        return Ok(None);
+    };
+    let key = node_key(node_id);
+    registry.get::<_, Option<Object<'js>>>(key.as_str())
+}
 
 /// The `document` global.
 ///
@@ -609,20 +680,9 @@ impl Element {
         options: Opt<Value<'js>>,
     ) -> rquickjs::Result<()> {
         let (capture, once, passive) = parse_listener_options(&ctx, options.0)?;
-        let instance: Object<'js> = this
-            .0
-            .into_value()
-            .into_object()
-            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
-        add_listener_to_instance(
-            &ctx,
-            &instance,
-            &event_type,
-            &listener,
-            capture,
-            once,
-            passive,
-        )
+        let node_id = this.0.borrow().node_id;
+        let map = element_listener_map(&ctx, node_id)?;
+        add_listener_to_map(&ctx, &map, &event_type, &listener, capture, once, passive)
     }
 
     /// `element.removeEventListener(type, listener, options?)`.
@@ -634,12 +694,11 @@ impl Element {
         options: Opt<Value<'js>>,
     ) -> rquickjs::Result<()> {
         let (capture, _, _) = parse_listener_options(&ctx, options.0)?;
-        let instance: Object<'js> = this
-            .0
-            .into_value()
-            .into_object()
-            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
-        remove_listener_from_instance(&ctx, &instance, &event_type, &listener, capture)
+        let node_id = this.0.borrow().node_id;
+        if let Some(map) = element_listener_map_opt(&ctx, node_id)? {
+            remove_listener_from_map(&ctx, &map, &event_type, &listener, capture)?;
+        }
+        Ok(())
     }
 
     /// `element.dispatchEvent(event)` — fire `event` on this element,
@@ -652,12 +711,10 @@ impl Element {
         ctx: Ctx<'js>,
         event: Value<'js>,
     ) -> rquickjs::Result<bool> {
-        let instance: Object<'js> = this
-            .0
-            .into_value()
-            .into_object()
-            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
-        dispatch_on_instance(&ctx, &instance, event)
+        let node_id = this.0.borrow().node_id;
+        let target: Value<'js> = this.0.clone().into_value();
+        let map = element_listener_map_opt(&ctx, node_id)?;
+        dispatch_with_map(&ctx, map.as_ref(), Some(target), event)
     }
 
     /// `element.click()` — synthesize and dispatch a cancelable
@@ -680,12 +737,10 @@ impl Element {
         );
         let event_class = Class::instance(ctx.clone(), event)?;
         let event_value: Value<'js> = event_class.into_value();
-        let instance: Object<'js> = this
-            .0
-            .into_value()
-            .into_object()
-            .ok_or_else(|| JsError::new_from_js_message("this", "Element", "not an object"))?;
-        let _ = dispatch_on_instance(&ctx, &instance, event_value)?;
+        let node_id = this.0.borrow().node_id;
+        let target: Value<'js> = this.0.clone().into_value();
+        let map = element_listener_map_opt(&ctx, node_id)?;
+        let _ = dispatch_with_map(&ctx, map.as_ref(), Some(target), event_value)?;
         Ok(())
     }
 }

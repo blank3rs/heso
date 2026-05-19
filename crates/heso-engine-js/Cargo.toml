@@ -44,6 +44,10 @@ rand_chacha = "0.3"
 # and `decisions/0014` (Phase 2 stdlib subset row).
 reqwest = { workspace = true }
 tokio = { workspace = true }
+# Session URL tracking (`crate::session::JsSession`): the page session
+# owns its current URL so navigation across steps is observable on the
+# Rust side. Matches the rest of the workspace's `url = 2`.
+url = { workspace = true }
 
 [dev-dependencies]
 # wiremock-rs: localhost mock server for the in-JS fetch tests.

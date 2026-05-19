@@ -474,6 +474,56 @@ impl JsEngine {
         out
     }
 
+    /// Install `document` as a JS global and execute every inline
+    /// `<script>` once, **without** then evaluating any user JS.
+    ///
+    /// Building block for [`crate::JsSession`]: load a page once,
+    /// then run many `click` / `fill` / `submit` / `eval` calls
+    /// against the same in-memory DOM. DOM mutations persist across
+    /// calls because the `document` global stays installed until
+    /// [`Self::install_document`] is called again to navigate to a
+    /// different page.
+    ///
+    /// Equivalent to the install + script-pump prefix of
+    /// [`Self::eval_with_html_capture`], minus the trailing user-JS
+    /// `eval`. Clears the console buffer on entry so callers can
+    /// drain page-script output independently.
+    pub fn install_document(
+        &self,
+        document: Document,
+        policy: ScriptFetchPolicy,
+    ) -> Result<ScriptOutcome, EvalError> {
+        let dom = document.dom_arc();
+
+        self.console_buffer
+            .lock()
+            .expect("console buffer poisoned")
+            .clear();
+
+        self.context
+            .with(|ctx| -> rquickjs::Result<()> {
+                let doc = Class::instance(ctx.clone(), document)?;
+                ctx.globals().set("document", doc)?;
+                Ok(())
+            })
+            .map_err(|e| EvalError::Engine(format!("install document global: {e}")))?;
+
+        let script_fetch_client = self.fetch_state.as_ref().and_then(|fs| match &fs.mode {
+            FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
+            FetchMode::DeterministicNoCassette => None,
+        });
+        let script_outcome = scripts::run_scripts(
+            &self.context,
+            &dom,
+            policy,
+            &self.console_buffer,
+            script_fetch_client.as_ref(),
+        )?;
+
+        self.run_pending_jobs()?;
+        Ok(script_outcome)
+    }
+
     /// Evaluate `js` against a parsed HTML page.
     ///
     /// Parses `html` into a [`dom_query::Document`], wraps it in an

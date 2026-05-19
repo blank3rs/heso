@@ -14,6 +14,7 @@ heso-primitives = { path = "../heso-primitives" }
 serde = { workspace = true }
 serde_json.workspace = true
 blake3.workspace = true
+thiserror.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

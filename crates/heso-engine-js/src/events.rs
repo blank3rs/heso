@@ -121,6 +121,7 @@ pub const EVENT_PHASE_BUBBLING: u32 = 3;
 const PROP_LISTENERS: &str = "__listeners";
 const PROP_REASON: &str = "__reason";
 const PROP_DETAIL: &str = "__detail";
+const PROP_TARGET: &str = "__target";
 
 // ===== DOMException =============================================================
 
@@ -384,19 +385,21 @@ impl Event {
         false
     }
 
-    /// `e.target` — phase-1B stub returning `null`. Storing the
-    /// back-reference would require Rust-side `Persistent`, which
-    /// breaks runtime teardown. Listeners get the event by value
-    /// instead; they don't need `target` to act on it.
+    /// `e.target` — the element on which `dispatchEvent` was
+    /// invoked. Stored as a JS-side hidden property by the dispatch
+    /// path (see [`dispatch_with_map`]) rather than as a Rust-side
+    /// `Persistent`, for the same anti-Persistent-footgun reasons
+    /// described in the module docs.
     #[qjs(get)]
-    fn target(&self) -> Option<i32> {
-        None
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
     }
 
-    /// `e.currentTarget` — phase-1B stub returning `null`.
+    /// `e.currentTarget` — in our flat-dispatch model this is the
+    /// same as `target` (no propagation walk).
     #[qjs(get)]
-    fn current_target(&self) -> Option<i32> {
-        None
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
     }
 
     /// `e.preventDefault()` — sets `defaultPrevented` to true if the
@@ -521,16 +524,16 @@ impl CustomEvent {
         false
     }
 
-    /// `e.target`.
+    /// `e.target` — see [`Event::target`].
     #[qjs(get)]
-    fn target(&self) -> Option<i32> {
-        None
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
     }
 
-    /// `e.currentTarget`.
+    /// `e.currentTarget` — see [`Event::current_target`].
     #[qjs(get)]
-    fn current_target(&self) -> Option<i32> {
-        None
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
     }
 
     /// `e.detail` — reads the JS-side hidden property installed by
@@ -729,6 +732,22 @@ pub(crate) fn add_listener_to_instance<'js>(
     passive: bool,
 ) -> rquickjs::Result<()> {
     let map = get_or_create_listener_map(ctx, instance)?;
+    add_listener_to_map(ctx, &map, event_type, callback, capture, once, passive)
+}
+
+/// [`add_listener_to_instance`] but against a caller-supplied map
+/// object — used by the DOM `Element` surface which keys listener
+/// maps by `NodeId` on the long-lived `document` global rather than
+/// by JS-wrapper identity (see `dom.rs::element_listener_map`).
+pub(crate) fn add_listener_to_map<'js>(
+    ctx: &Ctx<'js>,
+    map: &Object<'js>,
+    event_type: &str,
+    callback: &Function<'js>,
+    capture: bool,
+    once: bool,
+    passive: bool,
+) -> rquickjs::Result<()> {
     let list: Array<'js> = match map.get::<_, Option<Array<'js>>>(event_type)? {
         Some(a) => a,
         None => {
@@ -775,6 +794,18 @@ pub(crate) fn remove_listener_from_instance<'js>(
 ) -> rquickjs::Result<()> {
     let map: Option<Object<'js>> = instance.get::<_, Option<Object<'js>>>(PROP_LISTENERS)?;
     let Some(map) = map else { return Ok(()) };
+    remove_listener_from_map(ctx, &map, event_type, callback, capture)
+}
+
+/// [`remove_listener_from_instance`] but against a caller-supplied
+/// map object. See [`add_listener_to_map`].
+pub(crate) fn remove_listener_from_map<'js>(
+    ctx: &Ctx<'js>,
+    map: &Object<'js>,
+    event_type: &str,
+    callback: &Function<'js>,
+    capture: bool,
+) -> rquickjs::Result<()> {
     let list: Option<Array<'js>> = map.get::<_, Option<Array<'js>>>(event_type)?;
     let Some(list) = list else { return Ok(()) };
 
@@ -814,6 +845,25 @@ pub(crate) fn dispatch_on_instance<'js>(
     instance: &Object<'js>,
     event: Value<'js>,
 ) -> rquickjs::Result<bool> {
+    let map: Option<Object<'js>> = instance.get::<_, Option<Object<'js>>>(PROP_LISTENERS)?;
+    let target = instance.clone().into_value();
+    dispatch_with_map(ctx, map.as_ref(), Some(target), event)
+}
+
+/// [`dispatch_on_instance`] but against a caller-supplied listener
+/// map (which may be `None` if no listeners have been registered
+/// yet). `target` is what `event.target` / `event.currentTarget`
+/// will report during dispatch; pass `None` only when there is no
+/// meaningful target (which is rare — virtually every real
+/// dispatchEvent caller wants the JS-side target set so listener
+/// code can read `e.target.value`, `e.target.id`, etc.). Removes
+/// spent `once` listeners from the same map.
+pub(crate) fn dispatch_with_map<'js>(
+    ctx: &Ctx<'js>,
+    map: Option<&Object<'js>>,
+    target: Option<Value<'js>>,
+    event: Value<'js>,
+) -> rquickjs::Result<bool> {
     let view = view_from_value(&event).ok_or_else(|| {
         Exception::throw_type(
             ctx,
@@ -834,11 +884,20 @@ pub(crate) fn dispatch_on_instance<'js>(
     view.state.immediate_propagation_stopped.set(false);
     view.state.default_prevented.set(false);
 
+    // Pin the JS-side target on the event so listeners can read
+    // `e.target.value` / `e.target.id` / etc. Stored as a hidden
+    // JS property to avoid the Rust-side Persistent footgun.
+    if let Some(target) = target.as_ref() {
+        if let Some(ev_obj) = event.as_object() {
+            ev_obj.set(PROP_TARGET, target.clone())?;
+        }
+    }
+
     // Snapshot listener list — JS-side. Iterating over the live
     // Array and concurrently mutating it is undefined per spec; we
     // dupe up front.
     let mut snapshot: Vec<(Function<'js>, bool, bool)> = Vec::new();
-    if let Some(map) = instance.get::<_, Option<Object<'js>>>(PROP_LISTENERS)? {
+    if let Some(map) = map {
         if let Some(list) = map.get::<_, Option<Array<'js>>>(view.event_type.as_str())? {
             let len = list.len();
             for i in 0..len {
@@ -869,9 +928,11 @@ pub(crate) fn dispatch_on_instance<'js>(
 
     // Remove `once` listeners from the live list.
     if !once_to_remove.is_empty() {
-        for cb in &once_to_remove {
-            remove_listener_from_instance(ctx, instance, &view.event_type, cb, false)?;
-            remove_listener_from_instance(ctx, instance, &view.event_type, cb, true)?;
+        if let Some(map) = map {
+            for cb in &once_to_remove {
+                remove_listener_from_map(ctx, map, &view.event_type, cb, false)?;
+                remove_listener_from_map(ctx, map, &view.event_type, cb, true)?;
+            }
         }
     }
 
@@ -880,6 +941,21 @@ pub(crate) fn dispatch_on_instance<'js>(
     view.state.event_phase.set(EVENT_PHASE_NONE);
 
     Ok(!(view.cancelable && dp))
+}
+
+/// Shared getter body for `event.target` / `event.currentTarget` on
+/// both [`Event`] and [`CustomEvent`]: reads the hidden JS-side
+/// [`PROP_TARGET`] property set by [`dispatch_with_map`]. Returns JS
+/// `null` if no dispatch has populated it (i.e. an event not yet
+/// dispatched, or dispatched without a target).
+fn target_property<'js>(event_value: Value<'js>) -> rquickjs::Result<Value<'js>> {
+    let obj = event_value.as_object().cloned().ok_or_else(|| {
+        JsError::new_from_js_message("this", "Event", "not an object")
+    })?;
+    match obj.get::<_, Option<Value<'js>>>(PROP_TARGET)? {
+        Some(v) => Ok(v),
+        None => obj.ctx().clone().eval::<Value<'js>, _>("null"),
+    }
 }
 
 /// Two-callback strict-equality check using a tiny JS helper.
