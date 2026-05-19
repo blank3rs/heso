@@ -15,15 +15,26 @@
 //!   parsed DOM (already in tree from [`crate::dom::Document`]) and the
 //!   JS engine (already alive from [`crate::engine::JsEngine`]).
 //! - **It is not** a full implementation of WHATWG "prepare a script" +
-//!   "execute a script". Three deliberate Phase-1C simplifications:
-//!   - `<script type="module">` is treated as a regular classic script.
-//!     Real ES-module loading + cyclic dependency resolution is out of
-//!     scope for now.
+//!   "execute a script". Two deliberate Phase-1C simplifications remain:
 //!   - `defer` and `async` are ignored — every recognized script runs
 //!     synchronously in document order, like jsdom's basic mode.
 //!   - External `src=...` either errors or is skipped with a console
 //!     warning, gated by [`ScriptFetchPolicy`]. Fetching real subresources
 //!     is item C in the next-phase plan (vendor `llrt_fetch`).
+//!
+//! ## ES modules (item M-A)
+//!
+//! `<script type="module">` runs as a real ES module per WHATWG HTML
+//! §8.1.3 "Module scripts" — `import` / `export` syntax is now legal,
+//! and `import "./dep.js"` walks the dependency graph through the
+//! engine's [`crate::modules::HttpLoader`]. The engine pre-seeds inline
+//! module bodies into the [`crate::modules::ModuleCache`] under a
+//! synthetic specifier ([`crate::modules::inline_module_specifier`]),
+//! then calls `Module::evaluate`. External `<script type="module"
+//! src="...">` references go through the same `ScriptFetchPolicy::Fetch`
+//! path as classic external scripts — pre-fetched and seeded into the
+//! cache, then evaluated through QuickJS's module pump so any chained
+//! `import` runs through [`crate::modules::HttpLoader`] too.
 //!
 //! ## Algorithm references
 //!
@@ -67,9 +78,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use rquickjs::{CatchResultExt, CaughtError, Context, Value};
+use rquickjs::{CatchResultExt, CaughtError, Context, Module, Value};
 
 use crate::engine::{ConsoleEntry, ConsoleLevel, EvalError};
+use crate::modules::{inline_module_specifier, ModuleCache};
 
 /// Policy for handling external `<script src="...">` references.
 ///
@@ -163,13 +175,18 @@ pub fn run_scripts(
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
     fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
     base_url: Option<&url::Url>,
+    module_cache: &ModuleCache,
 ) -> Result<ScriptOutcome, EvalError> {
     let scripts = collect_scripts(document);
     let mut outcome = ScriptOutcome::default();
+    // Track inline module ordinal — each inline `<script type="module">`
+    // gets a distinct synthetic specifier so the runtime's module map
+    // doesn't collide them. See [`inline_module_specifier`].
+    let mut inline_module_index: usize = 0;
 
     for script in scripts {
         match script.kind {
-            ScriptKind::Inline { source } => match eval_one(context, &source)? {
+            ScriptKind::InlineClassic { source } => match eval_one(context, &source)? {
                 Some(err_msg) => {
                     outcome.executed_with_error += 1;
                     push_console(console_buffer, ConsoleLevel::Error, err_msg);
@@ -178,67 +195,49 @@ pub fn run_scripts(
                     outcome.executed += 1;
                 }
             },
-            ScriptKind::External { src } => {
-                outcome.external_handled += 1;
-                match (policy, fetch_client) {
-                    (ScriptFetchPolicy::Skip, _) => {
-                        push_console(
-                            console_buffer,
-                            ConsoleLevel::Warn,
-                            format!(
-                                "heso: skipped external script <script src=\"{src}\"> (pass --js-fetch to enable subresource fetch)"
-                            ),
-                        );
+            ScriptKind::InlineModule { source } => {
+                let specifier = inline_module_specifier(base_url, inline_module_index);
+                inline_module_index += 1;
+                // Pre-seed the cache so `HttpLoader::load` serves the
+                // body without trying to fetch the synthetic URL.
+                // Importing relative URLs from inside this module will
+                // still go through the loader and (on cache miss) hit
+                // the HTTP path.
+                module_cache.insert(specifier.clone(), source.clone());
+                match eval_one_module(context, &specifier, &source)? {
+                    Some(err_msg) => {
+                        outcome.executed_with_error += 1;
+                        push_console(console_buffer, ConsoleLevel::Error, err_msg);
                     }
-                    (ScriptFetchPolicy::Error, _) => {
-                        push_console(
-                            console_buffer,
-                            ConsoleLevel::Error,
-                            format!(
-                                "heso: external script fetch disabled. Wanted <script src=\"{src}\">"
-                            ),
-                        );
-                    }
-                    (ScriptFetchPolicy::Fetch, Some((client, rt))) => {
-                        // Synchronous-blocking fetch + execute, matching
-                        // jsdom's basic mode. Failures land on the
-                        // console buffer; the pump continues.
-                        match fetch_script_source(client, rt, &src, base_url) {
-                            Ok(source) => match eval_one(context, &source)? {
-                                Some(err_msg) => {
-                                    outcome.executed_with_error += 1;
-                                    push_console(
-                                        console_buffer,
-                                        ConsoleLevel::Error,
-                                        format!("<script src=\"{src}\"> threw: {err_msg}"),
-                                    );
-                                }
-                                None => {
-                                    outcome.executed += 1;
-                                }
-                            },
-                            Err(e) => {
-                                push_console(
-                                    console_buffer,
-                                    ConsoleLevel::Error,
-                                    format!("heso: <script src=\"{src}\"> fetch failed: {e}"),
-                                );
-                            }
-                        }
-                    }
-                    (ScriptFetchPolicy::Fetch, None) => {
-                        // Caller asked for Fetch policy but the engine
-                        // doesn't have a client — surface a clear
-                        // diagnostic so the agent can fix its config.
-                        push_console(
-                            console_buffer,
-                            ConsoleLevel::Error,
-                            format!(
-                                "heso: <script src=\"{src}\"> wanted Fetch policy but engine has no fetch client (build with JsEngine::new_with_fetch)"
-                            ),
-                        );
+                    None => {
+                        outcome.executed += 1;
                     }
                 }
+            }
+            ScriptKind::ExternalClassic { src } => {
+                outcome.external_handled += 1;
+                handle_external_classic(
+                    context,
+                    policy,
+                    console_buffer,
+                    fetch_client,
+                    base_url,
+                    &src,
+                    &mut outcome,
+                )?;
+            }
+            ScriptKind::ExternalModule { src } => {
+                outcome.external_handled += 1;
+                handle_external_module(
+                    context,
+                    policy,
+                    console_buffer,
+                    fetch_client,
+                    base_url,
+                    &src,
+                    module_cache,
+                    &mut outcome,
+                )?;
             }
             ScriptKind::NonScriptType => {
                 outcome.skipped_non_script_type += 1;
@@ -247,6 +246,166 @@ pub fn run_scripts(
     }
 
     Ok(outcome)
+}
+
+/// External classic `<script src="...">` — fetch synchronously, then
+/// evaluate as a classic script via `ctx.eval`. Same containment story
+/// as inline classics: a throw lands on the console buffer as
+/// `ConsoleLevel::Error` and the pump continues.
+#[allow(clippy::too_many_arguments)]
+fn handle_external_classic(
+    context: &Context,
+    policy: ScriptFetchPolicy,
+    console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+    fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
+    base_url: Option<&url::Url>,
+    src: &str,
+    outcome: &mut ScriptOutcome,
+) -> Result<(), EvalError> {
+    match (policy, fetch_client) {
+        (ScriptFetchPolicy::Skip, _) => {
+            push_console(
+                console_buffer,
+                ConsoleLevel::Warn,
+                format!(
+                    "heso: skipped external script <script src=\"{src}\"> (pass --js-fetch to enable subresource fetch)"
+                ),
+            );
+        }
+        (ScriptFetchPolicy::Error, _) => {
+            push_console(
+                console_buffer,
+                ConsoleLevel::Error,
+                format!("heso: external script fetch disabled. Wanted <script src=\"{src}\">"),
+            );
+        }
+        (ScriptFetchPolicy::Fetch, Some((client, rt))) => {
+            match fetch_script_source(client, rt, src, base_url) {
+                Ok(source) => match eval_one(context, &source)? {
+                    Some(err_msg) => {
+                        outcome.executed_with_error += 1;
+                        push_console(
+                            console_buffer,
+                            ConsoleLevel::Error,
+                            format!("<script src=\"{src}\"> threw: {err_msg}"),
+                        );
+                    }
+                    None => {
+                        outcome.executed += 1;
+                    }
+                },
+                Err(e) => {
+                    push_console(
+                        console_buffer,
+                        ConsoleLevel::Error,
+                        format!("heso: <script src=\"{src}\"> fetch failed: {e}"),
+                    );
+                }
+            }
+        }
+        (ScriptFetchPolicy::Fetch, None) => {
+            push_console(
+                console_buffer,
+                ConsoleLevel::Error,
+                format!(
+                    "heso: <script src=\"{src}\"> wanted Fetch policy but engine has no fetch client (build with JsEngine::new_with_fetch)"
+                ),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// External `<script type="module" src="...">` — resolve the URL,
+/// pre-fetch its body so the first hop stays on the sync path, seed
+/// it into [`ModuleCache`] under the resolved URL, then call
+/// [`Module::evaluate`]. QuickJS recursively calls [`HttpLoader::load`]
+/// for every nested `import` it encounters; the loader either serves a
+/// cached body or fetches via HTTP.
+#[allow(clippy::too_many_arguments)]
+fn handle_external_module(
+    context: &Context,
+    policy: ScriptFetchPolicy,
+    console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+    fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
+    base_url: Option<&url::Url>,
+    src: &str,
+    module_cache: &ModuleCache,
+    outcome: &mut ScriptOutcome,
+) -> Result<(), EvalError> {
+    match (policy, fetch_client) {
+        (ScriptFetchPolicy::Skip, _) => {
+            push_console(
+                console_buffer,
+                ConsoleLevel::Warn,
+                format!(
+                    "heso: skipped external module <script type=\"module\" src=\"{src}\"> (pass --js-fetch to enable subresource fetch)"
+                ),
+            );
+        }
+        (ScriptFetchPolicy::Error, _) => {
+            push_console(
+                console_buffer,
+                ConsoleLevel::Error,
+                format!(
+                    "heso: external module fetch disabled. Wanted <script type=\"module\" src=\"{src}\">"
+                ),
+            );
+        }
+        (ScriptFetchPolicy::Fetch, Some((client, rt))) => {
+            // Resolve `src` against page base URL — same join rule
+            // [`fetch_script_source`] uses internally. We do the join
+            // explicitly here so the cache key matches the URL that
+            // QuickJS's module evaluator will see (after our resolver
+            // also joins).
+            let resolved: String = match base_url {
+                Some(base) => match base.join(src) {
+                    Ok(u) => u.to_string(),
+                    Err(_) => src.to_owned(),
+                },
+                None => src.to_owned(),
+            };
+            match fetch_script_source(client, rt, src, base_url) {
+                Ok(source) => {
+                    module_cache.insert(resolved.clone(), source.clone());
+                    match eval_one_module(context, &resolved, &source)? {
+                        Some(err_msg) => {
+                            outcome.executed_with_error += 1;
+                            push_console(
+                                console_buffer,
+                                ConsoleLevel::Error,
+                                format!(
+                                    "<script type=\"module\" src=\"{src}\"> threw: {err_msg}"
+                                ),
+                            );
+                        }
+                        None => {
+                            outcome.executed += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    push_console(
+                        console_buffer,
+                        ConsoleLevel::Error,
+                        format!(
+                            "heso: <script type=\"module\" src=\"{src}\"> fetch failed: {e}"
+                        ),
+                    );
+                }
+            }
+        }
+        (ScriptFetchPolicy::Fetch, None) => {
+            push_console(
+                console_buffer,
+                ConsoleLevel::Error,
+                format!(
+                    "heso: <script type=\"module\" src=\"{src}\"> wanted Fetch policy but engine has no fetch client (build with JsEngine::new_with_fetch)"
+                ),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Synchronously fetch `src` via the shared `reqwest::Client`. Used
@@ -298,10 +457,25 @@ fn fetch_script_source(
 
 /// Internal: one script element after classification.
 enum ScriptKind {
-    /// Inline `<script>...source...</script>`.
-    Inline { source: String },
-    /// `<script src="..."></script>` — content is at the URL.
-    External { src: String },
+    /// Inline `<script>...source...</script>` of classic (non-module)
+    /// JavaScript MIME type. Evaluated via `ctx.eval` against the
+    /// shared global scope.
+    InlineClassic { source: String },
+    /// Inline `<script type="module">...source...</script>`. Evaluated
+    /// via [`Module::evaluate`] after the source is pre-seeded into
+    /// the [`ModuleCache`] under a synthetic specifier
+    /// ([`inline_module_specifier`]). `import` statements inside the
+    /// body resolve through the engine's [`HttpLoader`].
+    InlineModule { source: String },
+    /// `<script src="..."></script>` — classic-MIME content at a URL.
+    ExternalClassic { src: String },
+    /// `<script type="module" src="..."></script>` — ES module at a
+    /// URL. The engine pre-fetches the body, seeds it into the
+    /// [`ModuleCache`] under the resolved URL, then drives
+    /// [`Module::evaluate`] which runs through QuickJS's module pump
+    /// (recursively calling our `HttpLoader::load` for every nested
+    /// `import` it finds).
+    ExternalModule { src: String },
     /// `<script type="...">` whose type is not a JavaScript MIME nor
     /// `"module"` — a data block per HTML spec §4.12.1. Counted but
     /// not executed.
@@ -341,8 +515,8 @@ fn collect_scripts(document: &dom_query::Document) -> Vec<ClassifiedScript> {
         // 1. Classify by `type` attribute. Per the spec / jsdom's
         //    `_getTypeString` + `getType`:
         //    - absent / empty / JS MIME essence-match → classic
-        //    - "module" (ASCII case-insensitive) → module (we treat as
-        //      classic; see module-punt note in the file header)
+        //    - "module" (ASCII case-insensitive) → real ES module
+        //      (item M-A — see [`crate::modules`])
         //    - anything else (incl. "application/json", "importmap",
         //      "speculationrules", "text/html") → data block / null →
         //      not executed.
@@ -353,6 +527,7 @@ fn collect_scripts(document: &dom_query::Document) -> Vec<ClassifiedScript> {
             });
             continue;
         }
+        let is_module = is_module_script_type(type_attr.as_deref());
 
         // 2. Inline vs external. Per jsdom's `_eval()`:
         //    `if (hasAttribute("src")) fetchExternalScript(); else
@@ -363,18 +538,26 @@ fn collect_scripts(document: &dom_query::Document) -> Vec<ClassifiedScript> {
             // classification step, then the empty-URL fetch fails. We
             // simplify: empty src → External("") and let the policy
             // surface its standard warning.
-            out.push(ClassifiedScript {
-                kind: ScriptKind::External {
+            let kind = if is_module {
+                ScriptKind::ExternalModule {
                     src: src.to_string(),
-                },
-            });
+                }
+            } else {
+                ScriptKind::ExternalClassic {
+                    src: src.to_string(),
+                }
+            };
+            out.push(ClassifiedScript { kind });
             continue;
         }
 
         let source = descendant.text().to_string();
-        out.push(ClassifiedScript {
-            kind: ScriptKind::Inline { source },
-        });
+        let kind = if is_module {
+            ScriptKind::InlineModule { source }
+        } else {
+            ScriptKind::InlineClassic { source }
+        };
+        out.push(ClassifiedScript { kind });
     }
     out
 }
@@ -432,6 +615,18 @@ fn is_runnable_script_type(type_attr: Option<&str>) -> bool {
     JS_MIME_TYPES.iter().any(|m| *m == lower)
 }
 
+/// Return `true` only when `type_attr` classifies the script as an
+/// ES **module** (per WHATWG HTML §4.12.1 + §8.1.3). Missing, empty,
+/// and JS-MIME types are classic and return `false` here. Used to
+/// route module scripts through the [`crate::modules`] loader and
+/// classic scripts through plain `ctx.eval`.
+fn is_module_script_type(type_attr: Option<&str>) -> bool {
+    match type_attr {
+        None => false,
+        Some(s) => s.trim().eq_ignore_ascii_case("module"),
+    }
+}
+
 /// Evaluate one script's source against `context`. Returns
 /// `Ok(None)` if the script ran without throwing, `Ok(Some(msg))` if
 /// it threw a recoverable JS exception (the caller turns this into a
@@ -453,6 +648,55 @@ fn eval_one(context: &Context, source: &str) -> Result<Option<String>, EvalError
                 // the pump. The console-error-and-continue rule is
                 // for *script* failures only.
                 Err(EvalError::Engine(format!("script eval: {e}")))
+            }
+        }
+    })
+}
+
+/// Evaluate one ES-module script's source against `context` via
+/// [`Module::evaluate`] under the synthetic `specifier` (which
+/// doubles as the module's identity in QuickJS's internal module
+/// map and as the base URL for relative `import` resolution).
+///
+/// The promise [`Module::evaluate`] returns resolves to `undefined`
+/// when the module's top-level body finishes — including its
+/// dependency graph and any top-level synchronous `await`s the body
+/// performs. We don't await it here: the engine's `run_pending_jobs`
+/// pump runs immediately after [`run_scripts`] returns and drains
+/// any microtask the module produced. The Promise is dropped on
+/// purpose — QuickJS sees no unhandled-rejection if it rejects,
+/// because [`CatchResultExt`] intercepts the synchronous-throw path
+/// below.
+///
+/// Returns `Ok(None)` if the module's top-level compiled and ran
+/// without a synchronous throw, `Ok(Some(msg))` if it threw a
+/// recoverable JS exception (compile-time syntax error, top-level
+/// throw, or import-resolution error surfaced via
+/// [`Error::new_loading`]), `Err(_)` only for engine-internal failures.
+fn eval_one_module(
+    context: &Context,
+    specifier: &str,
+    source: &str,
+) -> Result<Option<String>, EvalError> {
+    context.with(|ctx| -> Result<Option<String>, EvalError> {
+        // Module::evaluate returns a Promise; we only care about the
+        // synchronous-error path for now. Module bodies that read
+        // through `await fetch(...)` resolve later, when the engine's
+        // run_pending_jobs pump fires after we return.
+        let result = Module::evaluate(ctx.clone(), specifier.to_owned(), source.to_owned())
+            .catch(&ctx);
+        match result {
+            Ok(_promise) => Ok(None),
+            Err(CaughtError::Exception(exc)) => {
+                let msg = match exc.message() {
+                    Some(m) if !m.is_empty() => m,
+                    _ => "<unknown module exception>".to_owned(),
+                };
+                Ok(Some(format_script_error(&msg, exc.stack())))
+            }
+            Err(CaughtError::Value(_)) => Ok(Some("<module threw non-error value>".to_owned())),
+            Err(CaughtError::Error(e)) => {
+                Err(EvalError::Engine(format!("module eval: {e}")))
             }
         }
     })
@@ -552,7 +796,7 @@ mod tests {
         let sources: Vec<String> = scripts
             .into_iter()
             .map(|s| match s.kind {
-                ScriptKind::Inline { source } => source,
+                ScriptKind::InlineClassic { source } => source,
                 _ => "other".into(),
             })
             .collect();
@@ -572,8 +816,47 @@ mod tests {
         );
         let scripts = collect_scripts(&doc);
         assert_eq!(scripts.len(), 3);
-        assert!(matches!(scripts[0].kind, ScriptKind::External { .. }));
+        assert!(matches!(scripts[0].kind, ScriptKind::ExternalClassic { .. }));
         assert!(matches!(scripts[1].kind, ScriptKind::NonScriptType));
-        assert!(matches!(scripts[2].kind, ScriptKind::Inline { .. }));
+        assert!(matches!(scripts[2].kind, ScriptKind::InlineClassic { .. }));
+    }
+
+    #[test]
+    fn collect_scripts_classifies_module_inline_and_external() {
+        // The new item M-A surface — module scripts get their own
+        // variants so the runner can route them through
+        // [`Module::evaluate`] rather than `ctx.eval`.
+        let doc = dom_query::Document::from(
+            r#"<html><body>
+                <script type="module">export const x = 1;</script>
+                <script type="module" src="/m.js"></script>
+                <script>var c = 1;</script>
+                <script src="/c.js"></script>
+            </body></html>"#,
+        );
+        let scripts = collect_scripts(&doc);
+        assert_eq!(scripts.len(), 4);
+        assert!(matches!(scripts[0].kind, ScriptKind::InlineModule { .. }));
+        assert!(matches!(scripts[1].kind, ScriptKind::ExternalModule { .. }));
+        assert!(matches!(scripts[2].kind, ScriptKind::InlineClassic { .. }));
+        assert!(matches!(scripts[3].kind, ScriptKind::ExternalClassic { .. }));
+    }
+
+    #[test]
+    fn is_module_script_type_recognizes_module_only() {
+        assert!(is_module_script_type(Some("module")));
+        assert!(is_module_script_type(Some("MODULE")));
+        assert!(is_module_script_type(Some("Module")));
+        assert!(is_module_script_type(Some("  module  ")));
+        // Classic-MIME types are NOT modules.
+        assert!(!is_module_script_type(Some("text/javascript")));
+        assert!(!is_module_script_type(Some("application/javascript")));
+        // Missing/empty types are classic, not modules.
+        assert!(!is_module_script_type(None));
+        assert!(!is_module_script_type(Some("")));
+        assert!(!is_module_script_type(Some("   ")));
+        // Data-block types are not modules either.
+        assert!(!is_module_script_type(Some("application/json")));
+        assert!(!is_module_script_type(Some("importmap")));
     }
 }

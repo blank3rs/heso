@@ -45,6 +45,7 @@ use url::Url;
 
 use crate::dom::{self, Document};
 use crate::fetch::{self, FetchMode, FetchQueue};
+use crate::modules::{HttpFetcher, HttpLoader, HttpResolver, ModuleCache};
 use crate::rng::SeededRng;
 use crate::scripts::{self, ScriptFetchPolicy, ScriptOutcome};
 use crate::timers::{self, TimerScheduler};
@@ -191,6 +192,13 @@ pub struct JsEngine {
     /// bare `heso eval-js`); set by [`Self::set_base_url`] or by
     /// [`crate::JsSession`] at open/navigate time.
     base_url: Mutex<Option<Url>>,
+    /// Per-engine ES-module source cache (item M-A). Pre-seeded by
+    /// the [`crate::scripts`] pump for each inline `<script
+    /// type="module">` body and for each external module's
+    /// pre-fetched body, then read by the runtime's installed
+    /// [`HttpLoader`] when QuickJS's module evaluator asks for a
+    /// dependency. See [`crate::modules`].
+    module_cache: ModuleCache,
 }
 
 /// Bundles a per-engine fetch queue with the mode that drives it.
@@ -299,6 +307,28 @@ impl JsEngine {
         let runtime = Runtime::new().map_err(|e| EvalError::Engine(e.to_string()))?;
         runtime.set_memory_limit(DEFAULT_MEMORY_LIMIT_BYTES);
         runtime.set_max_stack_size(DEFAULT_MAX_STACK_BYTES);
+
+        // Install the ES-module loader BEFORE we create the Context.
+        // The loader pair (`HttpResolver` + `HttpLoader`) is `'static`
+        // and shares the engine's `ModuleCache` via `Rc<RefCell<_>>`
+        // clones. The loader's HTTP fetcher matches `fetch_mode` —
+        // `Live` engines can resolve `import "https://cdn..."` over
+        // the network, while `DeterministicNoCassette` engines treat
+        // every uncached module URL as a hard error (consistent with
+        // ADR 0008's determinism gate; once item M lands the loader
+        // will route through the recorded-network shim instead).
+        let module_cache = ModuleCache::new();
+        let http_fetcher: Option<HttpFetcher> = match fetch_mode.as_ref() {
+            Some(FetchMode::Live { client, rt_handle }) => Some(HttpFetcher {
+                client: client.clone(),
+                rt: rt_handle.clone(),
+            }),
+            Some(FetchMode::DeterministicNoCassette) | None => None,
+        };
+        runtime.set_loader(
+            HttpResolver::new(),
+            HttpLoader::new(module_cache.clone(), http_fetcher),
+        );
 
         let context = Context::full(&runtime).map_err(|e| EvalError::Engine(e.to_string()))?;
         let console_buffer: Arc<Mutex<Vec<ConsoleEntry>>> = Arc::new(Mutex::new(Vec::new()));
@@ -431,6 +461,7 @@ impl JsEngine {
             rng,
             fetch_state,
             base_url: Mutex::new(None),
+            module_cache,
         })
     }
 
@@ -473,6 +504,15 @@ impl JsEngine {
     /// `SeededRng` clone observed in JS is reachable here.
     pub fn rng(&self) -> &SeededRng {
         &self.rng
+    }
+
+    /// The ES-module source cache installed into the runtime. Cloning
+    /// returns a handle that shares storage with the engine's loader
+    /// (the cache is `Rc<RefCell<_>>`-backed) — tests inspect this to
+    /// verify that two `import` sites against the same URL only
+    /// resulted in one HTTP fetch.
+    pub fn module_cache(&self) -> ModuleCache {
+        self.module_cache.clone()
     }
 
     /// Advance the deterministic virtual clock by `delta_ms`
@@ -919,6 +959,7 @@ impl JsEngine {
             &self.console_buffer,
             script_fetch_client.as_ref(),
             base_url.as_ref(),
+            &self.module_cache,
         )?;
 
         self.run_pending_jobs()?;
@@ -1042,6 +1083,7 @@ impl JsEngine {
             &self.console_buffer,
             script_fetch_client.as_ref(),
             base_url.as_ref(),
+            &self.module_cache,
         )?;
 
         // Drive any fetches the page scripts queued before running
@@ -3869,19 +3911,87 @@ mod tests {
     }
 
     #[test]
-    fn module_type_attr_runs_as_classic_for_now_phase_1c_punt() {
-        // We do NOT implement real ES module loading; we just treat
-        // type="module" as classic so the body of a simple module
-        // still gets a chance to populate the DOM. This documents
-        // the punt so a follow-up agent doesn't break the test
-        // without realizing it.
+    fn module_type_attr_runs_as_real_es_module() {
+        // Item M-A: `<script type="module">` is now a real ES module
+        // — `export` and `import` syntax parse + execute. The body
+        // here uses `export const` (which would syntax-error in
+        // classic-script mode) and proves the module body executes
+        // by writing through to `globalThis`. The negative control
+        // (`module_classic_syntax_error_on_export_in_classic_*`)
+        // pins the contrast: same body in `type="text/javascript"`
+        // fails to run because `export` is rejected by the classic
+        // parser. See `crates/heso-engine-js/src/modules.rs` for
+        // the loader implementation.
         let html = r#"<html><head>
-            <script type="module">globalThis.moduleRan = 'yes';</script>
+            <script type="module">
+                export const x = 1;
+                // If this script ran in classic mode `export` would
+                // throw a SyntaxError and `globalThis.moduleRan` would
+                // remain undefined. Writing `yes` proves the body
+                // ran as a module.
+                globalThis.moduleRan = 'yes';
+                globalThis.exportedValue = x;
+            </script>
         </head><body></body></html>"#;
         let out = engine()
-            .eval_with_html(html, "globalThis.moduleRan")
+            .eval_with_html(
+                html,
+                "[globalThis.moduleRan, globalThis.exportedValue]",
+            )
             .expect("eval ok");
-        assert_eq!(out.value, serde_json::json!("yes"));
+        // The body wrote `"yes"` and `1`. Together with the negative
+        // control these prove we're really in module-parsing mode —
+        // `export` is rejected by the classic parser and accepted by
+        // the module parser, and rquickjs's `Module::evaluate` is
+        // routing through the latter.
+        assert_eq!(out.value[0], serde_json::json!("yes"));
+        assert_eq!(out.value[1], serde_json::json!(1));
+    }
+
+    #[test]
+    fn module_inline_with_export_and_import() {
+        // Item M-A test 1 from the M-A brief: an inline
+        // `<script type="module">` whose body exercises module-only
+        // syntax (`export`). The body cannot import *from itself* in
+        // ES module semantics (no self-imports), but proving `export`
+        // parses + the side effect runs is what classifies us as
+        // really a module rather than a punt-as-classic.
+        let html = r#"<html><head>
+            <script type="module">
+                export const greeting = "hello";
+                // Module bindings are scoped to the module record —
+                // they are NOT on globalThis. We expose the value
+                // through globalThis explicitly so the user-JS pass
+                // can observe it.
+                globalThis.observedGreeting = greeting;
+            </script>
+        </head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "globalThis.observedGreeting")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!("hello"));
+    }
+
+    #[test]
+    fn module_classic_syntax_error_on_export_in_classic_proves_module_mode_is_load_bearing() {
+        // Negative control: an explicit `type="text/javascript"`
+        // script with `export const ...` syntax-errors and the body
+        // does NOT run. This proves item M-A's switch is real — if
+        // both classic and module routed through `ctx.eval` the same
+        // way, this test would pass identically to its module
+        // sibling above.
+        let html = r#"<html><head>
+            <script type="text/javascript">
+                export const x = 1;
+                globalThis.ran = true;
+            </script>
+        </head><body></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "globalThis.ran")
+            .expect("eval ok");
+        // The syntax error was caught into the console buffer; the
+        // body never ran, so `globalThis.ran` is undefined → null.
+        assert_eq!(out.value, serde_json::Value::Null);
     }
 
     #[test]

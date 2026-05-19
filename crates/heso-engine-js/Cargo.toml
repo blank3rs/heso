@@ -15,7 +15,13 @@ thiserror.workspace = true
 # Phase 1B adds the agent-shaped DOM as #[rquickjs::class]-backed
 # Rust types — needs `classes` (Class<T>, define, instance),
 # `properties` (getters/setters), and `macro` (derive macros).
-rquickjs = { version = "0.11", features = ["classes", "properties", "macro"] }
+# `loader` is enabled in Phase 1C item M-A (real ES module support
+# for `<script type="module">`): wires the project's HTTP-backed
+# `Resolver` + `Loader` (`src/modules.rs`) into the runtime via
+# `Runtime::set_loader`, so `import` / `export` resolve dependencies
+# against the page URL through the shared `reqwest::Client`. See
+# WHATWG HTML §8.1.3 Modules and `src/modules.rs` for the spec map.
+rquickjs = { version = "0.11", features = ["classes", "properties", "macro", "loader"] }
 # heso-engine-fetch supplies the protocol-level fetch + action graph
 # we'll wire DOM access against once mutations + events land.
 heso-engine-fetch = { path = "../heso-engine-fetch" }
