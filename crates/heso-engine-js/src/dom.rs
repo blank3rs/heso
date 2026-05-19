@@ -586,6 +586,111 @@ impl Document {
         // single child. dom_query 0.28 has `append_html` on NodeRef.
         parent.append_html(fragment);
     }
+
+    // ===== Trivial browser-globals batch =====================================
+    //
+    // Spec-required reads that frameworks gate on during init. Each
+    // returns a fixed-shape value because heso doesn't have the
+    // underlying machinery (load lifecycle, focus tracker, real cookie
+    // jar) — but the read NEEDS to exist or the page crashes.
+
+    /// `document.readyState` — always `"complete"`.
+    ///
+    /// heso parses + runs every `<script>` synchronously before
+    /// returning from `eval_with_html` / `install_document`, so by
+    /// the time JS gets to read `readyState`, the document is fully
+    /// loaded. There's no "loading" or "interactive" state to expose.
+    /// Frameworks (React, Vue, jQuery) gate boot on
+    /// `readyState === 'complete'`; returning anything else makes them
+    /// wait for a `DOMContentLoaded` event that will never fire in
+    /// heso's synchronous-load model.
+    #[qjs(get)]
+    fn ready_state(&self) -> &'static str {
+        "complete"
+    }
+
+    /// `document.activeElement` — currently always `document.body`.
+    ///
+    /// Per spec, `activeElement` is the focused element; the fallback
+    /// when nothing is focused is `<body>` (or `<html>` if no body).
+    /// heso has no real focus tracker yet, so we always return the
+    /// spec fallback. React's selection-restoration code and many
+    /// modal libraries call `document.activeElement` during init;
+    /// returning `null` makes them throw `Cannot read properties of
+    /// null`. Returning the body is the safest "nothing is focused
+    /// right now" answer.
+    #[qjs(get)]
+    fn active_element(&self) -> Option<Element> {
+        self.doc
+            .body()
+            .map(|n| Element::from_id(self.doc.clone(), n.id))
+    }
+
+    /// `document.cookie` getter — always `""`.
+    ///
+    /// Real cookie wiring is bigger than this batch: it needs to
+    /// route through the same cookie jar `heso-engine-fetch` uses for
+    /// HTTP requests, with respect for SameSite / Secure / HttpOnly
+    /// flags. For now, returning empty string keeps cookie-reading
+    /// init code from crashing while it waits for real cookies; pages
+    /// that gate behavior on a specific cookie will fall to their
+    /// default branch.
+    #[qjs(get)]
+    fn cookie(&self) -> &'static str {
+        ""
+    }
+
+    /// `document.cookie = value` setter — no-op.
+    ///
+    /// Same rationale as the getter: real cookies aren't wired yet.
+    /// Silent no-op (rather than throw) so analytics / consent
+    /// libraries that set tracking cookies during init don't crash.
+    /// A future cookie-jar agent will replace this with the real
+    /// thing.
+    #[qjs(set, rename = "cookie")]
+    fn set_cookie(&self, _value: String) {
+        // intentional no-op — see getter doc.
+    }
+
+    /// `document.contains(other)` — true if `other` is the document
+    /// itself or a descendant of the document tree, false otherwise.
+    ///
+    /// Implemented as an ancestor walk from `other`'s node up to the
+    /// root: a node is "in this document" iff its top ancestor is the
+    /// document's root node. A detached element (created via
+    /// `createElement` and never `appendChild`'d) walks to its own
+    /// orphan root, which is the same `doc.tree.root()` as the live
+    /// document — so we additionally require the walk to reach the
+    /// document element via an actual parent edge.
+    ///
+    /// Frameworks call `document.contains(node)` before binding
+    /// listeners and during teardown to avoid double-mounting; React
+    /// 19's createRoot path is one caller. A missing method throws
+    /// "document.contains is not a function".
+    fn contains(&self, other: Option<Element>) -> bool {
+        let Some(other) = other else { return false };
+        // The document's root NodeId is the parse-tree root; anything
+        // reachable by walking parents from `other` ending there is a
+        // descendant. We also accept `other` being the document
+        // element itself (an element node whose parent IS the root).
+        let root_id = self.doc.tree.root().id;
+        let Some(start) = self.doc.tree.get(&other.node_id) else {
+            return false;
+        };
+        // Walk up from `other` until we either hit the document root
+        // (success) or run out of ancestors (failure: detached).
+        if start.id == root_id {
+            return true;
+        }
+        let mut cur = start.parent();
+        while let Some(n) = cur {
+            if n.id == root_id {
+                return true;
+            }
+            cur = n.parent();
+        }
+        false
+    }
 }
 
 /// Escape `s` so it is safe to embed in HTML text content.
@@ -1429,6 +1534,148 @@ impl Element {
         let path = build_dispatch_path(&ctx, &element)?;
         let _ = dispatch_with_node_path(&ctx, &path, event_value)?;
         Ok(())
+    }
+
+    // ===== Trivial browser-globals batch (layout-zero stubs) =================
+    //
+    // ADR 0016 says heso has no layout/paint. But frameworks like
+    // Floating UI, Popper, Headless UI, Tippy, and React Aria call
+    // these layout-reading methods unconditionally during init.
+    // Throwing "X is not a function" halts hydration on otherwise-
+    // clean pages. We return zero-valued shapes so the call succeeds
+    // and the framework picks a sensible fallback (typically "render
+    // at 0,0 until a real position is computed").
+
+    /// `element.getBoundingClientRect()` — return a zero `DOMRect`.
+    ///
+    /// Real browsers return `{ x, y, width, height, top, right,
+    /// bottom, left }` where all eight fields are layout-derived.
+    /// heso has no layout, so every field is `0`. The returned object
+    /// is a plain JS POJO (not a `DOMRect` class instance) because
+    /// frameworks read the fields, never check the type. The
+    /// `toJSON()` method exists because some serialization paths
+    /// reach for it (`JSON.stringify(rect)` calls it).
+    fn get_bounding_client_rect<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        ctx.eval::<Value<'js>, _>(
+            r#"({
+                x: 0, y: 0,
+                width: 0, height: 0,
+                top: 0, right: 0, bottom: 0, left: 0,
+                toJSON: function() { return this; }
+            })"#,
+        )
+    }
+
+    /// `element.getClientRects()` — return an empty array (real
+    /// browsers return a `DOMRectList`; an empty plain array is
+    /// indistinguishable for the iteration-only patterns frameworks
+    /// use). Floating UI calls this and falls back to
+    /// `getBoundingClientRect()` when the list is empty.
+    fn get_client_rects<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        ctx.eval::<Value<'js>, _>("[]")
+    }
+
+    /// `element.clientWidth` — always `0` (no layout).
+    #[qjs(get)]
+    fn client_width(&self) -> u32 {
+        0
+    }
+
+    /// `element.clientHeight` — always `0` (no layout).
+    #[qjs(get)]
+    fn client_height(&self) -> u32 {
+        0
+    }
+
+    /// `element.offsetWidth` — always `0` (no layout).
+    #[qjs(get)]
+    fn offset_width(&self) -> u32 {
+        0
+    }
+
+    /// `element.offsetHeight` — always `0` (no layout).
+    #[qjs(get)]
+    fn offset_height(&self) -> u32 {
+        0
+    }
+
+    /// `element.offsetTop` — always `0` (no layout).
+    #[qjs(get)]
+    fn offset_top(&self) -> u32 {
+        0
+    }
+
+    /// `element.offsetLeft` — always `0` (no layout).
+    #[qjs(get)]
+    fn offset_left(&self) -> u32 {
+        0
+    }
+
+    /// `element.offsetParent` — always `null` (no layout / no
+    /// positioned-ancestor concept). Tippy / Popper read this to
+    /// pick a positioning context; `null` means "use the viewport",
+    /// which is the safe fallback when we have nothing better.
+    #[qjs(get)]
+    fn offset_parent(&self) -> Option<Element> {
+        None
+    }
+
+    /// `element.scrollWidth` — always `0`.
+    #[qjs(get)]
+    fn scroll_width(&self) -> u32 {
+        0
+    }
+
+    /// `element.scrollHeight` — always `0`.
+    #[qjs(get)]
+    fn scroll_height(&self) -> u32 {
+        0
+    }
+
+    /// `element.scrollTop` — always `0`. Setter is a no-op (see below).
+    #[qjs(get)]
+    fn scroll_top(&self) -> u32 {
+        0
+    }
+
+    /// `element.scrollTop = value` — silent no-op. Real browsers
+    /// scroll the element; heso has nothing to scroll. Setter exists
+    /// so `el.scrollTop = 100` doesn't throw on a read-only property.
+    #[qjs(set, rename = "scrollTop")]
+    fn set_scroll_top(&self, _value: f64) {
+        // intentional no-op — no layout.
+    }
+
+    /// `element.scrollLeft` — always `0`.
+    #[qjs(get)]
+    fn scroll_left(&self) -> u32 {
+        0
+    }
+
+    /// `element.scrollLeft = value` — silent no-op.
+    #[qjs(set, rename = "scrollLeft")]
+    fn set_scroll_left(&self, _value: f64) {
+        // intentional no-op — no layout.
+    }
+
+    /// `element.focus(options?)` — no-op. heso has no focus tracker
+    /// (yet). Real browsers move keyboard focus to the element and
+    /// dispatch `focusin` / `focus` events; a follow-up agent will
+    /// wire that path. For now: don't throw, don't do anything.
+    fn focus(&self, _options: Opt<Value<'_>>) {
+        // intentional no-op — focus model is a future item.
+    }
+
+    /// `element.blur()` — no-op. Same reasoning as [`Self::focus`].
+    fn blur(&self) {
+        // intentional no-op — focus model is a future item.
+    }
+
+    /// `element.scrollIntoView(opts?)` — no-op. Spec arg shape: a
+    /// boolean or an options object; we accept either as an opaque
+    /// `Value` and discard it so the caller doesn't crash.
+    fn scroll_into_view(&self, _arg: Opt<Value<'_>>) {
+        // intentional no-op — no layout.
     }
 }
 

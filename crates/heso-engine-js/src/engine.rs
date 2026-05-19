@@ -329,6 +329,15 @@ impl JsEngine {
         // when the host navigates the engine to a real page.
         install_location(&context, None)?;
 
+        // Install the "trivial browser globals" cluster — small APIs
+        // that real pages reach for during init (`navigator`, storage,
+        // `performance.now`, `queueMicrotask`, `requestAnimationFrame`,
+        // `atob` / `btoa`, `matchMedia`). Each is a one-or-two-line
+        // shim individually; collectively they unblock dozens of init
+        // paths on real-world pages that would otherwise throw on a
+        // missing global. See [`install_browser_apis`].
+        install_browser_apis(&context, timers.clone())?;
+
         // Optional: install the `fetch` global.
         let fetch_state = if let Some(mode) = fetch_mode {
             #[allow(clippy::arc_with_non_send_sync)]
@@ -454,6 +463,15 @@ impl JsEngine {
     /// no fetch state installed.
     pub fn run_pending_jobs(&self) -> Result<usize, EvalError> {
         let Some(fs) = self.fetch_state.as_ref() else {
+            // No fetch installed → no fetches to drain, but we still
+            // need to pump QuickJS's microtask queue so that
+            // `queueMicrotask(fn)` / `Promise.resolve().then(fn)`
+            // / inline-`.then(...)`-on-an-already-resolved-promise
+            // bodies fire before we return. Without this pump,
+            // microtask side effects (e.g. a queueMicrotask that
+            // sets `globalThis.X = ...`) wouldn't be observable
+            // from a subsequent `eval`.
+            self.execute_pending_jobs_until_idle()?;
             return Ok(0);
         };
         let mut total = 0;
@@ -1695,6 +1713,257 @@ const STYLE_PROXY_BOOTSTRAP: &str = r#"
             }
         });
     };
+})();
+"#;
+
+/// Install the "trivial browser globals" cluster on the context.
+///
+/// Each individual API is small — a `navigator` POJO, `performance.now`
+/// reading the virtual clock, `queueMicrotask` piggybacking on
+/// `Promise.resolve().then(...)`, `requestAnimationFrame` routing to
+/// `setTimeout(cb, 16)`, base64 `atob`/`btoa` via the Rust `base64`
+/// crate, a `matchMedia` POJO that always returns `matches: false`,
+/// and in-memory `localStorage` / `sessionStorage` maps. Collectively
+/// they unblock dozens of init paths on real-world pages that would
+/// otherwise throw on a missing global.
+///
+/// ## Design choices, with citations
+///
+/// - **User-agent string**: `"Mozilla/5.0 (compatible; heso/0.0.1)"`.
+///   Real-browser-shaped (begins with `Mozilla/5.0` so naive
+///   UA-sniffers don't crash), but identifies as heso so server
+///   operators see who's calling. The `(compatible; ...)` form is the
+///   same family as Googlebot's user-agent — the convention is "tell
+///   sniffers a baseline shape; identify yourself parenthetically."
+/// - **`navigator.webdriver = false`**: anti-bot scripts gate on this
+///   (Playwright defaults to `true`, which trips Cloudflare et al.).
+///   For an agent browser that genuinely isn't using WebDriver, the
+///   honest value is `false`. ADR 0016 (positioning) makes this the
+///   policy: heso is an agent browser, not a stealth Selenium.
+/// - **`requestAnimationFrame` → `setTimeout(cb, 16)`**: 16ms ≈ 60fps,
+///   close enough that pages relying on rAF for animation timing see
+///   a sensible-shaped delay. The ID returned by `setTimeout` doubles
+///   as the rAF id — `cancelAnimationFrame` simply calls
+///   `clearTimeout`.
+/// - **`performance.now()`**: pinned to `VirtualClock.now_ms() as f64`,
+///   same source as `Date.now`. Real browsers spec performance.now as
+///   "monotonic clock starting at `performance.timeOrigin`"; we give
+///   millisecond resolution from `0` (matching `Date.now`'s start).
+/// - **`matchMedia`**: always `matches: false`. No layout → no media
+///   queries can match. Frameworks gate on `matchMedia` *existing*,
+///   not on a specific match result.
+/// - **Storage**: in-memory `Map` per engine, separate maps for
+///   `localStorage` and `sessionStorage`. ADR 0014 commits to this
+///   shape (in-memory, deterministic, no persistence yet).
+/// - **`atob` / `btoa`**: Rust-side closures using the `base64` crate
+///   (0.22 — `Engine::decode` / `Engine::encode` with the standard
+///   alphabet). Invalid input throws a plain `Error` for now; a full
+///   `DOMException('InvalidCharacterError')` is a later concern.
+fn install_browser_apis(
+    context: &Context,
+    timers: Arc<Mutex<TimerScheduler>>,
+) -> Result<(), EvalError> {
+    use base64::Engine as _;
+    let perf_timers = timers.clone();
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            let globals = ctx.globals();
+
+            // ---- navigator ----
+            let navigator = Object::new(ctx.clone())?;
+            navigator.set("userAgent", "Mozilla/5.0 (compatible; heso/0.0.1)")?;
+            navigator.set("language", "en-US")?;
+            // `languages` is read-only in real browsers; we expose a
+            // plain array (frameworks iterate, they don't mutate).
+            let languages = rquickjs::Array::new(ctx.clone())?;
+            languages.set(0, "en-US")?;
+            navigator.set("languages", languages)?;
+            navigator.set("onLine", true)?;
+            navigator.set("cookieEnabled", true)?;
+            // anti-bot scripts gate on `webdriver`; heso isn't using
+            // WebDriver, so the honest answer is `false`. See ADR 0016.
+            navigator.set("webdriver", false)?;
+            // Platform is a freeform string; "Linux x86_64" is the
+            // baseline Chrome/Firefox value on Linux desktops and is
+            // the safest default for cross-platform sniffers.
+            navigator.set("platform", "Linux x86_64")?;
+            globals.set("navigator", navigator)?;
+
+            // ---- performance.now() ----
+            //
+            // Reads the same VirtualClock that backs Date.now and the
+            // timer scheduler. Determinism: same advance_clock sequence
+            // → same performance.now() readings across engines.
+            let perf = Object::new(ctx.clone())?;
+            let now_fn = Func::from(move || -> f64 {
+                match perf_timers.lock() {
+                    Ok(s) => s.now_ms() as f64,
+                    Err(_) => 0.0,
+                }
+            });
+            perf.set("now", now_fn)?;
+            // performance.timeOrigin: real browsers expose this as "ms
+            // since UNIX epoch when navigation started". heso's virtual
+            // clock starts at 0 so timeOrigin = 0 keeps the invariant
+            // `Date.now() === performance.timeOrigin + performance.now()`
+            // true on a fresh engine.
+            perf.set("timeOrigin", 0.0_f64)?;
+            globals.set("performance", perf)?;
+
+            // ---- atob / btoa ----
+            //
+            // base64 0.22's `STANDARD` engine uses the RFC 4648
+            // alphabet with padding, which is what real browsers'
+            // atob/btoa do.
+            let atob = Func::from(|ctx: Ctx<'_>, s: String| -> rquickjs::Result<String> {
+                match base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
+                    // atob returns a "binary string" — each output byte
+                    // becomes one char (code point 0..=255). Mapping via
+                    // `from_utf8_lossy` would corrupt high bytes; map
+                    // byte-to-char directly.
+                    Ok(bytes) => {
+                        let mut out = String::with_capacity(bytes.len());
+                        for b in bytes {
+                            out.push(b as char);
+                        }
+                        Ok(out)
+                    }
+                    Err(_) => Err(rquickjs::Exception::throw_message(
+                        &ctx,
+                        "InvalidCharacterError: atob: invalid base64 input",
+                    )),
+                }
+            });
+            globals.set("atob", atob)?;
+
+            let btoa = Func::from(|ctx: Ctx<'_>, s: String| -> rquickjs::Result<String> {
+                // btoa expects a "binary string" — every code point
+                // must be in 0..=255. Spec throws InvalidCharacterError
+                // for anything outside that range.
+                let mut bytes = Vec::with_capacity(s.len());
+                for c in s.chars() {
+                    let code = c as u32;
+                    if code > 0xFF {
+                        return Err(rquickjs::Exception::throw_message(
+                            &ctx,
+                            "InvalidCharacterError: btoa: character > U+00FF",
+                        ));
+                    }
+                    bytes.push(code as u8);
+                }
+                Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+            });
+            globals.set("btoa", btoa)?;
+
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install browser apis (Rust): {e}")))?;
+
+    // The rest is pure JS — queueMicrotask via Promise, rAF via
+    // setTimeout, matchMedia POJO, in-memory storage. Installed in
+    // one bootstrap so the source stays inspectable in one place.
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            ctx.eval::<(), _>(BROWSER_APIS_BOOTSTRAP)?;
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install browser apis (JS): {e}")))?;
+    Ok(())
+}
+
+/// JS bootstrap for the pure-JS half of [`install_browser_apis`]:
+/// `queueMicrotask`, `requestAnimationFrame` / `cancelAnimationFrame`,
+/// `matchMedia`, `localStorage`, `sessionStorage`.
+const BROWSER_APIS_BOOTSTRAP: &str = r#"
+(function() {
+    // queueMicrotask(fn) — schedule `fn` after the current synchronous
+    // block but before the next macrotask. Spec semantics are
+    // `Promise.resolve().then(fn)`. QuickJS's microtask pump surfaces
+    // any throw to `execute_pending_job`, which the engine captures as
+    // a console.error.
+    if (typeof globalThis.queueMicrotask !== 'function') {
+        globalThis.queueMicrotask = function(fn) {
+            if (typeof fn !== 'function') {
+                throw new TypeError('queueMicrotask: argument is not a function');
+            }
+            Promise.resolve().then(fn);
+        };
+    }
+
+    // requestAnimationFrame(cb) / cancelAnimationFrame(id) — route to
+    // setTimeout(cb, 16). 16ms ~= 60fps. The id returned IS the
+    // setTimeout id, so cancelAnimationFrame just calls clearTimeout.
+    // Spec requires the callback to receive a high-res timestamp; we
+    // pass performance.now() so animation code that interpolates
+    // against the delta sees a sensible-shaped number.
+    if (typeof globalThis.requestAnimationFrame !== 'function') {
+        globalThis.requestAnimationFrame = function(cb) {
+            if (typeof cb !== 'function') {
+                throw new TypeError('requestAnimationFrame: argument is not a function');
+            }
+            return setTimeout(function() { cb(performance.now()); }, 16);
+        };
+    }
+    if (typeof globalThis.cancelAnimationFrame !== 'function') {
+        globalThis.cancelAnimationFrame = function(id) {
+            clearTimeout(id);
+        };
+    }
+
+    // matchMedia(query) — return a MediaQueryList-shaped POJO that
+    // always reports `matches: false`. No layout → no media queries
+    // can match. The listener surface lets framework code subscribe
+    // without throwing.
+    if (typeof globalThis.matchMedia !== 'function') {
+        globalThis.matchMedia = function(query) {
+            return {
+                matches: false,
+                media: String(query == null ? '' : query),
+                onchange: null,
+                addListener: function() {},      // legacy
+                removeListener: function() {},   // legacy
+                addEventListener: function() {},
+                removeEventListener: function() {},
+                dispatchEvent: function() { return false; }
+            };
+        };
+    }
+
+    // localStorage / sessionStorage — in-memory Map per engine. ADR
+    // 0014 commits to this shape (in-memory, deterministic, no
+    // persistence yet). Closure-private Map keeps JS from poking at
+    // the backing store directly.
+    function makeStorage() {
+        var store = new Map();
+        return Object.create(null, {
+            length: { get: function() { return store.size; }, enumerable: true },
+            getItem: { value: function(k) {
+                var key = String(k);
+                return store.has(key) ? store.get(key) : null;
+            }, enumerable: true },
+            setItem: { value: function(k, v) {
+                store.set(String(k), String(v));
+            }, enumerable: true },
+            removeItem: { value: function(k) {
+                store.delete(String(k));
+            }, enumerable: true },
+            clear: { value: function() {
+                store.clear();
+            }, enumerable: true },
+            key: { value: function(i) {
+                var idx = Number(i) | 0;
+                if (idx < 0 || idx >= store.size) return null;
+                var keys = Array.from(store.keys());
+                return keys[idx];
+            }, enumerable: true }
+        });
+    }
+    if (typeof globalThis.localStorage === 'undefined') {
+        globalThis.localStorage = makeStorage();
+    }
+    if (typeof globalThis.sessionStorage === 'undefined') {
+        globalThis.sessionStorage = makeStorage();
+    }
 })();
 "#;
 

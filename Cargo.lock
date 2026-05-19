@@ -829,6 +829,7 @@ dependencies = [
 name = "heso-engine-js"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "dom_query",
  "heso-engine-fetch",
  "rand 0.8.6",

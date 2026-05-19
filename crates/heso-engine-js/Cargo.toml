@@ -48,6 +48,11 @@ tokio = { workspace = true }
 # owns its current URL so navigation across steps is observable on the
 # Rust side. Matches the rest of the workspace's `url = 2`.
 url = { workspace = true }
+# `atob` / `btoa` base64 globals (item: trivial browser-globals batch).
+# Already a transitive dep via reqwest; pinning here makes the
+# dependency explicit so the engine globals don't rot if a transitive
+# lifts it. 0.22 is the modern API (`Engine::encode`/`Engine::decode`).
+base64 = "0.22"
 
 [dev-dependencies]
 # wiremock-rs: localhost mock server for the in-JS fetch tests.
