@@ -14,12 +14,14 @@ Most of this codebase was written with help from Claude under one person's direc
 - `click`, `fill`, `submit`, `eval`, `navigate` — both as CLI verbs and over JSON-RPC for multi-step sessions.
 - Stateful sessions where DOM mutations and event listeners stick around between calls.
 - Optional reproducibility: seed the random number generator, freeze the clock, and the same page processed the same way produces the same hash.
-- Common modern JS surface: `fetch`, `URLSearchParams`, `history.pushState`, `Blob`/`File`/`FormData`, multipart upload, `<script type="module">`.
+- Common modern JS surface: `fetch`, `URLSearchParams`, `history.pushState`, `Blob`/`File`/`FormData`, multipart upload.
+- ES modules: `<script type="module">`, dynamic `import()`, import maps. Shared cache between the static and dynamic paths.
+- Web Components: `customElements.define`, `HTMLElement` as a base class, `connectedCallback`/`disconnectedCallback`/`attributeChangedCallback` lifecycle, `attachShadow`, `ShadowRoot`, `<slot>` with `assignedElements`.
 
 ## What doesn't
 
 - No rendering. No canvas, WebGL, CSS layout, or video. If your agent needs pixels, use a real browser.
-- Modern bundler-heavy SPAs aren't fully working yet. Static pages, server-rendered sites, and simple SPAs work. React 19 with full keyboard event handling, Turbopack-chunked Next.js, and full SVG namespace support are open work.
+- Modern bundler-heavy SPAs aren't fully working yet. Static pages, server-rendered sites, and SPAs that don't depend on WebGL or full keyboard interaction work. React 19 with full keyboard event handling, Turbopack-chunked Next.js, and full SVG namespace support are open work.
 - Compatibility breadth is well behind jsdom. jsdom has had years to handle weird real-world JavaScript. This is early.
 
 ## Demo
@@ -140,11 +142,12 @@ Pre-alpha. Roughly two weeks of work. Built fast with LLM help, used by one pers
 
 Concrete next work, in rough order:
 
-- Wire the import-map parser into the static module resolver.
+- A QuickJS GC teardown assertion that fires on a small number of pages (e.g. astro.build). The eval output is correct, but the engine aborts during drop. Real CI hazard, needs fixing.
 - Turbopack-chunk detection for Next.js builds.
 - SVG namespace and tag-name casing.
 - Full `KeyboardEvent` / `InputEvent` / `MouseEvent` constructors so React 19 interactions round-trip cleanly.
 - Real cookie jar shared between HTTP and `document.cookie`.
+- `:host` and `::slotted()` CSS selectors for shadow-DOM-scoped queries.
 
 ## Try it
 
