@@ -17,12 +17,14 @@ Most of this codebase was written with help from Claude under one person's direc
 - Common modern JS surface: `fetch`, `URLSearchParams`, `history.pushState`, `Blob`/`File`/`FormData`, multipart upload.
 - ES modules: `<script type="module">`, dynamic `import()`, import maps. Shared cache between the static and dynamic paths.
 - Web Components: `customElements.define`, `HTMLElement` as a base class, `connectedCallback`/`disconnectedCallback`/`attributeChangedCallback` lifecycle, `HTMLTemplateElement`, `attachShadow`, `ShadowRoot`, `<slot>` with `assignedElements`. Late-upgrade re-prototyping works — elements pre-rendered in HTML get the right class when JS defines them later. `element.dataset` and `insertAdjacentHTML` also there.
+- Next.js / Turbopack-bundled sites: `nextjs.org`, `stripe.com`, `supabase.com`, `posthog.com`, `ui.shadcn.com` all hydrate (title + h1 + body content). `document.currentScript` is what unblocked the Turbopack chunk loader.
 
 ## What doesn't
 
 - No rendering. No canvas, WebGL, CSS layout, or video. If your agent needs pixels, use a real browser.
-- Modern bundler-heavy SPAs aren't fully working yet. Static pages, server-rendered sites, and simpler SPAs work. React 19 with full keyboard interaction, Turbopack-chunked Next.js, and full SVG namespace support are open work.
-- The bigger compat blocker today is the **JS environment polyfill tail** — sites whose inline scripts assume a window global was set by a sibling script that didn't get to run, missing analytics shapes, module-loader edge cases. Real component libraries (Shoelace, lit.dev/playground) currently fail upstream of the WC layer for reasons like this, not because of the DOM/JS engine itself.
+- React Server Components hydration: pages that inline `<script>$RC(...)</script>` placeholders (newer Next.js, parts of Shopify) throw `$RC is not defined`. Not currently shimmed.
+- Some sites still partial. `vercel.com` extracts content then trips an rquickjs refcount assertion. `linear.app` titles work but a script `throw null` flakes ~half of probes. `astro.build` aborts on engine teardown with a QuickJS GC assertion.
+- Sites whose inline scripts assume a window global was set by a sibling script that didn't get to run (Shoelace's `window.lunr`, various analytics shapes). Each is its own small polyfill.
 - Compatibility breadth is well behind jsdom. jsdom has had years to handle weird real-world JavaScript. This is early.
 
 ## Demo
