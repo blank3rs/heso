@@ -84,6 +84,193 @@ use crate::engine::{ConsoleEntry, ConsoleLevel, EvalError};
 use crate::import_map::parse_import_map;
 use crate::modules::{inline_module_specifier, ModuleCache, SharedImportMap};
 
+/// Snapshot of what `document.currentScript` should reflect while a
+/// `<script>` element is executing.
+///
+/// Per WHATWG HTML §3.1.1 "Document.currentScript":
+///
+/// > Returns the script element, or the SVG script element, that is
+/// > currently executing, as long as the element represents a classic
+/// > script. In the case of reentrant script execution, returns the
+/// > one that most recently started executing amongst those that have
+/// > not yet finished executing. Returns null if the Document is not
+/// > currently executing a script or SVG script element (e.g., because
+/// > the running script is an event handler, or a timeout), or if the
+/// > currently executing script or SVG script element is a module
+/// > script.
+///
+/// Turbopack-emitted chunks rely on this for chunk-self-identification:
+/// each `<script src="/_next/static/chunks/<hash>.js">` body opens with
+///
+/// ```js
+/// (globalThis.TURBOPACK||(globalThis.TURBOPACK=[])).push([
+///     "object"==typeof document ? document.currentScript : void 0,
+///     <chunkId>, …
+/// ]);
+/// ```
+///
+/// then the runtime (added by the entrypoint Turbopack chunk) defines
+/// the `push` hook as `registerChunk`, which reads
+/// `registration[0].getAttribute("src")` to know which chunk just
+/// executed. When `document.currentScript` is `undefined`, that
+/// registration[0] is `void 0`, and the runtime throws
+/// `"chunk path empty but not in a worker"` (vercel/next.js,
+/// `turbopack/crates/turbopack-ecmascript-runtime/js/src/browser/runtime/base/runtime-base.ts`,
+/// the `getChunkFromRegistration` function), which kills hydration on
+/// every modern Next.js site (nextjs.org, vercel.com, Linear, Notion,
+/// most YC pages).
+///
+/// We don't have JS-side `HTMLScriptElement` objects for every parsed
+/// `<script>` (heso uses raw `dom_query` nodes for the pump), so the
+/// patch installs a small synthetic object on `document.currentScript`
+/// that mimics the bits browsers expose from a script element:
+///
+/// - `tagName` / `nodeName` — "SCRIPT" (frameworks check this when
+///   resolving the script's own ancestor).
+/// - `getAttribute(name)` — returns the raw `src` attribute value for
+///   external scripts (and `null` otherwise), exactly matching the DOM
+///   `Element.getAttribute(name)` contract (returns the literal string
+///   from the source HTML, not a resolved URL).
+/// - `hasAttribute("src")` — true iff external.
+/// - `src` — the *resolved* absolute URL, matching the HTMLScriptElement
+///   `src` IDL attribute which reflects via the URL parser. Consumers
+///   that want the resolved form (rare) get it; consumers that want the
+///   raw attribute (the common case, used by Turbopack) call
+///   `getAttribute("src")`.
+///
+/// Modules and the no-script-currently-running state set
+/// `document.currentScript = null`, per spec.
+enum CurrentScriptShape<'a> {
+    /// No script currently running — set to `null`.
+    None,
+    /// Inline classic script — set to a synthetic with no `src`
+    /// (matches `<script>…</script>` where `getAttribute("src")`
+    /// returns `null`).
+    InlineClassic,
+    /// External classic script — set to a synthetic carrying the raw
+    /// `src` attribute (what `getAttribute("src")` returns to JS) and
+    /// the resolved URL (what the `.src` IDL property returns).
+    ExternalClassic {
+        raw_src: &'a str,
+        resolved_src: &'a str,
+    },
+}
+
+/// Update `document.currentScript` to reflect `shape`.
+///
+/// Builds the synthetic POJO described on [`CurrentScriptShape`] and
+/// assigns it to `document.currentScript`. Best-effort: if the
+/// document global is missing (e.g. a future caller skips
+/// [`crate::JsEngine::install_document`]) the call is a no-op so the
+/// script pump still runs.
+///
+/// Failures inside the QuickJS eval are silently swallowed (returned as
+/// `Ok(())`) — a script pump that crashed because we couldn't write a
+/// debug-only spec field would be a worse outcome than the field being
+/// stale; this is the same "swallow internal-bookkeeping failures"
+/// posture [`install_location`] takes after a navigation.
+fn set_current_script(context: &Context, shape: CurrentScriptShape<'_>) -> Result<(), EvalError> {
+    let snippet = match shape {
+        CurrentScriptShape::None => {
+            "if (typeof document !== 'undefined') { document.currentScript = null; }".to_owned()
+        }
+        CurrentScriptShape::InlineClassic => {
+            // Inline script: spec-compliant `getAttribute("src")` returns
+            // null (an inline `<script>` has no `src` attribute). Most
+            // page code only checks `document.currentScript !== null`,
+            // so the non-null sentinel is enough; the few callers that
+            // call `.getAttribute("src")` see null, matching a real
+            // inline script.
+            r#"
+            if (typeof document !== 'undefined') {
+                document.currentScript = {
+                    tagName: 'SCRIPT',
+                    nodeName: 'SCRIPT',
+                    nodeType: 1,
+                    src: '',
+                    type: '',
+                    async: false,
+                    defer: false,
+                    noModule: false,
+                    getAttribute: function(name) { return null; },
+                    hasAttribute: function(name) { return false; },
+                    getAttributeNames: function() { return []; },
+                };
+            }
+            "#
+            .to_owned()
+        }
+        CurrentScriptShape::ExternalClassic {
+            raw_src,
+            resolved_src,
+        } => {
+            // External script: `getAttribute("src")` returns the raw
+            // attribute (Turbopack reads this), `.src` returns the
+            // resolved absolute URL (HTMLScriptElement IDL contract).
+            //
+            // Quote the strings via JSON.stringify-equivalent escaping
+            // — `serde_json` handles every JS-string edge case (quotes,
+            // backslashes, control chars, unicode) the same way
+            // `JSON.stringify` would.
+            let raw_lit = serde_json::Value::String(raw_src.to_owned()).to_string();
+            let resolved_lit = serde_json::Value::String(resolved_src.to_owned()).to_string();
+            format!(
+                r#"
+            if (typeof document !== 'undefined') {{
+                var __hesoCsRaw = {raw_lit};
+                var __hesoCsRes = {resolved_lit};
+                document.currentScript = {{
+                    tagName: 'SCRIPT',
+                    nodeName: 'SCRIPT',
+                    nodeType: 1,
+                    src: __hesoCsRes,
+                    type: '',
+                    async: false,
+                    defer: false,
+                    noModule: false,
+                    getAttribute: function(name) {{
+                        if (typeof name !== 'string') return null;
+                        return name.toLowerCase() === 'src' ? __hesoCsRaw : null;
+                    }},
+                    hasAttribute: function(name) {{
+                        return typeof name === 'string' && name.toLowerCase() === 'src';
+                    }},
+                    getAttributeNames: function() {{ return ['src']; }},
+                }};
+            }}
+            "#
+            )
+        }
+    };
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            // Swallow eval errors (no document, strict-mode quirks):
+            // currentScript bookkeeping must never abort the pump.
+            let _ = ctx.eval::<Value, _>(snippet);
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("set document.currentScript: {e}")))?;
+    Ok(())
+}
+
+/// Resolve a (possibly relative) `src` attribute against the page base
+/// URL — the canonical form a real `HTMLScriptElement.src` IDL property
+/// would return.
+///
+/// Mirrors the same `Url::join` rule [`fetch_script_source`] uses for
+/// the HTTP fetch path, so the URL bound to `document.currentScript.src`
+/// matches what the network layer requested. Without a base URL, the
+/// raw `src` is returned unchanged.
+fn resolve_script_src(src: &str, base_url: Option<&url::Url>) -> String {
+    match base_url {
+        Some(base) => match base.join(src) {
+            Ok(u) => u.to_string(),
+            Err(_) => src.to_owned(),
+        },
+        None => src.to_owned(),
+    }
+}
+
 /// Policy for handling external `<script src="...">` references.
 ///
 /// The synchronous-blocking fetch jsdom defaults to is the
@@ -187,6 +374,17 @@ pub fn run_scripts(
     // doesn't collide them. See [`inline_module_specifier`].
     let mut inline_module_index: usize = 0;
 
+    // Initialize `document.currentScript = null` per WHATWG HTML §3.1.1.
+    // Real browsers initialize this on Document construction; we do it
+    // at script-pump entry instead — `document` is a Class instance
+    // installed by [`JsEngine::install_document`] right before
+    // [`run_scripts`] runs, and arbitrary-property writes on Class
+    // instances are cheap. The null sentinel matters even on pages
+    // with no scripts: code that reads `document.currentScript` from a
+    // later `eval_no_clear` call (e.g. a user's probe) gets `null`
+    // (the spec value), not `undefined`.
+    set_current_script(context, CurrentScriptShape::None)?;
+
     // Wire 2 — pre-pass: scan for the first `<script type="importmap">`
     // and install its parsed map into the engine's `SharedImportMap`
     // BEFORE any module script runs.
@@ -213,15 +411,24 @@ pub fn run_scripts(
 
     for script in scripts {
         match script.kind {
-            ScriptKind::InlineClassic { source } => match eval_one(context, &source)? {
-                Some(err_msg) => {
-                    outcome.executed_with_error += 1;
-                    push_console(console_buffer, ConsoleLevel::Error, err_msg);
+            ScriptKind::InlineClassic { source } => {
+                // Mark `document.currentScript` per WHATWG HTML §3.1.1:
+                // "set to the script element being processed; classic
+                //  scripts only." Inline classics get a non-null
+                //  synthetic whose `getAttribute("src")` returns null.
+                set_current_script(context, CurrentScriptShape::InlineClassic)?;
+                let eval_result = eval_one(context, &source);
+                set_current_script(context, CurrentScriptShape::None)?;
+                match eval_result? {
+                    Some(err_msg) => {
+                        outcome.executed_with_error += 1;
+                        push_console(console_buffer, ConsoleLevel::Error, err_msg);
+                    }
+                    None => {
+                        outcome.executed += 1;
+                    }
                 }
-                None => {
-                    outcome.executed += 1;
-                }
-            },
+            }
             ScriptKind::InlineModule { source } => {
                 let specifier = inline_module_specifier(base_url, inline_module_index);
                 inline_module_index += 1;
@@ -231,6 +438,9 @@ pub fn run_scripts(
                 // still go through the loader and (on cache miss) hit
                 // the HTTP path.
                 module_cache.insert(specifier.clone(), source.clone());
+                // Per HTML §3.1.1, modules keep `document.currentScript`
+                // null — only classic scripts set it.
+                set_current_script(context, CurrentScriptShape::None)?;
                 match eval_one_module(context, &specifier, &source)? {
                     Some(err_msg) => {
                         outcome.executed_with_error += 1;
@@ -277,6 +487,10 @@ pub fn run_scripts(
             }
         }
     }
+
+    // Per spec, `document.currentScript` is null once script pump exits
+    // (it's only non-null while a classic script's body is executing).
+    set_current_script(context, CurrentScriptShape::None)?;
 
     Ok(outcome)
 }
@@ -357,19 +571,40 @@ fn handle_external_classic(
         }
         (ScriptFetchPolicy::Fetch, Some((client, rt))) => {
             match fetch_script_source(client, rt, src, base_url) {
-                Ok(source) => match eval_one(context, &source)? {
-                    Some(err_msg) => {
-                        outcome.executed_with_error += 1;
-                        push_console(
-                            console_buffer,
-                            ConsoleLevel::Error,
-                            format!("<script src=\"{src}\"> threw: {err_msg}"),
-                        );
+                Ok(source) => {
+                    // Set `document.currentScript` to a synthetic
+                    // HTMLScriptElement-shaped POJO so
+                    // [Turbopack-emitted chunks][1] can self-identify.
+                    //
+                    // [1]: see `CurrentScriptShape` for the runtime
+                    // contract (`getAttribute("src")` returning the raw
+                    // attribute is what trips the
+                    // "chunk path empty but not in a worker" throw when
+                    // it's missing).
+                    let resolved = resolve_script_src(src, base_url);
+                    set_current_script(
+                        context,
+                        CurrentScriptShape::ExternalClassic {
+                            raw_src: src,
+                            resolved_src: &resolved,
+                        },
+                    )?;
+                    let eval_result = eval_one(context, &source);
+                    set_current_script(context, CurrentScriptShape::None)?;
+                    match eval_result? {
+                        Some(err_msg) => {
+                            outcome.executed_with_error += 1;
+                            push_console(
+                                console_buffer,
+                                ConsoleLevel::Error,
+                                format!("<script src=\"{src}\"> threw: {err_msg}"),
+                            );
+                        }
+                        None => {
+                            outcome.executed += 1;
+                        }
                     }
-                    None => {
-                        outcome.executed += 1;
-                    }
-                },
+                }
                 Err(e) => {
                     push_console(
                         console_buffer,
@@ -441,6 +676,9 @@ fn handle_external_module(
                 },
                 None => src.to_owned(),
             };
+            // Per HTML §3.1.1, modules keep `document.currentScript`
+            // null — only classic scripts set it.
+            set_current_script(context, CurrentScriptShape::None)?;
             match fetch_script_source(client, rt, src, base_url) {
                 Ok(source) => {
                     module_cache.insert(resolved.clone(), source.clone());
@@ -450,9 +688,7 @@ fn handle_external_module(
                             push_console(
                                 console_buffer,
                                 ConsoleLevel::Error,
-                                format!(
-                                    "<script type=\"module\" src=\"{src}\"> threw: {err_msg}"
-                                ),
+                                format!("<script type=\"module\" src=\"{src}\"> threw: {err_msg}"),
                             );
                         }
                         None => {
@@ -464,9 +700,7 @@ fn handle_external_module(
                     push_console(
                         console_buffer,
                         ConsoleLevel::Error,
-                        format!(
-                            "heso: <script type=\"module\" src=\"{src}\"> fetch failed: {e}"
-                        ),
+                        format!("heso: <script type=\"module\" src=\"{src}\"> fetch failed: {e}"),
                     );
                 }
             }
@@ -812,8 +1046,8 @@ fn eval_one_module(
         // synchronous-error path for now. Module bodies that read
         // through `await fetch(...)` resolve later, when the engine's
         // run_pending_jobs pump fires after we return.
-        let result = Module::evaluate(ctx.clone(), specifier.to_owned(), source.to_owned())
-            .catch(&ctx);
+        let result =
+            Module::evaluate(ctx.clone(), specifier.to_owned(), source.to_owned()).catch(&ctx);
         match result {
             Ok(_promise) => Ok(None),
             Err(CaughtError::Exception(exc)) => {
@@ -824,9 +1058,7 @@ fn eval_one_module(
                 Ok(Some(format_script_error(&msg, exc.stack())))
             }
             Err(CaughtError::Value(_)) => Ok(Some("<module threw non-error value>".to_owned())),
-            Err(CaughtError::Error(e)) => {
-                Err(EvalError::Engine(format!("module eval: {e}")))
-            }
+            Err(CaughtError::Error(e)) => Err(EvalError::Engine(format!("module eval: {e}"))),
         }
     })
 }
@@ -945,7 +1177,10 @@ mod tests {
         );
         let scripts = collect_scripts(&doc);
         assert_eq!(scripts.len(), 3);
-        assert!(matches!(scripts[0].kind, ScriptKind::ExternalClassic { .. }));
+        assert!(matches!(
+            scripts[0].kind,
+            ScriptKind::ExternalClassic { .. }
+        ));
         assert!(matches!(scripts[1].kind, ScriptKind::NonScriptType));
         assert!(matches!(scripts[2].kind, ScriptKind::InlineClassic { .. }));
     }
@@ -968,7 +1203,10 @@ mod tests {
         assert!(matches!(scripts[0].kind, ScriptKind::InlineModule { .. }));
         assert!(matches!(scripts[1].kind, ScriptKind::ExternalModule { .. }));
         assert!(matches!(scripts[2].kind, ScriptKind::InlineClassic { .. }));
-        assert!(matches!(scripts[3].kind, ScriptKind::ExternalClassic { .. }));
+        assert!(matches!(
+            scripts[3].kind,
+            ScriptKind::ExternalClassic { .. }
+        ));
     }
 
     #[test]
@@ -987,5 +1225,54 @@ mod tests {
         // Data-block types are not modules either.
         assert!(!is_module_script_type(Some("application/json")));
         assert!(!is_module_script_type(Some("importmap")));
+    }
+
+    #[test]
+    fn resolve_script_src_handles_absolute_and_relative() {
+        // Absolute src — returns as-is (relative join still produces
+        // the absolute form back).
+        let base = url::Url::parse("https://example.com/foo/").unwrap();
+        assert_eq!(
+            resolve_script_src("https://other.example/bar.js", Some(&base)),
+            "https://other.example/bar.js",
+        );
+        // Site-absolute (/path) — joined against the host root.
+        assert_eq!(
+            resolve_script_src("/chunk.js", Some(&base)),
+            "https://example.com/chunk.js",
+        );
+        // Relative — joined against the base directory.
+        assert_eq!(
+            resolve_script_src("dep.js", Some(&base)),
+            "https://example.com/foo/dep.js",
+        );
+        // Without a base, raw `src` is returned unchanged (matches
+        // the contract `fetch_script_source` uses internally).
+        assert_eq!(resolve_script_src("/x.js", None), "/x.js");
+    }
+
+    /// `document.currentScript` lifecycle on a clean engine: after the
+    /// pump runs an inline classic script, it observes a non-null
+    /// synthetic; after the pump exits, the user's eval sees `null`.
+    ///
+    /// This is the core regression for the Turbopack
+    /// `"chunk path empty but not in a worker"` throw — though the
+    /// full end-to-end Turbopack-shaped runtime lives in
+    /// `tests/current_script.rs`.
+    #[test]
+    fn pump_initializes_current_script_to_null_and_restores_after() {
+        let engine = crate::JsEngine::new().expect("engine builds");
+        // No scripts in the page — pump still runs and sets
+        // currentScript to null (the spec value), not undefined.
+        let html = "<!doctype html><html><body></body></html>";
+        let out = engine
+            .eval_with_html_policy(
+                html,
+                "[typeof document.currentScript, document.currentScript === null]",
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        // After pump: currentScript exists and is null (not undefined).
+        assert_eq!(out.value, serde_json::json!(["object", true]));
     }
 }
