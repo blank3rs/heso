@@ -95,6 +95,7 @@ pub mod history;
 pub mod import_map;
 pub mod intersection_observer;
 pub mod modules;
+pub(crate) mod mutation_observer;
 pub mod rng;
 pub mod scripts;
 pub mod session;

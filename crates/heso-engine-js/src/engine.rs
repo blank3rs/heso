@@ -1346,6 +1346,20 @@ impl JsEngine {
         // first install_document.
         install_on_event_handlers(&self.context)?;
 
+        // Install the real `MutationObserver` — wraps
+        // Element.prototype.appendChild / insertBefore / removeChild /
+        // setAttribute / removeAttribute / textContent-setter so
+        // observed mutations queue MutationRecords and fire registered
+        // callbacks as a batched microtask (WHATWG DOM § 4.3). Replaces
+        // the noop stub the `install_browser_apis` bootstrap installs.
+        // Needs `document` to reach Element.prototype, same as
+        // [`install_on_event_handlers`] — runs right after. Idempotent
+        // via a one-shot sentinel inside the bootstrap. Frameworks
+        // (Lit, Stencil, Vue, Solid) rely on MO for custom-element
+        // late-upgrade detection, slot reassignment, and form
+        // auto-fill detection — a noop silently breaks them.
+        crate::mutation_observer::install(&self.context)?;
+
         let script_fetch_client = self.fetch_state.as_ref().and_then(|fs| match &fs.mode {
             FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
             FetchMode::DeterministicNoCassette => None,
@@ -1460,6 +1474,11 @@ impl JsEngine {
         // Element.prototype so Preact's `prop.toLowerCase() in el`
         // feature-detect picks the lowercase event name.
         install_on_event_handlers(&self.context)?;
+
+        // Wrap Element.prototype mutation methods so MutationObserver
+        // observers see them — see `install_document` for the
+        // rationale; same idempotent sentinel.
+        crate::mutation_observer::install(&self.context)?;
 
         // Run every <script> against the shared context — mutations
         // land on the same `Arc<dom_query::Document>` the JS-side
@@ -3686,12 +3705,23 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         Object.defineProperty(Observer, 'name', { value: name });
         globalThis[name] = Observer;
     }
+    // MutationObserver — install the noop here as a fallback for the
+    // bare-engine path (no document yet). The REAL MO implementation
+    // is installed by [`crate::mutation_observer::install`] called
+    // from [`JsEngine::install_document`] once `document` exists and
+    // Element.prototype is reachable — that pass overwrites the noop
+    // with a constructor whose callback actually fires on observed
+    // mutations (WHATWG DOM § 4.3). The noop survives only on bare
+    // [`JsEngine::eval`] calls where no document has been installed;
+    // SPA-shaped feature-detection code that ran before a navigation
+    // (rare) still sees a valid constructor surface.
     defineNoopObserver('MutationObserver');
     // IntersectionObserver is NOT a noop — `crate::intersection_observer::install`
     // runs after `install_browser_apis` and registers a real
     // implementation that fires its callback (with `isIntersecting:
     // true` for in-tree targets) on a microtask. See that module for
     // the design and the agent-relevance rationale.
+    defineNoopObserver('IntersectionObserver');
     defineNoopObserver('ResizeObserver');
     defineNoopObserver('PerformanceObserver');
 
