@@ -84,6 +84,16 @@ heso find  https://news.ycombinator.com --role link --name "more"   # → @e220
 heso click https://news.ycombinator.com @e220
 ```
 
+Or skip the find step entirely and click by visible text, CSS selector, or aria-label:
+
+```sh
+heso click https://news.ycombinator.com --text "More"
+heso fill  https://news.ycombinator.com --selector "input[name=q]" "rust"
+heso click https://news.ycombinator.com --aria-label "Close dialog"
+```
+
+`--text` and `--aria-label` match case-insensitive substrings (Playwright `get_by_text` / `get_by_role` semantics). Multiple matches return an "ambiguous: N matches" error listing every candidate's ref so the agent can pick by `@e<N>` on the retry.
+
 Sites as filesystems:
 
 ```sh
@@ -149,8 +159,13 @@ description: Use the heso headless browser (one Rust binary, no Chromium, no Nod
 - `heso meta <url>` — metadata only (OpenGraph, JSON-LD)
 - `heso find <url> [--role link|button|input|form] [--name "regex"]` — find an element
 - `heso click <url> @e<N>` — click element @eN
+- `heso click <url> --text "Submit"` — click by visible text (case-insensitive substring)
+- `heso click <url> --selector "button.primary"` — click by CSS selector
+- `heso click <url> --aria-label "Close"` — click by aria-label substring
 - `heso fill <url> @e<N> "value"` — type into input @eN
+- `heso fill <url> --selector "input[name=q]" "value"` — fill by locator (same flags as click)
 - `heso submit <url> @e<N>` — submit form @eN
+- `heso submit <url> --selector "form#login"` — submit by locator
 - `heso eval-dom <url> "<js>"` — fetch URL, run scripts, then evaluate your JS against the resulting DOM
 - `heso tree <url>` / `heso ls <url> <path>` / `heso cat <url> <path>` — navigate page sections
 - `heso serve` — multi-step session over JSON-RPC stdio

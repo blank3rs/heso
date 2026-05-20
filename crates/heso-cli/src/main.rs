@@ -103,8 +103,8 @@ use std::process::ExitCode;
 use heso_core::{IdentityKey, Url};
 use heso_engine_api::{EngineApi, Page};
 use heso_engine_fetch::{
-    linked_pages_to_json, resolve_action, ElementRef, ExploreOptions, FetchEngine,
-    DEFAULT_LINK_CAP, HARD_LINK_CAP,
+    linked_pages_to_json, resolve_action, resolve_locator_from_html, ElementRef, ExploreOptions,
+    FetchEngine, LocatorError, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use heso_trace::{
     parse_actions, trace_fingerprint, verify_fingerprint, verify_receipt, Action,
@@ -139,10 +139,13 @@ fn print_banner() {
     println!("    --network-idle [--idle-window DUR]   No queued fetch/timer for DUR (default 500ms; Playwright `networkidle` parity)");
     println!("    --time DUR                     Advance the deterministic virtual clock by DUR (e.g. `2s`, `750ms`)");
     println!("    [--timeout DUR]                Overall wall-clock cap (default 30s, Playwright default)");
-    println!("  heso click  <url> <@ref>      Fetch <url>, find element at <@ref> in the action graph, dispatch a click");
-    println!("  heso fill   <url> <@ref> <v>  Fetch <url>, find element at <@ref>, set its .value and fire input+change");
-    println!("  heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]");
-    println!("                                Fetch <url>, locate form at <@form-ref>, optionally pre-fill named inputs,");
+    println!("  heso click  <url> (<@ref> | --text S | --selector CSS | --aria-label S)");
+    println!("                                Fetch <url>, locate element by ref OR locator flag, dispatch a click.");
+    println!("                                One-shot ergonomic: skips the `read` → scan → `click @e7` round-trip.");
+    println!("  heso fill   <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value>");
+    println!("                                Fetch <url>, locate input by ref OR locator flag, set its .value and fire input+change.");
+    println!("  heso submit <url> (<@form-ref> | --text S | --selector CSS | --aria-label S) [--field NAME=VALUE]... [--data JSON]");
+    println!("                                Fetch <url>, locate form by ref OR locator flag, optionally pre-fill named inputs,");
     println!("                                dispatch submit, POST per enctype, return response body + status + parsed JSON.");
     println!("                                --field name=value     repeatable; matched by input `name` attribute.");
     println!("                                --data '{{\"k\":\"v\"}}'    JSON dict alternative; --field wins on the same name.");
@@ -1853,13 +1856,320 @@ fn css_attr_literal(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
+/// Locator-flag bundle. Parsed by [`parse_locator_flags`] from CLI args
+/// and consumed by [`resolve_target`] against the page's action graph.
+/// `ref_id` is `Some` for the `@e<N>` ergonomic; the locator-flag fields
+/// (`text`, `css_selector`, `aria_label`) are `Some` when the agent
+/// passed `--text` / `--selector` / `--aria-label`. Exactly one of the
+/// two modes must be supplied — [`resolve_target`] errors with usage
+/// guidance otherwise.
+pub(crate) struct LocatorTarget {
+    pub(crate) ref_id: Option<String>,
+    pub(crate) text: Option<String>,
+    pub(crate) css_selector: Option<String>,
+    pub(crate) aria_label: Option<String>,
+}
+
+impl LocatorTarget {
+    fn is_empty(&self) -> bool {
+        self.ref_id.is_none()
+            && self.text.is_none()
+            && self.css_selector.is_none()
+            && self.aria_label.is_none()
+    }
+
+    fn has_locator_flag(&self) -> bool {
+        self.text.is_some() || self.css_selector.is_some() || self.aria_label.is_some()
+    }
+}
+
+/// Failure modes for [`resolve_target`]. Each variant carries enough
+/// context for the CLI to render a clear, actionable error and exit
+/// with the right code.
+pub(crate) enum TargetError {
+    /// Usage error: caller supplied no @ref AND no locator flags.
+    NeitherRefNorLocator,
+    /// Usage error: caller mixed `@ref` with a locator flag.
+    RefAndLocatorMixed,
+    /// `@ref` was supplied but no element with that id exists.
+    UnknownRef(String),
+    /// `--selector` was malformed — passes through [`LocatorError`].
+    BadSelector { selector: String, message: String },
+    /// Locator matched zero elements.
+    NoMatch {
+        text: Option<String>,
+        css_selector: Option<String>,
+        aria_label: Option<String>,
+    },
+    /// Locator matched more than one element. The Vec carries the
+    /// candidate refs in document order so the agent can pick one.
+    Ambiguous {
+        text: Option<String>,
+        css_selector: Option<String>,
+        aria_label: Option<String>,
+        candidates: Vec<ElementRef>,
+    },
+}
+
+impl From<LocatorError> for TargetError {
+    fn from(e: LocatorError) -> Self {
+        match e {
+            LocatorError::BadSelector { selector, message } => {
+                TargetError::BadSelector { selector, message }
+            }
+        }
+    }
+}
+
+/// Resolve a [`LocatorTarget`] against a page to exactly one
+/// [`ElementRef`]. Returns owned values so the caller can drop the
+/// [`FetchPage`] borrow before issuing the second HTTP fetch in the
+/// click/fill/submit pipeline.
+///
+/// Resolution rules:
+/// - `@ref` path: exact id lookup via [`heso_engine_fetch::resolve_action`].
+/// - Locator flags path: combined AND-match via
+///   [`heso_engine_fetch::resolve_locator`]. The result must be exactly
+///   one element; zero or multiple matches produce a `TargetError`
+///   carrying the candidate list for the agent's next call.
+pub(crate) fn resolve_target(
+    html: &str,
+    actions: &[ElementRef],
+    target: &LocatorTarget,
+) -> Result<ElementRef, TargetError> {
+    if target.is_empty() {
+        return Err(TargetError::NeitherRefNorLocator);
+    }
+    if target.ref_id.is_some() && target.has_locator_flag() {
+        return Err(TargetError::RefAndLocatorMixed);
+    }
+    if let Some(ref_str) = target.ref_id.as_deref() {
+        let want = normalize_ref(ref_str);
+        return match resolve_action(actions, &want) {
+            Some(el) => Ok(el.clone()),
+            None => Err(TargetError::UnknownRef(want)),
+        };
+    }
+
+    // Locator-flag path. The `*_from_html` wrapper re-parses internally
+    // and returns owned values, so the CLI stays free of `scraper` as
+    // a direct dep.
+    let mut matches = resolve_locator_from_html(
+        html,
+        actions,
+        target.text.as_deref(),
+        target.css_selector.as_deref(),
+        target.aria_label.as_deref(),
+    )?;
+    match matches.len() {
+        0 => Err(TargetError::NoMatch {
+            text: target.text.clone(),
+            css_selector: target.css_selector.clone(),
+            aria_label: target.aria_label.clone(),
+        }),
+        1 => Ok(matches.remove(0)),
+        _ => Err(TargetError::Ambiguous {
+            text: target.text.clone(),
+            css_selector: target.css_selector.clone(),
+            aria_label: target.aria_label.clone(),
+            candidates: matches,
+        }),
+    }
+}
+
+/// Normalize an `@ref` argument — accept both `@e7` and `e7`.
+pub(crate) fn normalize_ref(s: &str) -> String {
+    if let Some(stripped) = s.strip_prefix('@') {
+        format!("@{stripped}")
+    } else {
+        format!("@{s}")
+    }
+}
+
+/// Render a [`TargetError`] to stderr (with the candidate JSON when
+/// ambiguous) and return the right [`ExitCode`]. Single source of
+/// truth for the locator-failure user experience across all three
+/// write verbs.
+fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
+    match err {
+        TargetError::NeitherRefNorLocator => {
+            eprintln!(
+                "{op_name}: need either an `@e<N>` ref OR one of --text/--selector/--aria-label"
+            );
+            ExitCode::from(2)
+        }
+        TargetError::RefAndLocatorMixed => {
+            eprintln!(
+                "{op_name}: cannot combine an `@e<N>` ref with --text/--selector/--aria-label"
+            );
+            ExitCode::from(2)
+        }
+        TargetError::UnknownRef(want) => {
+            eprintln!("no element at ref `{want}`");
+            ExitCode::from(2)
+        }
+        TargetError::BadSelector { selector, message } => {
+            eprintln!("invalid --selector `{selector}`: {message}");
+            ExitCode::from(2)
+        }
+        TargetError::NoMatch {
+            text,
+            css_selector,
+            aria_label,
+        } => {
+            eprintln!(
+                "no element matched locator {}",
+                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
+            );
+            ExitCode::from(2)
+        }
+        TargetError::Ambiguous {
+            text,
+            css_selector,
+            aria_label,
+            candidates,
+        } => {
+            let n = candidates.len();
+            eprintln!(
+                "ambiguous: {n} elements matched locator {}",
+                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
+            );
+            eprintln!("candidates (use one of these refs):");
+            for c in &candidates {
+                // Single-line candidate: `<ref> <role> <tag> "<name>"`.
+                // Cap snippet to 80 chars so a long button label
+                // doesn't blow up terminal width.
+                let name = c.name.as_deref().unwrap_or("");
+                let snippet = if name.chars().count() > 80 {
+                    let mut s: String = name.chars().take(80).collect();
+                    s.push('…');
+                    s
+                } else {
+                    name.to_owned()
+                };
+                eprintln!(
+                    "  {} ({} {}) \"{}\"",
+                    c.ref_id, c.role, c.tag, snippet
+                );
+            }
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Render the supplied locator filters back as a `{k: "v"}`-ish blob
+/// for error messages. We pass through `serde_json::to_string` so the
+/// payload survives shell-quoting unambiguously.
+fn format_locator(
+    text: Option<&str>,
+    css_selector: Option<&str>,
+    aria_label: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if let Some(v) = text {
+        parts.push(format!(
+            "text: {}",
+            serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_owned())
+        ));
+    }
+    if let Some(v) = css_selector {
+        parts.push(format!(
+            "selector: {}",
+            serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_owned())
+        ));
+    }
+    if let Some(v) = aria_label {
+        parts.push(format!(
+            "aria-label: {}",
+            serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_owned())
+        ));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
+/// Parse the `--text` / `--selector` / `--aria-label` flag pairs and a
+/// single optional `@ref` positional out of `args`. `extra` collects
+/// every other positional (e.g. the URL, the `<value>` for `fill`),
+/// preserving order. Used by `cmd_click` / `cmd_fill` / `cmd_submit`.
+///
+/// Returns `Err(ExitCode::from(2))` on flag-shape errors (missing
+/// values, duplicate flags) and prints a usage line to stderr.
+pub(crate) fn parse_locator_flags(
+    args: &[String],
+    op_name: &str,
+) -> Result<(LocatorTarget, Vec<String>), ExitCode> {
+    let mut target = LocatorTarget {
+        ref_id: None,
+        text: None,
+        css_selector: None,
+        aria_label: None,
+    };
+    let mut extra: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--text" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("{op_name}: --text needs a value");
+                    return Err(ExitCode::from(2));
+                };
+                if target.text.is_some() {
+                    eprintln!("{op_name}: --text passed more than once");
+                    return Err(ExitCode::from(2));
+                }
+                target.text = Some(v.clone());
+                i += 2;
+            }
+            "--selector" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("{op_name}: --selector needs a value");
+                    return Err(ExitCode::from(2));
+                };
+                if target.css_selector.is_some() {
+                    eprintln!("{op_name}: --selector passed more than once");
+                    return Err(ExitCode::from(2));
+                }
+                target.css_selector = Some(v.clone());
+                i += 2;
+            }
+            "--aria-label" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("{op_name}: --aria-label needs a value");
+                    return Err(ExitCode::from(2));
+                };
+                if target.aria_label.is_some() {
+                    eprintln!("{op_name}: --aria-label passed more than once");
+                    return Err(ExitCode::from(2));
+                }
+                target.aria_label = Some(v.clone());
+                i += 2;
+            }
+            // `@e<N>` style positional — capture as the ref. Multiple
+            // `@e…` positionals are a usage error.
+            other if other.starts_with('@') => {
+                if target.ref_id.is_some() {
+                    eprintln!("{op_name}: multiple `@ref` arguments");
+                    return Err(ExitCode::from(2));
+                }
+                target.ref_id = Some(other.to_owned());
+                i += 1;
+            }
+            _ => {
+                extra.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok((target, extra))
+}
+
 /// Shared body for `heso click` / `heso fill` / `heso submit`. Fetches
 /// `url`, resolves `ref_str` in the action graph, builds a CSS
 /// selector, and hands `(html, selector)` to `op`. `op` is the
 /// engine method to call — `dispatch_click`, `set_input_value`, or
 /// `submit_form`. Prints the unified `{ok, url, value, console}` JSON
 /// the existing eval-* commands use and returns a [`ExitCode`].
-async fn run_dispatch<F>(url_arg: &str, ref_arg: &str, op_name: &str, op: F) -> ExitCode
+async fn run_dispatch<F>(url_arg: &str, target: &LocatorTarget, op_name: &str, op: F) -> ExitCode
 where
     F: FnOnce(
         &heso_engine_js::JsEngine,
@@ -1867,13 +2177,6 @@ where
         &str,
     ) -> Result<heso_engine_js::EvalOutcome, heso_engine_js::EvalError>,
 {
-    // Normalize the @ref — accept both `@e7` and `e7` for ergonomics.
-    let want = if let Some(stripped) = ref_arg.strip_prefix('@') {
-        format!("@{stripped}")
-    } else {
-        format!("@{ref_arg}")
-    };
-
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
         Err(e) => {
@@ -1889,15 +2192,10 @@ where
         }
     };
 
-    // We need BOTH the parsed action graph (to resolve @ref → selector)
-    // AND the raw HTML (to hand to the JS engine). `open()` gives us
-    // the actions; `fetch_text` gives us the HTML. Two round-trips
-    // would be wasteful, so we fetch once via `open_static` (gets the
-    // actions) and re-fetch the text via `fetch_text`. NOTE: this is
-    // two HTTP calls — a follow-up should let `open_static` keep the
-    // raw HTML on the FetchPage so we can re-use it. For PR1 the
-    // duplicate fetch is acceptable: both go through the same client,
-    // and the second one comes from HTTP cache for sane servers.
+    // We need BOTH the parsed action graph (to resolve @ref or locator
+    // → selector) AND the raw HTML (to hand to the JS engine). `open()`
+    // gives us actions + body_html in one call so the locator path
+    // doesn't pay a second HTTP round-trip.
     let page = match engine.open(&url).await {
         Ok(p) => p,
         Err(e) => {
@@ -1905,14 +2203,12 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let action = match resolve_action(&page.actions, &want) {
-        Some(a) => a,
-        None => {
-            eprintln!("no element at ref `{want}`");
-            return ExitCode::from(2);
-        }
+    let action = match resolve_target(&page.body_html, &page.actions, target) {
+        Ok(a) => a,
+        Err(e) => return report_target_error(op_name, e),
     };
-    let selector = match selector_for_action(action) {
+    let want = action.ref_id.clone();
+    let selector = match selector_for_action(&action) {
         Some(s) => s,
         None => {
             eprintln!(
@@ -2013,34 +2309,56 @@ where
 /// Output: `{ok, op, url, ref, selector, value, console}`. `value`
 /// is `true` when the selector matched and the click was dispatched.
 ///
-/// Exit codes: 0 on success, 1 on fetch/JS failure, 2 on usage error
-/// or unknown @ref.
+/// Locator flags (alternatives to `@ref`):
+/// - `--text "<string>"` — case-insensitive substring match against the
+///   element's accessible name (text/placeholder/value/aria-label).
+/// - `--selector "<css>"` — CSS selector via `scraper::Selector`.
+/// - `--aria-label "<string>"` — case-insensitive substring match
+///   against the `aria-label` attribute.
+///
+/// Exit codes: 0 on success, 1 on fetch/JS failure, 2 on usage error,
+/// unknown ref, zero locator matches, ambiguous matches (with the
+/// candidate refs printed to stderr), or invalid CSS selector.
 async fn cmd_click(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("usage: heso click <url> <@ref>");
+    let (target, extra) = match parse_locator_flags(args, "click") {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    if extra.is_empty() {
+        eprintln!(
+            "usage: heso click <url> (<@ref> | --text S | --selector CSS | --aria-label S)"
+        );
         return ExitCode::from(2);
     }
-    run_dispatch(&args[0], &args[1], "click", |eng, html, sel| {
+    let url_arg = &extra[0];
+    run_dispatch(url_arg, &target, "click", |eng, html, sel| {
         eng.dispatch_click(html, sel)
     })
     .await
 }
 
-/// `heso fill <url> <@ref> <value>` — fetch <url>, locate the input
-/// at `@ref` in the action graph, set its `value` to `<value>`, and
-/// dispatch first an `"input"` then a `"change"` event (matching
-/// real browser behavior when a user types).
+/// `heso fill <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value>`
+/// — fetch <url>, locate the input by `@ref` OR a locator flag, set its
+/// `value` to `<value>`, and dispatch first an `"input"` then a
+/// `"change"` event (matching real browser behavior when a user types).
 ///
 /// Output shape mirrors `heso click`: `{ok, op, url, ref, selector,
 /// value, console}` where `value: true` indicates the selector
 /// matched. Exit codes match `heso click`.
 async fn cmd_fill(args: &[String]) -> ExitCode {
-    if args.len() < 3 {
-        eprintln!("usage: heso fill <url> <@ref> <value>");
+    let (target, extra) = match parse_locator_flags(args, "fill") {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    if extra.len() < 2 {
+        eprintln!(
+            "usage: heso fill <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value>"
+        );
         return ExitCode::from(2);
     }
-    let value = args[2].clone();
-    run_dispatch(&args[0], &args[1], "fill", move |eng, html, sel| {
+    let url_arg = extra[0].clone();
+    let value = extra[1].clone();
+    run_dispatch(&url_arg, &target, "fill", move |eng, html, sel| {
         eng.set_input_value(html, sel, &value)
     })
     .await
@@ -2108,10 +2426,18 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
 /// outcome — `preventDefault` is legitimate) or succeeded; 1 on HTTP
 /// failure, 2 on usage error.
 async fn cmd_submit(args: &[String]) -> ExitCode {
-    // Order-tolerant walk: split `--field name=value` (repeatable) and
-    // `--data <json>` flags from the two positionals `<url> <@ref>`.
+    // Order-tolerant walk: split `--field name=value` (repeatable),
+    // `--data <json>`, and the locator flags (`--text` /
+    // `--selector` / `--aria-label`) from the positionals (URL, plus
+    // an optional `@ref`).
     let mut fields_cli: Vec<(String, String)> = Vec::new();
     let mut data_json: Option<String> = None;
+    let mut target = LocatorTarget {
+        ref_id: None,
+        text: None,
+        css_selector: None,
+        aria_label: None,
+    };
     let mut positional: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -2144,12 +2470,56 @@ async fn cmd_submit(args: &[String]) -> ExitCode {
                 data_json = Some(v.clone());
                 i += 2;
             }
+            "--text" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("submit: --text needs a value");
+                    return ExitCode::from(2);
+                };
+                if target.text.is_some() {
+                    eprintln!("submit: --text passed more than once");
+                    return ExitCode::from(2);
+                }
+                target.text = Some(v.clone());
+                i += 2;
+            }
+            "--selector" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("submit: --selector needs a value");
+                    return ExitCode::from(2);
+                };
+                if target.css_selector.is_some() {
+                    eprintln!("submit: --selector passed more than once");
+                    return ExitCode::from(2);
+                }
+                target.css_selector = Some(v.clone());
+                i += 2;
+            }
+            "--aria-label" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("submit: --aria-label needs a value");
+                    return ExitCode::from(2);
+                };
+                if target.aria_label.is_some() {
+                    eprintln!("submit: --aria-label passed more than once");
+                    return ExitCode::from(2);
+                }
+                target.aria_label = Some(v.clone());
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
                 eprintln!(
-                    "usage: heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]"
+                    "usage: heso submit <url> (<@form-ref> | --text S | --selector CSS | --aria-label S) [--field NAME=VALUE]... [--data JSON]"
                 );
                 return ExitCode::from(2);
+            }
+            other if other.starts_with('@') => {
+                if target.ref_id.is_some() {
+                    eprintln!("submit: multiple `@ref` arguments");
+                    return ExitCode::from(2);
+                }
+                target.ref_id = Some(other.to_owned());
+                i += 1;
             }
             _ => {
                 positional.push(args[i].clone());
@@ -2157,9 +2527,9 @@ async fn cmd_submit(args: &[String]) -> ExitCode {
             }
         }
     }
-    if positional.len() < 2 {
+    if positional.is_empty() {
         eprintln!(
-            "usage: heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]"
+            "usage: heso submit <url> (<@form-ref> | --text S | --selector CSS | --aria-label S) [--field NAME=VALUE]... [--data JSON]"
         );
         return ExitCode::from(2);
     }
@@ -2210,7 +2580,7 @@ async fn cmd_submit(args: &[String]) -> ExitCode {
 
     let merged = merge_submit_fields(&data_fields, &fields_cli);
 
-    cmd_submit_inner(&positional[0], &positional[1], &merged).await
+    cmd_submit_inner(&positional[0], &target, &merged).await
 }
 
 /// Merge `--data` JSON fields with `--field NAME=VALUE` CLI flags so
@@ -2248,15 +2618,9 @@ pub(crate) fn merge_submit_fields(
 /// submit event fires.
 async fn cmd_submit_inner(
     url_arg: &str,
-    ref_arg: &str,
+    target: &LocatorTarget,
     fields: &[(String, String)],
 ) -> ExitCode {
-    let want = if let Some(stripped) = ref_arg.strip_prefix('@') {
-        format!("@{stripped}")
-    } else {
-        format!("@{ref_arg}")
-    };
-
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
         Err(e) => {
@@ -2279,14 +2643,12 @@ async fn cmd_submit_inner(
             return ExitCode::FAILURE;
         }
     };
-    let action = match resolve_action(&page.actions, &want) {
-        Some(a) => a,
-        None => {
-            eprintln!("no element at ref `{want}`");
-            return ExitCode::from(2);
-        }
+    let action = match resolve_target(&page.body_html, &page.actions, target) {
+        Ok(a) => a,
+        Err(e) => return report_target_error("submit", e),
     };
-    let selector = match selector_for_action(action) {
+    let want = action.ref_id.clone();
+    let selector = match selector_for_action(&action) {
         Some(s) => s,
         None => {
             eprintln!(

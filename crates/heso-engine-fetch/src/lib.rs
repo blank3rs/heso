@@ -70,7 +70,8 @@ pub mod plat;
 pub mod tree;
 
 pub use actions::{
-    extract as extract_actions, filter as filter_actions, resolve as resolve_action, ElementRef,
+    extract as extract_actions, filter as filter_actions, resolve as resolve_action,
+    resolve_locator, resolve_locator_from_html, ElementRef, LocatorError,
 };
 pub use data_attrs::{extract as extract_data_attrs, DataAttrValue};
 pub use explore::{

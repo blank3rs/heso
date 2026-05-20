@@ -40,7 +40,7 @@
 //! tree paths share one vocabulary — `heso cat /pricing` and the elements
 //! whose `section == "/pricing"` agree exactly.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 
 use scraper::{ElementRef as ScraperElementRef, Html, Node, Selector};
@@ -148,6 +148,185 @@ pub fn filter<'a>(
             true
         })
         .collect()
+}
+
+/// Errors produced by [`resolve_locator`].
+#[derive(Debug, thiserror::Error)]
+pub enum LocatorError {
+    /// The supplied CSS selector did not parse via [`scraper::Selector`].
+    #[error("invalid CSS selector `{selector}`: {message}")]
+    BadSelector {
+        /// The selector string that failed to parse.
+        selector: String,
+        /// A short human-readable parse error.
+        message: String,
+    },
+}
+
+/// Convenience wrapper for [`resolve_locator`] that takes the raw HTML
+/// body instead of a pre-parsed [`Html`]. Owned-result variant: returns
+/// fully owned [`ElementRef`]s so the CLI can drop the parse without
+/// borrow trouble.
+pub fn resolve_locator_from_html(
+    html: &str,
+    refs: &[ElementRef],
+    text: Option<&str>,
+    css_selector: Option<&str>,
+    aria_label: Option<&str>,
+) -> Result<Vec<ElementRef>, LocatorError> {
+    let doc = Html::parse_document(html);
+    let matches = resolve_locator(&doc, refs, text, css_selector, aria_label)?;
+    Ok(matches.into_iter().cloned().collect())
+}
+
+/// Resolve a locator to its set of matching [`ElementRef`]s, preserving
+/// document order. All three filters are optional; passing `None` for all
+/// of them returns an empty `Vec` (the caller should treat that as a
+/// usage error — `resolve_locator` is the locator-flag path, not the
+/// "list everything" path).
+///
+/// Matching semantics (mirrors Playwright `get_by_text` / `get_by_role`):
+/// - `text`: case-insensitive substring match against the element's
+///   accessible `name` (which already prefers `aria-label` →
+///   placeholder/value/name → text content → title).
+/// - `css_selector`: passed through `scraper::Selector`; a matched
+///   element must also be in the action graph (i.e. interactive).
+///   Non-interactive selector hits are ignored.
+/// - `aria_label`: case-insensitive substring against the element's
+///   `aria-label` attribute. Elements without an `aria-label` are
+///   skipped.
+///
+/// When multiple filters are supplied they AND together — an element
+/// must satisfy every supplied filter to be returned.
+pub fn resolve_locator<'a>(
+    doc: &Html,
+    refs: &'a [ElementRef],
+    text: Option<&str>,
+    css_selector: Option<&str>,
+    aria_label: Option<&str>,
+) -> Result<Vec<&'a ElementRef>, LocatorError> {
+    // No filters supplied: locator is empty, so the result is empty.
+    if text.is_none() && css_selector.is_none() && aria_label.is_none() {
+        return Ok(Vec::new());
+    }
+
+    // Pre-compile a scraper selector when one was supplied. Map any
+    // parse error into our public LocatorError so the CLI can render a
+    // clean message without depending on scraper's error type.
+    let compiled_css = match css_selector {
+        Some(s) => {
+            let parsed = Selector::parse(s).map_err(|e| LocatorError::BadSelector {
+                selector: s.to_owned(),
+                message: e.to_string(),
+            })?;
+            Some(parsed)
+        }
+        None => None,
+    };
+
+    // Collect node ids of CSS-selector matches once. We compare each
+    // interactive element's ego_tree NodeId against this set as we walk
+    // the document. Using NodeId (an integer wrapper) keeps the lookup
+    // O(1) and survives the second walk we do for aria-label / text.
+    let css_node_ids: Option<HashSet<ego_tree::NodeId>> = compiled_css.as_ref().map(|sel| {
+        doc.select(sel)
+            .map(|el| el.id())
+            .collect::<HashSet<_>>()
+    });
+
+    let text_needle = text.map(|s| s.to_lowercase());
+    let aria_needle = aria_label.map(|s| s.to_lowercase());
+
+    // Re-walk the doc the same way `extract` does. We need the walk
+    // (not just the pre-built `refs` slice) because aria-label is not
+    // stored on ElementRef and CSS matching needs each element's
+    // NodeId. The walk counter has to match `extract`'s output exactly
+    // so we can index back into `refs`.
+    let mut probe = LocatorProbe {
+        css_node_ids,
+        text_needle,
+        aria_needle,
+        counter: 0,
+        matched_indices: Vec::new(),
+    };
+    if let Some(body) = doc.select(&BODY_SEL).next() {
+        for child in body.children() {
+            locator_walk(child, &mut probe);
+        }
+    } else {
+        for child in doc.root_element().children() {
+            locator_walk(child, &mut probe);
+        }
+    }
+
+    // Map matched indices back to `&ElementRef` slots. The counter
+    // walks interactive elements in document order, exactly as
+    // `extract` does, so `refs[idx]` is the matching entry. Guard
+    // against the (defensive) case where the caller passed in a `refs`
+    // slice from a different parse of the same URL.
+    let out: Vec<&'a ElementRef> = probe
+        .matched_indices
+        .into_iter()
+        .filter_map(|idx| refs.get(idx))
+        .collect();
+    Ok(out)
+}
+
+struct LocatorProbe {
+    css_node_ids: Option<HashSet<ego_tree::NodeId>>,
+    text_needle: Option<String>,
+    aria_needle: Option<String>,
+    counter: usize,
+    matched_indices: Vec<usize>,
+}
+
+fn locator_walk(node: ego_tree::NodeRef<'_, Node>, probe: &mut LocatorProbe) {
+    let Node::Element(el) = node.value() else {
+        return;
+    };
+    let tag = el.name();
+    if matches!(tag, "script" | "style" | "noscript" | "template") {
+        return;
+    }
+
+    if let Some(elem) = ScraperElementRef::wrap(node) {
+        if compute_role(&elem).is_some() {
+            let idx = probe.counter;
+            probe.counter += 1;
+
+            // Each supplied filter must match. CSS filter: NodeId must
+            // appear in the pre-collected set. text: case-insensitive
+            // substring against the accessible name. aria-label:
+            // case-insensitive substring against the `aria-label`
+            // attribute.
+            let css_ok = match &probe.css_node_ids {
+                None => true,
+                Some(ids) => ids.contains(&node.id()),
+            };
+            let text_ok = match &probe.text_needle {
+                None => true,
+                Some(needle) => {
+                    let have = compute_name(&elem).unwrap_or_default().to_lowercase();
+                    have.contains(needle)
+                }
+            };
+            let aria_ok = match &probe.aria_needle {
+                None => true,
+                Some(needle) => match elem.value().attr("aria-label") {
+                    Some(v) => v.to_lowercase().contains(needle),
+                    None => false,
+                },
+            };
+
+            if css_ok && text_ok && aria_ok {
+                probe.matched_indices.push(idx);
+            }
+        }
+    }
+
+    for child in node.children() {
+        locator_walk(child, probe);
+    }
 }
 
 // ============================================================================
@@ -777,5 +956,156 @@ mod tests {
         let name = refs[0].name.as_deref().unwrap();
         assert!(name.chars().count() <= 121); // 120 + the …
         assert!(name.ends_with('…'));
+    }
+
+    // ========================================================================
+    // resolve_locator — text / CSS-selector / aria-label
+    // ========================================================================
+
+    #[test]
+    fn locator_text_substring_case_insensitive() {
+        let html = r#"
+            <html><body>
+              <a href="/a">Submit form</a>
+              <button>SUBMIT</button>
+              <a href="/c">cancel</a>
+            </body></html>
+        "#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        let matches =
+            resolve_locator(&doc, &refs, Some("submit"), None, None).expect("ok");
+        assert_eq!(matches.len(), 2);
+        let names: Vec<&str> = matches
+            .iter()
+            .map(|r| r.name.as_deref().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"Submit form"));
+        assert!(names.contains(&"SUBMIT"));
+    }
+
+    #[test]
+    fn locator_text_matches_input_placeholder() {
+        let html = r#"
+            <html><body>
+              <input type="search" name="q" placeholder="Search the web">
+              <input type="text" name="other" placeholder="other field">
+            </body></html>
+        "#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        let matches =
+            resolve_locator(&doc, &refs, Some("search"), None, None).expect("ok");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].attrs.get("name").map(String::as_str),
+            Some("q")
+        );
+    }
+
+    #[test]
+    fn locator_css_selector_filters_to_interactive() {
+        let html = r#"
+            <html><body>
+              <p class="hint">Some hint text</p>
+              <input type="search" name="q" placeholder="Search">
+              <button class="primary">Go</button>
+            </body></html>
+        "#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        // Selector matches the input by `[name=q]`.
+        let matches = resolve_locator(&doc, &refs, None, Some("input[name=q]"), None)
+            .expect("valid selector");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tag, "input");
+
+        // A selector that matches a non-interactive element returns
+        // zero matches — `.hint` is a <p>.
+        let none = resolve_locator(&doc, &refs, None, Some(".hint"), None).expect("ok");
+        assert_eq!(none.len(), 0);
+    }
+
+    #[test]
+    fn locator_css_selector_invalid_returns_error() {
+        let html = r#"<html><body><a href="/x">X</a></body></html>"#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        let err = resolve_locator(&doc, &refs, None, Some(">>> bad <<<"), None)
+            .expect_err("should be Err(BadSelector)");
+        match err {
+            LocatorError::BadSelector { selector, .. } => assert_eq!(selector, ">>> bad <<<"),
+        }
+    }
+
+    #[test]
+    fn locator_aria_label_substring_case_insensitive() {
+        let html = r#"
+            <html><body>
+              <a href="/x" aria-label="Close dialog">×</a>
+              <a href="/y" aria-label="Open Menu">≡</a>
+              <button>No aria here</button>
+            </body></html>
+        "#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        // "menu" substring matches "Open Menu" — case-insensitive.
+        let matches = resolve_locator(&doc, &refs, None, None, Some("menu")).expect("ok");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            matches[0].attrs.get("href").map(String::as_str),
+            Some("/y")
+        );
+        // Element without an aria-label is filtered out even though
+        // its text content contains the needle.
+        let none = resolve_locator(&doc, &refs, None, None, Some("no aria")).expect("ok");
+        assert_eq!(none.len(), 0);
+    }
+
+    #[test]
+    fn locator_filters_and_together() {
+        let html = r#"
+            <html><body>
+              <a href="/a" aria-label="Submit query">go</a>
+              <button>Submit form</button>
+            </body></html>
+        "#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        // text="submit" matches both, aria-label="query" matches only the link.
+        let matches =
+            resolve_locator(&doc, &refs, Some("submit"), None, Some("query")).expect("ok");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tag, "a");
+    }
+
+    #[test]
+    fn locator_empty_filters_returns_empty() {
+        let html = r#"<html><body><a href="/x">X</a></body></html>"#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        let matches = resolve_locator(&doc, &refs, None, None, None).expect("ok");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn locator_preserves_document_order() {
+        let html = r#"
+            <html><body>
+              <a href="/1">a item</a>
+              <a href="/2">a item</a>
+              <a href="/3">b item</a>
+              <a href="/4">a item</a>
+            </body></html>
+        "#;
+        let doc = parse(html);
+        let refs = extract(&doc);
+        let matches = resolve_locator(&doc, &refs, Some("a item"), None, None).expect("ok");
+        assert_eq!(matches.len(), 3);
+        let hrefs: Vec<&str> = matches
+            .iter()
+            .filter_map(|r| r.attrs.get("href").map(String::as_str))
+            .collect();
+        assert_eq!(hrefs, vec!["/1", "/2", "/4"]);
     }
 }

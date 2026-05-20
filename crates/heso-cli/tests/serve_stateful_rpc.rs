@@ -691,15 +691,42 @@ fn write_verb_without_active_page_errors_clearly() {
 
 #[test]
 fn fill_with_missing_ref_returns_bad_params() {
+    let server = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    "<!doctype html><html><body><input name=q></body></html>",
+                ))
+                .mount(&server)
+                .await;
+            server
+        });
+
     let (child, mut client) = spawn_serve();
     let _guard = KillOnDrop(child);
     let _ = client.read_ready();
-
-    let err = client.call_expect_error(
-        "fill",
-        // Missing `ref` field entirely.
-        serde_json::json!({"value": "x"}),
+    let _ = client.call(
+        "open",
+        serde_json::json!({"url": format!("{}/", server.uri())}),
     );
+
+    // Missing both `ref` AND `locator` — the resolver path now rejects
+    // this with a clear "need either `ref` or `locator`" error.
+    let err = client.call_expect_error("fill", serde_json::json!({"value": "x"}));
+    assert_eq!(err["code"], serde_json::json!(-32603));
+    let msg = err["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("ref") && msg.contains("locator"),
+        "expected message mentioning ref + locator, got: {msg}"
+    );
+
+    // Also: `value` itself is still schema-required; omitting it bubbles
+    // up as a `bad params` decode error (no `ref` field, no `locator`,
+    // and no `value` either — serde fails first on the missing value).
+    let err = client.call_expect_error("fill", serde_json::json!({}));
     assert_eq!(err["code"], serde_json::json!(-32603));
     let msg = err["message"].as_str().unwrap_or("");
     assert!(
@@ -818,4 +845,132 @@ fn parse_error_on_bad_request_does_not_kill_server() {
     // Tidy up.
     let _ = child.kill();
     let _ = child.wait();
+}
+
+// ============================================================================
+// Test 14 — `click` accepts a `locator: { text: "..." }` instead of a `ref`,
+// so frameworks can skip the `find`-by-role-or-name round-trip when they
+// just want to click the obvious "Submit" button.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn click_via_locator_text() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<!doctype html><html><body>
+                <button id="b">Submit</button>
+                <button id="c">Cancel</button>
+            </body></html>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let (child, mut client) = spawn_serve();
+    let _guard = KillOnDrop(child);
+    let _ = client.read_ready();
+    let _ = client.call(
+        "open",
+        serde_json::json!({"url": format!("{}/", server.uri())}),
+    );
+
+    // Install a flag we can check.
+    let _ = client.call(
+        "eval",
+        serde_json::json!({
+            "js": "globalThis.__which = 'none'; \
+                   document.querySelector('#b').addEventListener('click', () => { globalThis.__which = 'b'; }); \
+                   document.querySelector('#c').addEventListener('click', () => { globalThis.__which = 'c'; }); \
+                   'ok'",
+        }),
+    );
+
+    // Click via locator — "Submit" matches only #b.
+    let resp = client.call(
+        "click",
+        serde_json::json!({"locator": {"text": "Submit"}}),
+    );
+    assert_eq!(resp["ok"], serde_json::json!(true));
+    assert_eq!(resp["value"]["matched"], serde_json::json!(true));
+
+    let observe = client.call("eval", serde_json::json!({"js": "globalThis.__which"}));
+    assert_eq!(observe["value"], serde_json::json!("b"));
+}
+
+// ============================================================================
+// Test 15 — ambiguous locator returns an error carrying the candidate refs
+// so the agent can pick one by ref on the retry.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn click_via_locator_ambiguous_lists_candidates() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<!doctype html><html><body>
+                <button>Edit</button>
+                <button>Edit</button>
+                <button>Delete</button>
+            </body></html>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let (child, mut client) = spawn_serve();
+    let _guard = KillOnDrop(child);
+    let _ = client.read_ready();
+    let _ = client.call(
+        "open",
+        serde_json::json!({"url": format!("{}/", server.uri())}),
+    );
+
+    let err = client.call_expect_error(
+        "click",
+        serde_json::json!({"locator": {"text": "Edit"}}),
+    );
+    let msg = err["message"].as_str().unwrap_or("");
+    assert!(
+        msg.starts_with("ambiguous: 2 elements matched"),
+        "expected ambiguous-matches error, got: {msg}"
+    );
+    // Candidates should be embedded as JSON in the message.
+    assert!(msg.contains("candidates="), "expected candidates= payload, got: {msg}");
+    assert!(msg.contains("@e0"), "expected @e0 in candidates, got: {msg}");
+    assert!(msg.contains("@e1"), "expected @e1 in candidates, got: {msg}");
+}
+
+// ============================================================================
+// Test 16 — locator + ref together is a usage error.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn click_with_both_ref_and_locator_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<!doctype html><html><body><button>Go</button></body></html>",
+        ))
+        .mount(&server)
+        .await;
+
+    let (child, mut client) = spawn_serve();
+    let _guard = KillOnDrop(child);
+    let _ = client.read_ready();
+    let _ = client.call(
+        "open",
+        serde_json::json!({"url": format!("{}/", server.uri())}),
+    );
+
+    let err = client.call_expect_error(
+        "click",
+        serde_json::json!({"ref": "@e0", "locator": {"text": "Go"}}),
+    );
+    let msg = err["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("cannot pass both"),
+        "expected `cannot pass both` error, got: {msg}"
+    );
 }

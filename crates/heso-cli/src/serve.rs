@@ -97,8 +97,8 @@ use std::sync::Arc;
 use heso_core::Url;
 use heso_engine_api::{EngineApi, Page};
 use heso_engine_fetch::{
-    linked_pages_to_json, resolve_action, ElementRef, ExploreOptions, FetchEngine, FetchPage,
-    DEFAULT_LINK_CAP, HARD_LINK_CAP,
+    linked_pages_to_json, resolve_action, resolve_locator_from_html, ElementRef, ExploreOptions,
+    FetchEngine, FetchPage, LocatorError, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use heso_engine_js::{JsEngine, JsSession, ScriptFetchPolicy, WaitCondition};
 use serde::{Deserialize, Serialize};
@@ -564,10 +564,138 @@ async fn dispatch_close(
 // Method handlers — write methods (PR-Y2)
 // ============================================================================
 
+/// Locator shape mirrored from the CLI flags. When provided as a
+/// `locator` JSON object on a write-method call, it is an alternative
+/// to the `ref` field — exactly one of the two must be supplied.
+/// Multiple matches yield an error carrying the candidate refs; zero
+/// matches yields a clear "no match" error.
+#[derive(Deserialize, Default, Clone)]
+struct LocatorParams {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default, alias = "aria-label")]
+    aria_label: Option<String>,
+}
+
+impl LocatorParams {
+    fn is_empty(&self) -> bool {
+        self.text.is_none() && self.selector.is_none() && self.aria_label.is_none()
+    }
+}
+
+/// Resolve either an `@e<N>` ref OR a `LocatorParams` against a page's
+/// action graph. Returns an owned [`ElementRef`] so the caller can drop
+/// the lock without borrow trouble. Errors come back as JSON-RPC-shaped
+/// `String`s.
+fn resolve_ref_or_locator(
+    record: &PageRecord,
+    ref_str: Option<&str>,
+    locator: Option<&LocatorParams>,
+) -> Result<ElementRef, String> {
+    let has_ref = ref_str.is_some();
+    let has_locator = locator.map(|l| !l.is_empty()).unwrap_or(false);
+    if !has_ref && !has_locator {
+        return Err(
+            "need either `ref` or `locator: {text|selector|aria_label}`".to_owned(),
+        );
+    }
+    if has_ref && has_locator {
+        return Err("cannot pass both `ref` and `locator`".to_owned());
+    }
+    if let Some(rs) = ref_str {
+        let want = normalize_ref(rs);
+        return resolve_action(&record.current_actions, &want)
+            .cloned()
+            .ok_or_else(|| format!("no element at ref `{want}`"));
+    }
+    let l = locator.expect("locator present (checked above)");
+    let mut matches = resolve_locator_from_html(
+        &record.page.body_html,
+        &record.current_actions,
+        l.text.as_deref(),
+        l.selector.as_deref(),
+        l.aria_label.as_deref(),
+    )
+    .map_err(|e| match e {
+        LocatorError::BadSelector { selector, message } => {
+            format!("invalid CSS selector `{selector}`: {message}")
+        }
+    })?;
+    match matches.len() {
+        0 => Err(format!(
+            "no element matched locator {}",
+            format_locator(l.text.as_deref(), l.selector.as_deref(), l.aria_label.as_deref())
+        )),
+        1 => Ok(matches.remove(0)),
+        n => {
+            let candidates: Vec<serde_json::Value> = matches
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "ref": c.ref_id,
+                        "role": c.role,
+                        "tag": c.tag,
+                        "name": c.name,
+                    })
+                })
+                .collect();
+            // Pack the candidates list into the error message so a
+            // JSON-RPC client can parse it programmatically. The
+            // leading prose keeps human-tail logs readable.
+            let body = serde_json::json!({
+                "kind": "ambiguous",
+                "matched": n,
+                "locator": {
+                    "text": l.text,
+                    "selector": l.selector,
+                    "aria_label": l.aria_label,
+                },
+                "candidates": candidates,
+            });
+            Err(format!(
+                "ambiguous: {n} elements matched; candidates={body}"
+            ))
+        }
+    }
+}
+
+/// Render the supplied locator filters back as a `{k: "v"}`-ish blob
+/// for error messages. Mirrors the CLI's `format_locator`.
+fn format_locator(
+    text: Option<&str>,
+    css_selector: Option<&str>,
+    aria_label: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::with_capacity(3);
+    if let Some(v) = text {
+        parts.push(format!(
+            "text: {}",
+            serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_owned())
+        ));
+    }
+    if let Some(v) = css_selector {
+        parts.push(format!(
+            "selector: {}",
+            serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_owned())
+        ));
+    }
+    if let Some(v) = aria_label {
+        parts.push(format!(
+            "aria-label: {}",
+            serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_owned())
+        ));
+    }
+    format!("{{ {} }}", parts.join(", "))
+}
+
 #[derive(Deserialize)]
 struct FillParams {
-    #[serde(rename = "ref")]
-    ref_str: String,
+    #[serde(default, rename = "ref")]
+    ref_str: Option<String>,
+    #[serde(default)]
+    locator: Option<LocatorParams>,
     value: String,
     #[serde(default)]
     page_id: Option<String>,
@@ -583,10 +711,8 @@ async fn dispatch_fill(
     let record = pages
         .get_mut(&page_id)
         .ok_or_else(|| format!("no page_id `{}`", page_id))?;
-    let want = normalize_ref(&p.ref_str);
-    let elem = resolve_action(&record.current_actions, &want)
-        .ok_or_else(|| format!("no element at ref `{want}`"))?
-        .clone();
+    let elem = resolve_ref_or_locator(record, p.ref_str.as_deref(), p.locator.as_ref())?;
+    let want = elem.ref_id.clone();
     let selector = selector_for_action(&elem).ok_or_else(|| {
         format!(
             "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
@@ -613,8 +739,10 @@ async fn dispatch_fill(
 
 #[derive(Deserialize)]
 struct ClickParams {
-    #[serde(rename = "ref")]
-    ref_str: String,
+    #[serde(default, rename = "ref")]
+    ref_str: Option<String>,
+    #[serde(default)]
+    locator: Option<LocatorParams>,
     #[serde(default)]
     page_id: Option<String>,
 }
@@ -629,10 +757,8 @@ async fn dispatch_click(
     let record = pages
         .get_mut(&page_id)
         .ok_or_else(|| format!("no page_id `{}`", page_id))?;
-    let want = normalize_ref(&p.ref_str);
-    let elem = resolve_action(&record.current_actions, &want)
-        .ok_or_else(|| format!("no element at ref `{want}`"))?
-        .clone();
+    let elem = resolve_ref_or_locator(record, p.ref_str.as_deref(), p.locator.as_ref())?;
+    let want = elem.ref_id.clone();
     let selector = selector_for_action(&elem).ok_or_else(|| {
         format!(
             "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
@@ -659,8 +785,10 @@ async fn dispatch_click(
 
 #[derive(Deserialize)]
 struct SubmitParams {
-    #[serde(rename = "ref")]
-    ref_str: String,
+    #[serde(default, rename = "ref")]
+    ref_str: Option<String>,
+    #[serde(default)]
+    locator: Option<LocatorParams>,
     /// Optional `name → value` overrides (CLI `--field NAME=VALUE`
     /// equivalent). Values are JSON; strings/numbers/bools coerce to
     /// strings, `null` becomes empty. Other shapes are an error.
@@ -695,10 +823,8 @@ async fn dispatch_submit(
     let record = pages
         .get_mut(&page_id)
         .ok_or_else(|| format!("no page_id `{}`", page_id))?;
-    let want = normalize_ref(&p.ref_str);
-    let elem = resolve_action(&record.current_actions, &want)
-        .ok_or_else(|| format!("no element at ref `{want}`"))?
-        .clone();
+    let elem = resolve_ref_or_locator(record, p.ref_str.as_deref(), p.locator.as_ref())?;
+    let want = elem.ref_id.clone();
     let selector = selector_for_action(&elem).ok_or_else(|| {
         format!(
             "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
