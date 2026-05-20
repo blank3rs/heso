@@ -1,5 +1,7 @@
 # heso — The agent-native web engine. No Chromium. No Node. One Rust binary.
 
+**Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs)
+
 It fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
 
 ```
@@ -66,6 +68,8 @@ cargo build --release -p heso-cli
 ```
 
 You get JSON: title, description, a heading tree, and a list of clickable elements numbered `@e0`, `@e1`, and so on.
+
+For the full walk-through — installation, every verb with its inputs and outputs, JSON-RPC integration patterns, recipes — see **[heso.ca/docs](https://www.heso.ca/docs)**.
 
 ## Examples
 
@@ -175,3 +179,5 @@ cd heso
 cargo build --release -p heso-cli
 ./target/release/heso search "rust web scraping" --limit 5
 ```
+
+Full docs: **[heso.ca/docs](https://www.heso.ca/docs)** · Site: **[heso.ca](https://www.heso.ca)**
