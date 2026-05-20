@@ -82,3 +82,11 @@ debug = true
 # 324-test suite which does real HTML parsing + crypto in tests.
 [profile.dev.package."*"]
 opt-level = 3
+
+# cargo-dist build profile (release.yml uses `dist build` which compiles
+# with this profile). Inherits release; turns on thin LTO for smaller +
+# faster binaries in the published archives. Symbols are stripped via
+# `strip = true` in [profile.release] above, so we don't repeat it here.
+[profile.dist]
+inherits = "release"
+lto = "thin"
