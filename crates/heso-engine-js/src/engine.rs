@@ -36,6 +36,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use reqwest_cookie_store::CookieStoreMutex;
 use rquickjs::{
     prelude::{Func, Rest, This},
     CatchResultExt, CaughtError, Class, Context, Ctx, Function, Object, Runtime, Value,
@@ -43,6 +44,7 @@ use rquickjs::{
 
 use url::Url;
 
+use crate::cookies::install_cookie_bridge;
 use crate::dom::{self, Document};
 use crate::fetch::{self, FetchMode, FetchQueue};
 use crate::modules::{
@@ -248,6 +250,20 @@ pub struct JsEngine {
     /// `Rc<RefCell<_>>` (not `Arc<Mutex<_>>`) because the QuickJS
     /// runtime is single-threaded by construction.
     import_map: SharedImportMap,
+    /// Shared cookie jar bound to this engine. Same `Arc` is wired
+    /// into the `reqwest::Client` via
+    /// [`heso_engine_fetch::FetchEngine::cookie_jar`] when the host
+    /// constructs the engine via
+    /// [`Self::new_with_fetch_and_cookies`] / etc. (so HTTP
+    /// `Set-Cookie` responses populate it automatically) AND is
+    /// referenced by the JS-side `document.cookie` getter/setter
+    /// bridge installed in [`Self::new_inner`].
+    ///
+    /// Even on engines built without a fetch client we still keep a
+    /// (fresh, empty) jar here so `document.cookie =` from JS works
+    /// in isolation — write-then-read symmetry within a single page
+    /// session without HTTP involvement. Tests rely on this.
+    cookie_jar: Arc<CookieStoreMutex>,
 }
 
 /// Signature of the module resolver installed via
@@ -317,7 +333,7 @@ impl JsEngine {
     /// - `crypto.randomUUID()` — emits a v4-format UUID whose 16
     ///   underlying bytes come from the same stream.
     pub fn new_with_seed(seed: u64) -> Result<Self, EvalError> {
-        Self::new_inner(seed, None)
+        Self::new_inner(seed, None, None)
     }
 
     /// Create a fresh engine with the default seed (`0`) and the
@@ -342,7 +358,41 @@ impl JsEngine {
         client: Arc<reqwest::Client>,
         rt_handle: tokio::runtime::Handle,
     ) -> Result<Self, EvalError> {
-        Self::new_inner(0, Some(FetchMode::Live { client, rt_handle }))
+        Self::new_inner(0, Some(FetchMode::Live { client, rt_handle }), None)
+    }
+
+    /// Like [`Self::new_with_fetch`] but also accepts a shared cookie
+    /// jar — typically the one [`heso_engine_fetch::FetchEngine::cookie_jar`]
+    /// already handed to `reqwest::Client::cookie_provider`. Passing
+    /// the same `Arc` means JS `document.cookie` reads/writes operate
+    /// on the **identical store** reqwest's `Set-Cookie` ingestion +
+    /// `Cookie` request-header path uses. That single shared jar is
+    /// what closes the login-flow loop:
+    ///
+    /// 1. Server sends `Set-Cookie: session=abc` → reqwest writes it
+    ///    into the jar.
+    /// 2. JS reads `document.cookie` → sees `session=abc` (unless
+    ///    `HttpOnly`, in which case it stays in the jar but hidden
+    ///    from JS per WHATWG HTML §6.1).
+    /// 3. JS calls `document.cookie = 'pref=dark'` → bridge writes
+    ///    into the same jar.
+    /// 4. Next `fetch('/api')` → reqwest reads the jar and includes
+    ///    `Cookie: session=abc; pref=dark` automatically.
+    ///
+    /// If you don't have a shared jar — e.g. tests that build a
+    /// throwaway `reqwest::Client` directly — use
+    /// [`Self::new_with_fetch`] which creates an engine-local empty
+    /// jar (still functional for in-JS write-then-read flows).
+    pub fn new_with_fetch_and_cookies(
+        client: Arc<reqwest::Client>,
+        rt_handle: tokio::runtime::Handle,
+        cookie_jar: Arc<CookieStoreMutex>,
+    ) -> Result<Self, EvalError> {
+        Self::new_inner(
+            0,
+            Some(FetchMode::Live { client, rt_handle }),
+            Some(cookie_jar),
+        )
     }
 
     /// Like [`Self::new_with_fetch`] but also seeds the PRNG. When
@@ -364,7 +414,7 @@ impl JsEngine {
         // does, the cassette decides whether we route to the live
         // client or replay from disk; the public surface stays the
         // same.
-        Self::new_inner(seed, Some(FetchMode::DeterministicNoCassette))
+        Self::new_inner(seed, Some(FetchMode::DeterministicNoCassette), None)
     }
 
     /// Escape hatch: seeded PRNG + live fetch. Used by tests that
@@ -376,12 +426,23 @@ impl JsEngine {
         client: Arc<reqwest::Client>,
         rt_handle: tokio::runtime::Handle,
     ) -> Result<Self, EvalError> {
-        Self::new_inner(seed, Some(FetchMode::Live { client, rt_handle }))
+        Self::new_inner(seed, Some(FetchMode::Live { client, rt_handle }), None)
     }
 
     /// Internal constructor — the single place that wires up all
     /// globals so the public `new_*` variants don't drift.
-    fn new_inner(seed: u64, fetch_mode: Option<FetchMode>) -> Result<Self, EvalError> {
+    ///
+    /// `cookie_jar = None` makes the engine allocate a fresh, empty
+    /// `CookieStoreMutex` so `document.cookie =` from JS still works
+    /// in isolation (and persists across calls on the same engine).
+    /// Pass `Some(jar)` to share the same store with another caller
+    /// (typically [`heso_engine_fetch::FetchEngine::cookie_jar`] —
+    /// see [`Self::new_with_fetch_and_cookies`]).
+    fn new_inner(
+        seed: u64,
+        fetch_mode: Option<FetchMode>,
+        cookie_jar: Option<Arc<CookieStoreMutex>>,
+    ) -> Result<Self, EvalError> {
         let runtime = Runtime::new().map_err(|e| EvalError::Engine(e.to_string()))?;
         runtime.set_memory_limit(DEFAULT_MEMORY_LIMIT_BYTES);
         runtime.set_max_stack_size(DEFAULT_MAX_STACK_BYTES);
@@ -471,6 +532,21 @@ impl JsEngine {
         // `about:blank`; [`Self::set_base_url`] rewrites the fields
         // when the host navigates the engine to a real page.
         install_location(&context, None)?;
+
+        // Install the cookie bridge — `__hesoCookieGet()` and
+        // `__hesoCookieSet(spec)` — that `document.cookie` reads /
+        // writes thunk through. Wires the JS surface to the same
+        // `Arc<CookieStoreMutex>` `reqwest::Client::cookie_provider`
+        // is wired against when the host calls
+        // [`Self::new_with_fetch_and_cookies`]. With no shared jar
+        // supplied, we allocate a fresh empty one so JS-only
+        // write-then-read still works. MUST run after
+        // [`install_location`] because the bridge reads
+        // `globalThis.location.href` on every call to determine the
+        // cookie's origin (path / domain / secure scope per RFC 6265
+        // §5.3). See [`crate::cookies`].
+        let cookie_jar = cookie_jar.unwrap_or_else(|| Arc::new(CookieStoreMutex::default()));
+        install_cookie_bridge(&context, cookie_jar.clone())?;
 
         // Install `globalThis.history` + `PopStateEvent` + the
         // window-level `addEventListener` / `removeEventListener` /
@@ -634,7 +710,23 @@ impl JsEngine {
             module_cache,
             module_resolver,
             import_map,
+            cookie_jar,
         })
+    }
+
+    /// Borrow this engine's shared cookie jar. Same `Arc` the
+    /// `__hesoCookieGet` / `__hesoCookieSet` bridge writes to. When
+    /// the engine was built via [`Self::new_with_fetch_and_cookies`]
+    /// this is the *same* `Arc` `reqwest::Client::cookie_provider`
+    /// holds, so reading from it observes everything reqwest has
+    /// ingested via `Set-Cookie` responses too.
+    ///
+    /// Useful for tests that assert on the jar state without going
+    /// through JS, and for hosts that want to persist cookies across
+    /// process restarts (lock + serialize, drop on exit; reload on
+    /// next start).
+    pub fn cookie_jar(&self) -> Arc<CookieStoreMutex> {
+        self.cookie_jar.clone()
     }
 
     /// Set or clear the page URL used to resolve relative

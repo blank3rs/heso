@@ -925,7 +925,16 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         if seed != 0 {
             heso_engine_js::JsEngine::new_with_seed_and_fetch(seed, client, rt_handle)
         } else {
-            heso_engine_js::JsEngine::new_with_fetch(client, rt_handle)
+            // Share the *same* cookie jar reqwest's `cookie_provider`
+            // is wired against (see `FetchEngine::cookie_jar`). This is
+            // what makes `document.cookie` reads observe `Set-Cookie`
+            // responses AND makes JS `document.cookie = ...` writes
+            // travel on the next `fetch()` — login flows depend on it.
+            heso_engine_js::JsEngine::new_with_fetch_and_cookies(
+                client,
+                rt_handle,
+                fetch_engine.cookie_jar(),
+            )
         }
     } else {
         heso_engine_js::JsEngine::new_with_seed(seed)
@@ -1548,18 +1557,21 @@ async fn cmd_submit_inner(
 
     // Build a fetch-capable JS engine so the form submission can
     // actually go out over the wire (per PR-1). Share the same
-    // `reqwest::Client` as the static path so cookies / TLS / UA
-    // stay coherent — same wiring pattern as `cmd_eval_dom` uses
-    // for `--js-fetch`.
+    // `reqwest::Client` AND the same cookie jar as the static path
+    // so a server's `Set-Cookie` response on the page load is sent
+    // back on the form-submit `POST`, and any `document.cookie =`
+    // writes the page made before submission travel on the wire.
     let client = engine.client();
+    let cookie_jar = engine.cookie_jar();
     let rt_handle = tokio::runtime::Handle::current();
-    let js_engine = match heso_engine_js::JsEngine::new_with_fetch(client, rt_handle) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to create JS engine: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let js_engine =
+        match heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to create JS engine: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     // Open the page in a stateful session so the post-submit
     // navigation lands somewhere observable. `--seed` / determinism

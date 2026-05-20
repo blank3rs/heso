@@ -90,6 +90,7 @@ use std::sync::Arc;
 use heso_core::{Result as HesoResult, Url};
 use heso_engine_api::{EngineApi, Page};
 use reqwest::Client;
+use reqwest_cookie_store::CookieStoreMutex;
 use scraper::{ElementRef as ScraperElementRef, Html, Node};
 
 // ============================================================================
@@ -119,23 +120,45 @@ impl From<Error> for heso_core::Error {
 // ============================================================================
 
 /// A pure-Rust HTTP+HTML browser engine. Holds a shared `reqwest::Client`
-/// (which itself owns a connection pool) — clone-cheap, `Send + Sync`.
+/// (which itself owns a connection pool) plus the shared cookie jar
+/// `reqwest` writes Set-Cookie responses into and reads Cookie requests
+/// out of — clone-cheap, `Send + Sync`.
 #[derive(Debug, Clone)]
 pub struct FetchEngine {
     client: Client,
+    /// Shared cookie jar. Same `Arc` is handed to `reqwest` via
+    /// `ClientBuilder::cookie_provider` (the source of truth for
+    /// `Set-Cookie` ingestion + `Cookie` header outgoing) **and**
+    /// exposed via [`Self::cookie_jar`] so `heso-engine-js` can install
+    /// the `document.cookie` getter/setter bridge against the same
+    /// store. RFC 6265 parsing + path/domain matching lives inside
+    /// `cookie_store::CookieStore`.
+    cookie_jar: Arc<CookieStoreMutex>,
 }
 
 impl FetchEngine {
     /// Construct a new engine with sensible defaults: rustls TLS, gzip +
     /// brotli decoding, HTTP/2, follows up to 20 redirects, identifies as
-    /// `heso/<version>`.
+    /// `heso/<version>`, and a fresh empty cookie jar wired into the
+    /// `reqwest::Client` via `cookie_provider`. Cookies persist for the
+    /// lifetime of this `FetchEngine` (and any clone — `Arc` semantics).
     pub fn new() -> HesoResult<Self> {
+        let cookie_jar = Arc::new(CookieStoreMutex::default());
         let client = Client::builder()
             .user_agent(concat!("heso/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::limited(20))
+            // Hand the shared jar to reqwest. Per `reqwest` docs:
+            // calling `cookie_provider(my_store)` is the spec-compliant
+            // alternative to `cookie_store(true)` — Set-Cookie response
+            // headers go INTO `my_store`, outgoing requests pull Cookie
+            // headers OUT of it. The jar is `Arc<CookieStoreMutex>`
+            // shared with [`Self::cookie_jar`] so any other caller
+            // (e.g. `heso-engine-js`'s `document.cookie` bridge) sees
+            // the exact same store.
+            .cookie_provider(cookie_jar.clone())
             .build()
             .map_err(Error::from)?;
-        Ok(Self { client })
+        Ok(Self { client, cookie_jar })
     }
 
     /// Access the underlying [`reqwest::Client`]. Used by the [`explore`]
@@ -162,6 +185,24 @@ impl FetchEngine {
     /// signatures), not for cheaper cloning.
     pub fn client(&self) -> Arc<reqwest::Client> {
         Arc::new(self.client.clone())
+    }
+
+    /// A clone of the shared cookie jar. Same `Arc` reqwest writes
+    /// `Set-Cookie` responses into and reads `Cookie` request headers
+    /// out of — handing the same clone to
+    /// `heso_engine_js::JsEngine::new_with_fetch_and_cookies` makes JS
+    /// `document.cookie` reads/writes operate on the exact same store,
+    /// which is what closes the login-flow loop (server sets cookie →
+    /// next fetch sends it; JS sets cookie → next reqwest call sends
+    /// it; reqwest receives cookie → next `document.cookie` read sees
+    /// it).
+    ///
+    /// The jar lives behind `CookieStoreMutex` so concurrent access
+    /// from background tasks (e.g. `open_with_explore`'s per-link
+    /// fetches) is safe. Locking is short-lived inside the
+    /// `CookieStore` trait impl `reqwest` calls into.
+    pub fn cookie_jar(&self) -> Arc<CookieStoreMutex> {
+        self.cookie_jar.clone()
     }
 
     /// Open a URL with optional link-graph cartography per

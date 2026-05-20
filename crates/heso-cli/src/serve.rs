@@ -864,20 +864,29 @@ async fn dispatch_navigate(
 
 /// Lazily construct the [`JsSession`] inside `record` if it hasn't
 /// been built yet. The session reuses the server's shared
-/// `reqwest::Client` (cookies, TLS, UA stay coherent with the static
-/// fetch path) and the current tokio runtime handle (so JS-issued
-/// `fetch()` calls work).
+/// `reqwest::Client` AND its shared cookie jar (so `Set-Cookie`
+/// responses landed by the original page fetch / by any `navigate`
+/// call are visible to subsequent `fetch` / `navigate` calls AND to
+/// JS `document.cookie` reads) plus the current tokio runtime handle
+/// (so JS-issued `fetch()` calls work).
+///
+/// Sharing the cookie jar is what makes login flows work end-to-end:
+/// `open https://app.com/login` → `submit ref=@e3` (server sends
+/// `Set-Cookie: session=abc`) → `navigate /dashboard` carries the
+/// `session=abc` Cookie header → server returns the auth-gated page.
 ///
 /// Idempotent — calling on a record that already has a session is a
-/// no-op. Errors propagate from `JsEngine::new_with_fetch` or the
-/// initial inline-script pump.
+/// no-op. Errors propagate from
+/// `JsEngine::new_with_fetch_and_cookies` or the initial
+/// inline-script pump.
 fn ensure_session(engine: &FetchEngine, record: &mut PageRecord) -> Result<(), String> {
     if record.session.is_some() {
         return Ok(());
     }
     let client = engine.client();
+    let cookie_jar = engine.cookie_jar();
     let rt_handle = tokio::runtime::Handle::current();
-    let js_engine = JsEngine::new_with_fetch(client, rt_handle)
+    let js_engine = JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar)
         .map_err(|e| format!("failed to create JS engine: {e}"))?;
     // Use the same script policy as `JsSession::open` so inline
     // `<script>` tags run on first attach. Subsequent write verbs see

@@ -436,25 +436,29 @@ fn document_active_element_is_body() {
 }
 
 #[test]
-fn document_cookie_getter_is_empty_string() {
+fn document_cookie_getter_is_empty_when_no_cookies_set() {
+    // With the real cookie jar wired in, the getter returns "" only
+    // when no cookies match the current document URL — not as a stub
+    // value. Without a `location.href`, the bridge has no URL to
+    // scope against and also returns "". Use a session to give the
+    // engine a real URL.
     let html = "<html><body></body></html>";
-    let out = engine()
-        .eval_with_html(html, "document.cookie")
-        .expect("eval");
+    let (session, _) = JsSession::open(html, u()).expect("open");
+    let out = session.eval("document.cookie").expect("eval");
     assert_eq!(out.value, "");
 }
 
 #[test]
-fn document_cookie_setter_does_not_throw() {
+fn document_cookie_setter_roundtrips_within_session() {
+    // Setting `document.cookie = 'name=value'` writes into the
+    // engine's cookie jar; the next `document.cookie` read sees it
+    // back. End-to-end HTTP-driven cases live in `tests/cookies.rs`.
     let html = "<html><body></body></html>";
-    let out = engine()
-        .eval_with_html(
-            html,
-            "document.cookie = 'session=abc; Path=/'; document.cookie",
-        )
+    let (session, _) = JsSession::open(html, u()).expect("open");
+    let out = session
+        .eval("document.cookie = 'session=abc; Path=/'; document.cookie")
         .expect("eval");
-    // Still empty after the no-op setter.
-    assert_eq!(out.value, "");
+    assert_eq!(out.value, "session=abc");
 }
 
 #[test]

@@ -55,6 +55,13 @@ rand_chacha = "0.3"
 # boundary + part headers. See `src/form_submit.rs`.
 reqwest = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
+# Shared cookie jar (item: `document.cookie` real wiring). Both crates
+# come from the workspace so the type that `FetchEngine` puts into
+# `reqwest::Client::cookie_provider` is identical to the one
+# `crate::cookies` reads from when JS calls `document.cookie`. See
+# `crates/heso-engine-js/src/cookies.rs` for the bridge.
+cookie_store.workspace = true
+reqwest_cookie_store.workspace = true
 # Session URL tracking (`crate::session::JsSession`): the page session
 # owns its current URL so navigation across steps is observable on the
 # Rust side. Matches the rest of the workspace's `url = 2`.

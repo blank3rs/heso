@@ -22,6 +22,12 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
+# Shared cookie jar — wired into the engine's `reqwest::Client` via
+# `ClientBuilder::cookie_provider` so every Set-Cookie response header
+# automatically populates the same jar that `heso-engine-js` exposes
+# to JS as `document.cookie`. See `FetchEngine::cookie_jar`.
+cookie_store.workspace = true
+reqwest_cookie_store.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

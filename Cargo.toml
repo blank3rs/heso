@@ -32,7 +32,19 @@ serde_json = "1"
 url = { version = "2", features = ["serde"] }
 tracing = "0.1"
 blake3 = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "http2", "cookies"] }
+# Shared, spec-compliant cookie jar wired into reqwest via the
+# `cookies` feature. `cookie_store` owns the RFC 6265 parser + the
+# path/domain/secure matching rules; `reqwest_cookie_store` is the
+# thin adapter that lets us hand the same store to `reqwest`'s
+# `ClientBuilder::cookie_provider` AND keep a Rust-side handle to
+# read/write cookies from JS (the `document.cookie` bridge in
+# `heso-engine-js::cookies`). Both crates pin to versions that
+# match `reqwest 0.12`'s cookie integration — `reqwest_cookie_store`
+# 0.8 wires `cookie_store ^0.21` into `reqwest ^0.12`'s
+# `cookie_provider` (its 0.10 line targets reqwest 0.13).
+cookie_store = "0.21"
+reqwest_cookie_store = "0.8"
 # `scraper`'s default feature set enables `getopts` via the `main`
 # feature, which is only used by scraper's own bundled CLI binary.
 # Pruning to `errors` keeps the public API we use and drops one

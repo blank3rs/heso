@@ -1113,30 +1113,66 @@ impl Document {
             .map(|n| Element::from_id(self.doc.clone(), n.id))
     }
 
-    /// `document.cookie` getter — always `""`.
+    /// `document.cookie` getter (WHATWG HTML §6.1).
     ///
-    /// Real cookie wiring is bigger than this batch: it needs to
-    /// route through the same cookie jar `heso-engine-fetch` uses for
-    /// HTTP requests, with respect for SameSite / Secure / HttpOnly
-    /// flags. For now, returning empty string keeps cookie-reading
-    /// init code from crashing while it waits for real cookies; pages
-    /// that gate behavior on a specific cookie will fall to their
-    /// default branch.
+    /// Returns the `;`-joined `name=value` cookie string for the
+    /// current document URL, filtered by RFC 6265 §5.4 path/domain/
+    /// secure matching AND excluding any cookie whose `HttpOnly`
+    /// attribute is set (per spec — HttpOnly cookies are not exposed
+    /// to client-side scripts). Empty string when no cookies match.
+    ///
+    /// The actual jar access happens inside the Rust closure
+    /// installed as `globalThis.__hesoCookieGet` (see
+    /// [`crate::cookies::install_cookie_bridge`]). We thunk through
+    /// a JS global rather than holding the jar on the [`Document`]
+    /// because a `#[rquickjs::class]` method closure can capture
+    /// `Ctx<'js>` but not engine-level Rust state — same pattern
+    /// `__hesoFormSubmitNow` / `__hesoCurrentScript` use for the
+    /// same reason. Returns `""` when the bridge is not installed
+    /// (e.g. tests that construct a bare `Document` outside an
+    /// engine context).
     #[qjs(get)]
-    fn cookie(&self) -> &'static str {
-        ""
+    fn cookie<'js>(&self, ctx: Ctx<'js>) -> String {
+        let bridge: Option<Function<'js>> = ctx
+            .globals()
+            .get::<_, Option<Function<'js>>>(crate::cookies::GETTER_GLOBAL)
+            .ok()
+            .flatten();
+        match bridge {
+            Some(f) => f.call::<(), String>(()).unwrap_or_default(),
+            None => String::new(),
+        }
     }
 
-    /// `document.cookie = value` setter — no-op.
+    /// `document.cookie = value` setter (WHATWG HTML §6.1).
     ///
-    /// Same rationale as the getter: real cookies aren't wired yet.
-    /// Silent no-op (rather than throw) so analytics / consent
-    /// libraries that set tracking cookies during init don't crash.
-    /// A future cookie-jar agent will replace this with the real
-    /// thing.
+    /// Parses `value` as a Set-Cookie string (RFC 6265 §4.1 — handles
+    /// `Max-Age`, `Expires`, `Path=`, `Domain=`, `Secure`, `HttpOnly`,
+    /// `SameSite=Lax|Strict|None` via `cookie_store::CookieStore::parse`)
+    /// and inserts it into the shared jar as if it arrived from a
+    /// response to the current document URL. The next outgoing
+    /// `fetch(...)` / form submission picks it up automatically
+    /// because both paths share the same jar via
+    /// `reqwest::Client::cookie_provider`.
+    ///
+    /// A malformed cookie string is silently ignored, matching the
+    /// IDL's void return type (per spec there's no place to surface
+    /// a parse error). Setting from an `about:blank` page is a
+    /// silent no-op — there is no host to scope the cookie to.
+    ///
+    /// Thunks through `globalThis.__hesoCookieSet` (the bridge
+    /// installed in [`crate::cookies::install_cookie_bridge`]) for
+    /// the same reason the getter does.
     #[qjs(set, rename = "cookie")]
-    fn set_cookie(&self, _value: String) {
-        // intentional no-op — see getter doc.
+    fn set_cookie<'js>(&self, ctx: Ctx<'js>, value: String) {
+        let bridge: Option<Function<'js>> = ctx
+            .globals()
+            .get::<_, Option<Function<'js>>>(crate::cookies::SETTER_GLOBAL)
+            .ok()
+            .flatten();
+        if let Some(f) = bridge {
+            let _ = f.call::<(String,), ()>((value,));
+        }
     }
 
     /// `document.contains(other)` — true if `other` is the document
