@@ -13,7 +13,7 @@ batch        ~1.1 s   for 8 URLs in parallel
 
 ![heso agent demo](demo/demo.gif)
 
-That's a real recording — Claude Code (running `claude -p` from the repo root) loads `skills/heso/SKILL.md`, calls `heso search`, picks three results, and writes a summary. The script that produced it lives at [`demo/agent.py`](demo/agent.py); the raw recording is [`demo/demo.cast`](demo/demo.cast) (asciinema v2, replayable).
+That's a real recording — Claude Code (`claude -p` from the repo root, with the heso skill loaded) discovering the verbs, navigating the page tree, and pulling the live top story off Hacker News. No edits, no replays.
 
 ## A note before you read further
 
@@ -147,8 +147,6 @@ description: Use the heso headless browser (one Rust binary, no Chromium, no Nod
 
 The verbs are the contract. Same shape works in any harness that does tool or skill markdown.
 
-The Python demo in [`demo/agent.py`](demo/agent.py) is a small Claude-with-tool-use agent that points at exactly these verbs and answers questions like "find me three rust web scraping libraries and summarize them" by running real `heso` calls.
-
 ## Stats
 
 Measured on Windows 11, AMD x86_64, with the release binary:
@@ -161,7 +159,7 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
 | Search (DDG, 5 results) | ~1 s |
 
-No comparisons to other tools in this README — different tools have different tradeoffs and "X is faster than Y" framing rarely survives contact with a real workload. If you want to compare for your case, the [`bench/`](bench/) directory has a Playwright sidecar and a jsdom sidecar that run against the same target list.
+No comparisons to other tools — different tools have different tradeoffs and "X is faster than Y" framing rarely survives contact with a real workload.
 
 ## Status
 
@@ -174,7 +172,7 @@ MIT or Apache-2.0, your choice.
 ## Try it
 
 ```sh
-git clone https://github.com/Akshay-Dongare/heso
+git clone https://github.com/blank3rs/heso
 cd heso
 cargo build --release -p heso-cli
 ./target/release/heso search "rust web scraping" --limit 5
