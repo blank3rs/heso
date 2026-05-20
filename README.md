@@ -11,20 +11,24 @@ Most of this codebase was written with help from Claude under one person's direc
 - Fetching pages, following redirects, cookies.
 - HTML parsing.
 - JavaScript via QuickJS, with a DOM the engine implements directly.
-- `click`, `fill`, `submit`, `eval`, `navigate` — both as CLI verbs and over JSON-RPC for multi-step sessions.
-- Stateful sessions where DOM mutations and event listeners stick around between calls.
+- `open`, `read`, `wait`, `click`, `fill`, `submit`, `eval`, `navigate`, `serve` — CLI verbs plus JSON-RPC for multi-step sessions.
+- `heso read <url>` returns the page in one call: title, visible text, actionable elements, forms, cookies, console output, framework detection. One call, not five.
+- `heso wait <url> --selector-exists "..."` (also `--text-contains`, `--url-matches`, `--network-idle`, `--time`) blocks until a condition is met. No polling loop.
+- Stateful sessions where DOM mutations, listeners, and form state persist across calls.
+- Real cookie jar shared between the HTTP layer and JS `document.cookie`. Login flows work — `Set-Cookie` on response → next `fetch()` sends it → `document.cookie` reflects it.
 - Optional reproducibility: seed the random number generator, freeze the clock, and the same page processed the same way produces the same hash.
+- Spec-correct events: `KeyboardEvent` / `InputEvent` / `MouseEvent` / `FocusEvent` constructors with full options. `heso fill` dispatches the focus → keydown → beforeinput → input → keyup → change cascade. `heso click` does mousedown → mouseup → click.
 - Common modern JS surface: `fetch`, `URLSearchParams`, `history.pushState`, `Blob`/`File`/`FormData`, multipart upload.
 - ES modules: `<script type="module">`, dynamic `import()`, import maps. Shared cache between the static and dynamic paths.
-- Web Components: `customElements.define`, `HTMLElement` as a base class, `connectedCallback`/`disconnectedCallback`/`attributeChangedCallback` lifecycle, `HTMLTemplateElement`, `attachShadow`, `ShadowRoot`, `<slot>` with `assignedElements`. Late-upgrade re-prototyping works — elements pre-rendered in HTML get the right class when JS defines them later. `element.dataset` and `insertAdjacentHTML` also there.
-- Next.js / Turbopack-bundled sites: `nextjs.org`, `stripe.com`, `supabase.com`, `posthog.com`, `ui.shadcn.com` all hydrate (title + h1 + body content). `document.currentScript` is what unblocked the Turbopack chunk loader.
+- Web Components: `customElements.define`, `HTMLElement` as a base class, `connectedCallback`/`disconnectedCallback`/`attributeChangedCallback` lifecycle, `HTMLTemplateElement`, `attachShadow`, `ShadowRoot`, `<slot>` with `assignedElements`. Late-upgrade re-prototyping works.
+- Modern site coverage: `nextjs.org`, `vercel.com`, `stripe.com`, `supabase.com`, `posthog.com`, `bun.sh`, `astro.build`, `ui.shadcn.com`, `lit.dev/playground`, `hono.dev`, `linear.app` all hydrate (title + h1 + body content). Turbopack + RSC + heap headroom + the QuickJS iterator-helper crash workaround add up here.
 
 ## What doesn't
 
 - No rendering. No canvas, WebGL, CSS layout, or video. If your agent needs pixels, use a real browser.
-- React Server Components hydration: pages that inline `<script>$RC(...)</script>` placeholders (newer Next.js, parts of Shopify) throw `$RC is not defined`. Not currently shimmed.
-- Some sites still partial. `vercel.com` extracts content then trips an rquickjs refcount assertion. `linear.app` titles work but a script `throw null` flakes ~half of probes. `astro.build` aborts on engine teardown with a QuickJS GC assertion.
-- Sites whose inline scripts assume a window global was set by a sibling script that didn't get to run (Shoelace's `window.lunr`, various analytics shapes). Each is its own small polyfill.
+- Sites that depend on a sibling script having already set a global the next script reads. `shoelace.style` is the canonical case — its bundle dies on `window.lunr` not being defined yet. Each cascade is its own small polyfill and they're not all shimmed.
+- Lazy-loaded content: `IntersectionObserver` and `MutationObserver` are noop constructors. Anything that defers rendering on visibility (infinite scroll, deferred images, observer-driven hydration) doesn't fire.
+- SVG namespace handling is incomplete; sites that touch SVG via JS may break.
 - Compatibility breadth is well behind jsdom. jsdom has had years to handle weird real-world JavaScript. This is early.
 
 ## Demo
@@ -58,6 +62,14 @@ You get a JSON summary of the page: title, description, a tree of headings, and 
 
 ## Examples
 
+Read everything about a page in one call:
+
+```sh
+heso read --js-fetch https://nextjs.org/
+# → { "title": "...", "text": "...", "actions": [...], "forms": [...],
+#     "cookies": [...], "console": [...], "framework": "next.js", ... }
+```
+
 Read structured data:
 
 ```sh
@@ -89,10 +101,27 @@ heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241, every time
 
 The same seed makes `Math.random`, `crypto.getRandomValues`, `crypto.randomUUID`, `Date.now`, and `setTimeout` produce the same output across machines.
 
+Wait for a condition (no polling loop):
+
+```sh
+heso wait --js-fetch https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
+```
+
 Multi-step session over stdio:
 
 ```sh
 heso serve   # JSON-RPC; DOM persists across calls
+```
+
+Login flow end-to-end (real cookie jar carries the session):
+
+```sh
+# In a heso serve JSON-RPC session:
+# 1. navigate to /login
+# 2. fill user + pass
+# 3. submit
+# 4. wait for url-matches "/dashboard"
+# 5. read everything on the dashboard
 ```
 
 ## Speed

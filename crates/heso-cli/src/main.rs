@@ -1133,7 +1133,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         js_engine,
         &page.body_html,
         page.url().clone(),
-        heso_engine_js::ScriptFetchPolicy::default(),
+        heso_engine_js::ScriptFetchPolicy::Fetch,
     ) {
         Ok(pair) => pair,
         Err(e) => {
