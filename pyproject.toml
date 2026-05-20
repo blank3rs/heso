@@ -1,0 +1,54 @@
+# Maturin config for PyPI distribution of the heso CLI.
+#
+# This file lives at the workspace root so `maturin build` finds it,
+# but it only describes the PyPI wheel — the Rust workspace itself is
+# still driven by Cargo. The wheel is a binary-only ("bindings = bin")
+# wheel: maturin compiles the `heso` binary from crates/heso-cli and
+# embeds it in the wheel's `scripts/` dir so `pip install heso` puts
+# `heso` on PATH inside the active venv. No Python source.
+#
+# Same pattern as ruff (astral-sh/ruff), uv, deno (sort of), etc.
+# Pinned reference: https://www.maturin.rs/bindings#binary
+#
+# The version comes from crates/heso-cli/Cargo.toml (via the workspace
+# version in the root Cargo.toml). Bumping the workspace version is
+# the single edit needed before a release; this file never moves.
+
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "heso"
+description = "The agent-native web engine. No Chromium. No Node. One Rust binary."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT OR Apache-2.0" }
+keywords = ["headless-browser", "agent", "ai", "web-scraping", "automation"]
+authors = [{ name = "Akshay and heso contributors" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+    "Topic :: Software Development :: Libraries",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/blank3rs/heso"
+Repository = "https://github.com/blank3rs/heso"
+Issues = "https://github.com/blank3rs/heso/issues"
+
+[tool.maturin]
+# `bindings = "bin"` tells maturin to produce a wheel that ships the
+# compiled Rust binary as a `scripts/heso` entry. No Python module.
+bindings = "bin"
+# Compile the `heso` binary out of the heso-cli crate. maturin resolves
+# this path relative to the directory containing pyproject.toml.
+manifest-path = "crates/heso-cli/Cargo.toml"
+# Strip debug symbols — release profile already does this, but maturin
+# re-strips after copying so the wheel is as small as possible.
+strip = true

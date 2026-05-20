@@ -1,0 +1,36 @@
+{
+  "name": "@ixla/heso",
+  "version": "0.0.1",
+  "description": "The agent-native web engine. No Chromium. No Node. One Rust binary.",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/blank3rs/heso",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blank3rs/heso.git"
+  },
+  "bugs": {
+    "url": "https://github.com/blank3rs/heso/issues"
+  },
+  "keywords": [
+    "headless-browser",
+    "agent",
+    "ai",
+    "web-scraping",
+    "automation"
+  ],
+  "main": "index.js",
+  "bin": {
+    "heso": "bin/heso.js"
+  },
+  "files": [
+    "index.js",
+    "bin/heso.js",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@ixla/heso-win32-x64": "0.0.1"
+  },
+  "engines": {
+    "node": ">=14"
+  }
+}

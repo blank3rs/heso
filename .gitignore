@@ -57,9 +57,16 @@ heso-local-data/
 /research/
 /skills/
 /docs/
-/scripts/
 /state.json
 /state.schema.json
+
+# Release pipeline lives at /scripts/. The committed surface is the
+# template + README; the filled-in script (with tokens) is local-only.
+/scripts/release.ps1
+/scripts/*.local.*
+
+# Release scratch — fresh per release run.
+/dist/
 
 # Agent-process scratch — testing reports, regression dumps, scratch
 # JSON outputs from running heso against fixtures. Keep them on disk
