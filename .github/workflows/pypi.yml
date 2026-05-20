@@ -301,18 +301,29 @@ jobs:
 
   # ----------------------------------------------------------------------
   # 3. Publish all wheels to PyPI in a single job (one twine upload,
-  #    one OIDC token exchange). Trusted Publishers: no API token in
-  #    repo secrets; PyPI verifies the workflow identity by OIDC.
+  #    one OIDC token exchange).
   #
-  #    To bootstrap this, the PyPI side needs:
-  #      - PyPI project: "heso" (already exists from v0.0.1).
-  #      - Add a Trusted Publisher with:
-  #          owner: blank3rs
-  #          repo: heso
-  #          workflow filename: pypi.yml
-  #          environment name: pypi
-  #    Until then, set PYPI_API_TOKEN as a repo secret and uncomment
-  #    the password line below; comment out the OIDC publish step.
+  #    Defaults to PyPI Trusted Publishers (OIDC, no token in secrets).
+  #    If the `PYPI_API_TOKEN` repo secret is set, the workflow uses
+  #    that as a fallback automatically. Useful when:
+  #      - the Trusted Publisher config on PyPI isn't quite right yet
+  #        (it has to be on the existing project's settings page at
+  #        https://pypi.org/manage/project/heso/settings/publishing/,
+  #        NOT the pending-publisher form, because the project already
+  #        exists)
+  #      - the workflow filename or environment name on the PyPI form
+  #        doesn't match this file exactly
+  #      - you want a deterministic publish path that doesn't depend
+  #        on OIDC configuration
+  #
+  #    To use Trusted Publishers, on the PyPI project settings page add:
+  #      owner: blank3rs
+  #      repo: heso
+  #      workflow filename: pypi.yml
+  #      environment name: pypi
+  #
+  #    skip-existing: true makes re-runs of a tagged publish idempotent
+  #    -- already-uploaded wheels are skipped rather than failing.
   # ----------------------------------------------------------------------
   publish-pypi:
     name: Publish to PyPI
@@ -334,16 +345,15 @@ jobs:
         run: ls -la dist/
         shell: bash
 
-      # The PyPA action is the canonical OIDC path. It auto-exchanges
-      # the GitHub Actions OIDC token for a PyPI upload token, no
-      # secrets needed.
-      - name: Publish to PyPI (Trusted Publishers)
+      # If a PYPI_API_TOKEN secret exists, use it (deterministic path).
+      # Otherwise rely on the PyPI Trusted Publisher OIDC exchange.
+      # The pypa action picks the right auth based on whether
+      # `password` is set.
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
-          # Fallback while OIDC isn't fully configured: uncomment and
-          # set PYPI_API_TOKEN in repo secrets.
-          # password: ${{ secrets.PYPI_API_TOKEN }}
+          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
 
   # ----------------------------------------------------------------------
@@ -398,16 +408,44 @@ jobs:
           ls -la npm/platforms/
         shell: bash
 
+      # Idempotent across re-runs: npm publish returns HTTP 403 with
+      # "You cannot publish over the previously published versions"
+      # when a version already exists. Treat that as a skip, not a
+      # fatal error. Any OTHER failure (auth, network, validation,
+      # E402 payment-required, etc.) still aborts the job.
+      #
+      # v0.0.2 surfaced this: an earlier attempt published some
+      # platform packages, then a fix landed and re-triggered the
+      # workflow; the second run hit the 403 on the already-published
+      # platforms and exited, never reaching publish-npm-meta.
       - name: Publish each platform package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -e
+          published=0
+          skipped=0
           for dir in npm/platforms/*/; do
-            echo "::group::Publishing $dir"
-            (cd "$dir" && cat package.json && npm publish --access=public)
+            name=$(node -e "console.log(require('./${dir}package.json').name)")
+            version=$(node -e "console.log(require('./${dir}package.json').version)")
+            echo "::group::Publishing $name@$version (from $dir)"
+            log=$(cd "$dir" && npm publish --access=public 2>&1) || rc=$?
+            rc=${rc:-0}
+            echo "$log"
+            if [ $rc -eq 0 ]; then
+              published=$((published + 1))
+            elif echo "$log" | grep -qE "previously published versions|cannot publish over"; then
+              echo "  (already published at $version - skipping, not a failure)"
+              skipped=$((skipped + 1))
+              rc=0
+            else
+              echo "::error::npm publish failed for $name@$version (exit $rc)"
+              exit $rc
+            fi
+            unset rc
             echo "::endgroup::"
           done
+          echo "summary: published=$published, skipped=$skipped"
         shell: bash
 
   # ----------------------------------------------------------------------
@@ -458,10 +496,24 @@ jobs:
           "
         shell: bash
 
+      # Same idempotency contract as the platform-packages step above:
+      # if the meta version is already on the registry, that's a skip,
+      # not a fatal error. Lets us re-run a partially-failed tag without
+      # bumping the version each time.
       - name: Publish meta package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           cd npm/heso
-          npm publish --access=public
+          log=$(npm publish --access=public 2>&1) || rc=$?
+          rc=${rc:-0}
+          echo "$log"
+          if [ $rc -eq 0 ]; then
+            echo "  published @ixla/heso"
+          elif echo "$log" | grep -qE "previously published versions|cannot publish over"; then
+            echo "  (meta already published at this version - skipping, not a failure)"
+          else
+            echo "::error::npm publish failed for @ixla/heso (exit $rc)"
+            exit $rc
+          fi
         shell: bash
