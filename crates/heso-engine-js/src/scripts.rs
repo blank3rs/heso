@@ -78,7 +78,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rquickjs::{CatchResultExt, CaughtError, Context, Module, Value};
+use rquickjs::{CatchResultExt, CaughtError, Context, Function, Module, Value};
 
 use crate::engine::{ConsoleEntry, ConsoleLevel, EvalError};
 use crate::import_map::parse_import_map;
@@ -1005,7 +1005,9 @@ fn eval_one(context: &Context, source: &str) -> Result<Option<String>, EvalError
                 };
                 Ok(Some(format_script_error(&msg, exc.stack())))
             }
-            Err(CaughtError::Value(_)) => Ok(Some("<script threw non-error value>".to_owned())),
+            Err(CaughtError::Value(v)) => {
+                Ok(Some(format_non_error_throw(&ctx, &v, "script")))
+            },
             Err(CaughtError::Error(e)) => {
                 // Genuine engine error (OOM, alloc failure) — abort
                 // the pump. The console-error-and-continue rule is
@@ -1057,10 +1059,194 @@ fn eval_one_module(
                 };
                 Ok(Some(format_script_error(&msg, exc.stack())))
             }
-            Err(CaughtError::Value(_)) => Ok(Some("<module threw non-error value>".to_owned())),
+            Err(CaughtError::Value(v)) => Ok(Some(format_non_error_throw(&ctx, &v, "module"))),
             Err(CaughtError::Error(e)) => Err(EvalError::Engine(format!("module eval: {e}"))),
         }
     })
+}
+
+/// Format a non-`Error` thrown value into a readable diagnostic
+/// string.
+///
+/// JavaScript lets `throw` accept any value — `throw 42`, `throw "oops"`,
+/// `throw {code: ENOTFOUND}`, `throw Symbol("BAILOUT")`, `throw null`,
+/// even `throw Promise.resolve(x)` (the React-Suspense pattern). The
+/// rquickjs `CaughtError::Value(v)` arm hands us the raw [`Value`]
+/// that was thrown. Without coercion the only thing the engine can
+/// report is "non-error value," which makes diagnosing a page bug
+/// impossible — a real-agent V8 run flagged this on three Next.js
+/// chunks (supabase, stripe, posthog) where the actual throw turned
+/// out to be `null` (presumably from a webpack module-init pattern).
+///
+/// We surface the type and a structural summary:
+///
+/// - `null` / `undefined` — literal text "null" / "undefined".
+/// - Boolean / Number / BigInt — `String(value)` coercion (`true`,
+///   `42`, `9007199254740993n`).
+/// - String — quoted via `JSON.stringify` so embedded newlines /
+///   quotes stay visible. Truncated to ~200 chars with an ellipsis
+///   marker so a page that throws a megabyte of HTML doesn't spam
+///   the console buffer.
+/// - Symbol — `String(sym)` returns `"Symbol(description)"` which is
+///   exactly what a debugger would show; this is the form
+///   frameworks rely on for sentinels like `Symbol(BAILOUT_TO_CSR)`.
+/// - Promise — `[object Promise]` plus a hint that this is the
+///   React-Suspense bailout pattern (page code that throws a
+///   Promise expects the surrounding `<Suspense>` to catch it; we
+///   don't have a Suspense boundary at the top level, so the throw
+///   escapes).
+/// - Plain Object / Array — `JSON.stringify`, falling back to
+///   `Object.prototype.toString.call(v)` when stringify rejects
+///   (cycles, BigInt fields, custom toJSON throwing).
+/// - Function / Class — `[Function: name]` / `[Function: anonymous]`,
+///   matching Node.js's inspect format.
+///
+/// All extraction goes through best-effort `Function::call` /
+/// `ctx.eval`. If any helper itself throws (extremely unlikely — these
+/// are built-ins) the fallback is a clearly-marked diagnostic message
+/// rather than panic.
+///
+/// `source_label` is `"script"` or `"module"` — picked to match the
+/// historical `<script threw non-error value>` /
+/// `<module threw non-error value>` prefix so existing log scrapers
+/// keep parsing.
+fn format_non_error_throw<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    v: &Value<'js>,
+    source_label: &str,
+) -> String {
+    let summary = describe_thrown_value(ctx, v);
+    format!("<{source_label} threw non-Error value: {summary}>")
+}
+
+/// Internal: produce the structural summary used by
+/// [`format_non_error_throw`]. Split out so tests can exercise the
+/// describe step against synthetic throws without round-tripping
+/// through the full pump.
+fn describe_thrown_value<'js>(ctx: &rquickjs::Ctx<'js>, v: &Value<'js>) -> String {
+    // Primitive shortcuts — JSON.stringify / String() round-trips
+    // for these are wasteful and (for null/undefined) ambiguous.
+    if v.is_null() {
+        return "null".to_owned();
+    }
+    if v.is_undefined() {
+        return "undefined".to_owned();
+    }
+    if let Some(b) = v.as_bool() {
+        return b.to_string();
+    }
+    if let Some(i) = v.as_int() {
+        return i.to_string();
+    }
+    if let Some(f) = v.as_float() {
+        return f.to_string();
+    }
+    if v.is_big_int() {
+        // BigInt → String(n) gives the digit form with the `n`
+        // suffix elided; matches what `console.log(1n)` prints.
+        return coerce_to_string(ctx, v).unwrap_or_else(|| "<bigint>".to_owned()) + "n";
+    }
+    if let Some(s) = v.as_string() {
+        // Quote via JSON.stringify so embedded \n, \t, quotes stay
+        // readable. Truncate to keep one-line console entries small.
+        let raw = s.to_string().unwrap_or_default();
+        let truncated = truncate_for_display(&raw, 200);
+        return serde_json::Value::String(truncated).to_string();
+    }
+    if v.is_symbol() {
+        // `String(Symbol("BAILOUT"))` → `"Symbol(BAILOUT)"`.
+        return coerce_to_string(ctx, v).unwrap_or_else(|| "Symbol(?)".to_owned());
+    }
+    if v.is_promise() {
+        // React Suspense throws a Promise (a thenable) to signal
+        // "render this client-side" / "wait for me." Without a
+        // surrounding `<Suspense>` (we don't render Suspense
+        // boundaries server-side), the throw escapes to the script
+        // pump as a bare non-Error throw. Call out the pattern so
+        // debugging users don't chase a phantom error.
+        return "Promise (React Suspense bailout?)".to_owned();
+    }
+    if v.is_function() {
+        // [Function: name] or [Function: anonymous] — matches
+        // Node.js's util.inspect output for functions.
+        let name = read_function_name(v);
+        return format!("[Function: {}]", if name.is_empty() { "anonymous" } else { &name });
+    }
+
+    // Object / array fallthrough. Try JSON.stringify first — it gives
+    // the most useful summary for the common case (plain POJO error
+    // shapes like `{code: 42, message: "..."}`). If stringify rejects
+    // (cycles, BigInt fields, custom toJSON throwing) fall back to
+    // the `[object Foo]` tag from Object.prototype.toString.call.
+    if let Some(json) = json_stringify_safely(ctx, v) {
+        return truncate_for_display(&json, 300);
+    }
+    object_prototype_tag(ctx, v).unwrap_or_else(|| "[object ?]".to_owned())
+}
+
+/// Call `String(v)` via the JS global — works for any value type,
+/// including symbols and BigInts (where direct `.to_string()` is
+/// awkward). Returns `None` if the call itself faults.
+fn coerce_to_string<'js>(ctx: &rquickjs::Ctx<'js>, v: &Value<'js>) -> Option<String> {
+    let string_fn: Function<'_> = ctx.globals().get("String").ok()?;
+    let result: rquickjs::String<'_> = string_fn.call((v.clone(),)).ok()?;
+    result.to_string().ok()
+}
+
+/// Call `Object.prototype.toString.call(v)` to get the canonical
+/// `"[object Foo]"` tag — works on any object, never throws.
+fn object_prototype_tag<'js>(ctx: &rquickjs::Ctx<'js>, v: &Value<'js>) -> Option<String> {
+    let to_string: Function<'_> = ctx.eval("Object.prototype.toString").ok()?;
+    let result: rquickjs::String<'_> = to_string.call((v.clone(),)).ok()?;
+    result.to_string().ok()
+}
+
+/// Call `JSON.stringify(v)` safely — if stringify throws (cycle,
+/// BigInt field, custom toJSON throwing) or returns undefined, we
+/// return None and the caller falls back to a [object Foo] tag.
+///
+/// Why we re-resolve `JSON.stringify` each time rather than caching:
+/// the cost (one global get + one prop get) is negligible compared
+/// to the page-script bug we're diagnosing, and going through the
+/// globals every time means a page that monkey-patches
+/// `JSON.stringify` still gets honored (matches Node.js's behavior).
+fn json_stringify_safely<'js>(ctx: &rquickjs::Ctx<'js>, v: &Value<'js>) -> Option<String> {
+    let json: rquickjs::Object<'_> = ctx.globals().get("JSON").ok()?;
+    let stringify: Function<'_> = json.get("stringify").ok()?;
+    // CatchResultExt would let us swallow the throw cleanly, but
+    // we're already inside `Ctx::with`; just rely on `.ok()` to
+    // drop the error.
+    let result: Value<'_> = stringify.call((v.clone(),)).ok()?;
+    if result.is_undefined() {
+        return None;
+    }
+    let s = result.as_string()?;
+    s.to_string().ok()
+}
+
+/// Read a function's `.name` property (the standard ES spec field
+/// every named function has). Returns the empty string for anonymous
+/// functions / arrow expressions / classes without a binding name.
+fn read_function_name<'js>(v: &Value<'js>) -> String {
+    let Some(obj) = v.as_object() else {
+        return String::new();
+    };
+    obj.get::<_, String>("name").ok().unwrap_or_default()
+}
+
+/// Truncate `s` to at most `max_chars` characters (by Unicode scalar,
+/// not bytes — `String::truncate` would panic mid-grapheme on
+/// `s.len() > max_chars && s.is_char_boundary(max_chars) == false`).
+/// Appends "…(truncated, N more chars)" when truncation occurs so
+/// the user knows the value was longer.
+fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    let total: usize = s.chars().count();
+    if total <= max_chars {
+        return s.to_owned();
+    }
+    let kept: String = s.chars().take(max_chars).collect();
+    let dropped = total - max_chars;
+    format!("{kept}… (truncated, {dropped} more chars)")
 }
 
 /// Format an exception captured from a `<script>` into a readable
@@ -1249,6 +1435,49 @@ mod tests {
         // Without a base, raw `src` is returned unchanged (matches
         // the contract `fetch_script_source` uses internally).
         assert_eq!(resolve_script_src("/x.js", None), "/x.js");
+    }
+
+    #[test]
+    fn truncate_for_display_passthroughs_short_strings() {
+        // A string within the cap is returned verbatim — no marker,
+        // no character loss.
+        assert_eq!(truncate_for_display("hi", 100), "hi");
+        assert_eq!(truncate_for_display("", 100), "");
+    }
+
+    #[test]
+    fn truncate_for_display_clips_long_strings_with_marker() {
+        // A string over the cap is sliced to exactly `max_chars` and
+        // gains a "(truncated, N more chars)" marker. The marker
+        // gives the user a concrete sense of how much was dropped.
+        let long: String = "X".repeat(500);
+        let truncated = truncate_for_display(&long, 200);
+        assert!(
+            truncated.starts_with(&"X".repeat(200)),
+            "first 200 chars must be preserved verbatim"
+        );
+        assert!(
+            truncated.contains("truncated, 300 more chars"),
+            "marker must include the exact dropped-char count; got: {truncated}"
+        );
+    }
+
+    #[test]
+    fn truncate_for_display_handles_unicode_at_boundary() {
+        // `String::truncate` would panic if the byte boundary fell
+        // mid-grapheme; we use `.chars()` to clip on scalar values.
+        // Three 4-byte scalars and a cap of 2 should keep the first
+        // two scalars and drop the third — never panic.
+        let s = "𝓐𝓑𝓒"; // three 4-byte UTF-8 sequences
+        let truncated = truncate_for_display(s, 2);
+        assert!(
+            truncated.starts_with("𝓐𝓑"),
+            "first two unicode scalars must be preserved; got: {truncated}"
+        );
+        assert!(
+            truncated.contains("1 more chars"),
+            "dropped count must be in scalar units, not bytes; got: {truncated}"
+        );
     }
 
     /// `document.currentScript` lifecycle on a clean engine: after the
