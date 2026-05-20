@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-heso agent demo — a small Claude agent that uses heso as its tools.
+heso agent demo.
 
-The agent has four tools: search, read, batch_read, click. It gets a
-task from you, decides what to do, runs heso commands, and reports
-back what it found.
+Per AGENTS.md and skills/heso/SKILL.md, the agent is NOT inside heso —
+heso is the tool, the LLM harness is the agent. The "agent we made"
+is the heso skill loaded by Claude Code (or any harness that consumes
+SKILL.md). This script wires that up for a recorded demo:
 
-Run:
-    python demo/agent.py
-    # then type something like: "find me three rust web scraping libraries"
+    1. Spawn `claude -p --output-format stream-json` in the repo,
+       so Claude Code auto-discovers skills/heso/SKILL.md.
+    2. Pipe a query in.
+    3. Stream the events back, render them with rich.
+    4. Save the session to an SVG for the README.
 
-Needs ANTHROPIC_API_KEY in env. If not set, runs in offline-demo mode
-that does a scripted search-and-summarize so the recording still works.
+No anthropic SDK import. No second agent loop. The exact same Claude
+Code your editor uses, driving heso via its own skill.
 
-Built to be screen-recorded for the README. Keeps the UI tight and
-high-contrast so it reads well in a GIF.
+Fallback: with --no-claude (or when `claude` isn't on PATH), runs a
+pure-heso pipeline (search -> batch read -> summary) so the demo is
+still useful and recordable without an LLM in the loop. Be honest in
+the UI about which mode you're in.
 """
 
 import argparse
-import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-# Force UTF-8 on Windows so the rich UI renders Unicode arrows etc.
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
@@ -46,13 +50,12 @@ if not HESO.exists():
     HESO = REPO_ROOT / "target" / "release" / "heso"
 
 _RECORD = os.environ.get("HESO_DEMO_RECORD") == "1"
-console = Console(
-    width=110,
-    force_terminal=True,
-    legacy_windows=False,
-    record=_RECORD,
-)
+console = Console(width=110, force_terminal=True, legacy_windows=False, record=_RECORD)
 
+
+# ----------------------------------------------------------------------------
+# Banner
+# ----------------------------------------------------------------------------
 
 def banner():
     title = Text()
@@ -60,14 +63,145 @@ def banner():
     title.append("  ", style="")
     title.append("agent demo", style="dim")
     sub = Text(
-        "small Rust browser. tiny binary. fast. one tool per agent verb.",
+        "Claude Code drives heso via the existing skill. No new agent loop.",
         style="dim italic",
     )
     console.print(Panel(Group(title, sub), border_style="dark_violet", padding=(0, 2)))
 
 
+def short(s, n=80):
+    s = str(s)
+    return s if len(s) <= n else s[: n - 1] + "..."
+
+
+# ----------------------------------------------------------------------------
+# Path A: drive Claude Code (the real agent)
+# ----------------------------------------------------------------------------
+
+def claude_on_path():
+    return shutil.which("claude") is not None
+
+
+def run_via_claude_code(query):
+    """
+    Spawn `claude -p` from the repo root so it auto-discovers
+    skills/heso/SKILL.md. Stream JSONL events back and render them.
+    """
+    intro = Text(
+        "Calling Claude Code (claude -p) from the repo root.\n"
+        "It picks up skills/heso/SKILL.md and uses heso verbs as its tools.",
+        style="dim italic",
+    )
+    console.print(Panel(intro, border_style="dim"))
+
+    # Allow heso invocations the agent issues via Bash. The skill uses
+    # bare `heso` (and we also accept the relative release path).
+    # Pass the query via stdin to keep argv simple and avoid flag-list
+    # confusion with --allowed-tools.
+    cmd = [
+        "claude",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--include-partial-messages",
+        "--verbose",
+        "--allowed-tools",
+        "Bash(heso:*),Bash(./target/release/heso:*),Bash(./target/release/heso.exe:*)",
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(REPO_ROOT),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    proc.stdin.write(query)
+    proc.stdin.close()
+
+    final_text = []
+    current_tool = None
+    tool_start_ts = 0.0
+
+    spinner_live = Live(Spinner("dots", "thinking…", style="cyan"), console=console, refresh_per_second=8)
+    spinner_live.start()
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            etype = ev.get("type")
+            if etype == "assistant" and isinstance(ev.get("message"), dict):
+                for block in ev["message"].get("content", []):
+                    btype = block.get("type")
+                    if btype == "text" and block.get("text", "").strip():
+                        spinner_live.stop()
+                        console.print(Panel(Text(block["text"].strip(), style="white"), title="agent", border_style="cyan", padding=(0, 1)))
+                        spinner_live = Live(Spinner("dots", "thinking…", style="cyan"), console=console, refresh_per_second=8)
+                        spinner_live.start()
+                        final_text.append(block["text"].strip())
+                    elif btype == "tool_use":
+                        spinner_live.stop()
+                        name = block.get("name", "?")
+                        inputs = block.get("input", {}) or {}
+                        flat = " ".join(f"{k}={short(json.dumps(v), 40)}" for k, v in inputs.items())
+                        console.print(Text(f"  ↳ {name} ", style="bold magenta") + Text(short(flat, 90), style="dim"))
+                        current_tool = name
+                        tool_start_ts = time.time()
+                        spinner_live = Live(Spinner("dots", "running tool…", style="yellow"), console=console, refresh_per_second=8)
+                        spinner_live.start()
+            elif etype == "user" and isinstance(ev.get("message"), dict):
+                # Tool result blocks come back as user-role messages.
+                for block in ev["message"].get("content", []):
+                    if block.get("type") == "tool_result":
+                        spinner_live.stop()
+                        elapsed = int((time.time() - tool_start_ts) * 1000) if tool_start_ts else 0
+                        ok = not block.get("is_error", False)
+                        mark = Text("    ok ", style="green") if ok else Text("    err ", style="red")
+                        size = 0
+                        content = block.get("content")
+                        if isinstance(content, str):
+                            size = len(content)
+                        elif isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and isinstance(c.get("text"), str):
+                                    size += len(c["text"])
+                        console.print(mark + Text(f"{current_tool} -> {size} bytes ({elapsed}ms)", style="dim"))
+                        spinner_live = Live(Spinner("dots", "thinking…", style="cyan"), console=console, refresh_per_second=8)
+                        spinner_live.start()
+            elif etype == "result":
+                pass  # handled by stream end
+
+    finally:
+        try:
+            spinner_live.stop()
+        except Exception:
+            pass
+        proc.wait(timeout=30)
+
+    if proc.returncode != 0:
+        err = proc.stderr.read() if proc.stderr else ""
+        console.print(Panel(Text(f"claude -p exited {proc.returncode}\n{err}", style="red"), border_style="red"))
+        return
+
+    if final_text:
+        last = final_text[-1].strip()
+        console.print(Panel(Text(last, style="white"), title="answer", border_style="green", padding=(1, 2)))
+
+
+# ----------------------------------------------------------------------------
+# Path B: offline (no LLM) — just demonstrate the verbs
+# ----------------------------------------------------------------------------
+
 def run_heso(args, timeout=60):
-    """Invoke the heso binary, return (ok, parsed_json_or_text, raw_stderr)."""
     if not HESO.exists():
         return False, None, f"heso binary not found at {HESO}"
     proc = subprocess.run(
@@ -87,7 +221,7 @@ def run_heso(args, timeout=60):
         return proc.returncode == 0, out, err
 
 
-def show_tool_call(verb, args, status="running"):
+def tool_call_panel(verb, args, status="running"):
     cmd = Text()
     cmd.append("$ ", style="dim")
     cmd.append("heso ", style="bold cyan")
@@ -103,287 +237,107 @@ def show_tool_call(verb, args, status="running"):
     return Group(cmd, label)
 
 
-def short(s, n=80):
-    s = str(s)
-    return s if len(s) <= n else s[: n - 1] + "…"
-
-
-# ----------------------------------------------------------------------------
-# heso tool wrappers (the agent calls these)
-# ----------------------------------------------------------------------------
-
-def tool_search(query, limit=5):
-    ok, data, err = run_heso(["search", query, "--limit", str(limit)])
-    if not ok or not isinstance(data, dict):
-        return {"error": err or "search failed"}
-    return {
-        "query": data.get("query"),
-        "knowledge": data.get("knowledge"),
-        "results": [
-            {"rank": r["rank"], "title": r["title"], "url": r["url"], "snippet": r.get("snippet", "")}
-            for r in (data.get("results") or [])
-        ],
-    }
-
-
-def tool_read(url, complete=False):
-    args = ["read", url]
-    if complete:
-        args.append("--complete")
-    ok, data, err = run_heso(args, timeout=45)
-    if not ok or not isinstance(data, dict):
-        return {"error": err or "read failed"}
-    text = (data.get("text") or "")[:3000]
-    return {
-        "url": data.get("url"),
-        "title": data.get("title"),
-        "text": text,
-        "actions_count": len(data.get("actions") or []),
-        "framework": data.get("framework"),
-    }
-
-
-def tool_batch_read(urls, parallel=2):
-    args = ["batch", "read", "--parallel", str(parallel), *urls]
-    if not HESO.exists():
-        return {"error": "no heso binary"}
-    proc = subprocess.run(
-        [str(HESO), *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=120,
+def offline_demo(user_input):
+    console.print(
+        Panel(
+            Text(
+                "Offline demo: no LLM in the loop.\n"
+                "Runs heso primitives directly: search -> batch read -> summary.",
+                style="dim italic",
+            ),
+            border_style="dim",
+        )
     )
-    results = []
-    for line in (proc.stdout or "").strip().splitlines():
+
+    with Live(tool_call_panel("search", [f'"{user_input}"', "--limit 5"], "running"), refresh_per_second=8, console=console) as live:
+        start = time.time()
+        ok, data, _ = run_heso(["search", user_input, "--limit", "5"])
+        elapsed = int((time.time() - start) * 1000)
+        live.update(tool_call_panel("search", [f'"{user_input}"', "--limit 5", f"({elapsed}ms)"], "ok" if ok else "err"))
+
+    results = (data or {}).get("results", []) if isinstance(data, dict) else []
+    if results:
+        t = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
+        t.add_column(style="dim")
+        t.add_column()
+        for r in results[:5]:
+            t.add_row(
+                f"#{r['rank']}",
+                Text(short(r["title"], 70), style="bold")
+                + Text(f"\n   {r['url']}", style="cyan"),
+            )
+        console.print(t)
+
+    urls = [r["url"] for r in results[:3]]
+    if not urls:
+        console.print(Panel(Text("no results", style="red"), border_style="red"))
+        return
+
+    with Live(tool_call_panel("batch read", [f"--parallel 2 {len(urls)} urls"], "running"), refresh_per_second=8, console=console) as live:
+        start = time.time()
+        proc = subprocess.run(
+            [str(HESO), "batch", "read", "--parallel", "2", *urls],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        elapsed = int((time.time() - start) * 1000)
+        live.update(tool_call_panel("batch read", [f"--parallel 2 {len(urls)} urls", f"({elapsed}ms)"], "ok"))
+
+    batch_rows = []
+    for line in (proc.stdout or "").splitlines():
+        if not line.strip():
+            continue
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if "error" in d:
-            results.append({"url": d.get("url"), "ok": False, "error": d["error"]})
-        else:
-            results.append(
-                {
-                    "url": d.get("url"),
-                    "ok": True,
-                    "title": d.get("title"),
-                    "text": (d.get("text") or "")[:1500],
-                    "actions_count": len(d.get("actions") or []),
-                }
-            )
-    return {"results": results}
+        batch_rows.append(d)
 
+    t = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
+    t.add_column(width=3)
+    t.add_column()
+    for r in batch_rows:
+        ok = "error" not in r
+        mark = Text("ok", style="green") if ok else Text("er", style="red")
+        label = Text(short(r.get("title") or r.get("url", ""), 70))
+        t.add_row(mark, label)
+    console.print(t)
 
-# ----------------------------------------------------------------------------
-# Tool registry for the Claude agent
-# ----------------------------------------------------------------------------
-
-TOOLS_FOR_API = [
-    {
-        "name": "heso_search",
-        "description": "Search the web via DuckDuckGo + Wikipedia. Returns a list of results and an optional knowledge block.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer", "default": 5, "maximum": 10},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "heso_read",
-        "description": "Fetch a URL, run its JavaScript, return title + visible text + action list. Use --complete for sites with lazy-loaded content.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "complete": {"type": "boolean", "default": False},
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "heso_batch_read",
-        "description": "Read several URLs in parallel. Returns one entry per URL with title + text + actions.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "urls": {"type": "array", "items": {"type": "string"}},
-                "parallel": {"type": "integer", "default": 2, "maximum": 4},
-            },
-            "required": ["urls"],
-        },
-    },
-]
-
-
-def dispatch_tool(name, params):
-    if name == "heso_search":
-        return tool_search(params["query"], params.get("limit", 5))
-    if name == "heso_read":
-        return tool_read(params["url"], params.get("complete", False))
-    if name == "heso_batch_read":
-        return tool_batch_read(params["urls"], params.get("parallel", 2))
-    return {"error": f"unknown tool {name}"}
-
-
-SYSTEM_PROMPT = """You are an agent with access to a small headless browser called `heso`. Use it to answer the user's request.
-
-Tools available:
-- heso_search(query, limit) — web search
-- heso_read(url, complete) — fetch a page and get its content
-- heso_batch_read(urls, parallel) — fetch several pages in parallel
-
-Be quick. 2-4 tool calls is usually enough. Format the final answer as plain prose, no markdown headers, mention specific facts you saw. Don't speculate."""
-
-
-def run_claude_agent(user_input, client, model="claude-sonnet-4-5"):
-    messages = [{"role": "user", "content": user_input}]
-    panels = []
-
-    while True:
-        resp = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS_FOR_API,
-            messages=messages,
-        )
-
-        # Stream the model's text + tool calls
-        text_parts = []
-        tool_uses = []
-        for block in resp.content:
-            if block.type == "text" and block.text.strip():
-                text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_uses.append(block)
-
-        if text_parts:
-            txt = "\n".join(text_parts).strip()
-            console.print(Panel(Text(txt, style="white"), title="agent", border_style="cyan", padding=(0, 1)))
-
-        if not tool_uses:
-            return "\n".join(text_parts).strip() or "(no answer)"
-
-        # Run each tool, show the call live
-        tool_results = []
-        for tu in tool_uses:
-            args_pretty = json.dumps(tu.input, indent=None)[1:-1].replace(", ", " ")
-            with Live(show_tool_call(tu.name.replace("heso_", ""), [short(args_pretty, 70)], "running"), refresh_per_second=8, console=console) as live:
-                start = time.time()
-                result = dispatch_tool(tu.name, tu.input)
-                elapsed = int((time.time() - start) * 1000)
-                live.update(show_tool_call(tu.name.replace("heso_", ""), [short(args_pretty, 70), f"({elapsed}ms)"], "ok" if "error" not in result else "err"))
-
-            # Render a small summary of what came back
-            summary = render_tool_result_summary(tu.name, result)
-            if summary:
-                console.print(summary)
-
-            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": json.dumps(result)[:8000]})
-
-        messages.append({"role": "assistant", "content": resp.content})
-        messages.append({"role": "user", "content": tool_results})
-
-
-def render_tool_result_summary(tool_name, result):
-    if "error" in result:
-        return Panel(Text(result["error"], style="red"), border_style="red", padding=(0, 1))
-    if tool_name == "heso_search":
-        rows = result.get("results", [])
-        if not rows:
-            return Text("  (no results)", style="dim")
-        t = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
-        t.add_column(style="dim")
-        t.add_column()
-        for r in rows[:5]:
-            t.add_row(f"#{r['rank']}", Text(short(r["title"], 70), style="bold") + Text(f"\n   {r['url']}", style="cyan"))
-        return t
-    if tool_name == "heso_read":
-        bits = []
-        if result.get("title"):
-            bits.append(Text("  title:   ", style="dim") + Text(short(result["title"], 70), style="bold"))
-        if result.get("framework"):
-            bits.append(Text("  framework: ", style="dim") + Text(result["framework"]))
-        bits.append(Text(f"  actions: {result.get('actions_count', 0)}", style="dim"))
-        return Group(*bits)
-    if tool_name == "heso_batch_read":
-        rows = result.get("results", [])
-        t = Table(show_header=False, box=None, pad_edge=False, padding=(0, 1))
-        t.add_column(width=3)
-        t.add_column()
-        for r in rows:
-            mark = Text("✓", style="green") if r.get("ok") else Text("✗", style="red")
-            label = Text(short(r.get("title") or r.get("url", ""), 70))
-            t.add_row(mark, label)
-        return t
-    return None
-
-
-def offline_demo(user_input):
-    """Run a real heso pipeline without an API key. Honest about being scripted."""
-    console.print(Panel(Text("(offline demo - set ANTHROPIC_API_KEY for live agent)\n\nrunning a search -> batch-read -> summarize pipeline", style="dim italic"), border_style="dim"))
-    with Live(show_tool_call("search", [f'"{user_input}"', "--limit 5"], "running"), refresh_per_second=8, console=console) as live:
-        start = time.time()
-        search = tool_search(user_input, 5)
-        elapsed = int((time.time() - start) * 1000)
-        live.update(show_tool_call("search", [f'"{user_input}"', "--limit 5", f"({elapsed}ms)"], "ok"))
-    s = render_tool_result_summary("heso_search", search)
-    if s:
-        console.print(s)
-
-    urls = [r["url"] for r in search.get("results", [])[:3]]
-    if not urls:
-        console.print(Panel(Text("no results to read", style="red"), border_style="red"))
-        return
-
-    with Live(show_tool_call("batch read", [f"--parallel 2 {len(urls)} urls"], "running"), refresh_per_second=8, console=console) as live:
-        start = time.time()
-        batch = tool_batch_read(urls, 2)
-        elapsed = int((time.time() - start) * 1000)
-        live.update(show_tool_call("batch read", [f"--parallel 2 {len(urls)} urls", f"({elapsed}ms)"], "ok"))
-    s = render_tool_result_summary("heso_batch_read", batch)
-    if s:
-        console.print(s)
-
-    bits = []
-    if search.get("knowledge"):
-        k = search["knowledge"]
-        bits.append(Text(k.get("title", "knowledge"), style="bold"))
-        bits.append(Text(k.get("summary", ""), style=""))
-        bits.append(Text(""))
-    bits.append(Text("Top pages read:", style="bold"))
-    for r in batch.get("results", []):
-        if r.get("ok") and r.get("title"):
-            bits.append(Text(f"  • {short(r['title'], 70)}", style="white"))
-            bits.append(Text(f"    {r['url']}", style="cyan"))
+    bits = [Text("Pages read:", style="bold")]
+    for r in batch_rows:
+        if "error" in r:
+            continue
+        bits.append(Text(f"  - {short(r.get('title') or '', 70)}", style="white"))
+        bits.append(Text(f"    {r.get('url','')}", style="cyan"))
     console.print(Panel(Group(*bits), title="answer", border_style="green", padding=(1, 2)))
 
+
+# ----------------------------------------------------------------------------
+# Entrypoint
+# ----------------------------------------------------------------------------
 
 def main():
     banner()
     if not HESO.exists():
-        console.print(Panel(Text(f"heso binary not found at {HESO}\nrun: cargo build --release -p heso-cli", style="red"), border_style="red"))
+        console.print(
+            Panel(
+                Text(
+                    f"heso binary not found at {HESO}\n"
+                    f"run: cargo build --release -p heso-cli",
+                    style="red",
+                ),
+                border_style="red",
+            )
+        )
         sys.exit(1)
-
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if api_key:
-        try:
-            import anthropic
-            client = anthropic.Anthropic(api_key=api_key)
-        except ImportError:
-            console.print("[dim]anthropic SDK missing — pip install anthropic[/dim]")
-            client = None
-    else:
-        client = None
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--query", help="Skip the prompt; use this query")
-    parser.add_argument("--save-svg", help="After the run, save a styled SVG of the session here")
+    parser.add_argument("--no-claude", action="store_true", help="Skip Claude Code; run the heso-only pipeline")
+    parser.add_argument("--save-svg", help="Save a styled SVG of the session here")
     cli_args, _ = parser.parse_known_args()
 
     if cli_args.query:
@@ -400,14 +354,12 @@ def main():
 
     console.print()
     start = time.time()
-    if client:
-        final = run_claude_agent(user_input, client)
-        elapsed = int(time.time() - start)
-        console.print(Panel(Text(final, style="white"), title=f"answer · {elapsed}s", border_style="green", padding=(1, 2)))
-    else:
+    if cli_args.no_claude or not claude_on_path():
         offline_demo(user_input)
-        elapsed = int(time.time() - start)
-        console.print(Text(f"done in {elapsed}s", style="dim"))
+    else:
+        run_via_claude_code(user_input)
+    elapsed = int(time.time() - start)
+    console.print(Text(f"done in {elapsed}s", style="dim"))
 
     if cli_args.save_svg and console.record:
         out = Path(cli_args.save_svg)
