@@ -491,7 +491,7 @@ async fn cmd_meta(args: &[String]) -> ExitCode {
 ///   [`DEFAULT_LINK_CAP`], hard max [`HARD_LINK_CAP`]).
 async fn cmd_open(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... <url>");
         return ExitCode::from(2);
     }
 
@@ -503,6 +503,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let mut explore_depth: u8 = 0;
     let mut link_cap: usize = DEFAULT_LINK_CAP;
     let mut best_effort = false;
+    let mut inject_scripts: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -542,11 +543,23 @@ async fn cmd_open(args: &[String]) -> ExitCode {
                 best_effort = true;
                 i += 1;
             }
+            "--inject-script" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--inject-script needs a value (inline JS or @filepath)");
+                    return ExitCode::from(2);
+                };
+                match resolve_inject_script(v) {
+                    Ok(body) => inject_scripts.push(body),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!(
-                    "usage: heso open [--explore-links N] [--link-cap M] [--best-effort] <url>"
-                );
+                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -564,7 +577,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     }
 
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... <url>");
         return ExitCode::from(2);
     };
 
@@ -601,15 +614,80 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         }
     };
 
-    // Run the JS-side hydration pump so script-pump errors and
-    // console.error counts are observable as part of the open envelope.
-    // We swallow any hydration-step engine error (rare; alloc /
-    // QuickJS internals) so the static fields still ship.
-    let (failed_scripts, console_errors_count) = hydrate_for_failure_envelope(
-        &engine,
-        &page.body_html,
-        page.url().clone(),
-    );
+    // When `--inject-script` is present, run a full JS hydration pump so
+    // the injected polyfill is observable to the page's inline scripts.
+    // The pump also surfaces failed_scripts + console_errors_count for
+    // the structured failure envelope — same shape as the no-inject
+    // path below. Without inject scripts we take the cheap
+    // [`hydrate_for_failure_envelope`] path (still spins QuickJS but
+    // doesn't keep the session around for post-hydrate snapshots).
+    let (failed_scripts, console_errors_count, post_hydrate): (
+        Vec<heso_engine_js::ScriptFailure>,
+        usize,
+        Option<(String, Vec<heso_engine_js::ConsoleEntry>, Option<String>)>,
+    ) = if !inject_scripts.is_empty() {
+        let client = engine.client();
+        let cookie_jar = engine.cookie_jar();
+        let rt_handle = tokio::runtime::Handle::current();
+        let js_engine = match heso_engine_js::JsEngine::new_with_fetch_and_cookies(
+            client, rt_handle, cookie_jar,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to create JS engine: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let session_result = heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
+            js_engine,
+            &page.body_html,
+            page.url().clone(),
+            heso_engine_js::ScriptFetchPolicy::Fetch,
+            &inject_scripts,
+        );
+        match session_result {
+            Ok((session, _outcome)) => {
+                // Drain the install-time console buffer BEFORE the
+                // title eval — `JsEngine::eval` clears the console
+                // on entry per its "fresh per call" contract, so a
+                // title pull after the drain would otherwise wipe
+                // the inject + page-script console output we want
+                // to surface.
+                let failed = session.engine().drain_script_failures();
+                let console = session.engine().drain_console();
+                let console_errors = console
+                    .iter()
+                    .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
+                    .count();
+                let post_title = match session.engine().eval("document.title") {
+                    Ok(outcome) => outcome
+                        .value
+                        .as_str()
+                        .map(str::to_owned)
+                        .filter(|s| !s.trim().is_empty()),
+                    Err(_) => None,
+                };
+                let post_html = session.document_html();
+                (
+                    failed,
+                    console_errors,
+                    Some((post_html, console, post_title)),
+                )
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        // Run the JS-side hydration pump so script-pump errors and
+        // console.error counts are observable as part of the open envelope.
+        // We swallow any hydration-step engine error (rare; alloc /
+        // QuickJS internals) so the static fields still ship.
+        let (failed, console_errors) =
+            hydrate_for_failure_envelope(&engine, &page.body_html, page.url().clone());
+        (failed, console_errors, None)
+    };
     let (partial, partial_reason) =
         classify_failure_envelope(&failed_scripts, console_errors_count);
     // Without `--best-effort`, today's contract is "open always
@@ -664,6 +742,36 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         &failed_scripts,
         console_errors_count,
     );
+    // When `--inject-script` ran the JS hydration pass, overlay the
+    // post-hydration title (in case an injected polyfill + page script
+    // mutated `document.title`) and surface the console buffer so the
+    // agent sees what their inject + the page scripts logged. The body
+    // text is re-extracted via the same helper `cmd_read` uses so an
+    // agent who passed `--inject-script` to `heso open` gets a usable
+    // post-hydration text payload alongside the action graph.
+    if let Some((post_html, console, post_title)) = &post_hydrate {
+        let post_text = heso_engine_fetch::extract_visible_text(post_html);
+        if let Some(obj) = body.as_object_mut() {
+            // Overlay the post-hydration title (the JS pass may have
+            // set `document.title`, which is otherwise invisible to
+            // the static `tree.title`). Only swap when the JS eval
+            // returned a non-empty string.
+            if let Some(t) = post_title.as_ref() {
+                obj.insert(
+                    "title".to_owned(),
+                    serde_json::Value::String(t.clone()),
+                );
+            }
+            obj.insert(
+                "text".to_owned(),
+                serde_json::Value::String(post_text),
+            );
+            obj.insert(
+                "console".to_owned(),
+                serde_json::to_value(console).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
     // Compute plat_hash over the canonical form of `body`. The plat
     // module recursively strips any `plat_hash` field at every level
     // before hashing, so embedding it here doesn't poison the hash.
@@ -1204,11 +1312,15 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // of optional fields), `--since <prev_content_hash>` (cross-call
     // diff trigger — populates `delta` against the prior snapshot, or
     // returns `delta.since_matched: false` with everything-added when
-    // no prior snapshot exists in this process).
+    // no prior snapshot exists in this process), `--best-effort`
+    // (structured failure envelope + non-zero exit on script crashes),
+    // `--inject-script JS|@FILE` (repeatable: each entry runs after
+    // engine bootstrap, before page `<script>`).
     let mut url_arg: Option<String> = None;
     let mut include_csv: Option<String> = None;
     let mut since_arg: Option<String> = None;
     let mut best_effort = false;
+    let mut inject_scripts: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1232,9 +1344,23 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 best_effort = true;
                 i += 1;
             }
+            "--inject-script" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--inject-script needs a value (inline JS or @filepath)");
+                    return ExitCode::from(2);
+                };
+                match resolve_inject_script(v) {
+                    Ok(body) => inject_scripts.push(body),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] <url>");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1251,7 +1377,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         }
     }
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] <url>");
+        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... <url>");
         return ExitCode::from(2);
     };
 
@@ -1302,11 +1428,15 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // sink the verb — agent can still use the static portion of the
     // page (title/tree/actions/cookies). Without the flag, today's
     // behavior was to bail on a hydrate failure; we preserve that.
-    let (session, script_outcome) = match heso_engine_js::JsSession::open_on_engine(
+    // The `_with_pre_scripts` variant additionally surfaces
+    // `--inject-script #N threw: ...` errors on stderr — the
+    // structured message names the offending pre-script index.
+    let (session, script_outcome) = match heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
         js_engine,
         &page.body_html,
         page.url().clone(),
         heso_engine_js::ScriptFetchPolicy::Fetch,
+        &inject_scripts,
     ) {
         Ok(pair) => pair,
         Err(e) => {
@@ -1338,7 +1468,10 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 }
                 return print_json(&body);
             }
-            eprintln!("hydrate failed: {e}");
+            // The error's Display names the offending --inject-script
+            // index when the engine flagged a pre-script throw, so a
+            // bare `{e}` is informative enough here.
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
@@ -1955,6 +2088,7 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
     let mut time_value: Option<String> = None;
     let mut timeout: Option<String> = None;
     let mut best_effort = false;
+    let mut inject_scripts: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1964,6 +2098,20 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
                     return ExitCode::from(2);
                 };
                 selector_exists = Some(v.clone());
+                i += 2;
+            }
+            "--inject-script" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--inject-script needs a value (inline JS or @filepath)");
+                    return ExitCode::from(2);
+                };
+                match resolve_inject_script(v) {
+                    Ok(body) => inject_scripts.push(body),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::from(2);
+                    }
+                }
                 i += 2;
             }
             "--text-contains" => {
@@ -2022,7 +2170,7 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
             }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso wait <url> [--selector-exists CSS | --text-contains STR | --url-matches REGEX | --network-idle | --time DUR] [--timeout DUR] [--best-effort]");
+                eprintln!("usage: heso wait <url> [--selector-exists CSS | --text-contains STR | --url-matches REGEX | --network-idle | --time DUR] [--timeout DUR] [--best-effort] [--inject-script JS|@FILE]...");
                 return ExitCode::from(2);
             }
             _ => {
@@ -2136,15 +2284,18 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    let (session, _) = match heso_engine_js::JsSession::open_on_engine(
+    let (session, _) = match heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
         js_engine,
         &html,
         final_url,
         heso_engine_js::ScriptFetchPolicy::default(),
+        &inject_scripts,
     ) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("hydrate failed: {e}");
+            // `e` carries the inject-script index when the failure was
+            // a thrown polyfill; otherwise it's a normal hydrate error.
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
     };
@@ -2253,6 +2404,41 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
         other => return Err(format!("unknown duration unit `{other}` (use ms / s / m)")),
     };
     Ok(ms.round() as u64)
+}
+
+/// Resolve one `--inject-script <arg>` value into the JS source body to
+/// evaluate before the page's own scripts run.
+///
+/// Accepted forms:
+///
+/// - `--inject-script "<inline JS>"` — `arg` is taken verbatim as the
+///   script body. The common shape an agent reaches for —
+///   `--inject-script "window.lunr = { Index: { load: () => ({}) } }"`.
+/// - `--inject-script @<filepath>` — `arg` starts with a literal `@`;
+///   the remainder is read as a filesystem path (relative to the
+///   process CWD, or absolute), and the file's contents become the
+///   script body. Empty path after `@` is rejected.
+///
+/// On `@file` failures the caller gets back a human-readable error
+/// (file not found, permission denied, invalid UTF-8). No silent
+/// fallback to "treat the literal `@filepath` as JS" — that would mask
+/// a typo'd path as a script that throws `ReferenceError: filepath`.
+///
+/// No remote URLs: `--inject-script https://...` is a literal JS body
+/// (it will throw — that's the point: an agent should be aware they
+/// passed nonsense). The constraint is explicit in the design doc;
+/// fetching remote scripts at flag-parse time would invert the trust
+/// model.
+pub(crate) fn resolve_inject_script(arg: &str) -> Result<String, String> {
+    if let Some(rest) = arg.strip_prefix('@') {
+        if rest.is_empty() {
+            return Err("--inject-script: empty @path".to_owned());
+        }
+        std::fs::read_to_string(rest)
+            .map_err(|e| format!("--inject-script: failed to read `{rest}`: {e}"))
+    } else {
+        Ok(arg.to_owned())
+    }
 }
 
 /// Build a CSS selector that resolves an action-graph element via

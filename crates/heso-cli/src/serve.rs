@@ -39,7 +39,7 @@
 //!
 //! | Method   | Params | Result |
 //! |----------|--------|--------|
-//! | `open`     | `{url, explore_links_depth?: u8, link_cap?: usize}` | `{page_id, url, title, description, metadata, tree, actions, linked_pages?}` |
+//! | `open`     | `{url, explore_links_depth?: u8, link_cap?: usize, inject_scripts?: [string]}` | `{page_id, url, title, description, metadata, tree, actions, linked_pages?}` |
 //! | `ls`       | `{page_id, path?}` | `{path, entries: [LsRow, ...]}` |
 //! | `cat`      | `{page_id, target}` | `{path, content}` for a tree path, or `ElementRef` for `@ref` |
 //! | `find`     | `{page_id, role?, name_substr?, section?}` | `{count, matches: [ElementRef, ...]}` |
@@ -50,8 +50,8 @@
 //! | `submit`   | `{ref, field?: {name: value}, data?: {name: value}, page_id?}` | `{ok, op, url, ref, selector, value, console, postUrl}` |
 //! | `eval`     | `{js, page_id?}` | `{ok, url, value, console}` |
 //! | `navigate` | `{url, page_id?}` | `{ok, url, page_id, scripts}` |
-//! | `read`     | `{page_id?, include?}` | `{url, title, text, tree, actions, forms, cookies, console, framework, scripts, plat_hash}` |
-//! | `wait`     | `{page_id?, selector_exists?, text_contains?, url_matches?, network_idle?, idle_window_ms?, time_ms?, timeout_ms?}` | `{ok, elapsed_ms, condition, error?}` |
+//! | `read`     | `{page_id?, include?, inject_scripts?: [string]}` | `{url, title, text, tree, actions, forms, cookies, console, framework, scripts, plat_hash}` |
+//! | `wait`     | `{page_id?, selector_exists?, text_contains?, url_matches?, network_idle?, idle_window_ms?, time_ms?, timeout_ms?, inject_scripts?: [string]}` | `{ok, elapsed_ms, condition, error?}` |
 //!
 //! `open` with `explore_links_depth >= 1` pre-fetches up to `link_cap`
 //! same-origin links per level and embeds their tree + metadata + actions
@@ -188,6 +188,13 @@ struct PageRecord {
     page: FetchPage,
     session: Option<JsSession>,
     current_actions: Vec<ElementRef>,
+    /// Inline JS bodies the caller passed as `inject_scripts` on the
+    /// `open` (or as `--inject-script` to `read` / `wait`) — stashed
+    /// here so the LAZY `ensure_session` call can replay them when a
+    /// write verb finally builds the [`JsSession`]. Without this the
+    /// inject would only apply on the immediate-eager session, which
+    /// the read-only `open` does not build.
+    inject_scripts: Vec<String>,
 }
 
 impl PageRecord {
@@ -197,6 +204,17 @@ impl PageRecord {
             page,
             session: None,
             current_actions: actions,
+            inject_scripts: Vec::new(),
+        }
+    }
+
+    fn new_with_inject(page: FetchPage, inject_scripts: Vec<String>) -> Self {
+        let actions = page.actions.clone();
+        Self {
+            page,
+            session: None,
+            current_actions: actions,
+            inject_scripts,
         }
     }
 }
@@ -441,6 +459,13 @@ struct OpenParams {
     /// `DEFAULT_LINK_CAP` ([`DEFAULT_LINK_CAP`]).
     #[serde(default)]
     link_cap: Option<usize>,
+    /// Inline JS bodies to evaluate before any page `<script>` runs on
+    /// the lazy-built session for this page. Mirrors the CLI's
+    /// `--inject-script` flag (inline only — JSON-RPC will not read
+    /// files from the server-side filesystem). A pre-script that
+    /// throws is a hard server-side error and the open is rejected.
+    #[serde(default)]
+    inject_scripts: Vec<String>,
 }
 
 async fn dispatch_open(
@@ -520,7 +545,10 @@ async fn dispatch_open(
         .pages
         .lock()
         .await
-        .insert(page_id.clone(), PageRecord::new(page));
+        .insert(
+            page_id.clone(),
+            PageRecord::new_with_inject(page, p.inject_scripts),
+        );
     *state.last_page_id.lock().await = Some(page_id);
     Ok(payload)
 }
@@ -1081,6 +1109,15 @@ struct ReadParams {
     /// `actions_added`. When omitted, `delta` is `null`.
     #[serde(default)]
     since: Option<String>,
+    /// Optional inline JS bodies to evaluate before any page `<script>`
+    /// runs on this session. Only applied when the session hasn't
+    /// already been built (a prior write verb may have already
+    /// initialized it); if a session already exists the call is
+    /// rejected so the agent knows the inject would have been a no-op.
+    /// Inline-only (no `@filepath`) — JSON-RPC won't read files from
+    /// the server-side filesystem.
+    #[serde(default)]
+    inject_scripts: Vec<String>,
 }
 
 /// `read` — the agent's one-call page report against an open page_id.
@@ -1107,6 +1144,19 @@ async fn dispatch_read(
         let record = pages
             .get_mut(&page_id)
             .ok_or_else(|| format!("no page_id `{}`", page_id))?;
+        // Stash the inject_scripts for the lazy session build. If a
+        // session is already up the inject would silently be a no-op
+        // (the contract is "before page scripts" — once they've run, the
+        // window is closed), so reject the call.
+        if !p.inject_scripts.is_empty() {
+            if record.session.is_some() {
+                return Err(
+                    "inject_scripts: session already initialized; pass on `open` instead"
+                        .to_owned(),
+                );
+            }
+            record.inject_scripts.extend(p.inject_scripts);
+        }
         // Ensure a session exists so the post-mutation DOM and console
         // entries are observable. For purely read-only flows where no
         // write verb has touched the page, this builds a fresh session
@@ -1276,6 +1326,11 @@ struct WaitParams {
     /// Overall wall-clock timeout in ms. Defaults to 30000.
     #[serde(default)]
     timeout_ms: Option<u64>,
+    /// Optional inline JS bodies to evaluate before any page `<script>`
+    /// runs on this session. Same semantics as `read.inject_scripts`:
+    /// rejected if a session already exists; inline-only.
+    #[serde(default)]
+    inject_scripts: Vec<String>,
 }
 
 async fn dispatch_wait(
@@ -1334,6 +1389,14 @@ async fn dispatch_wait(
     let record = pages
         .get_mut(&page_id)
         .ok_or_else(|| format!("no page_id `{}`", page_id))?;
+    if !p.inject_scripts.is_empty() {
+        if record.session.is_some() {
+            return Err(
+                "inject_scripts: session already initialized; pass on `open` instead".to_owned(),
+            );
+        }
+        record.inject_scripts.extend(p.inject_scripts);
+    }
     ensure_session(&state.engine, record)?;
     let session = record.session.as_ref().expect("session ensured above");
 
@@ -1406,11 +1469,16 @@ fn ensure_session(engine: &FetchEngine, record: &mut PageRecord) -> Result<(), S
     // Use the same script policy as `JsSession::open` so inline
     // `<script>` tags run on first attach. Subsequent write verbs see
     // the post-script DOM, matching what an agent sees on a real page.
-    let (session, _outcome) = JsSession::open_on_engine(
+    // Pre-scripts (from `open` with `inject_scripts`) run AFTER engine
+    // bootstrap, BEFORE page `<script>` tags — the contract that lets
+    // an agent shim `window.lunr` style globals before the page's
+    // broken sibling script reads them.
+    let (session, _outcome) = JsSession::open_on_engine_with_pre_scripts(
         js_engine,
         &record.page.body_html,
         record.page.url().clone(),
         ScriptFetchPolicy::default(),
+        &record.inject_scripts,
     )
     .map_err(|e| format!("js session open failed: {e}"))?;
     record.session = Some(session);

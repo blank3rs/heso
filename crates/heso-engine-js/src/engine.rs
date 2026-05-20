@@ -1383,6 +1383,40 @@ impl JsEngine {
         document: Document,
         policy: ScriptFetchPolicy,
     ) -> Result<ScriptOutcome, EvalError> {
+        self.install_document_with_pre_scripts(document, policy, &[])
+    }
+
+    /// Like [`Self::install_document`] but evaluates each entry in
+    /// `pre_scripts` against the JS context AFTER the `document` global
+    /// and `on*` IDL plumbing are installed, but BEFORE any inline
+    /// `<script>` from the page body runs.
+    ///
+    /// This is the agent's "polyfill cascade" hook: a site that calls
+    /// `window.lunr.Index.load(...)` from a sibling script before its
+    /// loader runs can be unstuck with
+    /// `--inject-script "window.lunr = { Index: { load: () => ({}) } }"`
+    /// — the stub lands in the global scope before the broken sibling
+    /// reads it.
+    ///
+    /// Error semantics: a pre-script that throws aborts the install
+    /// and propagates an [`EvalError::Engine`] whose message names the
+    /// 1-based index of the failing script and the underlying JS
+    /// exception (or thrown value). The page's own `<script>` pump is
+    /// not entered. This is the deliberate "hard fail" contract — an
+    /// agent inject is a debug hammer; if it's broken the agent should
+    /// fix the polyfill before continuing.
+    ///
+    /// Pre-scripts run via the same code path as a top-level
+    /// `eval(source)` — classic-script semantics, `var`/`let`
+    /// declarations land in the global scope, and any microtasks they
+    /// queue are drained by the trailing `run_pending_jobs` at the end
+    /// of the install.
+    pub fn install_document_with_pre_scripts(
+        &self,
+        document: Document,
+        policy: ScriptFetchPolicy,
+        pre_scripts: &[String],
+    ) -> Result<ScriptOutcome, EvalError> {
         let dom = document.dom_arc();
 
         self.console_buffer
@@ -1417,6 +1451,45 @@ impl JsEngine {
         // late-upgrade detection, slot reassignment, and form
         // auto-fill detection — a noop silently breaks them.
         crate::mutation_observer::install(&self.context)?;
+
+        // Pre-scripts ("--inject-script" on the CLI / `inject_scripts`
+        // on JSON-RPC): run AFTER engine globals are wired (document,
+        // on-event handlers, MutationObserver) but BEFORE page
+        // `<script>` tags. Each script is evaluated in order; the
+        // first throw aborts the install with a structured error
+        // naming the index. Console output is preserved on the buffer
+        // so an agent debugging a chained polyfill sees `console.log`
+        // statements they added for instrumentation.
+        for (idx, source) in pre_scripts.iter().enumerate() {
+            let one_based = idx + 1;
+            let outcome = self
+                .context
+                .with(|ctx| -> Result<Option<EvalError>, EvalError> {
+                    match ctx.eval::<Value, _>(source.as_str()).catch(&ctx) {
+                        Ok(_) => Ok(None),
+                        Err(CaughtError::Exception(exc)) => {
+                            let msg = exc.message().unwrap_or_default();
+                            let detail = if msg.is_empty() {
+                                "<unknown exception>".to_owned()
+                            } else {
+                                msg
+                            };
+                            Ok(Some(EvalError::Engine(format!(
+                                "--inject-script #{one_based} threw: {detail}"
+                            ))))
+                        }
+                        Err(CaughtError::Value(_)) => Ok(Some(EvalError::Engine(format!(
+                            "--inject-script #{one_based} threw a non-Error value"
+                        )))),
+                        Err(CaughtError::Error(e)) => Err(EvalError::Engine(format!(
+                            "--inject-script #{one_based}: {e}"
+                        ))),
+                    }
+                })?;
+            if let Some(err) = outcome {
+                return Err(err);
+            }
+        }
 
         let script_fetch_client = self.fetch_state.as_ref().and_then(|fs| match &fs.mode {
             FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),

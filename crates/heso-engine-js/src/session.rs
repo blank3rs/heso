@@ -126,11 +126,31 @@ impl JsSession {
         url: Url,
         policy: ScriptFetchPolicy,
     ) -> Result<(Self, ScriptOutcome), EvalError> {
+        Self::open_on_engine_with_pre_scripts(engine, html, url, policy, &[])
+    }
+
+    /// [`Self::open_on_engine`] plus a `pre_scripts` list whose entries
+    /// are evaluated after the engine's `document` global and `on*` IDL
+    /// plumbing are installed, but BEFORE any inline `<script>` from the
+    /// HTML body runs. Surfaces `--inject-script` on the CLI to an
+    /// agent: lets the agent shim globals (`window.lunr`, `window.gtag`,
+    /// vendored polyfills) that a sibling page-script reads at parse
+    /// time. A pre-script that throws hard-fails the open with an
+    /// [`EvalError::Engine`] whose message names the offending index;
+    /// the page's own `<script>` tags do not run.
+    pub fn open_on_engine_with_pre_scripts(
+        engine: JsEngine,
+        html: &str,
+        url: Url,
+        policy: ScriptFetchPolicy,
+        pre_scripts: &[String],
+    ) -> Result<(Self, ScriptOutcome), EvalError> {
         // Set the base URL before installing so the inline-script
         // pump can resolve relative `<script src="...">` references.
         engine.set_base_url(Some(url.clone()));
         let document = Document::from_html(html);
-        let outcome = engine.install_document(document.clone(), policy)?;
+        let outcome =
+            engine.install_document_with_pre_scripts(document.clone(), policy, pre_scripts)?;
         Ok((
             Self {
                 engine,
