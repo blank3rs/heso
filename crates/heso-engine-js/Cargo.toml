@@ -92,6 +92,12 @@ url = { workspace = true }
 # dependency explicit so the engine globals don't rot if a transitive
 # lifts it. 0.22 is the modern API (`Engine::encode`/`Engine::decode`).
 base64 = "0.22"
+# `regex` powers the `--url-matches REGEX` wait condition (see
+# `src/wait_for.rs`). Matches Playwright's `page.waitForURL` contract
+# (any URL/regex string the agent supplies is compiled here). Already
+# a workspace dep — same crate used by `heso-trace`, no new top-level
+# dep added.
+regex.workspace = true
 
 [dev-dependencies]
 # wiremock-rs: localhost mock server for the in-JS fetch tests.

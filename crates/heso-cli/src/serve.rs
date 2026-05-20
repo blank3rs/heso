@@ -50,6 +50,8 @@
 //! | `submit`   | `{ref, field?: {name: value}, data?: {name: value}, page_id?}` | `{ok, op, url, ref, selector, value, console, postUrl}` |
 //! | `eval`     | `{js, page_id?}` | `{ok, url, value, console}` |
 //! | `navigate` | `{url, page_id?}` | `{ok, url, page_id, scripts}` |
+//! | `read`     | `{page_id?, include?}` | `{url, title, text, tree, actions, forms, cookies, console, framework, scripts, plat_hash}` |
+//! | `wait`     | `{page_id?, selector_exists?, text_contains?, url_matches?, network_idle?, idle_window_ms?, time_ms?, timeout_ms?}` | `{ok, elapsed_ms, condition, error?}` |
 //!
 //! `open` with `explore_links_depth >= 1` pre-fetches up to `link_cap`
 //! same-origin links per level and embeds their tree + metadata + actions
@@ -98,12 +100,15 @@ use heso_engine_fetch::{
     linked_pages_to_json, resolve_action, ElementRef, ExploreOptions, FetchEngine, FetchPage,
     DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
-use heso_engine_js::{JsEngine, JsSession, ScriptFetchPolicy};
+use heso_engine_js::{JsEngine, JsSession, ScriptFetchPolicy, WaitCondition};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use crate::{merge_submit_fields, selector_for_action};
+use crate::{
+    collect_cookies, detect_framework, group_forms, merge_submit_fields, parse_include_filter,
+    selector_for_action,
+};
 
 // ============================================================================
 // JSON-RPC types
@@ -150,6 +155,7 @@ const INTERNAL_ERROR: i32 = -32603;
 /// `match` arms in [`handle`].
 const ADVERTISED_METHODS: &[&str] = &[
     "open", "ls", "cat", "find", "close", "ping", "fill", "click", "submit", "eval", "navigate",
+    "read", "wait",
 ];
 
 // ============================================================================
@@ -329,6 +335,8 @@ async fn handle(state: Arc<ServerState>, line: &str) -> Response {
         "submit" => dispatch_submit(state.clone(), req.params).await,
         "eval" => dispatch_eval(state.clone(), req.params).await,
         "navigate" => dispatch_navigate(state.clone(), req.params).await,
+        "read" => dispatch_read(state.clone(), req.params).await,
+        "wait" => dispatch_wait(state.clone(), req.params).await,
         m => {
             return error_response(id, METHOD_NOT_FOUND, format!("unknown method `{m}`"));
         }
@@ -856,6 +864,219 @@ async fn dispatch_navigate(
         "page_id": page_id,
         "scripts": serde_json::Value::Null,
     }))
+}
+
+// ============================================================================
+// Method handlers — read primitive (PR `read`)
+// ============================================================================
+
+#[derive(Deserialize)]
+struct ReadParams {
+    #[serde(default)]
+    page_id: Option<String>,
+    /// Comma-separated list of optional fields to emit (matches the
+    /// CLI's `--include` flag). When omitted, every field ships. When
+    /// supplied, only the listed fields ship — required envelope
+    /// fields (url, title, meta, tree, actions, plat_hash) always
+    /// emit regardless.
+    #[serde(default)]
+    include: Option<String>,
+}
+
+/// `read` — the agent's one-call page report against an open page_id.
+///
+/// Same envelope shape as `heso read <url>` on the CLI, with the
+/// difference that this method ALWAYS sees post-mutation state
+/// (since `JsSession` persists across calls). If an earlier `click` /
+/// `fill` / `eval` mutated the DOM, `read` reflects those mutations
+/// in `text` / `forms` / `console`.
+async fn dispatch_read(
+    state: Arc<ServerState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let p: ReadParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let page_id = resolve_page_id(&state, p.page_id).await?;
+    let include = parse_include_filter(p.include.as_deref());
+
+    let mut pages = state.pages.lock().await;
+    let record = pages
+        .get_mut(&page_id)
+        .ok_or_else(|| format!("no page_id `{}`", page_id))?;
+    // Ensure a session exists so the post-mutation DOM and console
+    // entries are observable. For purely read-only flows where no
+    // write verb has touched the page, this builds a fresh session
+    // and runs inline scripts once — same cost as a lazy `click`
+    // would have paid.
+    ensure_session(&state.engine, record)?;
+
+    // Snapshot the static fields off the cached page first, then
+    // overlay the live post-hydration extras from the session.
+    let static_page = &record.page;
+    let session = record.session.as_ref().expect("session ensured above");
+
+    let console = session.engine().drain_console();
+    let post_html = session.document_html();
+    let live_url = session.url().clone();
+
+    let mut body = serde_json::json!({
+        "url": live_url.as_str(),
+        "title": static_page.tree.title,
+        "description": static_page.tree.description,
+        "metadata": static_page.metadata,
+        "tree": static_page.tree,
+        "actions": record.current_actions,
+    });
+    if !static_page.inline_data.is_empty() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "inline_data".to_owned(),
+                serde_json::to_value(&static_page.inline_data)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    if !static_page.data_attrs.is_empty() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "data_attrs".to_owned(),
+                serde_json::to_value(&static_page.data_attrs)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    if include.text {
+        body["text"] =
+            serde_json::Value::String(heso_engine_fetch::extract_visible_text(&post_html));
+    }
+    if include.forms {
+        body["forms"] = group_forms(&record.current_actions);
+    }
+    if include.cookies {
+        body["cookies"] = collect_cookies(&state.engine, &live_url);
+    }
+    if include.console {
+        body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);
+    }
+    if include.framework {
+        body["framework"] = serde_json::Value::String(detect_framework(static_page));
+    }
+    if include.scripts {
+        // The script-execution tally on a long-lived session is
+        // computed at install_document time and not re-tracked across
+        // subsequent navigates/evals. Without re-running scripts here
+        // we surface a `null` to signal the field is intentionally
+        // not available on a read-against-session call — the agent
+        // can call `navigate` to refresh.
+        body["scripts"] = serde_json::Value::Null;
+    }
+
+    let hash = heso_engine_fetch::plat_hash(&body);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+        obj.insert("page_id".to_owned(), serde_json::Value::String(page_id));
+    }
+    Ok(body)
+}
+
+// ============================================================================
+// Method handlers — wait primitive (PR `wait`)
+// ============================================================================
+
+#[derive(Deserialize)]
+struct WaitParams {
+    #[serde(default)]
+    page_id: Option<String>,
+    /// Exactly one of these condition fields must be set. Matches the
+    /// CLI's flag set: `--selector-exists` / `--text-contains` /
+    /// `--url-matches` / `--network-idle` / `--time`.
+    #[serde(default)]
+    selector_exists: Option<String>,
+    #[serde(default)]
+    text_contains: Option<String>,
+    #[serde(default)]
+    url_matches: Option<String>,
+    #[serde(default)]
+    network_idle: Option<bool>,
+    /// Network-idle quiet window in ms. Defaults to 500 (Playwright
+    /// parity). Ignored unless `network_idle` is `true`.
+    #[serde(default)]
+    idle_window_ms: Option<u64>,
+    /// Virtual-clock advance amount in ms. Setting this picks the
+    /// `--time DUR` condition; otherwise unused.
+    #[serde(default)]
+    time_ms: Option<u64>,
+    /// Overall wall-clock timeout in ms. Defaults to 30000.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+async fn dispatch_wait(
+    state: Arc<ServerState>,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let p: WaitParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let page_id = resolve_page_id(&state, p.page_id).await?;
+
+    // Construct the WaitCondition. Mirrors `cmd_wait` validation —
+    // exactly one of the condition fields must be set.
+    let count = [
+        p.selector_exists.is_some(),
+        p.text_contains.is_some(),
+        p.url_matches.is_some(),
+        p.network_idle.unwrap_or(false),
+        p.time_ms.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if count != 1 {
+        return Err(format!(
+            "wait: exactly one of selector_exists / text_contains / url_matches / network_idle / time_ms is required (got {count})"
+        ));
+    }
+
+    let condition = if let Some(css) = p.selector_exists {
+        WaitCondition::SelectorExists(css)
+    } else if let Some(needle) = p.text_contains {
+        WaitCondition::TextContains(needle)
+    } else if let Some(pat) = p.url_matches {
+        match regex::Regex::new(&pat) {
+            Ok(re) => WaitCondition::UrlMatches(re),
+            Err(e) => return Err(format!("url_matches: invalid regex: {e}")),
+        }
+    } else if p.network_idle.unwrap_or(false) {
+        WaitCondition::NetworkIdle {
+            idle_window_ms: p
+                .idle_window_ms
+                .unwrap_or(heso_engine_js::wait_for::DEFAULT_NETWORK_IDLE_WINDOW_MS),
+        }
+    } else {
+        // time_ms
+        WaitCondition::TimeElapsed {
+            duration_ms: p.time_ms.unwrap_or(0),
+        }
+    };
+
+    let timeout = std::time::Duration::from_millis(
+        p.timeout_ms
+            .unwrap_or(heso_engine_js::wait_for::DEFAULT_TIMEOUT_MS),
+    );
+
+    let mut pages = state.pages.lock().await;
+    let record = pages
+        .get_mut(&page_id)
+        .ok_or_else(|| format!("no page_id `{}`", page_id))?;
+    ensure_session(&state.engine, record)?;
+    let session = record.session.as_ref().expect("session ensured above");
+
+    let outcome = heso_engine_js::wait_for_on_engine(
+        session.engine(),
+        &condition,
+        timeout,
+        heso_engine_js::wait_for::DEFAULT_TICK_MS,
+    )
+    .map_err(|e| format!("wait failed: {e}"))?;
+    Ok(outcome.to_json())
 }
 
 // ============================================================================

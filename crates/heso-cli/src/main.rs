@@ -130,6 +130,15 @@ fn print_banner() {
     println!("  heso open  <url>              Fetch once, return {{url,title,description,metadata,tree,actions,plat_hash}} (agent-facing)");
     println!("    [--explore-links N]            Pre-fetch up to --link-cap direct (depth=1) or nested (depth>=2) same-origin links");
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
+    println!("  heso read  <url>              Like `open` PLUS post-hydration text, grouped forms, cookies, console, framework sniff, scripts");
+    println!("    [--include CSV]                Filter the optional surface: text,forms,cookies,console,framework,scripts (default: all)");
+    println!("  heso wait  <url> <condition>  Block until a page condition is satisfied (Playwright-style). Exit 0 ok / 1 timeout / 2 usage.");
+    println!("    --selector-exists CSS          `document.querySelector(CSS) !== null`");
+    println!("    --text-contains STRING         `document.body.textContent.includes(STRING)`");
+    println!("    --url-matches REGEX            `window.location.href` matches REGEX (SPA route detection)");
+    println!("    --network-idle [--idle-window DUR]   No queued fetch/timer for DUR (default 500ms; Playwright `networkidle` parity)");
+    println!("    --time DUR                     Advance the deterministic virtual clock by DUR (e.g. `2s`, `750ms`)");
+    println!("    [--timeout DUR]                Overall wall-clock cap (default 30s, Playwright default)");
     println!("  heso click  <url> <@ref>      Fetch <url>, find element at <@ref> in the action graph, dispatch a click");
     println!("  heso fill   <url> <@ref> <v>  Fetch <url>, find element at <@ref>, set its .value and fire input+change");
     println!("  heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]");
@@ -1006,6 +1015,747 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `heso read <url>` — agent-facing one-call page report.
+///
+/// Returns a JSON envelope that's a strict superset of `heso open`:
+/// the static fields (url, title, description, metadata, tree,
+/// actions, plat_hash) PLUS post-hydration extras an agent typically
+/// wants in one shot:
+///
+/// - `text` — full visible body text, scripts/styles stripped.
+/// - `forms` — every `<form>` grouped with its inputs and submit
+///   button (derived from the action graph; the WHATWG "successful
+///   control" set).
+/// - `cookies` — non-`HttpOnly` cookies visible to the page URL,
+///   matching what `document.cookie` would return in a real browser
+///   (per WHATWG HTML §6.1).
+/// - `console` — every `console.*` entry the page's inline scripts
+///   produced during hydration.
+/// - `framework` — best-effort stack sniff (`next.js`, `nuxt`,
+///   `astro`, `remix`, `vue`, `react`, or `vanilla`) from
+///   [`crate::detect_framework`].
+/// - `scripts` — `{executed, executed_with_error, external_handled,
+///   skipped_non_script_type}` from the page's script-execution
+///   pass; identical shape to `heso eval-dom`'s `scripts` field.
+///
+/// `--include` filters the optional fields. By default all of the
+/// above ship; pass `--include text,actions,cookies` (etc.) to trim
+/// the envelope for a smaller payload.
+///
+/// Eliminates the `open → find → eval-dom → eval-dom` call burn an
+/// agent would otherwise do to reconstruct the same picture.
+async fn cmd_read(args: &[String]) -> ExitCode {
+    // Order-tolerant flag walk, same shape as `cmd_open`. Positional:
+    // exactly one `<url>`. Flag: `--include CSV` (additive whitelist
+    // of optional fields).
+    let mut url_arg: Option<String> = None;
+    let mut include_csv: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--include" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--include needs a value (comma-separated list)");
+                    return ExitCode::from(2);
+                };
+                include_csv = Some(v.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] <url>");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if url_arg.is_some() {
+                    eprintln!(
+                        "unexpected extra argument `{}`; pass a single <url>",
+                        args[i]
+                    );
+                    return ExitCode::from(2);
+                }
+                url_arg = Some(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let Some(url_str) = url_arg else {
+        eprintln!("usage: heso read [--include ...] <url>");
+        return ExitCode::from(2);
+    };
+
+    let url = match Url::parse(&url_str) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid URL `{url_str}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let include = parse_include_filter(include_csv.as_deref());
+
+    let fetch_engine = match FetchEngine::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to build fetch engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Static path: gives us url/title/meta/tree/actions/inline_data
+    // plus the raw HTML for the JS-side hydration pass below.
+    let page = match fetch_engine.open(&url).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fetch failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // JS-side hydration pass: build a JsSession against the fetched
+    // HTML, run inline scripts, capture console output. The session's
+    // engine shares the FetchEngine's cookie jar so `document.cookie`
+    // reads observe the same Set-Cookie responses we just received.
+    let client = fetch_engine.client();
+    let cookie_jar = fetch_engine.cookie_jar();
+    let rt_handle = tokio::runtime::Handle::current();
+    let js_engine =
+        match heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to create JS engine: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let (session, script_outcome) = match heso_engine_js::JsSession::open_on_engine(
+        js_engine,
+        &page.body_html,
+        page.url().clone(),
+        heso_engine_js::ScriptFetchPolicy::default(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("hydrate failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let console = session.engine().drain_console();
+    let post_html = session.document_html();
+
+    // Build the envelope. Start from the same base as `cmd_open`,
+    // then layer the agent-facing extras on top per `include`.
+    let mut body = serde_json::json!({
+        "url": page.url().as_str(),
+        "title": page.tree.title,
+        "description": page.tree.description,
+        "metadata": page.metadata,
+        "tree": page.tree,
+        "actions": page.actions,
+    });
+    if !page.inline_data.is_empty() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "inline_data".to_owned(),
+                serde_json::to_value(&page.inline_data).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    if !page.data_attrs.is_empty() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "data_attrs".to_owned(),
+                serde_json::to_value(&page.data_attrs).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    if include.text {
+        // Re-derive text from the post-hydration HTML so
+        // SPAs that inject content via JS still surface their text.
+        let text = heso_engine_fetch::extract_visible_text(&post_html);
+        body["text"] = serde_json::Value::String(text);
+    }
+    if include.forms {
+        body["forms"] = group_forms(&page.actions);
+    }
+    if include.cookies {
+        body["cookies"] = collect_cookies(&fetch_engine, page.url());
+    }
+    if include.console {
+        body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);
+    }
+    if include.framework {
+        body["framework"] = serde_json::Value::String(detect_framework(&page));
+    }
+    if include.scripts {
+        body["scripts"] = serde_json::json!({
+            "executed": script_outcome.executed,
+            "executed_with_error": script_outcome.executed_with_error,
+            "external_handled": script_outcome.external_handled,
+            "skipped_non_script_type": script_outcome.skipped_non_script_type,
+        });
+    }
+
+    // plat_hash last — same canonical form as `heso open` so an
+    // agent that already trusts an `open` plat can verify a `read`
+    // payload identically.
+    let hash = heso_engine_fetch::plat_hash(&body);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+    }
+    print_json(&body)
+}
+
+/// Bitfield of `read`-envelope optional fields. Defaults to "all on";
+/// `--include text,actions,...` flips back to "only the listed ones".
+/// Required fields (`url`, `title`, `meta`, `tree`, `actions`,
+/// `plat_hash`) are always emitted — only the agent-extras are
+/// gateable.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IncludeFilter {
+    pub(crate) text: bool,
+    pub(crate) forms: bool,
+    pub(crate) cookies: bool,
+    pub(crate) console: bool,
+    pub(crate) framework: bool,
+    pub(crate) scripts: bool,
+}
+
+impl IncludeFilter {
+    pub(crate) fn all() -> Self {
+        Self {
+            text: true,
+            forms: true,
+            cookies: true,
+            console: true,
+            framework: true,
+            scripts: true,
+        }
+    }
+}
+
+pub(crate) fn parse_include_filter(csv: Option<&str>) -> IncludeFilter {
+    let Some(csv) = csv else {
+        return IncludeFilter::all();
+    };
+    let mut f = IncludeFilter {
+        text: false,
+        forms: false,
+        cookies: false,
+        console: false,
+        framework: false,
+        scripts: false,
+    };
+    for token in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        match token {
+            "text" => f.text = true,
+            "forms" => f.forms = true,
+            "cookies" => f.cookies = true,
+            "console" => f.console = true,
+            "framework" => f.framework = true,
+            "scripts" => f.scripts = true,
+            // Silently ignore unknown tokens — the contract is
+            // "additive whitelist of the optional surface"; an agent
+            // passing `actions` (which always ships) shouldn't fail.
+            _ => {}
+        }
+    }
+    f
+}
+
+/// Group the action-graph entries into `<form>` clusters. Each form's
+/// inputs are the action-graph entries whose `section` is the form's
+/// own section AND whose tag is a form control. The "submit" ref is
+/// the first `button[type=submit]` / `input[type=submit]` in the form's
+/// section, falling back to the first `<button>` with no explicit type.
+///
+/// Returns a JSON array. Each entry:
+///
+/// ```json
+/// {
+///   "ref": "@e3",
+///   "action": "/login",
+///   "method": "post",
+///   "inputs": [{ "ref": "@e4", "tag": "input", "name": "user", "type": "text" }, ...],
+///   "submit_ref": "@e5"
+/// }
+/// ```
+pub(crate) fn group_forms(actions: &[heso_engine_fetch::ElementRef]) -> serde_json::Value {
+    let mut forms = Vec::new();
+    for el in actions.iter().filter(|e| e.tag == "form") {
+        let action = el.attrs.get("action").cloned().unwrap_or_default();
+        let method = el.attrs.get("method").cloned().unwrap_or_default();
+        let mut inputs = Vec::new();
+        let mut submit_ref: Option<String> = None;
+        // The action graph already records `section` for every element
+        // — the heading-tree path of its enclosing section. Inputs
+        // INSIDE the form share the form's `section`. We also accept
+        // ones nested in subsections (prefix match) so a fieldset
+        // labeled `<h3>` doesn't drop its children.
+        for child in actions
+            .iter()
+            .filter(|c| c.ref_id != el.ref_id)
+            .filter(|c| starts_with_section(&c.section, &el.section))
+        {
+            if !is_form_control(&child.tag) {
+                continue;
+            }
+            let is_submit = is_submit_control(child);
+            let entry = serde_json::json!({
+                "ref": child.ref_id,
+                "tag": child.tag,
+                "name": child.attrs.get("name").cloned().unwrap_or_default(),
+                "type": child.attrs.get("type").cloned().unwrap_or_default(),
+            });
+            inputs.push(entry);
+            if is_submit && submit_ref.is_none() {
+                submit_ref = Some(child.ref_id.clone());
+            }
+        }
+        let mut form = serde_json::json!({
+            "ref": el.ref_id,
+            "action": action,
+            "method": method,
+            "inputs": inputs,
+        });
+        if let Some(s) = submit_ref {
+            form["submit_ref"] = serde_json::Value::String(s);
+        }
+        forms.push(form);
+    }
+    serde_json::Value::Array(forms)
+}
+
+fn is_form_control(tag: &str) -> bool {
+    matches!(tag, "input" | "textarea" | "select" | "button")
+}
+
+/// `true` when the element is a form submission control — `<button>`
+/// (default type is `submit`), `<button type="submit">`, or
+/// `<input type="submit">`. Mirrors the WHATWG "submitter" fallback
+/// chain ([`heso_engine_js::session::SUBMIT_DESCENDANT_FINDER_JS`]).
+fn is_submit_control(el: &heso_engine_fetch::ElementRef) -> bool {
+    match el.tag.as_str() {
+        "button" => el
+            .attrs
+            .get("type")
+            .map(|t| t.eq_ignore_ascii_case("submit"))
+            .unwrap_or(true), // <button> default type is submit
+        "input" => el
+            .attrs
+            .get("type")
+            .map(|t| t.eq_ignore_ascii_case("submit"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn starts_with_section(child: &str, form: &str) -> bool {
+    if form == "/" {
+        // Root-level form: every section starts with `/`, so the prefix
+        // match would over-match. Use the same logic as the
+        // action-graph's section filter (only the form's own section).
+        return child == "/";
+    }
+    child == form || child.starts_with(&format!("{form}/"))
+}
+
+/// Walk the fetch engine's cookie jar and emit the non-HttpOnly
+/// cookies that match `url`, in the same order
+/// `cookie_store::CookieStore::matches` produces. Each entry is the
+/// agent-facing shape `{name, value, domain, path}` — HttpOnly is
+/// dropped per WHATWG HTML §6.1 (the same filter `document.cookie`
+/// applies in a real browser).
+pub(crate) fn collect_cookies(engine: &FetchEngine, url: &Url) -> serde_json::Value {
+    let jar = engine.cookie_jar();
+    let guard = match jar.lock() {
+        Ok(g) => g,
+        Err(_) => return serde_json::Value::Array(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for c in guard.matches(url) {
+        if matches!(c.http_only(), Some(true)) {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "name": c.name(),
+            "value": c.value(),
+            "domain": c.domain().unwrap_or(""),
+            "path": c.path().unwrap_or("/"),
+        }));
+    }
+    serde_json::Value::Array(out)
+}
+
+/// Best-effort framework sniff. Inspects (in priority order):
+///
+/// 1. `page.inline_data` keys — Next.js ships `__NEXT_DATA__`, Nuxt
+///    ships `__NUXT_DATA__`, Remix routes ship under `__remixContext`,
+///    Apollo under `__APOLLO_STATE__`, etc. These are the canonical
+///    SSR hydration payload names; an agent should treat them as
+///    ground truth.
+/// 2. Document body text + `<script src=...>` references in
+///    `page.body_html` for client-only frameworks (Vue, React,
+///    Svelte) that don't embed an SSR payload.
+///
+/// Returns one of `"next.js"`, `"nuxt"`, `"remix"`, `"astro"`,
+/// `"react"`, `"vue"`, `"svelte"`, `"angular"`, or `"vanilla"` as the
+/// fallback. Matches the public-signature patterns the official
+/// projects ship (Next's `__NEXT_DATA__` is documented;
+/// `window.__VUE__` / `window.React` are de facto signposts every
+/// dev-tools extension uses).
+pub(crate) fn detect_framework(page: &heso_engine_fetch::FetchPage) -> String {
+    let inline = &page.inline_data;
+    if inline.keys().any(|k| k == "__NEXT_DATA__") || inline.contains_key("__next_f") {
+        return "next.js".to_owned();
+    }
+    if inline.contains_key("__NUXT__") || inline.contains_key("__NUXT_DATA__") {
+        return "nuxt".to_owned();
+    }
+    if inline.contains_key("__remixContext") {
+        return "remix".to_owned();
+    }
+    if inline.contains_key("__ACGH_DATA__") {
+        return "apple-cms".to_owned();
+    }
+    // Astro embeds an `astro-island` attribute on the HTML — not in
+    // inline_data but discoverable in the raw body.
+    let html = &page.body_html;
+    if html.contains("astro-island") || html.contains("data-astro-cid") {
+        return "astro".to_owned();
+    }
+    if html.contains("__sveltekit") || html.contains("svelte-kit") {
+        return "svelte".to_owned();
+    }
+    // Angular renders an `ng-version` attribute on the root element.
+    if html.contains(" ng-version=") {
+        return "angular".to_owned();
+    }
+    // Vue's hydration payload is `window.__VUE_SSR_CONTEXT__` or a
+    // mount tag `<div id="app" data-server-rendered="true">`. Vue 3's
+    // SFC compiler also emits `data-v-` scoped CSS class prefixes.
+    if html.contains("__VUE__")
+        || html.contains("__VUE_SSR_CONTEXT__")
+        || html.contains("data-server-rendered=\"true\"")
+        || html.contains(" data-v-")
+    {
+        return "vue".to_owned();
+    }
+    // React leaves no inline hydration payload on its own (apps that
+    // use it ship one via Next/Remix above); but client-only React
+    // apps tend to mount on `#root` and ship a `react.production.min.js`
+    // or load via `unpkg.com/react`. Both signals are weak — we report
+    // only when at least one is present.
+    if html.contains("data-reactroot")
+        || html.contains("react.production")
+        || html.contains("react.development")
+    {
+        return "react".to_owned();
+    }
+    "vanilla".to_owned()
+}
+
+/// `heso wait <url> --selector-exists "#dashboard" [--timeout 5s]` —
+/// block until a page condition is satisfied.
+///
+/// Five condition types:
+///
+/// - `--selector-exists CSS` — `document.querySelector(CSS) !== null`.
+/// - `--text-contains STRING` — `document.body.textContent.includes(STRING)`.
+/// - `--url-matches REGEX` — `window.location.href` matches the regex
+///   (useful for SPA route changes via `pushState`).
+/// - `--network-idle [--idle-window 500ms]` — no pending `fetch()`
+///   for `idle_window` ms. Mirrors Playwright's `networkidle` semantics.
+/// - `--time DURATION` — advance the virtual clock by `DURATION`.
+///   Deterministic (no wall-time waste), so hydration-by-setTimeout
+///   patterns can be advanced in trace-replay without real sleep.
+///
+/// Output (success):
+///
+/// ```json
+/// { "ok": true, "elapsed_ms": 1450, "condition": "selector-exists #dashboard" }
+/// ```
+///
+/// On timeout:
+///
+/// ```json
+/// { "ok": false, "elapsed_ms": 5000, "condition": "...", "error": "timeout" }
+/// ```
+///
+/// Default `--timeout` is 30 s, matching Playwright's
+/// `page.waitForSelector` default. Exit code: 0 on `ok=true`, 1 on
+/// timeout, 2 on usage error.
+async fn cmd_wait(args: &[String]) -> ExitCode {
+    let mut url_arg: Option<String> = None;
+    let mut selector_exists: Option<String> = None;
+    let mut text_contains: Option<String> = None;
+    let mut url_matches: Option<String> = None;
+    let mut network_idle = false;
+    let mut idle_window: Option<u64> = None;
+    let mut time_value: Option<String> = None;
+    let mut timeout: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--selector-exists" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--selector-exists needs a value");
+                    return ExitCode::from(2);
+                };
+                selector_exists = Some(v.clone());
+                i += 2;
+            }
+            "--text-contains" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--text-contains needs a value");
+                    return ExitCode::from(2);
+                };
+                text_contains = Some(v.clone());
+                i += 2;
+            }
+            "--url-matches" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--url-matches needs a value");
+                    return ExitCode::from(2);
+                };
+                url_matches = Some(v.clone());
+                i += 2;
+            }
+            "--network-idle" => {
+                network_idle = true;
+                i += 1;
+            }
+            "--idle-window" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--idle-window needs a value");
+                    return ExitCode::from(2);
+                };
+                idle_window = match parse_duration_ms(v) {
+                    Ok(ms) => Some(ms),
+                    Err(e) => {
+                        eprintln!("--idle-window: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
+                i += 2;
+            }
+            "--time" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--time needs a value");
+                    return ExitCode::from(2);
+                };
+                time_value = Some(v.clone());
+                i += 2;
+            }
+            "--timeout" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--timeout needs a value");
+                    return ExitCode::from(2);
+                };
+                timeout = Some(v.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                eprintln!("usage: heso wait <url> [--selector-exists CSS | --text-contains STR | --url-matches REGEX | --network-idle | --time DUR] [--timeout DUR]");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if url_arg.is_some() {
+                    eprintln!(
+                        "unexpected extra argument `{}`; pass a single <url>",
+                        args[i]
+                    );
+                    return ExitCode::from(2);
+                }
+                url_arg = Some(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    // Build the WaitCondition. Exactly one of the five condition
+    // flags must be set.
+    let condition_flag_count = [
+        selector_exists.is_some(),
+        text_contains.is_some(),
+        url_matches.is_some(),
+        network_idle,
+        time_value.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if condition_flag_count != 1 {
+        eprintln!(
+            "heso wait: exactly one of --selector-exists / --text-contains / --url-matches / --network-idle / --time is required (got {condition_flag_count})"
+        );
+        return ExitCode::from(2);
+    }
+
+    let condition = if let Some(css) = selector_exists {
+        heso_engine_js::WaitCondition::SelectorExists(css)
+    } else if let Some(needle) = text_contains {
+        heso_engine_js::WaitCondition::TextContains(needle)
+    } else if let Some(pat) = url_matches {
+        match regex::Regex::new(&pat) {
+            Ok(re) => heso_engine_js::WaitCondition::UrlMatches(re),
+            Err(e) => {
+                eprintln!("--url-matches: invalid regex: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else if network_idle {
+        heso_engine_js::WaitCondition::NetworkIdle {
+            idle_window_ms: idle_window.unwrap_or(heso_engine_js::wait_for::DEFAULT_NETWORK_IDLE_WINDOW_MS),
+        }
+    } else {
+        // --time
+        let duration_ms = match parse_duration_ms(time_value.as_deref().unwrap_or("")) {
+            Ok(ms) => ms,
+            Err(e) => {
+                eprintln!("--time: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        heso_engine_js::WaitCondition::TimeElapsed { duration_ms }
+    };
+
+    let timeout_ms = if let Some(s) = timeout.as_deref() {
+        match parse_duration_ms(s) {
+            Ok(ms) => ms,
+            Err(e) => {
+                eprintln!("--timeout: {e}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        heso_engine_js::wait_for::DEFAULT_TIMEOUT_MS
+    };
+
+    let Some(url_str) = url_arg else {
+        eprintln!("usage: heso wait <url> [condition] [--timeout DUR]");
+        return ExitCode::from(2);
+    };
+    let url = match Url::parse(&url_str) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("invalid URL `{url_str}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    // Build a transient session against the URL.
+    let fetch_engine = match FetchEngine::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to build fetch engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (final_url, html) = match fetch_engine.fetch_text(&url).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("fetch failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = fetch_engine.client();
+    let cookie_jar = fetch_engine.cookie_jar();
+    let rt_handle = tokio::runtime::Handle::current();
+    let js_engine =
+        match heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to create JS engine: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+    let (session, _) = match heso_engine_js::JsSession::open_on_engine(
+        js_engine,
+        &html,
+        final_url,
+        heso_engine_js::ScriptFetchPolicy::default(),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("hydrate failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The wait loop blocks the current task. We run it on a blocking
+    // pool because it calls `std::thread::sleep` for cooperative
+    // ticks; spawning it via `spawn_blocking` keeps the tokio runtime
+    // responsive (an HTTP fetch from inside the JS page can still
+    // drain). `JsSession` is `!Send` (QuickJS runtime), so we run
+    // synchronously on the current thread instead. The tokio runtime
+    // is multi-threaded, so other tasks keep moving.
+    let outcome = match heso_engine_js::wait_for_on_engine(
+        session.engine(),
+        &condition,
+        std::time::Duration::from_millis(timeout_ms),
+        heso_engine_js::wait_for::DEFAULT_TICK_MS,
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("wait failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let body = outcome.to_json();
+    let exit = if outcome.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    };
+    let _ = print_json(&body);
+    exit
+}
+
+/// Parse a duration string in the human-friendly shape Playwright
+/// users will reach for: `1s` / `500ms` / `2m` / `750` (bare number =
+/// milliseconds). Returns the duration as a `u64` of milliseconds.
+///
+/// Why not a crate: the parse is 12 lines and zero deps. `humantime`
+/// or `duration-str` would add a transitive crate (and a new arg
+/// shape — `5sec` vs `5 seconds`) for no expressivity win.
+fn parse_duration_ms(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("expected a duration like `500ms` / `5s` / `1m`".to_owned());
+    }
+    // Split into the numeric prefix + unit suffix. We accept fractional
+    // seconds so `0.5s` works the same as `500ms`.
+    let (num_part, unit) = {
+        let mut end = 0;
+        for (idx, c) in s.char_indices() {
+            if c.is_ascii_digit() || c == '.' {
+                end = idx + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        (&s[..end], s[end..].trim().to_ascii_lowercase())
+    };
+    if num_part.is_empty() {
+        return Err(format!("expected a number before the unit in `{s}`"));
+    }
+    let value: f64 = num_part
+        .parse()
+        .map_err(|e| format!("invalid number `{num_part}`: {e}"))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(format!("duration must be a non-negative finite number, got `{s}`"));
+    }
+    let ms = match unit.as_str() {
+        "" | "ms" => value,
+        "s" | "sec" | "secs" | "seconds" => value * 1_000.0,
+        "m" | "min" | "mins" | "minutes" => value * 60_000.0,
+        other => return Err(format!("unknown duration unit `{other}` (use ms / s / m)")),
+    };
+    Ok(ms.round() as u64)
 }
 
 /// Build a CSS selector that resolves an action-graph element via
@@ -2574,6 +3324,8 @@ async fn main() -> ExitCode {
         Some("find") => cmd_find(&args[1..]).await,
         Some("meta") => cmd_meta(&args[1..]).await,
         Some("open") => cmd_open(&args[1..]).await,
+        Some("read") => cmd_read(&args[1..]).await,
+        Some("wait") => cmd_wait(&args[1..]).await,
         Some("plat-hash") => cmd_plat_hash(&args[1..]).await,
         Some("plat-verify") => cmd_plat_verify(&args[1..]).await,
         Some("eval-js") => cmd_eval_js(&args[1..]).await,

@@ -23,6 +23,10 @@ heso-trace-exec = { path = "../heso-trace-exec" }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", "io-std", "sync", "fs"] }
+# `regex` compiles the `--url-matches REGEX` wait condition + the
+# matching `wait` RPC method. Workspace dep — same crate `heso-trace`
+# and `heso-engine-js` use, no new top-level dep introduced.
+regex.workspace = true
 # Global allocator: mimalloc beats Windows' UCRT allocator by
 # 20–50% on alloc-heavy workloads (reqwest body buffers, scraper
 # tree, serde_json, canonical-JSON writes) and has near-zero init

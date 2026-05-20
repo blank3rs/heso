@@ -99,6 +99,7 @@ pub mod scripts;
 pub mod session;
 pub mod timers;
 pub mod url_search_params;
+pub mod wait_for;
 pub mod web_apis;
 
 pub use dom::{Document, DomTokenList, Element, ShadowRoot};
@@ -115,4 +116,5 @@ pub use scripts::{ScriptFetchPolicy, ScriptOutcome};
 pub use session::JsSession;
 pub use timers::VirtualClock;
 pub use url_search_params::{UrlClass, UrlSearchParamsClass};
+pub use wait_for::{wait_for_on_engine, WaitCondition, WaitOutcome};
 pub use web_apis::{Blob, File, FormData, Headers};

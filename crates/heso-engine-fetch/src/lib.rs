@@ -416,11 +416,13 @@ impl EngineApi for FetchEngine {
 // ============================================================================
 
 /// Parse `html` and return the visible body text. Convenience wrapper
-/// around [`extract_visible_text_from_doc`] for callers that don't already
-/// hold a parsed `Html`. Test-only — the engine itself parses once in
-/// [`EngineApi::open`] and passes the doc straight through.
-#[cfg(test)]
-fn extract_visible_text(html: &str) -> String {
+/// around [`extract_visible_text_from_doc`] for callers that hold a
+/// raw HTML string (e.g. the post-mutation snapshot serialized out of
+/// a [`heso_engine_js::JsSession::document_html`]).
+///
+/// `<script>`, `<style>`, `<noscript>`, and `<template>` content is
+/// dropped; whitespace is normalized (runs collapse to single spaces).
+pub fn extract_visible_text(html: &str) -> String {
     extract_visible_text_from_doc(&Html::parse_document(html))
 }
 
