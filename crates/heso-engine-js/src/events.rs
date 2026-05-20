@@ -585,6 +585,1630 @@ impl CustomEvent {
     }
 }
 
+// ===== UI Events subclasses =====================================================
+//
+// WHATWG UI Events ([uievents]) defines a small hierarchy on top of
+// the base `Event`:
+//
+//   Event
+//   └─ UIEvent
+//      ├─ FocusEvent
+//      ├─ KeyboardEvent
+//      ├─ InputEvent
+//      └─ MouseEvent
+//         ├─ PointerEvent
+//         └─ WheelEvent
+//
+// Each subclass extends its parent with additional read-only init
+// fields. Browsers expose all of them as `globalThis` constructors so
+// pages can build synthetic events that the framework's `onChange` /
+// `onKeyDown` / `onClick` handlers — which probe `event.key`,
+// `event.button`, `event.shiftKey`, etc. — recognize as real.
+//
+// rquickjs's `#[rquickjs::class]` doesn't natively express IDL
+// inheritance, so each is its own struct here. The prototype chain is
+// rewired in `install_events` via `Object.setPrototypeOf`, the same
+// dance `File extends Blob` uses in `web_apis.rs`. That makes both
+// `instanceof KeyboardEvent` AND `instanceof Event` return `true` for
+// a `new KeyboardEvent(...)` instance.
+//
+// OSS cross-referenced:
+// - jsdom `lib/jsdom/living/events/{UIEvent,KeyboardEvent,InputEvent,
+//   MouseEvent,PointerEvent,WheelEvent,FocusEvent}-impl.js` — MIT.
+//   Source-of-truth for the per-class init-dictionary field set and
+//   spec-default values.
+// - happy-dom `src/event/events/{KeyboardEvent,InputEvent,MouseEvent,
+//   PointerEvent,WheelEvent,FocusEvent}.ts` — MIT. Cleaner reference
+//   for the read-only-IDL-attribute shape.
+//
+// [uievents]: https://w3c.github.io/uievents/
+
+/// Common base fields for every UI Events subclass.
+///
+/// Each subclass below carries one of these plus its own extra
+/// constructor-time-only fields. Kept in a small struct so the
+/// per-class boilerplate stays small.
+#[derive(Clone)]
+struct EventBase {
+    event_type: String,
+    bubbles: bool,
+    cancelable: bool,
+    composed: bool,
+    state: Rc<EventState>,
+}
+
+impl EventBase {
+    fn from_init(event_type: String, init: EventInit) -> Self {
+        Self {
+            event_type,
+            bubbles: init.bubbles,
+            cancelable: init.cancelable,
+            composed: init.composed,
+            state: Rc::new(EventState::default()),
+        }
+    }
+}
+
+// ----- UIEvent ------------------------------------------------------
+
+/// Optional fields added by [`UIEvent`] (and inherited by every
+/// subclass below it). `view` is stored as a JS-side hidden property
+/// because it must be a JS value (a `Window`-like reference); the rest
+/// are primitives.
+#[derive(Default, Clone)]
+struct UIEventInit {
+    detail: i64,
+}
+
+const PROP_UI_VIEW: &str = "__uiView";
+
+fn parse_ui_event_init<'js>(
+    ctx: &Ctx<'js>,
+    init: Option<Value<'js>>,
+) -> rquickjs::Result<(EventInit, UIEventInit, Option<Value<'js>>)> {
+    let Some(value) = init else {
+        return Ok((EventInit::default(), UIEventInit::default(), None));
+    };
+    if value.is_null() || value.is_undefined() {
+        return Ok((EventInit::default(), UIEventInit::default(), None));
+    }
+    let base = parse_event_init(ctx, Some(value.clone()))?;
+    let obj = value
+        .clone()
+        .into_object()
+        .ok_or_else(|| JsError::new_from_js_message("init", "UIEventInit", "expected an object"))?;
+    let detail = obj.get::<_, Option<i64>>("detail")?.unwrap_or(0);
+    let view = obj.get::<_, Option<Value<'js>>>("view")?;
+    Ok((base, UIEventInit { detail }, view))
+}
+
+/// `UIEvent` — base for `KeyboardEvent` / `InputEvent` / `MouseEvent`
+/// / `FocusEvent` / etc. Adds `detail` and `view`.
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename = "UIEvent")]
+pub struct UIEvent {
+    #[qjs(skip_trace)]
+    base: EventBase,
+    #[qjs(skip_trace)]
+    detail: i64,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl UIEvent {
+    /// `new UIEvent(type, init?)`. `init` extends `EventInit` with
+    /// `detail: number` and `view: Window`.
+    #[qjs(constructor)]
+    pub fn new<'js>(
+        ctx: Ctx<'js>,
+        event_type: String,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Self> {
+        let (base_init, ui_init, view) = parse_ui_event_init(&ctx, init.0)?;
+        let _ = view; // Stashed by the JS-side constructor wrapper.
+        Ok(Self {
+            base: EventBase::from_init(event_type, base_init),
+            detail: ui_init.detail,
+        })
+    }
+
+    /// `e.type`.
+    #[qjs(get, rename = "type")]
+    fn event_type(&self) -> String {
+        self.base.event_type.clone()
+    }
+    /// `e.bubbles`.
+    #[qjs(get)]
+    fn bubbles(&self) -> bool {
+        self.base.bubbles
+    }
+    /// `e.cancelable`.
+    #[qjs(get)]
+    fn cancelable(&self) -> bool {
+        self.base.cancelable
+    }
+    /// `e.composed`.
+    #[qjs(get)]
+    fn composed(&self) -> bool {
+        self.base.composed
+    }
+    /// `e.defaultPrevented`.
+    #[qjs(get)]
+    fn default_prevented(&self) -> bool {
+        self.base.state.default_prevented.get()
+    }
+    /// `e.eventPhase`.
+    #[qjs(get)]
+    fn event_phase(&self) -> u32 {
+        self.base.state.event_phase.get()
+    }
+    /// `e.timeStamp` — 0 per the Phase-1B punt.
+    #[qjs(get)]
+    fn time_stamp(&self) -> f64 {
+        0.0
+    }
+    /// `e.isTrusted` — synthesized events always report `false`.
+    #[qjs(get)]
+    fn is_trusted(&self) -> bool {
+        false
+    }
+    /// `e.detail` — UIEvent-specific click-count-ish counter.
+    #[qjs(get)]
+    fn detail(&self) -> i64 {
+        self.detail
+    }
+    /// `e.view` — the `Window`-like reference passed at construction.
+    /// Stored JS-side because it's an arbitrary JS value, not a
+    /// primitive.
+    #[qjs(get)]
+    fn view<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        view_property(this.0.clone().into_value())
+    }
+    /// `e.target` — see [`Event::target`].
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
+    }
+    /// `e.currentTarget` — see [`Event::current_target`].
+    #[qjs(get)]
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        current_target_property(this.0.clone().into_value())
+    }
+    /// `e.preventDefault()`.
+    fn prevent_default(&self) {
+        if self.base.cancelable {
+            self.base.state.default_prevented.set(true);
+        }
+    }
+    /// `e.stopPropagation()`.
+    fn stop_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+    }
+    /// `e.stopImmediatePropagation()`.
+    fn stop_immediate_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+        self.base.state.immediate_propagation_stopped.set(true);
+    }
+}
+
+// ----- KeyboardEvent ------------------------------------------------
+
+/// Init dictionary for [`KeyboardEvent`]. Per
+/// [UI Events §5.6.4](https://w3c.github.io/uievents/#interface-keyboardeventinit).
+#[derive(Default, Clone)]
+struct KeyboardEventInit {
+    key: String,
+    code: String,
+    location: u32,
+    repeat: bool,
+    is_composing: bool,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+    char_code: u32,
+    key_code: u32,
+    which: u32,
+}
+
+fn parse_keyboard_event_init<'js>(
+    ctx: &Ctx<'js>,
+    init: Option<Value<'js>>,
+) -> rquickjs::Result<(EventInit, UIEventInit, Option<Value<'js>>, KeyboardEventInit)> {
+    let (base, ui, view) = parse_ui_event_init(ctx, init.clone())?;
+    let Some(value) = init else {
+        return Ok((base, ui, view, KeyboardEventInit::default()));
+    };
+    if value.is_null() || value.is_undefined() {
+        return Ok((base, ui, view, KeyboardEventInit::default()));
+    }
+    let obj = value.into_object().ok_or_else(|| {
+        JsError::new_from_js_message("init", "KeyboardEventInit", "expected an object")
+    })?;
+    Ok((
+        base,
+        ui,
+        view,
+        KeyboardEventInit {
+            key: obj.get::<_, Option<String>>("key")?.unwrap_or_default(),
+            code: obj.get::<_, Option<String>>("code")?.unwrap_or_default(),
+            location: obj.get::<_, Option<u32>>("location")?.unwrap_or(0),
+            repeat: obj.get::<_, Option<bool>>("repeat")?.unwrap_or(false),
+            is_composing: obj
+                .get::<_, Option<bool>>("isComposing")?
+                .unwrap_or(false),
+            ctrl_key: obj.get::<_, Option<bool>>("ctrlKey")?.unwrap_or(false),
+            shift_key: obj.get::<_, Option<bool>>("shiftKey")?.unwrap_or(false),
+            alt_key: obj.get::<_, Option<bool>>("altKey")?.unwrap_or(false),
+            meta_key: obj.get::<_, Option<bool>>("metaKey")?.unwrap_or(false),
+            char_code: obj.get::<_, Option<u32>>("charCode")?.unwrap_or(0),
+            key_code: obj.get::<_, Option<u32>>("keyCode")?.unwrap_or(0),
+            which: obj.get::<_, Option<u32>>("which")?.unwrap_or(0),
+        },
+    ))
+}
+
+/// `KeyboardEvent` — fires on `keydown` / `keyup` / `keypress`. Carries
+/// `key` (printable char or named key), `code` (physical key), plus the
+/// four modifier flags + the legacy `keyCode` / `which` / `charCode`
+/// trio. Frameworks (React in particular) probe `event.key` and
+/// `event.shiftKey` so a partial-shape synthetic was useless.
+///
+/// Per [UI Events §5.6](https://w3c.github.io/uievents/#interface-keyboardevent).
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename = "KeyboardEvent")]
+pub struct KeyboardEvent {
+    #[qjs(skip_trace)]
+    base: EventBase,
+    #[qjs(skip_trace)]
+    detail: i64,
+    #[qjs(skip_trace)]
+    kb: KeyboardEventInit,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl KeyboardEvent {
+    /// `new KeyboardEvent(type, init?)`. See [`KeyboardEventInit`]
+    /// (private struct) for the accepted fields.
+    #[qjs(constructor)]
+    pub fn new<'js>(
+        ctx: Ctx<'js>,
+        event_type: String,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Self> {
+        let (base, ui, _view, kb) = parse_keyboard_event_init(&ctx, init.0)?;
+        Ok(Self {
+            base: EventBase::from_init(event_type, base),
+            detail: ui.detail,
+            kb,
+        })
+    }
+
+    // ---- Event base getters (mirror UIEvent) ----
+    /// `e.type`.
+    #[qjs(get, rename = "type")]
+    fn event_type(&self) -> String {
+        self.base.event_type.clone()
+    }
+    /// `e.bubbles`.
+    #[qjs(get)]
+    fn bubbles(&self) -> bool {
+        self.base.bubbles
+    }
+    /// `e.cancelable`.
+    #[qjs(get)]
+    fn cancelable(&self) -> bool {
+        self.base.cancelable
+    }
+    /// `e.composed`.
+    #[qjs(get)]
+    fn composed(&self) -> bool {
+        self.base.composed
+    }
+    /// `e.defaultPrevented`.
+    #[qjs(get)]
+    fn default_prevented(&self) -> bool {
+        self.base.state.default_prevented.get()
+    }
+    /// `e.eventPhase`.
+    #[qjs(get)]
+    fn event_phase(&self) -> u32 {
+        self.base.state.event_phase.get()
+    }
+    /// `e.timeStamp`.
+    #[qjs(get)]
+    fn time_stamp(&self) -> f64 {
+        0.0
+    }
+    /// `e.isTrusted`.
+    #[qjs(get)]
+    fn is_trusted(&self) -> bool {
+        false
+    }
+    /// `e.detail` (from UIEvent).
+    #[qjs(get)]
+    fn detail(&self) -> i64 {
+        self.detail
+    }
+    /// `e.view` (from UIEvent).
+    #[qjs(get)]
+    fn view<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        view_property(this.0.clone().into_value())
+    }
+    /// `e.target`.
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
+    }
+    /// `e.currentTarget`.
+    #[qjs(get)]
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        current_target_property(this.0.clone().into_value())
+    }
+    /// `e.preventDefault()`.
+    fn prevent_default(&self) {
+        if self.base.cancelable {
+            self.base.state.default_prevented.set(true);
+        }
+    }
+    /// `e.stopPropagation()`.
+    fn stop_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+    }
+    /// `e.stopImmediatePropagation()`.
+    fn stop_immediate_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+        self.base.state.immediate_propagation_stopped.set(true);
+    }
+
+    // ---- KeyboardEvent-specific ----
+    /// `e.key` — printable character or named key (e.g. `"a"`, `"Enter"`).
+    #[qjs(get)]
+    fn key(&self) -> String {
+        self.kb.key.clone()
+    }
+    /// `e.code` — physical key identifier (e.g. `"KeyA"`, `"Enter"`).
+    #[qjs(get)]
+    fn code(&self) -> String {
+        self.kb.code.clone()
+    }
+    /// `e.location` — `KeyboardEvent.DOM_KEY_LOCATION_*`.
+    #[qjs(get)]
+    fn location(&self) -> u32 {
+        self.kb.location
+    }
+    /// `e.repeat` — true on auto-repeat.
+    #[qjs(get)]
+    fn repeat(&self) -> bool {
+        self.kb.repeat
+    }
+    /// `e.isComposing` — IME composition session active.
+    #[qjs(get)]
+    fn is_composing(&self) -> bool {
+        self.kb.is_composing
+    }
+    /// `e.ctrlKey`.
+    #[qjs(get)]
+    fn ctrl_key(&self) -> bool {
+        self.kb.ctrl_key
+    }
+    /// `e.shiftKey`.
+    #[qjs(get)]
+    fn shift_key(&self) -> bool {
+        self.kb.shift_key
+    }
+    /// `e.altKey`.
+    #[qjs(get)]
+    fn alt_key(&self) -> bool {
+        self.kb.alt_key
+    }
+    /// `e.metaKey`.
+    #[qjs(get)]
+    fn meta_key(&self) -> bool {
+        self.kb.meta_key
+    }
+    /// `e.charCode` — legacy, deprecated.
+    #[qjs(get)]
+    fn char_code(&self) -> u32 {
+        self.kb.char_code
+    }
+    /// `e.keyCode` — legacy, deprecated.
+    #[qjs(get)]
+    fn key_code(&self) -> u32 {
+        self.kb.key_code
+    }
+    /// `e.which` — legacy, deprecated.
+    #[qjs(get)]
+    fn which(&self) -> u32 {
+        self.kb.which
+    }
+    /// `e.getModifierState(key)` — returns whether the named modifier
+    /// is currently pressed. We honor the four canonical modifiers
+    /// `Control` / `Shift` / `Alt` / `Meta`; everything else returns
+    /// `false` (we don't track CapsLock / NumLock / etc.).
+    fn get_modifier_state(&self, key: String) -> bool {
+        match key.as_str() {
+            "Control" => self.kb.ctrl_key,
+            "Shift" => self.kb.shift_key,
+            "Alt" => self.kb.alt_key,
+            "Meta" => self.kb.meta_key,
+            _ => false,
+        }
+    }
+}
+
+// ----- InputEvent ---------------------------------------------------
+
+/// Init dictionary for [`InputEvent`]. Per
+/// [UI Events §5.7.6](https://w3c.github.io/uievents/#interface-inputeventinit).
+#[derive(Default, Clone)]
+struct InputEventInit {
+    data: Option<String>,
+    input_type: String,
+    is_composing: bool,
+}
+
+fn parse_input_event_init<'js>(
+    ctx: &Ctx<'js>,
+    init: Option<Value<'js>>,
+) -> rquickjs::Result<(EventInit, UIEventInit, Option<Value<'js>>, InputEventInit)> {
+    let (base, ui, view) = parse_ui_event_init(ctx, init.clone())?;
+    let Some(value) = init else {
+        return Ok((base, ui, view, InputEventInit::default()));
+    };
+    if value.is_null() || value.is_undefined() {
+        return Ok((base, ui, view, InputEventInit::default()));
+    }
+    let obj = value.into_object().ok_or_else(|| {
+        JsError::new_from_js_message("init", "InputEventInit", "expected an object")
+    })?;
+    Ok((
+        base,
+        ui,
+        view,
+        InputEventInit {
+            data: obj.get::<_, Option<String>>("data")?,
+            input_type: obj.get::<_, Option<String>>("inputType")?.unwrap_or_default(),
+            is_composing: obj
+                .get::<_, Option<bool>>("isComposing")?
+                .unwrap_or(false),
+        },
+    ))
+}
+
+/// `InputEvent` — `input` / `beforeinput`. Carries `data` (the
+/// inserted text, may be null) and `inputType` (e.g. `"insertText"`,
+/// `"deleteContentBackward"`).
+///
+/// Per [UI Events §5.7](https://w3c.github.io/uievents/#interface-inputevent).
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename = "InputEvent")]
+pub struct InputEvent {
+    #[qjs(skip_trace)]
+    base: EventBase,
+    #[qjs(skip_trace)]
+    detail: i64,
+    #[qjs(skip_trace)]
+    ie: InputEventInit,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl InputEvent {
+    /// `new InputEvent(type, init?)`. See [`InputEventInit`] (private
+    /// struct) for the accepted fields.
+    #[qjs(constructor)]
+    pub fn new<'js>(
+        ctx: Ctx<'js>,
+        event_type: String,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Self> {
+        let (base, ui, _view, ie) = parse_input_event_init(&ctx, init.0)?;
+        Ok(Self {
+            base: EventBase::from_init(event_type, base),
+            detail: ui.detail,
+            ie,
+        })
+    }
+
+    /// `e.type`.
+    #[qjs(get, rename = "type")]
+    fn event_type(&self) -> String {
+        self.base.event_type.clone()
+    }
+    /// `e.bubbles`.
+    #[qjs(get)]
+    fn bubbles(&self) -> bool {
+        self.base.bubbles
+    }
+    /// `e.cancelable`.
+    #[qjs(get)]
+    fn cancelable(&self) -> bool {
+        self.base.cancelable
+    }
+    /// `e.composed`.
+    #[qjs(get)]
+    fn composed(&self) -> bool {
+        self.base.composed
+    }
+    /// `e.defaultPrevented`.
+    #[qjs(get)]
+    fn default_prevented(&self) -> bool {
+        self.base.state.default_prevented.get()
+    }
+    /// `e.eventPhase`.
+    #[qjs(get)]
+    fn event_phase(&self) -> u32 {
+        self.base.state.event_phase.get()
+    }
+    /// `e.timeStamp`.
+    #[qjs(get)]
+    fn time_stamp(&self) -> f64 {
+        0.0
+    }
+    /// `e.isTrusted`.
+    #[qjs(get)]
+    fn is_trusted(&self) -> bool {
+        false
+    }
+    /// `e.detail`.
+    #[qjs(get)]
+    fn detail(&self) -> i64 {
+        self.detail
+    }
+    /// `e.view`.
+    #[qjs(get)]
+    fn view<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        view_property(this.0.clone().into_value())
+    }
+    /// `e.target`.
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
+    }
+    /// `e.currentTarget`.
+    #[qjs(get)]
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        current_target_property(this.0.clone().into_value())
+    }
+    /// `e.preventDefault()`.
+    fn prevent_default(&self) {
+        if self.base.cancelable {
+            self.base.state.default_prevented.set(true);
+        }
+    }
+    /// `e.stopPropagation()`.
+    fn stop_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+    }
+    /// `e.stopImmediatePropagation()`.
+    fn stop_immediate_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+        self.base.state.immediate_propagation_stopped.set(true);
+    }
+
+    // ---- InputEvent-specific ----
+    /// `e.data` — the inserted text (or `null` when unavailable, e.g.
+    /// `deleteContentBackward`).
+    #[qjs(get)]
+    fn data<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        let borrowed = this.0.borrow();
+        let ctx = this.0.clone().into_value().ctx().clone();
+        match &borrowed.ie.data {
+            Some(s) => Ok(rquickjs::String::from_str(ctx, s)?.into_value()),
+            None => ctx.eval::<Value<'js>, _>("null"),
+        }
+    }
+    /// `e.inputType` — see WHATWG Input Events list of `inputType`
+    /// values; commonly `"insertText"` / `"deleteContentBackward"`.
+    #[qjs(get)]
+    fn input_type(&self) -> String {
+        self.ie.input_type.clone()
+    }
+    /// `e.isComposing`.
+    #[qjs(get)]
+    fn is_composing(&self) -> bool {
+        self.ie.is_composing
+    }
+}
+
+// ----- MouseEvent ---------------------------------------------------
+
+/// Init dictionary for [`MouseEvent`]. Per
+/// [UI Events §5.4.6](https://w3c.github.io/uievents/#interface-mouseeventinit).
+#[derive(Default, Clone)]
+struct MouseEventInit {
+    screen_x: f64,
+    screen_y: f64,
+    client_x: f64,
+    client_y: f64,
+    button: i16,
+    buttons: u32,
+    ctrl_key: bool,
+    shift_key: bool,
+    alt_key: bool,
+    meta_key: bool,
+    movement_x: f64,
+    movement_y: f64,
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_mouse_event_init<'js>(
+    ctx: &Ctx<'js>,
+    init: Option<Value<'js>>,
+) -> rquickjs::Result<(
+    EventInit,
+    UIEventInit,
+    Option<Value<'js>>,
+    Option<Value<'js>>,
+    MouseEventInit,
+)> {
+    let (base, ui, view) = parse_ui_event_init(ctx, init.clone())?;
+    let Some(value) = init else {
+        return Ok((base, ui, view, None, MouseEventInit::default()));
+    };
+    if value.is_null() || value.is_undefined() {
+        return Ok((base, ui, view, None, MouseEventInit::default()));
+    }
+    let obj = value.into_object().ok_or_else(|| {
+        JsError::new_from_js_message("init", "MouseEventInit", "expected an object")
+    })?;
+    let related_target = obj.get::<_, Option<Value<'js>>>("relatedTarget")?;
+    Ok((
+        base,
+        ui,
+        view,
+        related_target,
+        MouseEventInit {
+            screen_x: obj.get::<_, Option<f64>>("screenX")?.unwrap_or(0.0),
+            screen_y: obj.get::<_, Option<f64>>("screenY")?.unwrap_or(0.0),
+            client_x: obj.get::<_, Option<f64>>("clientX")?.unwrap_or(0.0),
+            client_y: obj.get::<_, Option<f64>>("clientY")?.unwrap_or(0.0),
+            button: obj.get::<_, Option<i16>>("button")?.unwrap_or(0),
+            buttons: obj.get::<_, Option<u32>>("buttons")?.unwrap_or(0),
+            ctrl_key: obj.get::<_, Option<bool>>("ctrlKey")?.unwrap_or(false),
+            shift_key: obj.get::<_, Option<bool>>("shiftKey")?.unwrap_or(false),
+            alt_key: obj.get::<_, Option<bool>>("altKey")?.unwrap_or(false),
+            meta_key: obj.get::<_, Option<bool>>("metaKey")?.unwrap_or(false),
+            movement_x: obj.get::<_, Option<f64>>("movementX")?.unwrap_or(0.0),
+            movement_y: obj.get::<_, Option<f64>>("movementY")?.unwrap_or(0.0),
+        },
+    ))
+}
+
+const PROP_RELATED_TARGET: &str = "__relatedTarget";
+
+/// `MouseEvent` — `click` / `mousedown` / `mouseup` / `mousemove`. Carries
+/// `button` (0=left, 1=middle, 2=right), `buttons` bitmask, the four
+/// modifier flags, and the spatial fields (`screenX/Y`, `clientX/Y`,
+/// `movementX/Y`).
+///
+/// Per [UI Events §5.4](https://w3c.github.io/uievents/#interface-mouseevent).
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename = "MouseEvent")]
+pub struct MouseEvent {
+    #[qjs(skip_trace)]
+    base: EventBase,
+    #[qjs(skip_trace)]
+    detail: i64,
+    #[qjs(skip_trace)]
+    me: MouseEventInit,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl MouseEvent {
+    /// `new MouseEvent(type, init?)`. See [`MouseEventInit`] (private
+    /// struct) for the accepted fields.
+    #[qjs(constructor)]
+    pub fn new<'js>(
+        ctx: Ctx<'js>,
+        event_type: String,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Self> {
+        let (base, ui, _view, _related, me) = parse_mouse_event_init(&ctx, init.0)?;
+        Ok(Self {
+            base: EventBase::from_init(event_type, base),
+            detail: ui.detail,
+            me,
+        })
+    }
+
+    /// `e.type`.
+    #[qjs(get, rename = "type")]
+    fn event_type(&self) -> String {
+        self.base.event_type.clone()
+    }
+    /// `e.bubbles`.
+    #[qjs(get)]
+    fn bubbles(&self) -> bool {
+        self.base.bubbles
+    }
+    /// `e.cancelable`.
+    #[qjs(get)]
+    fn cancelable(&self) -> bool {
+        self.base.cancelable
+    }
+    /// `e.composed`.
+    #[qjs(get)]
+    fn composed(&self) -> bool {
+        self.base.composed
+    }
+    /// `e.defaultPrevented`.
+    #[qjs(get)]
+    fn default_prevented(&self) -> bool {
+        self.base.state.default_prevented.get()
+    }
+    /// `e.eventPhase`.
+    #[qjs(get)]
+    fn event_phase(&self) -> u32 {
+        self.base.state.event_phase.get()
+    }
+    /// `e.timeStamp`.
+    #[qjs(get)]
+    fn time_stamp(&self) -> f64 {
+        0.0
+    }
+    /// `e.isTrusted`.
+    #[qjs(get)]
+    fn is_trusted(&self) -> bool {
+        false
+    }
+    /// `e.detail`.
+    #[qjs(get)]
+    fn detail(&self) -> i64 {
+        self.detail
+    }
+    /// `e.view`.
+    #[qjs(get)]
+    fn view<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        view_property(this.0.clone().into_value())
+    }
+    /// `e.target`.
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
+    }
+    /// `e.currentTarget`.
+    #[qjs(get)]
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        current_target_property(this.0.clone().into_value())
+    }
+    /// `e.preventDefault()`.
+    fn prevent_default(&self) {
+        if self.base.cancelable {
+            self.base.state.default_prevented.set(true);
+        }
+    }
+    /// `e.stopPropagation()`.
+    fn stop_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+    }
+    /// `e.stopImmediatePropagation()`.
+    fn stop_immediate_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+        self.base.state.immediate_propagation_stopped.set(true);
+    }
+
+    // ---- MouseEvent-specific ----
+    /// `e.screenX`.
+    #[qjs(get)]
+    fn screen_x(&self) -> f64 {
+        self.me.screen_x
+    }
+    /// `e.screenY`.
+    #[qjs(get)]
+    fn screen_y(&self) -> f64 {
+        self.me.screen_y
+    }
+    /// `e.clientX`.
+    #[qjs(get)]
+    fn client_x(&self) -> f64 {
+        self.me.client_x
+    }
+    /// `e.clientY`.
+    #[qjs(get)]
+    fn client_y(&self) -> f64 {
+        self.me.client_y
+    }
+    /// `e.pageX` — for now reports the same value as `clientX` (no
+    /// scroll offset tracking yet).
+    #[qjs(get)]
+    fn page_x(&self) -> f64 {
+        self.me.client_x
+    }
+    /// `e.pageY` — see [`Self::page_x`].
+    #[qjs(get)]
+    fn page_y(&self) -> f64 {
+        self.me.client_y
+    }
+    /// `e.offsetX` — for now reports the same value as `clientX`.
+    #[qjs(get)]
+    fn offset_x(&self) -> f64 {
+        self.me.client_x
+    }
+    /// `e.offsetY` — see [`Self::offset_x`].
+    #[qjs(get)]
+    fn offset_y(&self) -> f64 {
+        self.me.client_y
+    }
+    /// `e.x` — alias of `clientX`.
+    #[qjs(get)]
+    fn x(&self) -> f64 {
+        self.me.client_x
+    }
+    /// `e.y` — alias of `clientY`.
+    #[qjs(get)]
+    fn y(&self) -> f64 {
+        self.me.client_y
+    }
+    /// `e.button` — 0=left, 1=middle, 2=right.
+    #[qjs(get)]
+    fn button(&self) -> i16 {
+        self.me.button
+    }
+    /// `e.buttons` — bitmask of currently held buttons.
+    #[qjs(get)]
+    fn buttons(&self) -> u32 {
+        self.me.buttons
+    }
+    /// `e.ctrlKey`.
+    #[qjs(get)]
+    fn ctrl_key(&self) -> bool {
+        self.me.ctrl_key
+    }
+    /// `e.shiftKey`.
+    #[qjs(get)]
+    fn shift_key(&self) -> bool {
+        self.me.shift_key
+    }
+    /// `e.altKey`.
+    #[qjs(get)]
+    fn alt_key(&self) -> bool {
+        self.me.alt_key
+    }
+    /// `e.metaKey`.
+    #[qjs(get)]
+    fn meta_key(&self) -> bool {
+        self.me.meta_key
+    }
+    /// `e.movementX`.
+    #[qjs(get)]
+    fn movement_x(&self) -> f64 {
+        self.me.movement_x
+    }
+    /// `e.movementY`.
+    #[qjs(get)]
+    fn movement_y(&self) -> f64 {
+        self.me.movement_y
+    }
+    /// `e.relatedTarget` — stashed JS-side at construction.
+    #[qjs(get)]
+    fn related_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        related_target_property(this.0.clone().into_value())
+    }
+    /// `e.getModifierState(key)`. See [`KeyboardEvent::get_modifier_state`].
+    fn get_modifier_state(&self, key: String) -> bool {
+        match key.as_str() {
+            "Control" => self.me.ctrl_key,
+            "Shift" => self.me.shift_key,
+            "Alt" => self.me.alt_key,
+            "Meta" => self.me.meta_key,
+            _ => false,
+        }
+    }
+}
+
+// ----- PointerEvent -------------------------------------------------
+
+/// Init dictionary for [`PointerEvent`]. Per
+/// [W3C Pointer Events §5.4](https://www.w3.org/TR/pointerevents/#dictdef-pointereventinit).
+#[derive(Default, Clone)]
+struct PointerEventInit {
+    pointer_id: i32,
+    width: f64,
+    height: f64,
+    pressure: f64,
+    tangential_pressure: f64,
+    tilt_x: i32,
+    tilt_y: i32,
+    twist: i32,
+    pointer_type: String,
+    is_primary: bool,
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_pointer_event_init<'js>(
+    ctx: &Ctx<'js>,
+    init: Option<Value<'js>>,
+) -> rquickjs::Result<(
+    EventInit,
+    UIEventInit,
+    Option<Value<'js>>,
+    Option<Value<'js>>,
+    MouseEventInit,
+    PointerEventInit,
+)> {
+    let (base, ui, view, related, me) = parse_mouse_event_init(ctx, init.clone())?;
+    let Some(value) = init else {
+        return Ok((base, ui, view, related, me, PointerEventInit::default()));
+    };
+    if value.is_null() || value.is_undefined() {
+        return Ok((base, ui, view, related, me, PointerEventInit::default()));
+    }
+    let obj = value.into_object().ok_or_else(|| {
+        JsError::new_from_js_message("init", "PointerEventInit", "expected an object")
+    })?;
+    Ok((
+        base,
+        ui,
+        view,
+        related,
+        me,
+        PointerEventInit {
+            pointer_id: obj.get::<_, Option<i32>>("pointerId")?.unwrap_or(0),
+            width: obj.get::<_, Option<f64>>("width")?.unwrap_or(1.0),
+            height: obj.get::<_, Option<f64>>("height")?.unwrap_or(1.0),
+            pressure: obj.get::<_, Option<f64>>("pressure")?.unwrap_or(0.0),
+            tangential_pressure: obj
+                .get::<_, Option<f64>>("tangentialPressure")?
+                .unwrap_or(0.0),
+            tilt_x: obj.get::<_, Option<i32>>("tiltX")?.unwrap_or(0),
+            tilt_y: obj.get::<_, Option<i32>>("tiltY")?.unwrap_or(0),
+            twist: obj.get::<_, Option<i32>>("twist")?.unwrap_or(0),
+            pointer_type: obj
+                .get::<_, Option<String>>("pointerType")?
+                .unwrap_or_default(),
+            is_primary: obj.get::<_, Option<bool>>("isPrimary")?.unwrap_or(false),
+        },
+    ))
+}
+
+/// `PointerEvent` — generic pointing-device event (mouse / pen /
+/// touch). Inherits everything from [`MouseEvent`] and adds the
+/// pointer-shape fields.
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename = "PointerEvent")]
+pub struct PointerEvent {
+    #[qjs(skip_trace)]
+    base: EventBase,
+    #[qjs(skip_trace)]
+    detail: i64,
+    #[qjs(skip_trace)]
+    me: MouseEventInit,
+    #[qjs(skip_trace)]
+    pe: PointerEventInit,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl PointerEvent {
+    /// `new PointerEvent(type, init?)`. See [`PointerEventInit`]
+    /// (private struct) for the accepted fields.
+    #[qjs(constructor)]
+    pub fn new<'js>(
+        ctx: Ctx<'js>,
+        event_type: String,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Self> {
+        let (base, ui, _view, _related, me, pe) = parse_pointer_event_init(&ctx, init.0)?;
+        Ok(Self {
+            base: EventBase::from_init(event_type, base),
+            detail: ui.detail,
+            me,
+            pe,
+        })
+    }
+
+    /// `e.type`.
+    #[qjs(get, rename = "type")]
+    fn event_type(&self) -> String {
+        self.base.event_type.clone()
+    }
+    /// `e.bubbles`.
+    #[qjs(get)]
+    fn bubbles(&self) -> bool {
+        self.base.bubbles
+    }
+    /// `e.cancelable`.
+    #[qjs(get)]
+    fn cancelable(&self) -> bool {
+        self.base.cancelable
+    }
+    /// `e.composed`.
+    #[qjs(get)]
+    fn composed(&self) -> bool {
+        self.base.composed
+    }
+    /// `e.defaultPrevented`.
+    #[qjs(get)]
+    fn default_prevented(&self) -> bool {
+        self.base.state.default_prevented.get()
+    }
+    /// `e.eventPhase`.
+    #[qjs(get)]
+    fn event_phase(&self) -> u32 {
+        self.base.state.event_phase.get()
+    }
+    /// `e.timeStamp`.
+    #[qjs(get)]
+    fn time_stamp(&self) -> f64 {
+        0.0
+    }
+    /// `e.isTrusted`.
+    #[qjs(get)]
+    fn is_trusted(&self) -> bool {
+        false
+    }
+    /// `e.detail`.
+    #[qjs(get)]
+    fn detail(&self) -> i64 {
+        self.detail
+    }
+    /// `e.view`.
+    #[qjs(get)]
+    fn view<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        view_property(this.0.clone().into_value())
+    }
+    /// `e.target`.
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
+    }
+    /// `e.currentTarget`.
+    #[qjs(get)]
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        current_target_property(this.0.clone().into_value())
+    }
+    /// `e.preventDefault()`.
+    fn prevent_default(&self) {
+        if self.base.cancelable {
+            self.base.state.default_prevented.set(true);
+        }
+    }
+    /// `e.stopPropagation()`.
+    fn stop_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+    }
+    /// `e.stopImmediatePropagation()`.
+    fn stop_immediate_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+        self.base.state.immediate_propagation_stopped.set(true);
+    }
+
+    // ---- MouseEvent inherited ----
+    /// `e.screenX`.
+    #[qjs(get)]
+    fn screen_x(&self) -> f64 {
+        self.me.screen_x
+    }
+    /// `e.screenY`.
+    #[qjs(get)]
+    fn screen_y(&self) -> f64 {
+        self.me.screen_y
+    }
+    /// `e.clientX`.
+    #[qjs(get)]
+    fn client_x(&self) -> f64 {
+        self.me.client_x
+    }
+    /// `e.clientY`.
+    #[qjs(get)]
+    fn client_y(&self) -> f64 {
+        self.me.client_y
+    }
+    /// `e.button`.
+    #[qjs(get)]
+    fn button(&self) -> i16 {
+        self.me.button
+    }
+    /// `e.buttons`.
+    #[qjs(get)]
+    fn buttons(&self) -> u32 {
+        self.me.buttons
+    }
+    /// `e.ctrlKey`.
+    #[qjs(get)]
+    fn ctrl_key(&self) -> bool {
+        self.me.ctrl_key
+    }
+    /// `e.shiftKey`.
+    #[qjs(get)]
+    fn shift_key(&self) -> bool {
+        self.me.shift_key
+    }
+    /// `e.altKey`.
+    #[qjs(get)]
+    fn alt_key(&self) -> bool {
+        self.me.alt_key
+    }
+    /// `e.metaKey`.
+    #[qjs(get)]
+    fn meta_key(&self) -> bool {
+        self.me.meta_key
+    }
+    /// `e.movementX`.
+    #[qjs(get)]
+    fn movement_x(&self) -> f64 {
+        self.me.movement_x
+    }
+    /// `e.movementY`.
+    #[qjs(get)]
+    fn movement_y(&self) -> f64 {
+        self.me.movement_y
+    }
+    /// `e.relatedTarget`.
+    #[qjs(get)]
+    fn related_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        related_target_property(this.0.clone().into_value())
+    }
+    /// `e.getModifierState(key)`.
+    fn get_modifier_state(&self, key: String) -> bool {
+        match key.as_str() {
+            "Control" => self.me.ctrl_key,
+            "Shift" => self.me.shift_key,
+            "Alt" => self.me.alt_key,
+            "Meta" => self.me.meta_key,
+            _ => false,
+        }
+    }
+
+    // ---- PointerEvent-specific ----
+    /// `e.pointerId`.
+    #[qjs(get)]
+    fn pointer_id(&self) -> i32 {
+        self.pe.pointer_id
+    }
+    /// `e.width`.
+    #[qjs(get)]
+    fn width(&self) -> f64 {
+        self.pe.width
+    }
+    /// `e.height`.
+    #[qjs(get)]
+    fn height(&self) -> f64 {
+        self.pe.height
+    }
+    /// `e.pressure`.
+    #[qjs(get)]
+    fn pressure(&self) -> f64 {
+        self.pe.pressure
+    }
+    /// `e.tangentialPressure`.
+    #[qjs(get)]
+    fn tangential_pressure(&self) -> f64 {
+        self.pe.tangential_pressure
+    }
+    /// `e.tiltX`.
+    #[qjs(get)]
+    fn tilt_x(&self) -> i32 {
+        self.pe.tilt_x
+    }
+    /// `e.tiltY`.
+    #[qjs(get)]
+    fn tilt_y(&self) -> i32 {
+        self.pe.tilt_y
+    }
+    /// `e.twist`.
+    #[qjs(get)]
+    fn twist(&self) -> i32 {
+        self.pe.twist
+    }
+    /// `e.pointerType` — `"mouse"` / `"pen"` / `"touch"`.
+    #[qjs(get)]
+    fn pointer_type(&self) -> String {
+        self.pe.pointer_type.clone()
+    }
+    /// `e.isPrimary`.
+    #[qjs(get)]
+    fn is_primary(&self) -> bool {
+        self.pe.is_primary
+    }
+}
+
+// ----- WheelEvent ---------------------------------------------------
+
+/// Init dictionary for [`WheelEvent`]. Per
+/// [UI Events §5.5.5](https://w3c.github.io/uievents/#interface-wheeleventinit).
+#[derive(Default, Clone)]
+struct WheelEventInit {
+    delta_x: f64,
+    delta_y: f64,
+    delta_z: f64,
+    delta_mode: u32,
+}
+
+#[allow(clippy::type_complexity)]
+fn parse_wheel_event_init<'js>(
+    ctx: &Ctx<'js>,
+    init: Option<Value<'js>>,
+) -> rquickjs::Result<(
+    EventInit,
+    UIEventInit,
+    Option<Value<'js>>,
+    Option<Value<'js>>,
+    MouseEventInit,
+    WheelEventInit,
+)> {
+    let (base, ui, view, related, me) = parse_mouse_event_init(ctx, init.clone())?;
+    let Some(value) = init else {
+        return Ok((base, ui, view, related, me, WheelEventInit::default()));
+    };
+    if value.is_null() || value.is_undefined() {
+        return Ok((base, ui, view, related, me, WheelEventInit::default()));
+    }
+    let obj = value.into_object().ok_or_else(|| {
+        JsError::new_from_js_message("init", "WheelEventInit", "expected an object")
+    })?;
+    Ok((
+        base,
+        ui,
+        view,
+        related,
+        me,
+        WheelEventInit {
+            delta_x: obj.get::<_, Option<f64>>("deltaX")?.unwrap_or(0.0),
+            delta_y: obj.get::<_, Option<f64>>("deltaY")?.unwrap_or(0.0),
+            delta_z: obj.get::<_, Option<f64>>("deltaZ")?.unwrap_or(0.0),
+            delta_mode: obj.get::<_, Option<u32>>("deltaMode")?.unwrap_or(0),
+        },
+    ))
+}
+
+/// `WheelEvent` — scroll-wheel event. Inherits from [`MouseEvent`] and
+/// adds the four `delta*` fields.
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename = "WheelEvent")]
+pub struct WheelEvent {
+    #[qjs(skip_trace)]
+    base: EventBase,
+    #[qjs(skip_trace)]
+    detail: i64,
+    #[qjs(skip_trace)]
+    me: MouseEventInit,
+    #[qjs(skip_trace)]
+    we: WheelEventInit,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl WheelEvent {
+    /// `new WheelEvent(type, init?)`. See [`WheelEventInit`] (private
+    /// struct) for the accepted fields.
+    #[qjs(constructor)]
+    pub fn new<'js>(
+        ctx: Ctx<'js>,
+        event_type: String,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Self> {
+        let (base, ui, _view, _related, me, we) = parse_wheel_event_init(&ctx, init.0)?;
+        Ok(Self {
+            base: EventBase::from_init(event_type, base),
+            detail: ui.detail,
+            me,
+            we,
+        })
+    }
+
+    /// `e.type`.
+    #[qjs(get, rename = "type")]
+    fn event_type(&self) -> String {
+        self.base.event_type.clone()
+    }
+    /// `e.bubbles`.
+    #[qjs(get)]
+    fn bubbles(&self) -> bool {
+        self.base.bubbles
+    }
+    /// `e.cancelable`.
+    #[qjs(get)]
+    fn cancelable(&self) -> bool {
+        self.base.cancelable
+    }
+    /// `e.composed`.
+    #[qjs(get)]
+    fn composed(&self) -> bool {
+        self.base.composed
+    }
+    /// `e.defaultPrevented`.
+    #[qjs(get)]
+    fn default_prevented(&self) -> bool {
+        self.base.state.default_prevented.get()
+    }
+    /// `e.eventPhase`.
+    #[qjs(get)]
+    fn event_phase(&self) -> u32 {
+        self.base.state.event_phase.get()
+    }
+    /// `e.timeStamp`.
+    #[qjs(get)]
+    fn time_stamp(&self) -> f64 {
+        0.0
+    }
+    /// `e.isTrusted`.
+    #[qjs(get)]
+    fn is_trusted(&self) -> bool {
+        false
+    }
+    /// `e.detail`.
+    #[qjs(get)]
+    fn detail(&self) -> i64 {
+        self.detail
+    }
+    /// `e.view`.
+    #[qjs(get)]
+    fn view<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        view_property(this.0.clone().into_value())
+    }
+    /// `e.target`.
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
+    }
+    /// `e.currentTarget`.
+    #[qjs(get)]
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        current_target_property(this.0.clone().into_value())
+    }
+    /// `e.preventDefault()`.
+    fn prevent_default(&self) {
+        if self.base.cancelable {
+            self.base.state.default_prevented.set(true);
+        }
+    }
+    /// `e.stopPropagation()`.
+    fn stop_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+    }
+    /// `e.stopImmediatePropagation()`.
+    fn stop_immediate_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+        self.base.state.immediate_propagation_stopped.set(true);
+    }
+
+    // ---- MouseEvent inherited ----
+    /// `e.screenX`.
+    #[qjs(get)]
+    fn screen_x(&self) -> f64 {
+        self.me.screen_x
+    }
+    /// `e.screenY`.
+    #[qjs(get)]
+    fn screen_y(&self) -> f64 {
+        self.me.screen_y
+    }
+    /// `e.clientX`.
+    #[qjs(get)]
+    fn client_x(&self) -> f64 {
+        self.me.client_x
+    }
+    /// `e.clientY`.
+    #[qjs(get)]
+    fn client_y(&self) -> f64 {
+        self.me.client_y
+    }
+    /// `e.button`.
+    #[qjs(get)]
+    fn button(&self) -> i16 {
+        self.me.button
+    }
+    /// `e.buttons`.
+    #[qjs(get)]
+    fn buttons(&self) -> u32 {
+        self.me.buttons
+    }
+    /// `e.ctrlKey`.
+    #[qjs(get)]
+    fn ctrl_key(&self) -> bool {
+        self.me.ctrl_key
+    }
+    /// `e.shiftKey`.
+    #[qjs(get)]
+    fn shift_key(&self) -> bool {
+        self.me.shift_key
+    }
+    /// `e.altKey`.
+    #[qjs(get)]
+    fn alt_key(&self) -> bool {
+        self.me.alt_key
+    }
+    /// `e.metaKey`.
+    #[qjs(get)]
+    fn meta_key(&self) -> bool {
+        self.me.meta_key
+    }
+    /// `e.movementX`.
+    #[qjs(get)]
+    fn movement_x(&self) -> f64 {
+        self.me.movement_x
+    }
+    /// `e.movementY`.
+    #[qjs(get)]
+    fn movement_y(&self) -> f64 {
+        self.me.movement_y
+    }
+    /// `e.relatedTarget`.
+    #[qjs(get)]
+    fn related_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        related_target_property(this.0.clone().into_value())
+    }
+
+    // ---- WheelEvent-specific ----
+    /// `e.deltaX`.
+    #[qjs(get)]
+    fn delta_x(&self) -> f64 {
+        self.we.delta_x
+    }
+    /// `e.deltaY`.
+    #[qjs(get)]
+    fn delta_y(&self) -> f64 {
+        self.we.delta_y
+    }
+    /// `e.deltaZ`.
+    #[qjs(get)]
+    fn delta_z(&self) -> f64 {
+        self.we.delta_z
+    }
+    /// `e.deltaMode` — 0 = pixel, 1 = line, 2 = page.
+    #[qjs(get)]
+    fn delta_mode(&self) -> u32 {
+        self.we.delta_mode
+    }
+}
+
+// ----- FocusEvent ---------------------------------------------------
+
+fn parse_focus_event_init<'js>(
+    ctx: &Ctx<'js>,
+    init: Option<Value<'js>>,
+) -> rquickjs::Result<(EventInit, UIEventInit, Option<Value<'js>>, Option<Value<'js>>)> {
+    let (base, ui, view) = parse_ui_event_init(ctx, init.clone())?;
+    let Some(value) = init else {
+        return Ok((base, ui, view, None));
+    };
+    if value.is_null() || value.is_undefined() {
+        return Ok((base, ui, view, None));
+    }
+    let obj = value.into_object().ok_or_else(|| {
+        JsError::new_from_js_message("init", "FocusEventInit", "expected an object")
+    })?;
+    let related_target = obj.get::<_, Option<Value<'js>>>("relatedTarget")?;
+    Ok((base, ui, view, related_target))
+}
+
+/// `FocusEvent` — `focus` / `blur` / `focusin` / `focusout`. Carries
+/// `relatedTarget` (the element gaining/losing focus on the other
+/// side of the transition).
+///
+/// Per [UI Events §5.3](https://w3c.github.io/uievents/#interface-focusevent).
+#[derive(Clone, Trace, JsLifetime)]
+#[rquickjs::class(rename = "FocusEvent")]
+pub struct FocusEvent {
+    #[qjs(skip_trace)]
+    base: EventBase,
+    #[qjs(skip_trace)]
+    detail: i64,
+}
+
+#[rquickjs::methods(rename_all = "camelCase")]
+impl FocusEvent {
+    /// `new FocusEvent(type, init?)`. `init` extends `UIEventInit`
+    /// with `relatedTarget`.
+    #[qjs(constructor)]
+    pub fn new<'js>(
+        ctx: Ctx<'js>,
+        event_type: String,
+        init: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Self> {
+        let (base, ui, _view, _related) = parse_focus_event_init(&ctx, init.0)?;
+        Ok(Self {
+            base: EventBase::from_init(event_type, base),
+            detail: ui.detail,
+        })
+    }
+
+    /// `e.type`.
+    #[qjs(get, rename = "type")]
+    fn event_type(&self) -> String {
+        self.base.event_type.clone()
+    }
+    /// `e.bubbles`.
+    #[qjs(get)]
+    fn bubbles(&self) -> bool {
+        self.base.bubbles
+    }
+    /// `e.cancelable`.
+    #[qjs(get)]
+    fn cancelable(&self) -> bool {
+        self.base.cancelable
+    }
+    /// `e.composed`.
+    #[qjs(get)]
+    fn composed(&self) -> bool {
+        self.base.composed
+    }
+    /// `e.defaultPrevented`.
+    #[qjs(get)]
+    fn default_prevented(&self) -> bool {
+        self.base.state.default_prevented.get()
+    }
+    /// `e.eventPhase`.
+    #[qjs(get)]
+    fn event_phase(&self) -> u32 {
+        self.base.state.event_phase.get()
+    }
+    /// `e.timeStamp`.
+    #[qjs(get)]
+    fn time_stamp(&self) -> f64 {
+        0.0
+    }
+    /// `e.isTrusted`.
+    #[qjs(get)]
+    fn is_trusted(&self) -> bool {
+        false
+    }
+    /// `e.detail`.
+    #[qjs(get)]
+    fn detail(&self) -> i64 {
+        self.detail
+    }
+    /// `e.view`.
+    #[qjs(get)]
+    fn view<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        view_property(this.0.clone().into_value())
+    }
+    /// `e.target`.
+    #[qjs(get)]
+    fn target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        target_property(this.0.clone().into_value())
+    }
+    /// `e.currentTarget`.
+    #[qjs(get)]
+    fn current_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        current_target_property(this.0.clone().into_value())
+    }
+    /// `e.preventDefault()`.
+    fn prevent_default(&self) {
+        if self.base.cancelable {
+            self.base.state.default_prevented.set(true);
+        }
+    }
+    /// `e.stopPropagation()`.
+    fn stop_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+    }
+    /// `e.stopImmediatePropagation()`.
+    fn stop_immediate_propagation(&self) {
+        self.base.state.propagation_stopped.set(true);
+        self.base.state.immediate_propagation_stopped.set(true);
+    }
+    /// `e.relatedTarget` — element gaining/losing focus.
+    #[qjs(get)]
+    fn related_target<'js>(this: This<Class<'js, Self>>) -> rquickjs::Result<Value<'js>> {
+        related_target_property(this.0.clone().into_value())
+    }
+}
+
+/// Shared getter body for `event.view` on every UI-event subclass —
+/// the JS object was stashed JS-side at construction by the
+/// post-constructor wrapper installed in [`install_event_constructors`].
+fn view_property<'js>(event_value: Value<'js>) -> rquickjs::Result<Value<'js>> {
+    let obj = event_value.as_object().cloned().ok_or_else(|| {
+        JsError::new_from_js_message("this", "UIEvent", "not an object")
+    })?;
+    match obj.get::<_, Option<Value<'js>>>(PROP_UI_VIEW)? {
+        Some(v) => Ok(v),
+        None => obj.ctx().clone().eval::<Value<'js>, _>("null"),
+    }
+}
+
+/// Shared getter body for `event.relatedTarget` on `MouseEvent` /
+/// `PointerEvent` / `WheelEvent` / `FocusEvent`.
+fn related_target_property<'js>(event_value: Value<'js>) -> rquickjs::Result<Value<'js>> {
+    let obj = event_value.as_object().cloned().ok_or_else(|| {
+        JsError::new_from_js_message("this", "Event", "not an object")
+    })?;
+    match obj.get::<_, Option<Value<'js>>>(PROP_RELATED_TARGET)? {
+        Some(v) => Ok(v),
+        None => obj.ctx().clone().eval::<Value<'js>, _>("null"),
+    }
+}
+
 /// View struct holding the Rc<EventState> + cancelable + event_type
 /// for either [`Event`] or [`CustomEvent`], pulled out so the
 /// dispatch loop can be written once.
@@ -594,8 +2218,9 @@ struct EventView {
     cancelable: bool,
 }
 
-/// Read an [`EventView`] from a JS value that should be a Class<Event>
-/// or Class<CustomEvent>. Returns `None` if neither.
+/// Read an [`EventView`] from a JS value that should be a Class<Event>,
+/// Class<CustomEvent>, or any of the UI-event subclasses. Returns
+/// `None` if none of those.
 fn view_from_value<'js>(value: &Value<'js>) -> Option<EventView> {
     let obj = value.as_object()?;
     if let Some(c) = obj.as_class::<Event>() {
@@ -612,6 +2237,62 @@ fn view_from_value<'js>(value: &Value<'js>) -> Option<EventView> {
             state: ev.state.clone(),
             event_type: ev.event_type.clone(),
             cancelable: ev.cancelable,
+        });
+    }
+    if let Some(c) = obj.as_class::<UIEvent>() {
+        let ev = c.borrow();
+        return Some(EventView {
+            state: ev.base.state.clone(),
+            event_type: ev.base.event_type.clone(),
+            cancelable: ev.base.cancelable,
+        });
+    }
+    if let Some(c) = obj.as_class::<KeyboardEvent>() {
+        let ev = c.borrow();
+        return Some(EventView {
+            state: ev.base.state.clone(),
+            event_type: ev.base.event_type.clone(),
+            cancelable: ev.base.cancelable,
+        });
+    }
+    if let Some(c) = obj.as_class::<InputEvent>() {
+        let ev = c.borrow();
+        return Some(EventView {
+            state: ev.base.state.clone(),
+            event_type: ev.base.event_type.clone(),
+            cancelable: ev.base.cancelable,
+        });
+    }
+    if let Some(c) = obj.as_class::<MouseEvent>() {
+        let ev = c.borrow();
+        return Some(EventView {
+            state: ev.base.state.clone(),
+            event_type: ev.base.event_type.clone(),
+            cancelable: ev.base.cancelable,
+        });
+    }
+    if let Some(c) = obj.as_class::<PointerEvent>() {
+        let ev = c.borrow();
+        return Some(EventView {
+            state: ev.base.state.clone(),
+            event_type: ev.base.event_type.clone(),
+            cancelable: ev.base.cancelable,
+        });
+    }
+    if let Some(c) = obj.as_class::<WheelEvent>() {
+        let ev = c.borrow();
+        return Some(EventView {
+            state: ev.base.state.clone(),
+            event_type: ev.base.event_type.clone(),
+            cancelable: ev.base.cancelable,
+        });
+    }
+    if let Some(c) = obj.as_class::<FocusEvent>() {
+        let ev = c.borrow();
+        return Some(EventView {
+            state: ev.base.state.clone(),
+            event_type: ev.base.event_type.clone(),
+            cancelable: ev.base.cancelable,
         });
     }
     None
@@ -1641,6 +3322,276 @@ pub fn install_events(context: &Context) -> Result<(), EvalError> {
         .map_err(|e| EvalError::Engine(format!("install events: {e}")))?;
     Ok(())
 }
+
+/// Register the WHATWG UI Events subclasses (`UIEvent`,
+/// `KeyboardEvent`, `InputEvent`, `MouseEvent`, `PointerEvent`,
+/// `WheelEvent`, `FocusEvent`) on `globalThis` and rewire their
+/// prototype chains to mirror the IDL inheritance hierarchy:
+///
+/// ```text
+/// Event
+///  ├─ UIEvent
+///  │   ├─ FocusEvent
+///  │   ├─ KeyboardEvent
+///  │   ├─ InputEvent
+///  │   └─ MouseEvent
+///  │       ├─ PointerEvent
+///  │       └─ WheelEvent
+/// ```
+///
+/// After this runs, `new KeyboardEvent('keydown', {key: 'Enter'})
+/// instanceof Event` returns `true`, which is what every framework's
+/// `addEventListener('keydown', e => …)` handler tests for.
+///
+/// Also installs JS-side post-constructor wrappers that pin
+/// non-primitive init fields (`view`, `relatedTarget`) as JS-hidden
+/// properties on the freshly-constructed instance — the Rust
+/// `#[qjs(constructor)]` can't see `this`, same constraint that
+/// `CustomEvent`'s `detail` wrapper handles in [`install_events`].
+///
+/// Called by [`crate::engine::JsEngine::new`] after
+/// [`install_events`].
+pub fn install_event_constructors(context: &Context) -> Result<(), EvalError> {
+    context
+        .with(|ctx| -> rquickjs::Result<()> {
+            let globals = ctx.globals();
+
+            // ---- Register classes ----
+            Class::<UIEvent>::define(&globals)?;
+            Class::<KeyboardEvent>::define(&globals)?;
+            Class::<InputEvent>::define(&globals)?;
+            Class::<MouseEvent>::define(&globals)?;
+            Class::<PointerEvent>::define(&globals)?;
+            Class::<WheelEvent>::define(&globals)?;
+            Class::<FocusEvent>::define(&globals)?;
+
+            // ---- Rewire prototype chains ----
+            //
+            // The JS-side bootstrap reaches for each constructor by
+            // name on globalThis (rquickjs sets them up there during
+            // `Class::define`) and calls Object.setPrototypeOf to
+            // splice the prototypes into the IDL chain. Same dance
+            // `File extends Blob` uses in `web_apis.rs`.
+            //
+            // Also installs JS-side post-constructor wrappers that
+            // pin `init.view` / `init.relatedTarget` as JS-hidden
+            // properties on the freshly-constructed instance —
+            // mirrors the CustomEvent.detail wrapper above.
+            ctx.eval::<(), _>(EVENT_CONSTRUCTORS_BOOTSTRAP)?;
+
+            // Install the typing-dispatch helper at engine setup so
+            // both the host (via `JsEngine::set_input_value`) AND
+            // user-level JS (any script that wants to script real
+            // typing for testing) can call it.
+            ctx.eval::<(), _>(TYPING_DISPATCH_HELPER_JS)?;
+
+            Ok(())
+        })
+        .map_err(|e| EvalError::Engine(format!("install event constructors: {e}")))?;
+    Ok(())
+}
+
+/// JS source defining `__hesoDispatchTyping(el, value)` — the
+/// spec-correct typing pump used by [`crate::JsEngine::set_input_value`]
+/// and [`crate::JsSession::fill`]. Dispatches the sequence:
+///
+/// 1. `focus` (FocusEvent, no bubble per spec)
+/// 2. For each character of `value`:
+///    - `keydown` (KeyboardEvent, key/code derived)
+///    - `beforeinput` (InputEvent, `inputType: 'insertText'`,
+///      `data: char`) — listeners may `preventDefault()` to abort.
+///    - element `value` mutated
+///    - `input` (InputEvent, same shape as beforeinput, non-cancelable
+///      per UI Events §5.7.4)
+///    - `keyup` (KeyboardEvent)
+/// 3. `change` (Event, bubbles)
+///
+/// Mirrors the user-agent input pipeline real browsers run on a
+/// keystroke (WHATWG HTML §4.10.5.5 "User interactions" +
+/// UI Events §3.4 "Keyboard events").
+///
+/// Defined as a string constant rather than a JS file so it lives
+/// inside the binary; embedded in [`crate::JsEngine::set_input_value`]
+/// via a `format!`.
+pub const TYPING_DISPATCH_HELPER_JS: &str = r#"
+if (typeof globalThis.__hesoDispatchTyping !== 'function') {
+    // ---- Key-shape mapper: char → {key, code, keyCode} -----------
+    // Covers the common printable ASCII range + Enter / Tab / Backspace.
+    // Outside that, `code` falls back to '' and `keyCode` to 0 — the
+    // same degradation real browsers exhibit for Unicode chars that
+    // don't map to a physical US-QWERTY scancode.
+    function __hesoKeyInfo(ch) {
+        const c = ch.charCodeAt(0);
+        // Special characters by code:
+        if (c === 13) return { key: 'Enter',     code: 'Enter',     keyCode: 13 };
+        if (c === 9)  return { key: 'Tab',       code: 'Tab',       keyCode: 9 };
+        if (c === 8)  return { key: 'Backspace', code: 'Backspace', keyCode: 8 };
+        if (c === 27) return { key: 'Escape',    code: 'Escape',    keyCode: 27 };
+        if (c === 32) return { key: ' ',         code: 'Space',     keyCode: 32 };
+        // Letter A-Z / a-z → KeyA / KeyB ...
+        if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+            const upper = ch.toUpperCase();
+            return { key: ch, code: 'Key' + upper, keyCode: upper.charCodeAt(0) };
+        }
+        // Digits 0-9 → Digit0 / ...
+        if (c >= 48 && c <= 57) {
+            return { key: ch, code: 'Digit' + ch, keyCode: c };
+        }
+        // Everything else (punctuation, Unicode): `key` is the char,
+        // `code` is empty, `keyCode` is the code point.
+        return { key: ch, code: '', keyCode: c };
+    }
+
+    globalThis.__hesoDispatchTyping = function (el, value) {
+        // 1) focus
+        el.dispatchEvent(new FocusEvent('focus', {
+            bubbles: false, cancelable: false, composed: true,
+        }));
+        // (Also dispatch focusin which DOES bubble — frameworks
+        // sometimes listen for it at the document level.)
+        el.dispatchEvent(new FocusEvent('focusin', {
+            bubbles: true, cancelable: false, composed: true,
+        }));
+
+        // 2) Per-character keydown / beforeinput / input / keyup.
+        //    React-controlled inputs gate on the `input` event with
+        //    real InputEvent.data — without it the controlled-input
+        //    setState never fires.
+        let current = '';
+        for (const ch of value) {
+            const info = __hesoKeyInfo(ch);
+            const kd = new KeyboardEvent('keydown', {
+                bubbles: true, cancelable: true, composed: true,
+                key: info.key, code: info.code,
+                keyCode: info.keyCode, which: info.keyCode, charCode: 0,
+            });
+            const kdAllowed = el.dispatchEvent(kd);
+            if (!kdAllowed) {
+                // Listener called preventDefault: skip the character
+                // (browser behavior) but continue to keyup.
+                el.dispatchEvent(new KeyboardEvent('keyup', {
+                    bubbles: true, cancelable: true, composed: true,
+                    key: info.key, code: info.code,
+                    keyCode: info.keyCode, which: info.keyCode, charCode: 0,
+                }));
+                continue;
+            }
+
+            const bi = new InputEvent('beforeinput', {
+                bubbles: true, cancelable: true, composed: true,
+                data: ch, inputType: 'insertText',
+            });
+            const biAllowed = el.dispatchEvent(bi);
+            if (biAllowed) {
+                current += ch;
+                el.value = current;
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true, cancelable: false, composed: true,
+                    data: ch, inputType: 'insertText',
+                }));
+            }
+
+            el.dispatchEvent(new KeyboardEvent('keyup', {
+                bubbles: true, cancelable: true, composed: true,
+                key: info.key, code: info.code,
+                keyCode: info.keyCode, which: info.keyCode, charCode: 0,
+            }));
+        }
+
+        // 3) Final value commit: ensure el.value reflects `value` even
+        //    if a listener mutated it mid-typing, then fire `change`
+        //    (the spec puts `change` on blur/commit, but every real
+        //    page's onChange handler expects it after each fill — we
+        //    fire it here for parity with the original behavior).
+        if (el.value !== value) {
+            try { el.value = value; } catch (_) {}
+        }
+        el.dispatchEvent(new Event('change', {
+            bubbles: true, cancelable: false, composed: false,
+        }));
+    };
+}
+"#;
+
+/// JS bootstrap source for [`install_event_constructors`]: rewires
+/// the WHATWG UI-events prototype chain on the freshly-registered
+/// constructors, and installs post-constructor wrappers that copy
+/// `init.view` / `init.relatedTarget` onto the JS instance.
+const EVENT_CONSTRUCTORS_BOOTSTRAP: &str = r#"
+(function () {
+    // ---- 1) Prototype chain ---------------------------------------
+    // Order matters: walk top-down so each setPrototypeOf splices in
+    // against a prototype that already inherits from Event.
+    Object.setPrototypeOf(UIEvent.prototype, Event.prototype);
+    Object.setPrototypeOf(FocusEvent.prototype, UIEvent.prototype);
+    Object.setPrototypeOf(KeyboardEvent.prototype, UIEvent.prototype);
+    Object.setPrototypeOf(InputEvent.prototype, UIEvent.prototype);
+    Object.setPrototypeOf(MouseEvent.prototype, UIEvent.prototype);
+    Object.setPrototypeOf(PointerEvent.prototype, MouseEvent.prototype);
+    Object.setPrototypeOf(WheelEvent.prototype, MouseEvent.prototype);
+
+    // ---- 2) DOM_KEY_LOCATION_* constants on KeyboardEvent ---------
+    // Per UI Events §5.6.3.
+    Object.defineProperty(KeyboardEvent, 'DOM_KEY_LOCATION_STANDARD',
+        { value: 0, writable: false, enumerable: false, configurable: false });
+    Object.defineProperty(KeyboardEvent, 'DOM_KEY_LOCATION_LEFT',
+        { value: 1, writable: false, enumerable: false, configurable: false });
+    Object.defineProperty(KeyboardEvent, 'DOM_KEY_LOCATION_RIGHT',
+        { value: 2, writable: false, enumerable: false, configurable: false });
+    Object.defineProperty(KeyboardEvent, 'DOM_KEY_LOCATION_NUMPAD',
+        { value: 3, writable: false, enumerable: false, configurable: false });
+    // And on the prototype, since the spec defines them in both
+    // places.
+    for (const k of ['DOM_KEY_LOCATION_STANDARD', 'DOM_KEY_LOCATION_LEFT',
+                     'DOM_KEY_LOCATION_RIGHT', 'DOM_KEY_LOCATION_NUMPAD']) {
+        Object.defineProperty(KeyboardEvent.prototype, k,
+            { value: KeyboardEvent[k], writable: false, enumerable: false, configurable: false });
+    }
+
+    // ---- 3) Post-constructor wrappers -----------------------------
+    //
+    // Pin non-primitive init fields on the freshly-built instance so
+    // the Rust-side getter can read them back. Mirrors the
+    // CustomEvent.detail wrapper. Each shim:
+    //   1. constructs via Reflect.construct on the underlying class
+    //      (so `instanceof OurClass` still works correctly),
+    //   2. copies the named init fields onto the instance via
+    //      Object.defineProperty (non-enumerable, non-writable).
+    function wrap(name, fields) {
+        const Orig = globalThis[name];
+        if (typeof Orig !== 'function') return;
+        function wrapped(type, init) {
+            // Mirror the spec: missing `type` throws TypeError.
+            // QuickJS's class constructor will surface that via its
+            // own argument-count check, so we just forward.
+            const inst = Reflect.construct(Orig, [type, init], wrapped);
+            if (init && typeof init === 'object') {
+                for (const [name, prop] of fields) {
+                    if (name in init && init[name] != null) {
+                        Object.defineProperty(inst, prop, {
+                            value: init[name],
+                            writable: false,
+                            enumerable: false,
+                            configurable: false,
+                        });
+                    }
+                }
+            }
+            return inst;
+        }
+        wrapped.prototype = Orig.prototype;
+        Object.defineProperty(wrapped, 'name', { value: name, configurable: true });
+        globalThis[name] = wrapped;
+    }
+    wrap('UIEvent',       [['view', '__uiView']]);
+    wrap('KeyboardEvent', [['view', '__uiView']]);
+    wrap('InputEvent',    [['view', '__uiView']]);
+    wrap('MouseEvent',    [['view', '__uiView'], ['relatedTarget', '__relatedTarget']]);
+    wrap('PointerEvent',  [['view', '__uiView'], ['relatedTarget', '__relatedTarget']]);
+    wrap('WheelEvent',    [['view', '__uiView'], ['relatedTarget', '__relatedTarget']]);
+    wrap('FocusEvent',    [['view', '__uiView'], ['relatedTarget', '__relatedTarget']]);
+})();
+"#;
 
 // ===== Tests ====================================================================
 

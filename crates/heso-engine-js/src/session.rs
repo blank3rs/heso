@@ -206,12 +206,30 @@ impl JsSession {
     pub fn click(&self, selector: &str) -> Result<EvalOutcome, EvalError> {
         let selector_lit = serde_json::to_string(selector)
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
+        // Dispatch the spec-correct mousedown → mouseup → click trio
+        // (UI Events §3.5.1) so framework handlers reading
+        // `event.button` / `event.clientX` / etc. see real MouseEvent
+        // shapes. Only the final `click` event's `defaultPrevented`
+        // is reported in the outcome — `mousedown`/`mouseup` can also
+        // be cancelled but the caller is asking "did the click go
+        // through?" which is the click-level question.
         let script = format!(
             r#"
             (() => {{
                 const el = document.querySelector({selector_lit});
                 if (!el) return {{ matched: false, defaultPrevented: false }};
-                const ev = new Event('click', {{ bubbles: true, cancelable: true }});
+                el.dispatchEvent(new MouseEvent('mousedown', {{
+                    bubbles: true, cancelable: true, composed: true,
+                    button: 0, buttons: 1, detail: 1,
+                }}));
+                el.dispatchEvent(new MouseEvent('mouseup', {{
+                    bubbles: true, cancelable: true, composed: true,
+                    button: 0, buttons: 0, detail: 1,
+                }}));
+                const ev = new MouseEvent('click', {{
+                    bubbles: true, cancelable: true, composed: true,
+                    button: 0, buttons: 0, detail: 1,
+                }});
                 el.dispatchEvent(ev);
                 return {{ matched: true, defaultPrevented: ev.defaultPrevented }};
             }})()
@@ -233,20 +251,22 @@ impl JsSession {
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
         let value_lit = serde_json::to_string(value)
             .map_err(|e| EvalError::Engine(format!("encode value: {e}")))?;
+        // Dispatch the spec-correct typing sequence: focus → per-char
+        // keydown/beforeinput/input/keyup → change. The helper itself
+        // (`__hesoDispatchTyping`) is installed at engine setup by
+        // [`crate::events::install_event_constructors`]; see
+        // [`crate::events::TYPING_DISPATCH_HELPER_JS`] for the full
+        // event list. React-controlled inputs gate on `input` with a
+        // real `InputEvent.data`, so the bare `Event` synthetics this
+        // path used to fire silently dropped controlled-input
+        // setState calls — that's the bug this upgrade fixes.
         let script = format!(
             r#"
             (() => {{
                 const el = document.querySelector({selector_lit});
                 if (!el) return {{ matched: false, defaultPrevented: false }};
-                el.value = {value_lit};
-                const inp = new Event('input', {{ bubbles: true, cancelable: true }});
-                el.dispatchEvent(inp);
-                const chg = new Event('change', {{ bubbles: true, cancelable: true }});
-                el.dispatchEvent(chg);
-                return {{
-                    matched: true,
-                    defaultPrevented: inp.defaultPrevented || chg.defaultPrevented,
-                }};
+                __hesoDispatchTyping(el, {value_lit});
+                return {{ matched: true, defaultPrevented: false }};
             }})()
             "#,
         );

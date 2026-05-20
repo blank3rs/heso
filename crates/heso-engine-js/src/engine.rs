@@ -496,6 +496,7 @@ impl JsEngine {
         // for the global on every access.
         install_style_proxy(&context)?;
         crate::events::install_events(&context)?;
+        crate::events::install_event_constructors(&context)?;
 
         // rquickjs's `Persistent<Function<'static>>` (held inside
         // [`TimerScheduler`]'s entries) is not `Send + Sync` because
@@ -1489,15 +1490,28 @@ impl JsEngine {
         let selector_lit = serde_json::to_string(selector)
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
         // `script` runs inside `eval_with_html`'s context, where
-        // `document` is already wired. We want the expression-position
-        // value of the script to be the boolean "found and clicked?",
-        // so we wrap the body in an IIFE.
+        // `document` is already wired. We dispatch the spec-correct
+        // mousedown → mouseup → click trio (UI Events §3.5.1) so
+        // framework handlers reading `event.button` / `event.buttons` /
+        // `event.clientX` see real MouseEvent shapes instead of bare
+        // `Event` synthetics. Returns the boolean "found and clicked?".
         let script = format!(
             r#"
             (() => {{
                 const el = document.querySelector({selector_lit});
                 if (!el) return false;
-                el.click();
+                el.dispatchEvent(new MouseEvent('mousedown', {{
+                    bubbles: true, cancelable: true, composed: true,
+                    button: 0, buttons: 1, detail: 1,
+                }}));
+                el.dispatchEvent(new MouseEvent('mouseup', {{
+                    bubbles: true, cancelable: true, composed: true,
+                    button: 0, buttons: 0, detail: 1,
+                }}));
+                el.dispatchEvent(new MouseEvent('click', {{
+                    bubbles: true, cancelable: true, composed: true,
+                    button: 0, buttons: 0, detail: 1,
+                }}));
                 return true;
             }})()
             "#,
@@ -1505,16 +1519,24 @@ impl JsEngine {
         self.eval_with_html(html, &script)
     }
 
-    /// Load `html`, find the element at `selector`, set its `value`
-    /// to `value`, and dispatch first an `"input"` event then a
-    /// `"change"` event on it. Both events are constructed as
-    /// `bubbles: true, cancelable: true` (matching real browser
-    /// behavior when a user types into an `<input>` / `<textarea>`).
+    /// Load `html`, find the element at `selector`, focus it, and
+    /// dispatch the spec-correct typing sequence: a `focus` event
+    /// (FocusEvent), then for each character a `keydown` → `beforeinput`
+    /// → input-value mutation → `input` → `keyup` (KeyboardEvent +
+    /// InputEvent), then a `change` event on commit (WHATWG HTML §4.10
+    /// + UI Events §5.6 / §5.7).
+    ///
+    /// Framework handlers reading `event.key` / `event.code` /
+    /// `event.shiftKey` / `event.data` / `event.inputType` see real
+    /// spec-shaped events instead of bare `Event` synthetics — the
+    /// upgrade that unblocks React-style `onKeyDown` / `onChange`
+    /// handlers.
     ///
     /// The returned [`EvalOutcome`]'s `value` is `true` when an
     /// element matched the selector, `false` when no element matched
     /// — same shape as [`Self::dispatch_click`]. The `console` field
-    /// includes any output from `input` / `change` listeners.
+    /// includes any output from `keydown` / `input` / `change`
+    /// listeners.
     pub fn set_input_value(
         &self,
         html: &str,
@@ -1525,14 +1547,15 @@ impl JsEngine {
             .map_err(|e| EvalError::Engine(format!("encode selector: {e}")))?;
         let value_lit = serde_json::to_string(value)
             .map_err(|e| EvalError::Engine(format!("encode value: {e}")))?;
+        // `__hesoDispatchTyping` is installed by
+        // `events::install_event_constructors` at engine setup, so
+        // it's already on `globalThis` here.
         let script = format!(
             r#"
             (() => {{
                 const el = document.querySelector({selector_lit});
                 if (!el) return false;
-                el.value = {value_lit};
-                el.dispatchEvent(new Event('input', {{ bubbles: true, cancelable: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true, cancelable: true }}));
+                __hesoDispatchTyping(el, {value_lit});
                 return true;
             }})()
             "#,

@@ -103,7 +103,10 @@ pub mod web_apis;
 
 pub use dom::{Document, DomTokenList, Element, ShadowRoot};
 pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};
-pub use events::{AbortController, AbortSignal, CustomEvent, DOMException, Event, EventTarget};
+pub use events::{
+    AbortController, AbortSignal, CustomEvent, DOMException, Event, EventTarget, FocusEvent,
+    InputEvent, KeyboardEvent, MouseEvent, PointerEvent, UIEvent, WheelEvent,
+};
 pub use fetch::FetchMode;
 pub use import_map::{parse_import_map, ImportMap, ImportMapError};
 pub use modules::{HttpFetcher, HttpLoader, HttpResolver, ModuleCache, SharedImportMap};

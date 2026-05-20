@@ -3339,25 +3339,31 @@ impl Element {
     }
 
     /// `element.click()` — synthesize and dispatch a cancelable
-    /// `"click"` event on this element. Equivalent to
-    /// `element.dispatchEvent(new Event('click', { bubbles: true,
-    /// cancelable: true }))`, which is what real browsers do for the
-    /// HTMLElement.click() shortcut.
+    /// `"click"` event on this element. Per WHATWG HTML §4.10.5.4
+    /// "Element.click()" the spec only fires the `click` event (not
+    /// the full mousedown/mouseup/click trio — those come from real
+    /// user input). The synthesized event is a proper [`MouseEvent`]
+    /// with `button: 0`, `buttons: 0`, `detail: 1` so framework
+    /// handlers reading those fields see a real shape.
     ///
     /// Returns nothing — call sites that want to know whether
     /// `preventDefault()` was called should use `dispatchEvent`
     /// directly. (DOM spec says `.click()` is `void` too.)
     fn click<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<()> {
-        let event = events::Event::new_with_init(
-            "click".to_owned(),
-            Some(events::EventInit {
-                bubbles: true,
-                cancelable: true,
-                composed: false,
-            }),
-        );
-        let event_class = Class::instance(ctx.clone(), event)?;
-        let event_value: Value<'js> = event_class.into_value();
+        // Build a `new MouseEvent('click', { bubbles, cancelable,
+        // composed, button: 0, buttons: 0, detail: 1 })` by calling
+        // the JS-side constructor via a tiny helper — that way all the
+        // post-construction wiring (prototype chain rewire,
+        // `__relatedTarget` / `__uiView` pinning installed by
+        // [`events::install_event_constructors`]) runs as it would for
+        // user-level JS.
+        let factory: rquickjs::Function<'js> = ctx.eval(
+            "(() => new MouseEvent('click', { \
+                bubbles: true, cancelable: true, composed: true, \
+                button: 0, buttons: 0, detail: 1, \
+            }))",
+        )?;
+        let event_value: rquickjs::Value<'js> = factory.call(())?;
         let element = this.0.borrow().clone();
         let path = build_dispatch_path(&ctx, &element)?;
         let _ = dispatch_with_node_path(&ctx, &path, event_value)?;
