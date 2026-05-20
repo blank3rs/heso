@@ -630,6 +630,16 @@ impl JsEngine {
         // missing global. See [`install_browser_apis`].
         install_browser_apis(&context, timers.clone())?;
 
+        // Replace the IntersectionObserver noop ctor (registered by
+        // `install_browser_apis` for parity with the other observer
+        // stubs) with a working implementation that fires the spec's
+        // mandated initial notification on a microtask. Without this,
+        // sites that gate content behind IO callbacks (lazy images,
+        // infinite scroll, Astro `client:visible`, deferred component
+        // hydration) leave their gated content unreachable to `heso`.
+        // See [`crate::intersection_observer`].
+        crate::intersection_observer::install(&context)?;
+
         // Install `URL` and `URLSearchParams` globals (WHATWG). The
         // `url.searchParams` view shares a refcell-backed `Url` with
         // its parent so mutations on the view reflect back into
@@ -3677,7 +3687,11 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         globalThis[name] = Observer;
     }
     defineNoopObserver('MutationObserver');
-    defineNoopObserver('IntersectionObserver');
+    // IntersectionObserver is NOT a noop — `crate::intersection_observer::install`
+    // runs after `install_browser_apis` and registers a real
+    // implementation that fires its callback (with `isIntersecting:
+    // true` for in-tree targets) on a microtask. See that module for
+    // the design and the agent-relevance rationale.
     defineNoopObserver('ResizeObserver');
     defineNoopObserver('PerformanceObserver');
 

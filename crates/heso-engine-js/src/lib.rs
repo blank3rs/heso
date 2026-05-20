@@ -93,6 +93,7 @@ pub mod fetch;
 pub(crate) mod form_submit;
 pub mod history;
 pub mod import_map;
+pub mod intersection_observer;
 pub mod modules;
 pub mod rng;
 pub mod scripts;
