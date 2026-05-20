@@ -86,6 +86,7 @@
 //! [ADR 0014]: ../../decisions/0014-bundled-quickjs-agent-dom.md
 //! [ADR 0016]: ../../decisions/0016-positioning-headless-browser-for-agents.md
 
+mod batch;
 mod serve;
 
 // Replace the system allocator with mimalloc. Windows' UCRT
@@ -132,6 +133,15 @@ fn print_banner() {
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
     println!("  heso read  <url>              Like `open` PLUS post-hydration text, grouped forms, cookies, console, framework sniff, scripts");
     println!("    [--include CSV]                Filter the optional surface: text,forms,cookies,console,framework,scripts (default: all)");
+    println!("  heso batch [open|read] <urls...>");
+    println!("                                Parallel multi-URL scraping in ONE process. Shared cookie jar + reqwest");
+    println!("                                connection pool. JSON-Lines on stdout, completion-ordered. Default subverb");
+    println!("                                is `open`. URLs may also come from stdin (one per line) when none are given.");
+    println!("    [--parallel N]                Concurrent slots (default 8 for open / 2 for read, hard max 32)");
+    println!("    [--timeout-per-url DUR]       Per-URL wall-clock cap (e.g. `5s`, `200ms`, `1m`; default 30s)");
+    println!("    [--fail-fast]                 Stop on first error (default: continue, surface per-URL errors inline)");
+    println!("    [--include CSV] [--js-fetch]  Passed through to `read` subverb");
+    println!("                                Exit code: 0 if any succeeded, 1 if all failed, 2 on usage error");
     println!("  heso wait  <url> <condition>  Block until a page condition is satisfied (Playwright-style). Exit 0 ok / 1 timeout / 2 usage.");
     println!("    --selector-exists CSS          `document.querySelector(CSS) !== null`");
     println!("    --text-contains STRING         `document.body.textContent.includes(STRING)`");
@@ -4367,6 +4377,7 @@ async fn main() -> ExitCode {
         Some("meta") => cmd_meta(&args[1..]).await,
         Some("open") => cmd_open(&args[1..]).await,
         Some("read") => cmd_read(&args[1..]).await,
+        Some("batch") => batch::cmd_batch(&args[1..]).await,
         Some("wait") => cmd_wait(&args[1..]).await,
         Some("plat-hash") => cmd_plat_hash(&args[1..]).await,
         Some("plat-verify") => cmd_plat_verify(&args[1..]).await,
