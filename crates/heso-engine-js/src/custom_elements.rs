@@ -329,6 +329,53 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
         globalThis.DomTokenList = DOMTokenList;
     }
 
+    // ---------------------------------------------------------------
+    // HTMLTemplateElement
+    //
+    // Spec: WHATWG HTML §4.12.3 "interface HTMLTemplateElement". Bare
+    // `new HTMLTemplateElement()` throws "Illegal constructor". The
+    // interface gates `el instanceof HTMLTemplateElement` for any
+    // `<template>` Element — Lit / Material Web / shoelace feature-
+    // detect this surface heavily during boot, and a ReferenceError
+    // on the global halts module evaluation.
+    //
+    // Phase 1B doesn't have a separate Rust type for templates, so
+    // the constructor's `.prototype` is the shared Element prototype
+    // and `Symbol.hasInstance` discriminates by tag name. The
+    // load-bearing surface is:
+    //   - `template instanceof HTMLTemplateElement`
+    //   - `template.content` returns something with
+    //     `.querySelector`, `.children`, `.cloneNode(true)`.
+    //
+    // `.content` punt: per WHATWG HTML §4.12.3 the property returns
+    // a `DocumentFragment` holding the template's children
+    // (off-document). heso doesn't have a real off-document
+    // DocumentFragment node, so `.content` returns the template
+    // element itself. That preserves the load-bearing methods
+    // (`querySelector`, `children`, `firstElementChild`,
+    // `cloneNode(true)`) without splitting the children out into a
+    // distinct fragment node. Lit's pattern
+    // `document.importNode(template.content, true)` doesn't apply
+    // (heso has no `importNode`), but `template.content.cloneNode(true)`
+    // works because the cloned root carries the parsed children.
+    // ---------------------------------------------------------------
+    var HTMLTemplateElement = makeIllegalConstructor('HTMLTemplateElement', elementProto);
+    try {
+        Object.defineProperty(HTMLTemplateElement, Symbol.hasInstance, {
+            value: function(instance) {
+                if (!instance || typeof instance !== 'object') return false;
+                try {
+                    var ln = instance.localName;
+                    return typeof ln === 'string' && ln.toLowerCase() === 'template';
+                } catch (e) { return false; }
+            },
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        });
+    } catch (e) { /* leave default proto-chain instanceof */ }
+    globalThis.HTMLTemplateElement = HTMLTemplateElement;
+
     // ===============================================================
     // HTMLElement + customElements registry
     // ===============================================================
@@ -552,6 +599,60 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
     }
 
     // -----------------------------------------------------------------
+    // Lazy prototype stamping for fresh wrappers.
+    //
+    // Why this exists: `document.querySelector(...)` and friends each
+    // produce a brand-new JS wrapper around the same underlying
+    // dom_query NodeId every call. WHATWG HTML §4.13.6.6 "upgrade an
+    // element" step 8 changes the element's prototype to the
+    // definition's interface prototype — but on heso that "element"
+    // is the JS wrapper, and a different wrapper for the same node
+    // would still have the bare `Element.prototype` chain. Without
+    // stamping the prototype at materialisation, the third Shoelace
+    // bootstrap test (`el instanceof SlButton` after the page has
+    // <sl-button> elements present at parse time and the Shoelace
+    // module is loaded after) returns false on every wrapper the
+    // page hands to user JS, even though the registry knows the
+    // mapping.
+    //
+    // `stampPrototypeIfRegistered(el)` is idempotent and cheap:
+    // if the localName matches a registered definition AND the
+    // wrapper's current [[Prototype]] differs, set it. Methods we
+    // care about (`querySelector`, `querySelectorAll`, etc.) call
+    // this on every wrapper they return.
+    //
+    // Reference: jsdom's `upgradeElement` runs once at first
+    // observation thanks to stable wrapper identity (each NodeId
+    // has exactly one JS wrapper for life). happy-dom takes the
+    // same approach. heso's fresh-per-call wrapper model means we
+    // have to stamp lazily; the work is trivial (one prototype
+    // walk + one setPrototypeOf) so the cost amortizes.
+    // -----------------------------------------------------------------
+    function stampPrototypeIfRegistered(el) {
+        if (!el || typeof el.localName !== 'string') return el;
+        var lname = el.localName.toLowerCase();
+        var def = nameToDef[lname];
+        if (!def) return el;
+        var target = def.ctor && def.ctor.prototype;
+        if (!target) return el;
+        try {
+            var current = Object.getPrototypeOf(el);
+            if (current !== target) {
+                Object.setPrototypeOf(el, target);
+            }
+        } catch (e) { /* ignore — fall through with the original */ }
+        return el;
+    }
+
+    function stampArrayPrototypes(arr) {
+        if (!arr || typeof arr.length !== 'number') return arr;
+        for (var i = 0; i < arr.length; i++) {
+            stampPrototypeIfRegistered(arr[i]);
+        }
+        return arr;
+    }
+
+    // -----------------------------------------------------------------
     // Lifecycle invocation helpers.
     //
     // Heso quirk: every `document.querySelector(...)` returns a FRESH
@@ -729,9 +830,55 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
             nameToDef[name] = def;
             ctorToName.set(ctor, name);
 
+            // Install Symbol.hasInstance on the user's class so that
+            // `el instanceof MyEl` returns true for ANY wrapper whose
+            // `localName` matches the registered name, regardless of
+            // the wrapper's current [[Prototype]].
+            //
+            // Why: every `document.querySelector('my-el')` produces a
+            // fresh wrapper around the same NodeId. Even after the
+            // upgrade walk re-prototypes one wrapper, a later
+            // querySelector hands back a wrapper whose proto is still
+            // bare `Element.prototype`. The native `instanceof`
+            // walks proto chains and would miss. WHATWG HTML
+            // §4.13.6.6 ("upgrade an element") implicitly assumes
+            // stable wrapper identity (the spec talks about "the
+            // element" as one object); heso's wrapper-per-query
+            // model means we additionally route through
+            // `Symbol.hasInstance` for the spec-conformant outcome.
+            //
+            // OSS reference: jsdom doesn't need this because its
+            // wrappers are stable; happy-dom does the same trick
+            // for its WindowBrowserSettings-gated class detection.
+            try {
+                Object.defineProperty(ctor, Symbol.hasInstance, {
+                    value: function(instance) {
+                        if (!instance || typeof instance !== 'object') return false;
+                        try {
+                            var ln = instance.localName;
+                            if (typeof ln !== 'string') return false;
+                            return ln.toLowerCase() === name;
+                        } catch (e) { return false; }
+                    },
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                });
+            } catch (e) {
+                // Some classes lock Symbol.hasInstance via their own
+                // descriptor (rare in practice). Fall back to the
+                // default prototype-chain instanceof; the lazy
+                // stamping below covers the most common path.
+            }
+
             // Upgrade existing elements. Spec §4.13.1.define step 14:
             // for every element in the document whose local name is
-            // `name`, enqueue an upgrade reaction.
+            // `name`, enqueue an upgrade reaction. Per WHATWG HTML
+            // §4.13.6.6 ("upgrade an element") step 8, the upgrade
+            // changes the element's [[Prototype]] to the definition's
+            // interface prototype — this is what `constructUpgradeOnto`
+            // accomplishes (via Reflect.construct + the
+            // HTMLElement constructor's setPrototypeOf inside).
             //
             // We walk the doc once, upgrade, then fire
             // connectedCallback on those that are in the tree.
@@ -1031,6 +1178,118 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
         };
     }
 
+    // ===============================================================
+    // Lazy prototype stamping on wrapper-returning methods.
+    //
+    // Every `document.querySelector(...)` / `querySelectorAll(...)` /
+    // `getElementById(...)` / `getElementsByTagName(...)` and their
+    // Element-side counterparts produces a FRESH wrapper around the
+    // same NodeId. The upgrade walk in `define()` only stamps the
+    // prototype on the wrappers it saw during the walk; subsequent
+    // fresh wrappers (the ones the page actually hands to user JS)
+    // arrive with bare `Element.prototype`. We hook each
+    // wrapper-returning method to call `stampPrototypeIfRegistered`
+    // on the result so the user's class methods, `constructor`, and
+    // the prototype-chain `instanceof` all work for late-defined
+    // tags. Methods (as opposed to getters) are configurable per
+    // rquickjs 0.11's macro/methods/method.rs (each method gets
+    // `.writable().configurable()` flags), so we can override them.
+    // Getters like `parentNode` / `children` / `firstElementChild`
+    // remain non-configurable; their wrappers ride the
+    // `Symbol.hasInstance` path on user ctors instead.
+    // ===============================================================
+
+    function wrapReturnsElement(proto, method) {
+        if (!proto) return;
+        var orig = proto[method];
+        if (typeof orig !== 'function') return;
+        proto[method] = function() {
+            var result = orig.apply(this, arguments);
+            return stampPrototypeIfRegistered(result);
+        };
+    }
+
+    function wrapReturnsElementArray(proto, method) {
+        if (!proto) return;
+        var orig = proto[method];
+        if (typeof orig !== 'function') return;
+        proto[method] = function() {
+            var result = orig.apply(this, arguments);
+            return stampArrayPrototypes(result);
+        };
+    }
+
+    // Document.prototype query methods.
+    wrapReturnsElement(documentProto, 'querySelector');
+    wrapReturnsElementArray(documentProto, 'querySelectorAll');
+    wrapReturnsElement(documentProto, 'getElementById');
+    wrapReturnsElementArray(documentProto, 'getElementsByTagName');
+    wrapReturnsElementArray(documentProto, 'getElementsByClassName');
+    wrapReturnsElementArray(documentProto, 'getElementsByName');
+
+    // Element.prototype query methods (descendant queries).
+    wrapReturnsElement(elementProto, 'querySelector');
+    wrapReturnsElementArray(elementProto, 'querySelectorAll');
+    wrapReturnsElement(elementProto, 'closest');
+    wrapReturnsElementArray(elementProto, 'getElementsByTagName');
+    wrapReturnsElementArray(elementProto, 'getElementsByClassName');
+
+    // cloneNode returns a fresh wrapper — stamp it if the cloned
+    // element's tag is registered.
+    wrapReturnsElement(elementProto, 'cloneNode');
+
+    // ===============================================================
+    // Element.prototype.constructor as a tag-dispatched getter.
+    //
+    // Why: even when a fresh wrapper's [[Prototype]] hasn't been
+    // re-pointed at the user's class prototype (e.g. a wrapper
+    // captured BEFORE define() but accessed AFTER), `el.constructor`
+    // and `el.constructor.name` need to return the registered ctor.
+    // Real browsers achieve this via stable wrapper identity (one
+    // wrapper per node, upgraded once). heso's fresh-per-query model
+    // breaks that, so we route `.constructor` through a getter that
+    // checks the receiver's localName against the registry.
+    //
+    // `makeIllegalConstructor` set `Element.prototype.constructor`
+    // as a configurable data property pointing at the `Element`
+    // illegal-ctor function. We re-define it here as an accessor
+    // that returns the registered ctor for tags in the registry,
+    // and falls back to `Element` otherwise. Spec-conformance: the
+    // own/inherited-property layout differs from a real browser
+    // (where `el.constructor` resolves on the user's prototype
+    // directly) but the observable values are identical for
+    // `el.constructor === MyEl` and `el.constructor.name === "MyEl"`.
+    //
+    // Since this getter only changes the observable value of
+    // `el.constructor` (not e.g. `el.appendChild`), pre-existing
+    // tests that assert `el.constructor === Element` for bare
+    // elements still hold: an `<div>` has no entry in `nameToDef`,
+    // so the getter falls through to `Element`.
+    // ===============================================================
+    var defaultElementCtor = Element;
+    try {
+        Object.defineProperty(elementProto, 'constructor', {
+            get: function() {
+                try {
+                    if (this && typeof this.localName === 'string') {
+                        var def = nameToDef[this.localName.toLowerCase()];
+                        if (def && def.ctor) return def.ctor;
+                    }
+                } catch (e) {}
+                return defaultElementCtor;
+            },
+            // No setter: `el.constructor = ...` becomes a no-op,
+            // matching the spec (constructor is not writable on a
+            // typical interface).
+            configurable: true,
+            enumerable: false,
+        });
+    } catch (e) {
+        if (typeof console !== 'undefined' && console.warn) {
+            console.warn('heso: failed to install constructor dispatcher:', e && e.message ? e.message : e);
+        }
+    }
+
     // createDocumentFragment shim — Phase 1B doesn't have a Rust
     // DocumentFragment type. We approximate via a detached <template>
     // wrapper: createElement('template') gives an orphan element
@@ -1051,6 +1310,295 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
             var frag = this.createElement('template');
             return frag;
         };
+    }
+
+    // ===============================================================
+    // template.content — DocumentFragment-shaped view over the
+    // template's children. WHATWG HTML §4.12.3 specifies a real
+    // off-document fragment; heso punts to a lazy "materialised
+    // copy" approach because dom_query / html5ever stash a parsed
+    // `<template>`'s children in an associated document fragment
+    // that `dom_query::NodeRef` does NOT expose to Rust callers
+    // (verified against dom_query 0.28's `NodeRef` API surface — no
+    // `template_content` / `content_document` accessor). Walking the
+    // template via `.children` / `.querySelector` therefore sees an
+    // empty subtree, even though `t.outerHTML` correctly serializes
+    // the inner markup (the html5ever serializer special-cases
+    // `<template>` and inlines the fragment).
+    //
+    // Workaround: lazily build a sibling element ("content holder")
+    // populated by parsing the template's outerHTML and stripping
+    // the wrapper. Cache it as a non-enumerable own-property on the
+    // template wrapper so repeated `.content` access from the same
+    // wrapper returns the same object. (Across fresh wrappers the
+    // cache misses — but Lit always reuses one template wrapper for
+    // many renders, so the per-render cost is one parse at first
+    // touch.)
+    //
+    // The load-bearing surface for Lit / Material Web / shoelace:
+    //   - `template.content.querySelector(...)` / `.children`
+    //   - `template.content.cloneNode(true)` — copies the holder
+    //     element with its parsed children. Lit's TreeWalker then
+    //     iterates descendants of the clone, which works because
+    //     the clone preserves the child node structure.
+    //
+    // Known limit (still a punt): the holder is an Element wrapper
+    // with nodeType=1, not a real DocumentFragment with nodeType=11.
+    // Strict feature-detects that branch on
+    // `content.nodeType === 11` get the wrong answer; we accept the
+    // mismatch because the practical Lit / Material Web path uses
+    // `content.firstElementChild` / `content.children` / `.cloneNode`
+    // without sniffing nodeType. A future fix can promote the
+    // holder to a real DocumentFragment node once heso's Rust DOM
+    // grows fragment-typed nodes.
+    //
+    // Installed as a configurable getter on Element.prototype; a
+    // generic Element gets `undefined` (real browsers only expose
+    // `.content` on HTMLTemplateElement, never on bare Element).
+    // ===============================================================
+    var TEMPLATE_CONTENT_HOLDER = '__hesoTemplateContentHolder';
+
+    function buildTemplateContentHolder(template) {
+        var outer = '';
+        try { outer = template.outerHTML || ''; } catch (e) { outer = ''; }
+        // Strip the outer <template[ attrs]>...</template> wrapper.
+        // html5ever's serializer always emits the closing tag, so
+        // a regex that matches the open + close pair is sufficient
+        // for well-formed templates. Edge case: a template with
+        // nested templates would have multiple closing tags; the
+        // greedy match accommodates that (we drop the OUTERMOST
+        // wrapper only).
+        var inner = outer;
+        var openEnd = inner.indexOf('>');
+        if (openEnd >= 0) {
+            inner = inner.slice(openEnd + 1);
+        }
+        var closeStart = inner.lastIndexOf('</template>');
+        if (closeStart >= 0) {
+            inner = inner.slice(0, closeStart);
+        }
+        // Build a holder element and parse the inner markup into it.
+        // 'template-content-holder' avoids any chance of colliding
+        // with a registered custom element name (registered names
+        // can't contain double hyphens at the spec-validation level,
+        // but defensively keep one anyway).
+        var holder;
+        try {
+            holder = (typeof document !== 'undefined')
+                ? document.createElement('template-content-holder')
+                : null;
+        } catch (e) { holder = null; }
+        if (holder) {
+            try { holder.innerHTML = inner; } catch (e) {}
+        }
+        return holder;
+    }
+
+    try {
+        Object.defineProperty(elementProto, 'content', {
+            get: function() {
+                try {
+                    if (typeof this.localName !== 'string'
+                        || this.localName.toLowerCase() !== 'template') {
+                        return undefined;
+                    }
+                } catch (e) { return undefined; }
+                // Cache the holder on the wrapper to keep repeated
+                // accesses cheap (the wrapper itself is fresh per
+                // query, so the cache is per-wrapper, not per-node;
+                // Lit reuses one wrapper for many renders).
+                if (this[TEMPLATE_CONTENT_HOLDER]) {
+                    return this[TEMPLATE_CONTENT_HOLDER];
+                }
+                var holder = buildTemplateContentHolder(this);
+                try {
+                    Object.defineProperty(this, TEMPLATE_CONTENT_HOLDER, {
+                        value: holder,
+                        writable: true,
+                        configurable: true,
+                        enumerable: false,
+                    });
+                } catch (e) { /* fresh wrapper next time */ }
+                return holder;
+            },
+            configurable: true,
+            enumerable: false,
+        });
+    } catch (e) {
+        // If a Rust-side `content` accessor ever lands on the
+        // Element class, this becomes a redefine-on-non-configurable
+        // throw — log and continue without the shim.
+        if (typeof console !== 'undefined' && console.warn) {
+            console.warn('heso: failed to install template.content shim:', e && e.message ? e.message : e);
+        }
+    }
+
+    // ===============================================================
+    // element.dataset — DOMStringMap over `data-*` attributes.
+    //
+    // WHATWG HTML §3.2.6.6 "DOMStringMap":
+    //   - `el.dataset.foo` ↔ `el.getAttribute('data-foo')`
+    //   - `el.dataset.fooBar` ↔ `el.getAttribute('data-foo-bar')`
+    //     (camelCase ↔ kebab-case conversion: lowercase letter
+    //      preceded by a "-" becomes uppercase; uppercase letter
+    //      becomes "-" + lowercase letter)
+    //   - `'foo' in el.dataset` checks attribute presence
+    //   - `delete el.dataset.foo` removes the attribute
+    //
+    // Installed as a configurable getter that returns a per-call
+    // Proxy. The Proxy traps `get` / `set` / `has` / `deleteProperty`
+    // / `ownKeys` / `getOwnPropertyDescriptor` (the last two so
+    // `Object.keys(el.dataset)` and spread `{...el.dataset}` work).
+    //
+    // Per-call construction: the Proxy holds a closure over `this`
+    // (the element wrapper). Real browsers cache the DOMStringMap
+    // per element; heso's fresh-wrapper-per-query model would defeat
+    // any caching scheme keyed by JS identity, so we build on
+    // demand. Cost: one Proxy allocation per `el.dataset` access.
+    // Negligible at typical framework call frequency.
+    //
+    // OSS reference: jsdom's DOMStringMap impl is a Proxy with the
+    // same five traps, modulo their use of WebIDL-generated key
+    // validation. happy-dom uses a plain object with on-demand
+    // recompute via getters — simpler, but doesn't support
+    // arbitrary `data-x-y` keys without enumerating. Proxy wins.
+    // ===============================================================
+    function datasetKeyToAttr(key) {
+        // camelCase → kebab-case: "fooBar" → "foo-bar". Per the
+        // spec the rule is "for each uppercase letter, insert '-'
+        // before it and lowercase it". If the key contains
+        // characters that aren't valid in an attribute name
+        // (whitespace, "=", etc.), real browsers throw SyntaxError;
+        // we return a safe-ish placeholder so user code gets a
+        // null read rather than a thrown property access.
+        var out = '';
+        for (var i = 0; i < key.length; i++) {
+            var c = key.charCodeAt(i);
+            if (c >= 65 && c <= 90) { /* A-Z */
+                out += '-' + key.charAt(i).toLowerCase();
+            } else {
+                out += key.charAt(i);
+            }
+        }
+        return 'data-' + out;
+    }
+
+    function attrToDatasetKey(attr) {
+        // kebab-case → camelCase: "data-foo-bar" → "fooBar". Drop
+        // the "data-" prefix, then for each "-x" (x = lowercase
+        // ascii letter), drop the "-" and uppercase x. Other dashes
+        // are passed through (spec allows e.g. "data-3d").
+        if (!attr || attr.indexOf('data-') !== 0) return null;
+        var rest = attr.slice(5);
+        var out = '';
+        var i = 0;
+        while (i < rest.length) {
+            var ch = rest.charAt(i);
+            if (ch === '-' && i + 1 < rest.length) {
+                var next = rest.charAt(i + 1);
+                var code = rest.charCodeAt(i + 1);
+                if (code >= 97 && code <= 122) { /* a-z */
+                    out += next.toUpperCase();
+                    i += 2;
+                    continue;
+                }
+            }
+            out += ch;
+            i += 1;
+        }
+        return out;
+    }
+
+    function makeDatasetProxy(el) {
+        var target = Object.create(null);
+        return new Proxy(target, {
+            get: function(_t, key) {
+                if (typeof key !== 'string') return undefined;
+                var attr = datasetKeyToAttr(key);
+                try {
+                    if (el.hasAttribute && el.hasAttribute(attr)) {
+                        return el.getAttribute(attr);
+                    }
+                } catch (e) {}
+                return undefined;
+            },
+            set: function(_t, key, value) {
+                if (typeof key !== 'string') return true;
+                var attr = datasetKeyToAttr(key);
+                try {
+                    if (el.setAttribute) {
+                        el.setAttribute(attr, value == null ? '' : String(value));
+                    }
+                } catch (e) {}
+                return true;
+            },
+            has: function(_t, key) {
+                if (typeof key !== 'string') return false;
+                var attr = datasetKeyToAttr(key);
+                try {
+                    return !!(el.hasAttribute && el.hasAttribute(attr));
+                } catch (e) { return false; }
+            },
+            deleteProperty: function(_t, key) {
+                if (typeof key !== 'string') return true;
+                var attr = datasetKeyToAttr(key);
+                try {
+                    if (el.removeAttribute) el.removeAttribute(attr);
+                } catch (e) {}
+                return true;
+            },
+            ownKeys: function(_t) {
+                // Walk the element's attribute list for `data-*` keys.
+                // heso doesn't expose `el.attributes` as a NamedNodeMap
+                // directly, but `el.getAttributeNames()` (if present)
+                // returns the same list. Fall back to an empty array
+                // so iteration is well-defined.
+                var keys = [];
+                var seen = Object.create(null);
+                try {
+                    if (typeof el.getAttributeNames === 'function') {
+                        var attrs = el.getAttributeNames();
+                        for (var i = 0; i < attrs.length; i++) {
+                            var key = attrToDatasetKey(attrs[i]);
+                            if (key && !seen[key]) {
+                                seen[key] = true;
+                                keys.push(key);
+                            }
+                        }
+                    }
+                } catch (e) {}
+                return keys;
+            },
+            getOwnPropertyDescriptor: function(_t, key) {
+                if (typeof key !== 'string') return undefined;
+                var attr = datasetKeyToAttr(key);
+                try {
+                    if (el.hasAttribute && el.hasAttribute(attr)) {
+                        return {
+                            value: el.getAttribute(attr),
+                            writable: true,
+                            enumerable: true,
+                            configurable: true,
+                        };
+                    }
+                } catch (e) {}
+                return undefined;
+            },
+        });
+    }
+
+    try {
+        Object.defineProperty(elementProto, 'dataset', {
+            get: function() {
+                return makeDatasetProxy(this);
+            },
+            configurable: true,
+            enumerable: false,
+        });
+    } catch (e) {
+        if (typeof console !== 'undefined' && console.warn) {
+            console.warn('heso: failed to install dataset shim:', e && e.message ? e.message : e);
+        }
     }
 
     Object.defineProperty(globalThis, '__hesoCustomElementsInstalled', {

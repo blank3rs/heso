@@ -1427,6 +1427,72 @@ impl Element {
         }
     }
 
+    /// `element.insertAdjacentHTML(position, html)` — parse `html` and
+    /// insert the resulting nodes at `position` relative to this element.
+    ///
+    /// Positions per WHATWG DOM § Element-insertAdjacentHTML:
+    /// - `"beforebegin"` — insert as a sibling before `self`.
+    /// - `"afterbegin"` — insert as the first child of `self`.
+    /// - `"beforeend"` — insert as the last child of `self`.
+    /// - `"afterend"` — insert as a sibling after `self`.
+    ///
+    /// `beforebegin` / `afterend` require `self` to have a parent;
+    /// when absent, the spec throws `SyntaxError`. We surface that as
+    /// an [`rquickjs::Exception`] with a `SyntaxError`-shaped message
+    /// so user JS can `catch (e) { e.name === 'SyntaxError' }`.
+    ///
+    /// Backed by `dom_query::NodeRef::{before,after,prepend,append}_html`,
+    /// which run the same `html5ever` fragment parser as the
+    /// `innerHTML` setter (see [`Self::set_inner_html`]).
+    #[qjs(rename = "insertAdjacentHTML")]
+    fn insert_adjacent_html<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        position: String,
+        html: String,
+    ) -> rquickjs::Result<()> {
+        let Some(n) = self.node_ref() else {
+            return Ok(());
+        };
+        let pos = position.to_ascii_lowercase();
+        match pos.as_str() {
+            "beforebegin" => {
+                if n.parent().is_none() {
+                    return Err(rquickjs::Exception::throw_message(
+                        &ctx,
+                        "insertAdjacentHTML: 'beforebegin' requires the element to have a parent",
+                    ));
+                }
+                n.before_html(html);
+                Ok(())
+            }
+            "afterbegin" => {
+                n.prepend_html(html);
+                Ok(())
+            }
+            "beforeend" => {
+                n.append_html(html);
+                Ok(())
+            }
+            "afterend" => {
+                if n.parent().is_none() {
+                    return Err(rquickjs::Exception::throw_message(
+                        &ctx,
+                        "insertAdjacentHTML: 'afterend' requires the element to have a parent",
+                    ));
+                }
+                n.after_html(html);
+                Ok(())
+            }
+            _ => Err(rquickjs::Exception::throw_message(
+                &ctx,
+                &format!(
+                    "insertAdjacentHTML: position must be one of 'beforebegin', 'afterbegin', 'beforeend', 'afterend' (got: {position:?})"
+                ),
+            )),
+        }
+    }
+
     /// `element.outerHTML` — serialized HTML of this element including
     /// itself.
     #[qjs(get, rename = "outerHTML")]
@@ -1434,6 +1500,28 @@ impl Element {
         self.node_ref()
             .map(|n| n.html().to_string())
             .unwrap_or_default()
+    }
+
+    /// `element.getAttributeNames()` — return every attribute name on
+    /// this element, in DOM-tree order. WHATWG DOM § Element-
+    /// getAttributeNames.
+    ///
+    /// The `dataset` Proxy installed by
+    /// [`crate::custom_elements::install_custom_elements`] needs this
+    /// to implement the `ownKeys` trap (so `Object.keys(el.dataset)`
+    /// and `{...el.dataset}` enumerate the `data-*` keys). Real code
+    /// also reaches for it — Vue's hydration walks every attribute
+    /// once per element to reconcile against the v-bind set.
+    #[qjs(rename = "getAttributeNames")]
+    fn get_attribute_names(&self) -> Vec<String> {
+        match self.node_ref() {
+            Some(n) => n
+                .attrs()
+                .into_iter()
+                .map(|a| a.name.local.to_string())
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     /// `element.style` — a Proxy over the element's `style` attribute
@@ -5010,3 +5098,4 @@ mod tests {
         assert_eq!(div.class_name(), "");
     }
 }
+
