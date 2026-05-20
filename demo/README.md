@@ -1,31 +1,33 @@
 # demo/
 
-The demo runs Claude Code (`claude -p`) from the repo root so it auto-discovers `skills/heso/SKILL.md` and uses heso verbs as its tools. There is no separate "demo agent" — per [AGENTS.md](../AGENTS.md), heso is agentware and the LLM harness is the agent.
+A recorded run of Claude Code using heso on a single task: *"what's the top story on Hacker News right now?"*
 
-## Run
+The demo is intentionally plain — a real terminal session, not a UI wrapper. The agent (`claude -p` with `skills/heso/SKILL.md` auto-discovered) calls heso verbs, the steps stream by, and the answer appears at the end.
 
-```sh
-cargo build --release -p heso-cli    # if you haven't already
-python demo/agent.py
-```
-
-You'll be prompted for a query. The wrapper streams Claude Code's tool calls and final answer with a rich terminal UI.
-
-Without Claude Code on PATH, the script falls back to `--no-claude` mode that runs a hardcoded `search -> batch read -> summary` pipeline using heso primitives directly. Useful for a recording when an LLM isn't available; honest about being scripted.
-
-## Record for the README
-
-```pwsh
-pwsh demo/record.ps1                                # prompts for query
-pwsh demo/record.ps1 "rust web scraping libraries"  # one-shot
-```
-
-Captures the desktop with `ffmpeg gdigrab` while the agent runs, then renders an optimized GIF (`demo/demo.gif`) and keeps the raw MP4 (`demo/demo.mp4`).
-
-Requirements: `ffmpeg` in PATH (`winget install Gyan.FFmpeg`) and `python` with `rich` (`pip install rich`). For the live-agent path also: `pip install anthropic`.
+Heso is the tool, the harness is the agent — per [AGENTS.md](../AGENTS.md) and ADR 0017.
 
 ## Files
 
-- `agent.py` — the agent loop + UI (Python, `rich`)
-- `record.ps1` — recording wrapper (PowerShell, ffmpeg)
-- `demo.mp4` / `demo.gif` — produced by `record.ps1` (committed when refreshed)
+- `demo.gif` — what the README embeds
+- `demo.cast` — asciinema v2; replay with `asciinema play demo/demo.cast`
+- `record.py` — re-records the cast (drives `claude -p --output-format stream-json`, renders each tool call as a clean inline line, finishes with the model's answer)
+- `agent.py` — secondary script for the `--no-claude` path (hardcoded `search → batch-read → summary` pipeline, useful if you don't have Claude Code installed)
+
+## Re-record
+
+```sh
+cargo build --release -p heso-cli
+python demo/record.py --query "what's the top story on Hacker News right now? Use heso. Reply with title, points, and a one-sentence summary."
+```
+
+Then convert the cast to a GIF (binary from [asciinema/agg](https://github.com/asciinema/agg) releases):
+
+```sh
+agg demo/demo.cast demo/demo.gif --theme monokai --font-size 14 --cols 110 --rows 36
+```
+
+## What's intentionally not here
+
+- No rich Python UI wrapper around the recording. The cleaner the visual, the more it reads like a real session — which is what someone watching the README wants to see.
+- No Anthropic SDK dependency. The "agent" is Claude Code itself loading the existing heso skill, not a parallel agent loop.
+- No benchmark comparisons inline. The demo's job is to show heso working — not to argue against other tools.
