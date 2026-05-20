@@ -27,6 +27,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "io-util", 
 # matching `wait` RPC method. Workspace dep — same crate `heso-trace`
 # and `heso-engine-js` use, no new top-level dep introduced.
 regex.workspace = true
+# `blake3` powers the `content_hash` field on `heso read` envelopes
+# (BLAKE3 of title + visible-text + actions[].name/ref + forms[]) so
+# agents can diff cross-call state. Workspace dep — same crate
+# `heso-engine-fetch` uses for `plat_hash`, no new top-level dep.
+blake3.workspace = true
 # Global allocator: mimalloc beats Windows' UCRT allocator by
 # 20–50% on alloc-heavy workloads (reqwest body buffers, scraper
 # tree, serde_json, canonical-JSON writes) and has near-zero init

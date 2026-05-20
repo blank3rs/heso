@@ -1051,10 +1051,14 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
 /// agent would otherwise do to reconstruct the same picture.
 async fn cmd_read(args: &[String]) -> ExitCode {
     // Order-tolerant flag walk, same shape as `cmd_open`. Positional:
-    // exactly one `<url>`. Flag: `--include CSV` (additive whitelist
-    // of optional fields).
+    // exactly one `<url>`. Flags: `--include CSV` (additive whitelist
+    // of optional fields), `--since <prev_content_hash>` (cross-call
+    // diff trigger — populates `delta` against the prior snapshot, or
+    // returns `delta.since_matched: false` with everything-added when
+    // no prior snapshot exists in this process).
     let mut url_arg: Option<String> = None;
     let mut include_csv: Option<String> = None;
+    let mut since_arg: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1066,9 +1070,17 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 include_csv = Some(v.clone());
                 i += 2;
             }
+            "--since" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--since needs a content_hash value (e.g. blake3:abc...)");
+                    return ExitCode::from(2);
+                };
+                since_arg = Some(v.clone());
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] <url>");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1085,7 +1097,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         }
     }
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso read [--include ...] <url>");
+        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] <url>");
         return ExitCode::from(2);
     };
 
@@ -1173,14 +1185,18 @@ async fn cmd_read(args: &[String]) -> ExitCode {
             );
         }
     }
+    // Always compute visible_text + forms — they feed `content_hash`
+    // and the `--since` snapshot store even when the include filter
+    // would have dropped them from the user-visible body. The body
+    // gates them per `include`, the hash always sees them.
+    let visible_text = heso_engine_fetch::extract_visible_text(&post_html);
+    let forms_json = group_forms(&page.actions);
+
     if include.text {
-        // Re-derive text from the post-hydration HTML so
-        // SPAs that inject content via JS still surface their text.
-        let text = heso_engine_fetch::extract_visible_text(&post_html);
-        body["text"] = serde_json::Value::String(text);
+        body["text"] = serde_json::Value::String(visible_text.clone());
     }
     if include.forms {
-        body["forms"] = group_forms(&page.actions);
+        body["forms"] = forms_json.clone();
     }
     if include.cookies {
         body["cookies"] = collect_cookies(&fetch_engine, page.url());
@@ -1198,6 +1214,28 @@ async fn cmd_read(args: &[String]) -> ExitCode {
             "external_handled": script_outcome.external_handled,
             "skipped_non_script_type": script_outcome.skipped_non_script_type,
         });
+    }
+
+    // content_hash + delta — see `ReadSnapshot` / `compute_content_hash`.
+    // One-shot CLI has no snapshot store, so `--since` always yields
+    // `since_matched: false` (agent treats it as "fresh page, here's
+    // everything"). The serve path is where a true diff materializes.
+    let snap = ReadSnapshot::from_parts(
+        &page.tree.title,
+        &visible_text,
+        &page.actions,
+        &forms_json,
+    );
+    let delta = match since_arg.as_deref() {
+        Some(_prev_hash) => delta_no_prior(&snap),
+        None => serde_json::Value::Null,
+    };
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "content_hash".to_owned(),
+            serde_json::Value::String(snap.content_hash.clone()),
+        );
+        obj.insert("delta".to_owned(), delta);
     }
 
     // plat_hash last — same canonical form as `heso open` so an
@@ -1265,6 +1303,214 @@ pub(crate) fn parse_include_filter(csv: Option<&str>) -> IncludeFilter {
         }
     }
     f
+}
+
+// ============================================================================
+// read_diff — content_hash + --since cross-call state-diff
+// ============================================================================
+
+/// A minimal frozen view of a `heso read` envelope, sufficient to:
+/// (a) compute the `content_hash` deterministically, and
+/// (b) diff against a later `read` to produce the `delta` field.
+///
+/// Stored per-URL on the `serve` session (LRU 8) so a follow-up `read`
+/// with `--since <hash>` against the same URL can be compared without
+/// re-fetching anything.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadSnapshot {
+    pub(crate) content_hash: String,
+    pub(crate) title: String,
+    pub(crate) text: String,
+    /// `(ref_id, name)` pairs from the action graph, in the same order
+    /// the action graph emitted them (document order). Diff treats this
+    /// as a set keyed by `(ref_id, name)`.
+    pub(crate) actions: Vec<(String, Option<String>)>,
+    /// The post-`group_forms` JSON value. Deep-eq is enough for
+    /// `forms_changed`.
+    pub(crate) forms: serde_json::Value,
+}
+
+impl ReadSnapshot {
+    /// Construct from the live envelope pieces.
+    pub(crate) fn from_parts(
+        title: &str,
+        text: &str,
+        actions: &[heso_engine_fetch::ElementRef],
+        forms_json: &serde_json::Value,
+    ) -> Self {
+        let actions: Vec<(String, Option<String>)> = actions
+            .iter()
+            .map(|el| (el.ref_id.clone(), el.name.clone()))
+            .collect();
+        let content_hash = compute_content_hash(title, text, &actions, forms_json);
+        Self {
+            content_hash,
+            title: title.to_owned(),
+            text: text.to_owned(),
+            actions,
+            forms: forms_json.clone(),
+        }
+    }
+}
+
+/// BLAKE3 over a deterministic canonical byte string built from:
+/// title, visible-text, actions sorted by `ref_id` then `name`, and
+/// forms (sorted-by-ref with sorted-by-name inputs). Returns
+/// `"blake3:<64-hex>"`.
+///
+/// The canonical form uses `\x01` as record separator and `\x00` as
+/// field separator — neither can appear inside the inputs (HTML
+/// extraction strips control bytes; ref ids are `@eN` ASCII).
+pub(crate) fn compute_content_hash(
+    title: &str,
+    text: &str,
+    actions: &[(String, Option<String>)],
+    forms_json: &serde_json::Value,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    // 1. title
+    hasher.update(b"title\x00");
+    hasher.update(title.as_bytes());
+    hasher.update(b"\x01");
+    // 2. visible text
+    hasher.update(b"text\x00");
+    hasher.update(text.as_bytes());
+    hasher.update(b"\x01");
+    // 3. actions, sorted by (ref_id, name) — order-tolerant because the
+    //    action graph order can shift with DOM mutations even when the
+    //    set is the same; the agent-facing semantics is "what's
+    //    actionable on this page" regardless of which order we walked.
+    let mut sorted_actions: Vec<&(String, Option<String>)> = actions.iter().collect();
+    sorted_actions.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.as_deref().unwrap_or("").cmp(b.1.as_deref().unwrap_or("")))
+    });
+    hasher.update(b"actions\x00");
+    for (ref_id, name) in &sorted_actions {
+        hasher.update(ref_id.as_bytes());
+        hasher.update(b"\x00");
+        hasher.update(name.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\x01");
+    }
+    // 4. forms — emit a canonical reduction: each form contributes
+    //    `(ref, action, method, [(input_name, input_ref)...])`. We
+    //    avoid hashing the full forms_json so that a noise-only diff
+    //    in input `type` field doesn't trip content_hash.
+    hasher.update(b"forms\x00");
+    /// `(form.ref, form.action, form.method, sorted [(input.name, input.ref)])`.
+    /// Local type alias keeps the clippy::type_complexity lint quiet
+    /// without spawning a top-level type def for one call site.
+    type FormKey = (String, String, String, Vec<(String, String)>);
+    if let Some(arr) = forms_json.as_array() {
+        let mut form_keys: Vec<FormKey> = arr
+            .iter()
+            .map(|f| {
+                let ref_id = f.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                let method = f.get("method").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                let inputs: Vec<(String, String)> = f
+                    .get("inputs")
+                    .and_then(|v| v.as_array())
+                    .map(|inputs| {
+                        let mut v: Vec<(String, String)> = inputs
+                            .iter()
+                            .map(|i| {
+                                (
+                                    i.get("name").and_then(|x| x.as_str()).unwrap_or("").to_owned(),
+                                    i.get("ref").and_then(|x| x.as_str()).unwrap_or("").to_owned(),
+                                )
+                            })
+                            .collect();
+                        v.sort();
+                        v
+                    })
+                    .unwrap_or_default();
+                (ref_id, action, method, inputs)
+            })
+            .collect();
+        form_keys.sort();
+        for (ref_id, action, method, inputs) in &form_keys {
+            hasher.update(ref_id.as_bytes());
+            hasher.update(b"\x00");
+            hasher.update(action.as_bytes());
+            hasher.update(b"\x00");
+            hasher.update(method.as_bytes());
+            hasher.update(b"\x00");
+            for (name, ref_id) in inputs {
+                hasher.update(name.as_bytes());
+                hasher.update(b"\x00");
+                hasher.update(ref_id.as_bytes());
+                hasher.update(b"\x00");
+            }
+            hasher.update(b"\x01");
+        }
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+/// Compute the `delta` field by diffing `current` against `prior`.
+/// All five diff slots populate:
+///   - `actions_added`, `actions_removed`: shallow set-diff on `(ref, name)`.
+///   - `forms_changed`, `text_changed`, `title_changed`: deep-eq booleans.
+///   - `since_matched`: always `true` here (caller chose this path
+///     because they found a prior snapshot).
+pub(crate) fn compute_delta(
+    current: &ReadSnapshot,
+    prior: &ReadSnapshot,
+) -> serde_json::Value {
+    use std::collections::HashSet;
+    let prior_set: HashSet<(&str, &str)> = prior
+        .actions
+        .iter()
+        .map(|(r, n)| (r.as_str(), n.as_deref().unwrap_or("")))
+        .collect();
+    let current_set: HashSet<(&str, &str)> = current
+        .actions
+        .iter()
+        .map(|(r, n)| (r.as_str(), n.as_deref().unwrap_or("")))
+        .collect();
+    let actions_added: Vec<serde_json::Value> = current
+        .actions
+        .iter()
+        .filter(|(r, n)| !prior_set.contains(&(r.as_str(), n.as_deref().unwrap_or(""))))
+        .map(|(r, n)| serde_json::json!({ "ref": r, "name": n.as_deref().unwrap_or("") }))
+        .collect();
+    let actions_removed: Vec<serde_json::Value> = prior
+        .actions
+        .iter()
+        .filter(|(r, n)| !current_set.contains(&(r.as_str(), n.as_deref().unwrap_or(""))))
+        .map(|(r, n)| serde_json::json!({ "ref": r, "name": n.as_deref().unwrap_or("") }))
+        .collect();
+    serde_json::json!({
+        "since_matched": true,
+        "actions_added": actions_added,
+        "actions_removed": actions_removed,
+        "forms_changed": current.forms != prior.forms,
+        "text_changed": current.text != prior.text,
+        "title_changed": current.title != prior.title,
+    })
+}
+
+/// Build a `delta` for the "no prior snapshot found" branch — every
+/// current action lands in `actions_added`, all flags `false`,
+/// `since_matched: false`. This is what one-shot `heso read --since
+/// <hash>` returns (no serve-session store to consult) AND what serve
+/// returns when the supplied `since` hash didn't match any cached
+/// snapshot for that URL.
+pub(crate) fn delta_no_prior(current: &ReadSnapshot) -> serde_json::Value {
+    let actions_added: Vec<serde_json::Value> = current
+        .actions
+        .iter()
+        .map(|(r, n)| serde_json::json!({ "ref": r, "name": n.as_deref().unwrap_or("") }))
+        .collect();
+    serde_json::json!({
+        "since_matched": false,
+        "actions_added": actions_added,
+        "actions_removed": [],
+        "forms_changed": false,
+        "text_changed": false,
+        "title_changed": false,
+    })
 }
 
 /// Group the action-graph entries into `<form>` clusters. Each form's

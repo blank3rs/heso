@@ -106,9 +106,18 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::{
-    collect_cookies, detect_framework, group_forms, merge_submit_fields, parse_include_filter,
-    selector_for_action,
+    collect_cookies, compute_delta, delta_no_prior, detect_framework, group_forms,
+    merge_submit_fields, parse_include_filter, selector_for_action, ReadSnapshot,
 };
+
+/// Cap on the per-session `read` snapshot store. After the 8th distinct
+/// URL is read, the least-recently-touched URL is evicted. Bounded
+/// memory is the only reason for the cap — an agent that ping-pongs
+/// across 50 URLs in one `serve` session is still mostly going to be
+/// interested in the last few it touched. 8 was picked over 4 to give
+/// click-heavy multi-page flows some headroom; over 16 because past
+/// that the linear LRU scan starts to feel silly.
+const SNAPSHOT_LRU_CAP: usize = 8;
 
 // ============================================================================
 // JSON-RPC types
@@ -205,6 +214,19 @@ struct ServerState {
     /// default when a write verb omits `page_id`, so single-page agents
     /// can stay terse. `None` until the first `open` succeeds.
     last_page_id: Mutex<Option<String>>,
+    /// LRU snapshot store keyed by URL — populated by every `read`,
+    /// consulted by the next `read` with `--since <hash>`. Bounded at
+    /// `SNAPSHOT_LRU_CAP` entries; on touch the matched URL moves to
+    /// the front (Vec back == evict candidate). One store per `serve`
+    /// process; not persisted across runs.
+    ///
+    /// Why URL-keyed and not page_id-keyed: a `navigate` swaps the URL
+    /// on an existing `page_id`, so an agent that reads A → navigates
+    /// to B → reads → expects to diff B against its previous B read
+    /// should match by URL, not by page_id. The agent passes the prior
+    /// `content_hash` it observed; we look up snapshots for the
+    /// current URL and check if any one has that hash.
+    snapshots: Mutex<Vec<(Url, ReadSnapshot)>>,
 }
 
 impl ServerState {
@@ -214,12 +236,48 @@ impl ServerState {
             pages: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
             last_page_id: Mutex::new(None),
+            snapshots: Mutex::new(Vec::new()),
         })
     }
 
     fn next_id(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed) + 1;
         format!("p{n}")
+    }
+}
+
+/// Look up the snapshot stored under `url` and return a *clone* of it
+/// IFF its `content_hash` matches `since`. None means "no prior
+/// snapshot for this URL, or it didn't match the hash the agent
+/// supplied" — both cases collapse to `delta.since_matched: false` at
+/// the caller.
+///
+/// Mutates the store to bump the matched URL to the front (LRU
+/// touch). Caller already holds the `pages` lock briefly above this
+/// call, but the snapshot store is its own Mutex so the read-side
+/// lookup and the post-read write are independent of the page lock.
+fn find_snapshot(store: &mut Vec<(Url, ReadSnapshot)>, url: &Url, since: &str) -> Option<ReadSnapshot> {
+    let idx = store.iter().position(|(u, _)| u == url)?;
+    if store[idx].1.content_hash != since {
+        return None;
+    }
+    // LRU touch — move matched entry to front.
+    let (u, snap) = store.remove(idx);
+    let cloned = snap.clone();
+    store.insert(0, (u, snap));
+    Some(cloned)
+}
+
+/// Insert/replace the snapshot for `url` and evict beyond
+/// `SNAPSHOT_LRU_CAP`. New (or refreshed) entry lands at the front;
+/// the oldest tail entry drops out when we overflow.
+fn install_snapshot(store: &mut Vec<(Url, ReadSnapshot)>, url: Url, snap: ReadSnapshot) {
+    if let Some(idx) = store.iter().position(|(u, _)| u == &url) {
+        store.remove(idx);
+    }
+    store.insert(0, (url, snap));
+    while store.len() > SNAPSHOT_LRU_CAP {
+        store.pop();
     }
 }
 
@@ -1007,6 +1065,13 @@ struct ReadParams {
     /// emit regardless.
     #[serde(default)]
     include: Option<String>,
+    /// Optional prior `content_hash` (the agent's most-recent observed
+    /// hash for this URL). When supplied, populate the `delta` field:
+    /// matching hash → `since_matched: true` with a real diff; no
+    /// matching snapshot → `since_matched: false` with everything in
+    /// `actions_added`. When omitted, `delta` is `null`.
+    #[serde(default)]
+    since: Option<String>,
 }
 
 /// `read` — the agent's one-call page report against an open page_id.
@@ -1023,77 +1088,122 @@ async fn dispatch_read(
     let p: ReadParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let page_id = resolve_page_id(&state, p.page_id).await?;
     let include = parse_include_filter(p.include.as_deref());
+    let since = p.since.clone();
 
-    let mut pages = state.pages.lock().await;
-    let record = pages
-        .get_mut(&page_id)
-        .ok_or_else(|| format!("no page_id `{}`", page_id))?;
-    // Ensure a session exists so the post-mutation DOM and console
-    // entries are observable. For purely read-only flows where no
-    // write verb has touched the page, this builds a fresh session
-    // and runs inline scripts once — same cost as a lazy `click`
-    // would have paid.
-    ensure_session(&state.engine, record)?;
+    // Phase 1: gather everything off the page record + session under
+    // the `pages` lock, then DROP it before touching the snapshots
+    // mutex. Same nested-lock-avoidance pattern as `dispatch_navigate`.
+    let (mut body, snap, live_url) = {
+        let mut pages = state.pages.lock().await;
+        let record = pages
+            .get_mut(&page_id)
+            .ok_or_else(|| format!("no page_id `{}`", page_id))?;
+        // Ensure a session exists so the post-mutation DOM and console
+        // entries are observable. For purely read-only flows where no
+        // write verb has touched the page, this builds a fresh session
+        // and runs inline scripts once — same cost as a lazy `click`
+        // would have paid.
+        ensure_session(&state.engine, record)?;
 
-    // Snapshot the static fields off the cached page first, then
-    // overlay the live post-hydration extras from the session.
-    let static_page = &record.page;
-    let session = record.session.as_ref().expect("session ensured above");
+        // Snapshot the static fields off the cached page first, then
+        // overlay the live post-hydration extras from the session.
+        let static_page = &record.page;
+        let session = record.session.as_ref().expect("session ensured above");
 
-    let console = session.engine().drain_console();
-    let post_html = session.document_html();
-    let live_url = session.url().clone();
+        let console = session.engine().drain_console();
+        let post_html = session.document_html();
+        let live_url = session.url().clone();
 
-    let mut body = serde_json::json!({
-        "url": live_url.as_str(),
-        "title": static_page.tree.title,
-        "description": static_page.tree.description,
-        "metadata": static_page.metadata,
-        "tree": static_page.tree,
-        "actions": record.current_actions,
-    });
-    if !static_page.inline_data.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "inline_data".to_owned(),
-                serde_json::to_value(&static_page.inline_data)
-                    .unwrap_or(serde_json::Value::Null),
-            );
+        // Always compute visible_text + forms — they feed `content_hash`
+        // and the snapshot store even when `include` would drop them
+        // from the body. Identical contract to the one-shot CLI path.
+        let visible_text = heso_engine_fetch::extract_visible_text(&post_html);
+        let forms_json = group_forms(&record.current_actions);
+
+        let mut body = serde_json::json!({
+            "url": live_url.as_str(),
+            "title": static_page.tree.title,
+            "description": static_page.tree.description,
+            "metadata": static_page.metadata,
+            "tree": static_page.tree,
+            "actions": record.current_actions,
+        });
+        if !static_page.inline_data.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "inline_data".to_owned(),
+                    serde_json::to_value(&static_page.inline_data)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
         }
-    }
-    if !static_page.data_attrs.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "data_attrs".to_owned(),
-                serde_json::to_value(&static_page.data_attrs)
-                    .unwrap_or(serde_json::Value::Null),
-            );
+        if !static_page.data_attrs.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "data_attrs".to_owned(),
+                    serde_json::to_value(&static_page.data_attrs)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
         }
-    }
-    if include.text {
-        body["text"] =
-            serde_json::Value::String(heso_engine_fetch::extract_visible_text(&post_html));
-    }
-    if include.forms {
-        body["forms"] = group_forms(&record.current_actions);
-    }
-    if include.cookies {
-        body["cookies"] = collect_cookies(&state.engine, &live_url);
-    }
-    if include.console {
-        body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);
-    }
-    if include.framework {
-        body["framework"] = serde_json::Value::String(detect_framework(static_page));
-    }
-    if include.scripts {
-        // The script-execution tally on a long-lived session is
-        // computed at install_document time and not re-tracked across
-        // subsequent navigates/evals. Without re-running scripts here
-        // we surface a `null` to signal the field is intentionally
-        // not available on a read-against-session call — the agent
-        // can call `navigate` to refresh.
-        body["scripts"] = serde_json::Value::Null;
+        if include.text {
+            body["text"] = serde_json::Value::String(visible_text.clone());
+        }
+        if include.forms {
+            body["forms"] = forms_json.clone();
+        }
+        if include.cookies {
+            body["cookies"] = collect_cookies(&state.engine, &live_url);
+        }
+        if include.console {
+            body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);
+        }
+        if include.framework {
+            body["framework"] = serde_json::Value::String(detect_framework(static_page));
+        }
+        if include.scripts {
+            // The script-execution tally on a long-lived session is
+            // computed at install_document time and not re-tracked across
+            // subsequent navigates/evals. Without re-running scripts here
+            // we surface a `null` to signal the field is intentionally
+            // not available on a read-against-session call — the agent
+            // can call `navigate` to refresh.
+            body["scripts"] = serde_json::Value::Null;
+        }
+        let snap = ReadSnapshot::from_parts(
+            &static_page.tree.title,
+            &visible_text,
+            &record.current_actions,
+            &forms_json,
+        );
+        (body, snap, live_url)
+    };
+
+    // Phase 2: snapshot lookup + delta. Mutex held only for this
+    // short critical section.
+    let delta = {
+        let mut store = state.snapshots.lock().await;
+        let prior = since
+            .as_deref()
+            .and_then(|s| find_snapshot(&mut store, &live_url, s));
+        let delta_value = match (since.as_deref(), prior.as_ref()) {
+            (None, _) => serde_json::Value::Null,
+            (Some(_), None) => delta_no_prior(&snap),
+            (Some(_), Some(prev)) => compute_delta(&snap, prev),
+        };
+        // Install the freshly-computed snapshot under the live URL.
+        // Replaces any prior entry for the URL; evicts the tail past
+        // the LRU cap.
+        install_snapshot(&mut store, live_url.clone(), snap.clone());
+        delta_value
+    };
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "content_hash".to_owned(),
+            serde_json::Value::String(snap.content_hash.clone()),
+        );
+        obj.insert("delta".to_owned(), delta);
     }
 
     let hash = heso_engine_fetch::plat_hash(&body);
