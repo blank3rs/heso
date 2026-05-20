@@ -3126,9 +3126,11 @@ fn install_browser_apis(
 /// `window.closed` / `length` / `name` / `opener` iframe-detection
 /// stubs, `queueMicrotask`, `requestAnimationFrame` /
 /// `cancelAnimationFrame`, `matchMedia`, `localStorage`,
-/// `sessionStorage`, `heso.flush`, and noop observer ctors
+/// `sessionStorage`, `heso.flush`, noop observer ctors
 /// (`MutationObserver`, `IntersectionObserver`, `ResizeObserver`,
-/// `PerformanceObserver`).
+/// `PerformanceObserver`), the React Fizz streaming-hydration
+/// instruction set (`$RC` / `$RX` / `$RB` / `$RS` / `$RP`), and the
+/// webpack-JSONP entry points (`webpackChunk_N_E` / `_N_E`).
 const BROWSER_APIS_BOOTSTRAP: &str = r#"
 (function() {
     // -------------------------------------------------------------
@@ -3391,6 +3393,243 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             enumerable: true,
             configurable: false
         });
+    }
+
+    // -------------------------------------------------------------
+    // Webpack-JSONP entry points: `window.webpackChunk_N_E` and
+    // bare `_N_E`.
+    //
+    // Next.js with the webpack runtime emits chunks shaped like:
+    //
+    //   (self.webpackChunk_N_E = self.webpackChunk_N_E || []).push(
+    //     [[8792], {...modules...}], e => { ...; _N_E = e.O() }
+    //   );
+    //
+    // The first arg uses a `|| []` fallback so the array is created
+    // on demand — that part works fine.  The second arg is an
+    // "after-load" callback that webpack invokes once all chunks in
+    // the entry have loaded: it tries to assign `_N_E = e.O()`.
+    // QuickJS treats this as a write to an undeclared identifier and
+    // throws `ReferenceError: _N_E is not defined`.  Pre-declaring
+    // `_N_E` as a writable global makes the write a property update
+    // instead of an implicit-global creation, so it succeeds.
+    //
+    // The matching `webpackChunk_N_E = []` is technically redundant
+    // (the `|| []` fallback would create it), but installing it up
+    // front means the webpack runtime sees the array on first push
+    // and registers its own `.push` override over our value rather
+    // than racing against the first chunk's fallback assignment.
+    // Both shapes are observed on supabase.com / stripe.com / any
+    // Next.js Turbopack site that ships a webpack-style chunk loader.
+    // V7 agent run flagged `_N_E is not defined` on both sites.
+    // -------------------------------------------------------------
+    if (typeof globalThis.webpackChunk_N_E === 'undefined') {
+        globalThis.webpackChunk_N_E = [];
+    }
+    if (typeof globalThis._N_E === 'undefined') {
+        // Value doesn't matter — webpack's after-load callback
+        // overwrites it.  `undefined` is the most honest default.
+        globalThis._N_E = undefined;
+    }
+
+    // -------------------------------------------------------------
+    // React Fizz streaming-hydration instruction set: `$RC`, `$RX`,
+    // `$RB`, `$RS`, `$RP`.
+    //
+    // React's server renderer ("Fizz") streams a page in chunks
+    // wrapped in `<!--$?-->` / `<!--/$-->` comment boundaries, then
+    // emits short inline `<script>$RC("B:1","S:0")</script>` calls
+    // after each chunk arrives to splice the streamed content into
+    // place.  These instructions are installed earlier in the
+    // document by separate inline scripts emitted by Fizz — but only
+    // when the boundary they wrap is first encountered.  When heso
+    // serves a fully-buffered HTML response (everything arrives at
+    // once), the install-time inline scripts have already run by the
+    // time later `$RC` / `$RX` / `$RB` references fire, and any that
+    // reference symbols the installer hadn't published yet throw
+    // ReferenceError.
+    //
+    // V7 agent run on nextjs.org saw 13× `$RC is not defined`, 1×
+    // `$RB is not defined`, and 3× `$RX is not defined` — the page
+    // still hydrated (the Turbopack chunks already ran), but the
+    // streaming-reveal noise was the dominant remaining error class.
+    //
+    // Spec source (verified against facebook/react main, MIT, file
+    // `packages/react-dom-bindings/src/server/fizz-instruction-set/
+    // ReactDOMFizzInstructionSetShared.js`):
+    //
+    //   window['$RB'] = [];
+    //   window['$RV'] = revealCompletedBoundaries;
+    //   window['$RC'] = completeBoundary;
+    //   window['$RX'] = clientRenderBoundary;
+    //   window['$RS'] = completeSegment;
+    //
+    // Real-React `$RC` is asynchronous: it queues a `(suspenseIdNode,
+    // contentNode)` pair onto `$RB`, sets a throttle timer, and calls
+    // `$RV` (revealCompletedBoundaries) which walks `<!--$?-->` /
+    // `<!--/$-->` comment markers around the fallback, removes the
+    // fallback subtree, and splices the content into place.
+    //
+    // heso's `dom_query` DOM exposes comment nodes (`nodeType === 8`)
+    // but doesn't surface a `Comment.data` accessor, so the
+    // comment-marker walk used by `revealCompletedBoundaries` to find
+    // fallback bounds is not available to us yet.  We implement a
+    // **synchronous-splice** variant: when both ids resolve, insert
+    // every child of `contentNode` immediately *before* `suspenseIdNode`
+    // (its parent's `insertBefore` is enough — we don't need to
+    // remove the fallback sibling chain), then drop `suspenseIdNode`
+    // and `contentNode`.  Observable end state for a headless agent
+    // reading the DOM after-the-fact is the same: the boundary content
+    // is in the document, no errors thrown.  The fallback markers
+    // (and any fallback children that lived between them) remain in
+    // place because we can't identify them — see "Known limit" in the
+    // commit message.
+    //
+    // `$RX` (clientRenderBoundary) is implemented per spec: find the
+    // boundary id node, write error metadata to its `dataset`, call
+    // `_reactRetry` if present.  We skip the
+    // `suspenseNode.data = SUSPENSE_FALLBACK_START_DATA` step because
+    // it requires a Comment.data setter we don't expose; this only
+    // affects React's later decision to client-render, which an agent
+    // run never reaches.
+    //
+    // `$RS` (completeSegment) is implemented per spec: it doesn't
+    // touch comment markers — it just moves children and removes a
+    // placeholder, both of which work on heso's DOM.
+    //
+    // `$RP` is not part of current React/Fizz (verified by walking
+    // the `fizz-instruction-set/` directory on `main` — only $RB,
+    // $RC, $RM, $RR, $RS, $RT, $RV, $RX exist).  It appears in the
+    // V7 issue brief as a hypothetical symbol, so we install a safe
+    // no-op for defensive parity in case a future React minor adds
+    // it.  If real semantics emerge, the no-op is easy to replace.
+    // -------------------------------------------------------------
+    if (typeof globalThis.$RB === 'undefined') {
+        // React Fizz declares `$RB` as an Array; the `completeBoundary`
+        // body does `window['$RB'].push(...)` so the value MUST be
+        // array-shaped before any `$RC` call.
+        globalThis.$RB = [];
+    }
+    if (typeof globalThis.$RC !== 'function') {
+        globalThis.$RC = function $RC(suspenseBoundaryID, contentID) {
+            var contentNode = document.getElementById(contentID);
+            if (!contentNode) { return; }
+            var suspenseIdNode = document.getElementById(suspenseBoundaryID);
+            if (!suspenseIdNode) {
+                // Per spec: "We'll never reveal this boundary so we
+                // can remove its content immediately."
+                if (contentNode.parentNode) {
+                    contentNode.parentNode.removeChild(contentNode);
+                }
+                return;
+            }
+            // Synchronous splice (see header comment for rationale).
+            // Insert every child of contentNode immediately before
+            // suspenseIdNode in its parent, then drop both anchors.
+            var parent = suspenseIdNode.parentNode;
+            if (parent) {
+                while (contentNode.firstChild) {
+                    parent.insertBefore(contentNode.firstChild, suspenseIdNode);
+                }
+                parent.removeChild(suspenseIdNode);
+            }
+            if (contentNode.parentNode) {
+                contentNode.parentNode.removeChild(contentNode);
+            }
+        };
+    }
+    if (typeof globalThis.$RX !== 'function') {
+        globalThis.$RX = function $RX(suspenseBoundaryID, errorDigest, errorMsg, errorStack, errorComponentStack) {
+            var suspenseIdNode = document.getElementById(suspenseBoundaryID);
+            if (!suspenseIdNode) { return; }
+            // Per React source: stamp the error fields onto the
+            // boundary node's dataset so React's later client-render
+            // pass can pick them up.
+            var dataset = suspenseIdNode.dataset;
+            if (dataset) {
+                if (errorDigest) { dataset.dgst = errorDigest; }
+                if (errorMsg) { dataset.msg = errorMsg; }
+                if (errorStack) { dataset.stck = errorStack; }
+                if (errorComponentStack) { dataset.cstck = errorComponentStack; }
+            }
+            // The boundary's previousSibling is the `<!--$?-->`
+            // SUSPENSE marker; if React stashed `_reactRetry` on it,
+            // call it to trigger the client-render attempt.
+            var suspenseNode = suspenseIdNode.previousSibling;
+            if (suspenseNode && typeof suspenseNode._reactRetry === 'function') {
+                suspenseNode._reactRetry();
+            }
+        };
+    }
+    if (typeof globalThis.$RS !== 'function') {
+        globalThis.$RS = function $RS(containerID, placeholderID) {
+            // Per spec: move every child of the segment container in
+            // front of the placeholder, then remove both anchors.
+            var segmentContainer = document.getElementById(containerID);
+            var placeholderNode = document.getElementById(placeholderID);
+            if (!segmentContainer || !placeholderNode) { return; }
+            if (segmentContainer.parentNode) {
+                segmentContainer.parentNode.removeChild(segmentContainer);
+            }
+            var placeholderParent = placeholderNode.parentNode;
+            if (placeholderParent) {
+                while (segmentContainer.firstChild) {
+                    placeholderParent.insertBefore(segmentContainer.firstChild, placeholderNode);
+                }
+                placeholderParent.removeChild(placeholderNode);
+            }
+        };
+    }
+    if (typeof globalThis.$RP !== 'function') {
+        // Defensive no-op; see header comment.
+        globalThis.$RP = function $RP() { /* not in current React/Fizz */ };
+    }
+    // Adjunct Fizz symbols: `$RV` (revealCompletedBoundaries),
+    // `$RR` (completeBoundaryWithStyles), `$RM` (Map of loaded
+    // stylesheets), `$RT` (last-paint performance.now() metric).
+    //
+    // Our `$RC` does a synchronous splice instead of queueing — so
+    // `$RV` should never fire from our code path.  But the
+    // upgrade-to-view-transitions install script (a separate inline
+    // emitted on view-transition pages) references `$RV` directly to
+    // wrap it for batching.  V7 agent run on nextjs.org saw 1×
+    // `$RV is not defined` after $RC/$RX were installed; observing
+    // that error before this stub was added confirmed Fizz emits a
+    // bare `$RV` read at boundary-group end.  The function takes a
+    // batch array and reveals it; for us that means draining the
+    // batch (we already did the work in $RC).
+    if (typeof globalThis.$RV !== 'function') {
+        globalThis.$RV = function $RV(batch) {
+            if (batch && typeof batch.length === 'number') {
+                batch.length = 0;
+            }
+        };
+    }
+    if (typeof globalThis.$RR !== 'function') {
+        // Stylesheet-aware boundary completion.  Real React preloads
+        // the styles, then calls `$RC` on resolve and `$RX` on reject.
+        // We don't track stylesheet loading state yet (no real CSSOM),
+        // so we skip straight to `$RC` — the boundary content lands
+        // immediately, just without precedence-hoisted <link> tags.
+        // This is the same punt heso already makes for `<link
+        // rel="stylesheet">` (no layout, no CSSOM).
+        globalThis.$RR = function $RR(suspenseBoundaryID, contentID /* , stylesheetDescriptors */) {
+            globalThis.$RC(suspenseBoundaryID, contentID);
+        };
+    }
+    if (typeof globalThis.$RM === 'undefined') {
+        // React Fizz declares `$RM` as `new Map()` (cached stylesheet
+        // links keyed by href).  Empty map is fine — every lookup
+        // misses and the `$RR` path constructs a fresh <link>.
+        globalThis.$RM = new Map();
+    }
+    if (typeof globalThis.$RT === 'undefined') {
+        // `$RT` is a performance-timing milestone (a number, not a
+        // function).  Real React writes `performance.now()` here as
+        // each boundary reveals.  Treating it as 0 / "no paint yet"
+        // is harmless for the throttle math in any code that reads
+        // it.
+        globalThis.$RT = 0;
     }
 })();
 "#;
@@ -4941,5 +5180,257 @@ mod tests {
             .expect("eval ok");
         assert_eq!(out.value["ok"], true);
         assert_eq!(out.value["x"], 99);
+    }
+
+    // ===== React Fizz streaming-hydration instruction set =====
+    //
+    // Spec source: facebook/react MIT, file
+    // `packages/react-dom-bindings/src/server/fizz-instruction-set/
+    // ReactDOMFizzInstructionSetShared.js` (verified against `main` —
+    // current as of this commit).
+    //
+    // Test plan:
+    // 1. `$RC` / `$RX` / `$RB` / `$RS` / `$RP` exist as the right
+    //    *type* at engine start (functions where the spec says
+    //    functions; an Array for `$RB`).
+    // 2. Calling `$RC` / `$RX` / `$RS` with ids that don't exist in
+    //    the document is a safe no-op (matches React's first-line
+    //    early-exits).
+    // 3. Calling `$RC(boundaryID, contentID)` on a real document
+    //    moves contentID's children to where boundaryID lived, then
+    //    drops both anchor nodes. This is the agent-observable end
+    //    state.
+    // 4. Inline `<script>$RC(...)</script>` does not throw —
+    //    eval_with_html_capture's executed_with_error stays at 0.
+
+    #[test]
+    fn fizz_instruction_set_globals_have_spec_shapes() {
+        let e = engine();
+        let out = e
+            .eval(
+                r#"({
+                    rc: typeof $RC,
+                    rx: typeof $RX,
+                    rs: typeof $RS,
+                    rp: typeof $RP,
+                    rv: typeof $RV,
+                    rr: typeof $RR,
+                    rb_is_array: Array.isArray($RB),
+                    rb_len: $RB.length,
+                    rm_is_map: $RM instanceof Map,
+                    rt_is_number: typeof $RT === 'number',
+                })"#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value["rc"], "function");
+        assert_eq!(out.value["rx"], "function");
+        assert_eq!(out.value["rs"], "function");
+        assert_eq!(out.value["rp"], "function");
+        assert_eq!(out.value["rv"], "function");
+        assert_eq!(out.value["rr"], "function");
+        assert_eq!(out.value["rb_is_array"], true);
+        assert_eq!(out.value["rb_len"], 0);
+        assert_eq!(out.value["rm_is_map"], true);
+        assert_eq!(out.value["rt_is_number"], true);
+    }
+
+    #[test]
+    fn fizz_rc_inline_script_does_not_throw_when_ids_missing() {
+        // The minimum spec-shaped guarantee: an inline
+        // `<script>$RC("missing-b","missing-s")</script>` running
+        // against an empty document must not surface as a
+        // ReferenceError or any other thrown exception. Real React
+        // also no-ops in this branch (see
+        // `ReactDOMFizzInstructionSetShared.completeBoundary`'s
+        // first two `if (!contentNodeOuter / !suspenseIdNodeOuter)`
+        // early returns).
+        let html = r#"<html><head>
+            <script>$RC("missing-b", "missing-s")</script>
+            <script>$RX("missing-b")</script>
+            <script>$RS("missing-c", "missing-p")</script>
+            <script>$RP("anything")</script>
+        </head><body></body></html>"#;
+        let (_out, script_outcome) = engine()
+            .eval_with_html_capture(html, "true", ScriptFetchPolicy::Skip)
+            .expect("eval ok");
+        // All four inline scripts ran clean.
+        assert_eq!(script_outcome.executed, 4);
+        assert_eq!(script_outcome.executed_with_error, 0);
+    }
+
+    #[test]
+    fn fizz_rc_synchronously_splices_content_into_boundary_position() {
+        // Mirror what Fizz emits during streaming: a fallback anchor
+        // (`<div id="S:0">…fallback…</div>`) where the boundary lives,
+        // and a hidden content container (`<div id="B:0">…real…</div>`)
+        // emitted later in the document. `$RC("S:0","B:0")` should
+        // move the real content into where the fallback lived.
+        let html = r#"<html><body>
+            <div id="parent">
+                <span>before</span>
+                <div id="S:0">fallback content</div>
+                <span>after</span>
+            </div>
+            <div id="B:0" hidden>
+                <p class="real">real content one</p>
+                <p class="real">real content two</p>
+            </div>
+            <script>$RC("S:0", "B:0")</script>
+        </body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(
+                html,
+                r#"({
+                    parentHTML: document.getElementById('parent').innerHTML,
+                    realCount: document.querySelectorAll('.real').length,
+                    // Verify the fallback DIV's text was displaced by
+                    // checking #parent doesn't contain it.  We don't
+                    // assert `document.getElementById('S:0') === null`
+                    // because dom_query 0.28's `descendants_it` from
+                    // the tree root may still surface a detached node
+                    // by its id attribute (the node is orphaned from
+                    // its parent but its slot in the node-arena Vec
+                    // remains, with the id attribute intact).  The
+                    // load-bearing invariant for agent-visible end
+                    // state is "where do the real elements live?" —
+                    // they live in #parent, the fallback content is
+                    // gone from #parent, that's what counts.
+                })"#,
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        assert_eq!(script_outcome.executed_with_error, 0);
+        // Both real <p>s ended up in #parent (their original parent
+        // was #B:0, which we drained).
+        assert_eq!(out.value["realCount"], 2);
+        // And they sit between the surrounding <span>s where the
+        // fallback used to live.
+        let html_snippet = out.value["parentHTML"].as_str().expect("string");
+        assert!(html_snippet.contains("before"), "{html_snippet}");
+        assert!(html_snippet.contains("real content one"), "{html_snippet}");
+        assert!(html_snippet.contains("real content two"), "{html_snippet}");
+        assert!(html_snippet.contains("after"), "{html_snippet}");
+        // Fallback content was wiped (it lived inside the now-removed #S:0).
+        assert!(!html_snippet.contains("fallback content"), "{html_snippet}");
+        // The fallback DIV itself is gone from #parent.
+        assert!(!html_snippet.contains(r#"id="S:0""#), "{html_snippet}");
+    }
+
+    #[test]
+    fn fizz_rs_completes_segment_per_spec() {
+        // `$RS(containerID, placeholderID)` — straight-line per spec:
+        // move children, remove both anchors. No suspense markers
+        // involved, so this one fully matches real React's behavior.
+        // (We don't assert `getElementById(...) === null` for the
+        // removed anchors — see the $RC test for why.  The agent-
+        // visible invariant is the innerHTML of the parent.)
+        let html = r#"<html><body>
+            <div id="parent">
+                <span id="ph">placeholder</span>
+            </div>
+            <div id="seg">
+                <p>moved one</p>
+                <p>moved two</p>
+            </div>
+            <script>$RS("seg", "ph")</script>
+        </body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(
+                html,
+                r#"({ parentHTML: document.getElementById('parent').innerHTML })"#,
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        assert_eq!(script_outcome.executed_with_error, 0);
+        let html_snippet = out.value["parentHTML"].as_str().expect("string");
+        assert!(html_snippet.contains("moved one"), "{html_snippet}");
+        assert!(html_snippet.contains("moved two"), "{html_snippet}");
+        assert!(!html_snippet.contains("placeholder"), "{html_snippet}");
+        // The placeholder anchor span is removed from #parent.
+        assert!(!html_snippet.contains(r#"id="ph""#), "{html_snippet}");
+    }
+
+    #[test]
+    fn fizz_rx_writes_error_metadata_to_dataset() {
+        // `$RX(boundaryID, digest, msg, stack, componentStack)`
+        // stamps the error fields onto the boundary node's `dataset`
+        // (spec: `dataset['dgst']`, `dataset['msg']`, `dataset['stck']`,
+        // `dataset['cstck']`). Used by React to surface server-side
+        // errors to the client during hydration.
+        let html = r#"<html><body>
+            <div id="B:0"></div>
+            <script>$RX("B:0", "abc123", "boom", "stack lines", "comp stack")</script>
+        </body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(
+                html,
+                r#"({
+                    dgst: document.getElementById('B:0').dataset.dgst,
+                    msg: document.getElementById('B:0').dataset.msg,
+                    stck: document.getElementById('B:0').dataset.stck,
+                    cstck: document.getElementById('B:0').dataset.cstck,
+                })"#,
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        assert_eq!(script_outcome.executed_with_error, 0);
+        assert_eq!(out.value["dgst"], "abc123");
+        assert_eq!(out.value["msg"], "boom");
+        assert_eq!(out.value["stck"], "stack lines");
+        assert_eq!(out.value["cstck"], "comp stack");
+    }
+
+    // ===== webpack-JSONP entry points =====
+
+    #[test]
+    fn webpack_chunk_n_e_array_is_pushable() {
+        // The shape Next.js webpack chunks expect: an Array on
+        // `self.webpackChunk_N_E` they can `.push([[chunkID], {...}])`
+        // into. Real webpack runtime later replaces `.push` with its
+        // own JSONP handler — we just need the array to exist so the
+        // first push doesn't throw.
+        let html = r#"<html><body>
+            <script>
+                (self.webpackChunk_N_E = self.webpackChunk_N_E || []).push([
+                    [9999],
+                    { mod1: function(){ return 42; } }
+                ]);
+                globalThis.observedLength = self.webpackChunk_N_E.length;
+            </script>
+        </body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(html, "globalThis.observedLength", ScriptFetchPolicy::Skip)
+            .expect("eval ok");
+        assert_eq!(script_outcome.executed_with_error, 0);
+        assert_eq!(out.value, serde_json::json!(1));
+    }
+
+    #[test]
+    fn n_e_global_is_assignable_without_implicit_global_error() {
+        // The failure mode V7 saw on supabase / stripe: webpack's
+        // after-load callback executes `_N_E = e.O()` as an implicit
+        // global assignment, which QuickJS rejects with
+        // `ReferenceError: _N_E is not defined`. Pre-declaring the
+        // global makes the write a property update that succeeds in
+        // both strict and sloppy mode.
+        let html = r#"<html><body>
+            <script>
+                // This shape is the exact one from supabase's main
+                // chunk's after-load callback (see commit message).
+                _N_E = { O: function(){ return 'ok'; } };
+                globalThis.observedNE = typeof _N_E;
+                globalThis.observedNEResult = _N_E.O();
+            </script>
+        </body></html>"#;
+        let (out, script_outcome) = engine()
+            .eval_with_html_capture(
+                html,
+                r#"({ neType: globalThis.observedNE, neResult: globalThis.observedNEResult })"#,
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        assert_eq!(script_outcome.executed_with_error, 0);
+        assert_eq!(out.value["neType"], "object");
+        assert_eq!(out.value["neResult"], "ok");
     }
 }
