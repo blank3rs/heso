@@ -11,9 +11,9 @@ engine only  ~35 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
 ```
 
-![heso agent demo](demo/demo.svg)
+![heso agent demo](demo/demo.gif)
 
-The image above is a real run — the agent gets a question, calls `heso search`, fans out `heso batch read` across the top results, and returns an answer. Same picture you get if you run `python demo/agent.py` yourself.
+That's a real recording — Claude Code (running `claude -p` from the repo root) loads `skills/heso/SKILL.md`, calls `heso search`, picks three results, and writes a summary. The script that produced it lives at [`demo/agent.py`](demo/agent.py); the raw recording is [`demo/demo.cast`](demo/demo.cast) (asciinema v2, replayable).
 
 ## A note before you read further
 
