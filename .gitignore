@@ -79,6 +79,17 @@ heso-local-data/
 # Logs
 *.log
 
+# Demo / bench: node_modules + generated mp4 (gif is committed for the README).
+bench/jsdom/node_modules/
+bench/playwright/node_modules/
+demo/demo.mp4
+demo/.palette.png
+bench/heso-results-fresh.json
+bench/playwright/results-fresh.json
+bench/jsdom/results.json
+bench/jsdom/progress.log
+bench/playwright/progress.log
+
 # Identity material — NEVER commit private keys
 identity/private/
 *.priv

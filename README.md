@@ -1,55 +1,64 @@
 # heso
 
-A small headless browser for scripts and agents that read web pages without needing them rendered. Fetches a URL, parses the HTML, runs the JavaScript, lets you click and fill forms, and returns the result as JSON. One Rust binary, around 8 MB. No Chromium, no Node.
+A small browser for AI agents. One Rust binary. No Chromium, no Node.
+
+It fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
+
+```
+binary       9.2 MB
+cold start   ~80 ms   (open https://example.com, network included)
+engine only  ~35 ms   (no network)
+batch        ~1.1 s   for 8 URLs in parallel
+```
+
+![heso agent demo](demo/demo.svg)
+
+The image above is a real run — the agent gets a question, calls `heso search`, fans out `heso batch read` across the top results, and returns an answer. Same picture you get if you run `python demo/agent.py` yourself.
 
 ## A note before you read further
 
-Most of this codebase was written with help from Claude under one person's direction. The co-author tag is on basically every commit. It moved fast, which means the feature surface ran ahead of real usage. Treat the README as design intent plus working code — not as battle-tested production claims — until more people have actually tried it on real workloads.
+Most of this codebase was written with help from Claude under one person's direction. The co-author tag is on basically every commit. It moved fast, which means the feature surface ran ahead of real usage. Treat this as working code that needs more eyes on real workloads, not a finished product.
 
-## What works today
+## What it can do
 
-- Fetching pages, following redirects, cookies.
-- HTML parsing.
-- JavaScript via QuickJS, with a DOM the engine implements directly.
-- `open`, `read`, `wait`, `click`, `fill`, `submit`, `eval`, `navigate`, `serve` — CLI verbs plus JSON-RPC for multi-step sessions.
-- `heso read <url>` returns the page in one call: title, visible text, actionable elements, forms, cookies, console output, framework detection. One call, not five.
-- `heso wait <url> --selector-exists "..."` (also `--text-contains`, `--url-matches`, `--network-idle`, `--time`) blocks until a condition is met. No polling loop.
-- Stateful sessions where DOM mutations, listeners, and form state persist across calls.
-- Real cookie jar shared between the HTTP layer and JS `document.cookie`. Login flows work — `Set-Cookie` on response → next `fetch()` sends it → `document.cookie` reflects it.
-- Optional reproducibility: seed the random number generator, freeze the clock, and the same page processed the same way produces the same hash.
-- Spec-correct events: `KeyboardEvent` / `InputEvent` / `MouseEvent` / `FocusEvent` constructors with full options. `heso fill` dispatches the focus → keydown → beforeinput → input → keyup → change cascade. `heso click` does mousedown → mouseup → click.
-- Common modern JS surface: `fetch`, `URLSearchParams`, `history.pushState`, `Blob`/`File`/`FormData`, multipart upload.
-- ES modules: `<script type="module">`, dynamic `import()`, import maps. Shared cache between the static and dynamic paths.
-- Web Components: `customElements.define`, `HTMLElement` as a base class, `connectedCallback`/`disconnectedCallback`/`attributeChangedCallback` lifecycle, `HTMLTemplateElement`, `attachShadow`, `ShadowRoot`, `<slot>` with `assignedElements`. Late-upgrade re-prototyping works.
-- Modern site coverage: `nextjs.org`, `vercel.com`, `stripe.com`, `supabase.com`, `posthog.com`, `bun.sh`, `astro.build`, `ui.shadcn.com`, `lit.dev/playground`, `hono.dev`, `linear.app` all hydrate (title + h1 + body content). Turbopack + RSC + heap headroom + the QuickJS iterator-helper crash workaround add up here.
+**Find and read things.**
 
-## What doesn't
+- `heso search "<query>"` — searches the web (DuckDuckGo + Wikipedia, optional SearXNG). No API key.
+- `heso open <url>` — fetches and returns a page summary: title, headings, actionable elements.
+- `heso read <url>` — fetches, runs JS, returns the full picture: title, visible text, actions, forms, cookies, console output, framework detection. One call.
+- `heso read <url> --complete` — same, but heso loops "fire pending observers + click load-more + wait for DOM to settle" until the page stops changing. For lazy-loaded sites.
+- `heso batch [open|read] <urls...>` — runs many URLs in parallel. Shared cookie jar, JSON-Lines out.
+- `heso wait <url> --selector-exists ".foo"` (also `--text-contains`, `--url-matches`, `--network-idle`, `--time`) — blocks until a condition is true. No polling loop.
 
-- No rendering. No canvas, WebGL, CSS layout, or video. If your agent needs pixels, use a real browser.
-- Sites that depend on a sibling script having already set a global the next script reads. `shoelace.style` is the canonical case — its bundle dies on `window.lunr` not being defined yet. Each cascade is its own small polyfill and they're not all shimmed.
-- Lazy-loaded content: `IntersectionObserver` and `MutationObserver` are noop constructors. Anything that defers rendering on visibility (infinite scroll, deferred images, observer-driven hydration) doesn't fire.
-- SVG namespace handling is incomplete; sites that touch SVG via JS may break.
-- Compatibility breadth is well behind jsdom. jsdom has had years to handle weird real-world JavaScript. This is early.
+**Interact with sites.**
 
-## Demo
+- `heso click <url> @e7` — click by element ref.
+- `heso click <url> --text "Sign in"` — or by visible text, CSS selector, or aria-label.
+- `heso fill <url> @e3 "hello"` — type into an input.
+- `heso submit <url> @e9` — submit a form.
+- `heso navigate` — change URL within a session.
+- `heso eval-dom <url> "<js>"` — fetch, run scripts, then run your JS against the resulting DOM.
 
-```console
-$ heso eval-dom https://news.ycombinator.com \
-    'Array.from(document.querySelectorAll(".titleline > a")).slice(0,5).map(a => a.textContent)'
-{
-  "ok": true,
-  "url": "https://news.ycombinator.com/",
-  "value": [
-    "The foundations of a provably secure operating system (PSOS) (1979) [pdf]",
-    "GenCAD",
-    "Crystals found inside wreckage from the first nuclear bomb test",
-    "It is time to give up the dualism introduced by the debate on consciousness",
-    "I turned a $80 RK3562 Android tablet into a Debian Linux workstation"
-  ]
-}
-```
+**Recover from broken sites.**
 
-Fetch, parse, run JS, get five titles in under 400 ms.
+- `--best-effort` on `open` / `read` / `wait` — exit 0 even when scripts crash. Output includes `partial: true`, `partial_reason: "script_crash" | "wait_timeout" | "fetch_failed" | "parse_error"`, and `failed_scripts: [...]`. The agent sees what broke and decides what to try next.
+- `--inject-script "<inline-js>"` or `--inject-script @file.js` — run JS before the page's own scripts. Use it to shim a missing global (the canonical `window.lunr` cascade kind of thing).
+
+**Detect cross-call state changes.**
+
+- `heso read` always returns a `content_hash`. Pass `--since <prev_hash>` to get a `delta` describing what changed (`actions_added`, `actions_removed`, `forms_changed`, `text_changed`, `title_changed`).
+
+**Stateful sessions.**
+
+- `heso serve` — JSON-RPC over stdin/stdout. Cookies, DOM mutations, listeners, and history persist across calls. Useful for login → navigate → scrape flows.
+
+## What it can't do
+
+- **No rendering.** No canvas, WebGL, CSS layout, or video. If the meaning is in pixels, use a real browser.
+- **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `Mozilla/5.0 (compatible; heso/0.0.1)` so anything fingerprinting will see us coming.
+- **Pages built on tech we don't simulate.** Service Workers, WebRTC, WebUSB, WebBluetooth — not supported.
+- **Sites whose JS we can't run.** QuickJS isn't V8. Most works; some doesn't.
+- **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
 
 ## Quickstart
 
@@ -58,143 +67,109 @@ cargo build --release -p heso-cli
 ./target/release/heso open https://example.com
 ```
 
-You get a JSON summary of the page: title, description, a tree of headings, and a list of clickable elements numbered `@e0`, `@e1`, and so on.
+You get JSON: title, description, a heading tree, and a list of clickable elements numbered `@e0`, `@e1`, and so on.
 
 ## Examples
 
-Read everything about a page in one call:
+Search the web, then read the top hits in parallel:
 
 ```sh
-heso read --js-fetch https://nextjs.org/
-# → { "title": "...", "text": "...", "actions": [...], "forms": [...],
-#     "cookies": [...], "console": [...], "framework": "next.js", ... }
+heso search "rust web scraping" --limit 5
+heso batch read url1 url2 url3 --parallel 2
 ```
 
-Read structured data:
+Read everything from one page in one call:
 
 ```sh
-heso eval-dom https://news.ycombinator.com \
-  'Array.from(document.querySelectorAll(".titleline > a")).slice(0,5).map(a => a.textContent)'
+heso read https://nextjs.org/
+# → { title, text, actions, forms, cookies, console, framework,
+#     content_hash, lazy_hints, partial: false, ... }
 ```
 
-Find and click:
-
-```sh
-heso find  https://news.ycombinator.com --role link --name "more"   # → @e220
-heso click https://news.ycombinator.com @e220
-```
-
-Or skip the find step entirely and click by visible text, CSS selector, or aria-label:
+Find by visible text, click, follow:
 
 ```sh
 heso click https://news.ycombinator.com --text "More"
-heso fill  https://news.ycombinator.com --selector "input[name=q]" "rust"
-heso click https://news.ycombinator.com --aria-label "Close dialog"
 ```
 
-`--text` and `--aria-label` match case-insensitive substrings (Playwright `get_by_text` / `get_by_role` semantics). Multiple matches return an "ambiguous: N matches" error listing every candidate's ref so the agent can pick by `@e<N>` on the retry.
-
-Sites as filesystems:
+Wait for an SPA condition:
 
 ```sh
-heso tree https://stripe.com
-heso ls   https://stripe.com /pricing
-heso cat  https://stripe.com /pricing/business
+heso wait https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
 ```
 
-Reproducibility:
+Rescue a broken site with a polyfill:
 
 ```sh
-heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
-heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241, every time
-```
-
-The same seed makes `Math.random`, `crypto.getRandomValues`, `crypto.randomUUID`, `Date.now`, and `setTimeout` produce the same output across machines.
-
-Wait for a condition (no polling loop):
-
-```sh
-heso wait --js-fetch https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
+heso open https://shoelace.style --best-effort \
+  --inject-script "window.lunr = (() => ({ Index: { load: () => ({}) } }))()"
 ```
 
 Multi-step session over stdio:
 
 ```sh
-heso serve   # JSON-RPC; DOM persists across calls
+heso serve
+# → JSON-RPC. Page state, cookies, DOM all persist across requests.
 ```
 
-Login flow end-to-end (real cookie jar carries the session):
+Reproducibility (same seed → same output across machines):
 
 ```sh
-# In a heso serve JSON-RPC session:
-# 1. navigate to /login
-# 2. fill user + pass
-# 3. submit
-# 4. wait for url-matches "/dashboard"
-# 5. read everything on the dashboard
+heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
+heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
 ```
-
-## Speed
-
-For one-shot calls — fetch a single URL, get something out — heso is roughly 2.7× faster than Playwright plus Chromium on the same eight URLs, with around 17 MB of memory instead of 100+ MB. Numbers in [`bench/playwright/RESULTS.md`](bench/playwright/RESULTS.md).
-
-Caveats worth knowing:
-
-- The Playwright comparison is cold-start vs cold-start. In production, Playwright keeps the browser warm with a persistent context across requests, which eliminates most of heso's startup advantage.
-- jsdom isn't benchmarked head-to-head yet. It's likely fast enough for many cases and definitely better at compatibility. heso's advantage there is single-binary deploy and reproducibility, not raw throughput.
 
 ## Use as an agent skill
 
-heso is built to be a tool an agent calls, not a library a human drives. The cleanest integration is the skill / tool markdown pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses use. A starter skill:
+heso is built to be a tool an agent calls, not a library a human drives. The cleanest integration is the skill markdown pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses use:
 
 ```markdown
 ---
 name: heso
-description: Use the heso headless browser (one Rust binary, no Chromium, no Node) to fetch a real web page, parse it, run its JavaScript, extract content, navigate, fill forms, or click links. Prefer this over WebFetch when you need a DOM, stateful clicks, or framework-rendered content.
+description: Use the heso headless browser (one Rust binary, no Chromium, no Node) to search the web, fetch pages, run their JavaScript, extract content, navigate, fill forms, or click links. Prefer this over WebFetch when you need a DOM, stateful clicks, or framework-rendered content.
 ---
 
 ## Verbs
 
-- `heso open <url>` — page summary: title, metadata, actions, content hash
-- `heso meta <url>` — metadata only (OpenGraph, JSON-LD)
-- `heso find <url> [--role link|button|input|form] [--name "regex"]` — find an element
-- `heso click <url> @e<N>` — click element @eN
-- `heso click <url> --text "Submit"` — click by visible text (case-insensitive substring)
-- `heso click <url> --selector "button.primary"` — click by CSS selector
-- `heso click <url> --aria-label "Close"` — click by aria-label substring
-- `heso fill <url> @e<N> "value"` — type into input @eN
-- `heso fill <url> --selector "input[name=q]" "value"` — fill by locator (same flags as click)
-- `heso submit <url> @e<N>` — submit form @eN
-- `heso submit <url> --selector "form#login"` — submit by locator
-- `heso eval-dom <url> "<js>"` — fetch URL, run scripts, then evaluate your JS against the resulting DOM
-- `heso tree <url>` / `heso ls <url> <path>` / `heso cat <url> <path>` — navigate page sections
-- `heso serve` — multi-step session over JSON-RPC stdio
+- `heso search "<query>" [--limit N]` — web search via DDG + Wikipedia
+- `heso open <url>` — page summary
+- `heso read <url> [--complete]` — full content + actions + forms (use --complete for lazy-loaded sites)
+- `heso wait <url> --selector-exists ".x"` — block until a condition is true
+- `heso batch [open|read] <urls...> [--parallel N]` — parallel scrape
+- `heso click <url> --text "..." | --selector "..." | @eN` — click
+- `heso fill <url> @eN "value"` — type into input
+- `heso submit <url> @eN` — submit form
+- `heso eval-dom <url> "<js>"` — run JS against the page
+- `heso serve` — multi-step JSON-RPC session
+- `--best-effort` on open/read/wait — exit 0 on partial failures, surface what broke
+- `--inject-script "<js>" | @file` — inject a polyfill before page scripts run
 ```
 
-The verbs are the contract. Same shape works in any harness with tool or skill markdown.
+The verbs are the contract. Same shape works in any harness that does tool or skill markdown.
 
-## How it compares
+The Python demo in [`demo/agent.py`](demo/agent.py) is a small Claude-with-tool-use agent that points at exactly these verbs and answers questions like "find me three rust web scraping libraries and summarize them" by running real `heso` calls.
 
-Not a replacement for either of these. Different tradeoffs.
+## Stats
 
-Versus Playwright with Chromium: heso is smaller, uses less memory, starts faster, and runs on machines without a browser binary. Playwright renders pixels and works on every site.
+Measured on Windows 11, AMD x86_64, with the release binary:
 
-Versus jsdom with Node: heso is a static binary, no `node_modules`, no Node runtime. jsdom has years of compatibility work that heso doesn't.
+| Thing | Number |
+|---|---|
+| Binary size | 9.2 MB |
+| Cold start (`open https://example.com`, network included) | ~80 ms |
+| Engine-only (no network, local fixture) | ~35 ms |
+| Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
+| Search (DDG, 5 results) | ~1 s |
 
-If your workload doesn't need single-binary deploy or content-hashed output, jsdom probably handles it better today.
+No comparisons to other tools in this README — different tools have different tradeoffs and "X is faster than Y" framing rarely survives contact with a real workload. If you want to compare for your case, the [`bench/`](bench/) directory has a Playwright sidecar and a jsdom sidecar that run against the same target list.
 
 ## Status
 
-Pre-alpha. Roughly two weeks of work. Built fast with LLM help, used by one person so far. Worth trying if the use case fits; not worth depending on for production yet.
+Pre-alpha. Worth trying if the use case fits; not worth depending on in production yet.
 
-Concrete next work, in rough order:
+## License
 
-- A QuickJS GC teardown assertion that fires on a small number of pages (e.g. astro.build). The eval output is correct, but the engine aborts during drop. Real CI hazard, needs fixing.
-- Turbopack-chunk detection for Next.js builds.
-- SVG namespace and tag-name casing.
-- Full `KeyboardEvent` / `InputEvent` / `MouseEvent` constructors so React 19 interactions round-trip cleanly.
-- Real cookie jar shared between HTTP and `document.cookie`.
-- `:host` and `::slotted()` CSS selectors for shadow-DOM-scoped queries.
+MIT or Apache-2.0, your choice.
 
 ## Try it
 
@@ -202,9 +177,5 @@ Concrete next work, in rough order:
 git clone https://github.com/Akshay-Dongare/heso
 cd heso
 cargo build --release -p heso-cli
-./target/release/heso open https://example.com
+./target/release/heso search "rust web scraping" --limit 5
 ```
-
-## License
-
-MIT or Apache-2.0, your choice.
