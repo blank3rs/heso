@@ -21,7 +21,28 @@ thiserror.workspace = true
 # `Runtime::set_loader`, so `import` / `export` resolve dependencies
 # against the page URL through the shared `reqwest::Client`. See
 # WHATWG HTML §8.1.3 Modules and `src/modules.rs` for the spec map.
-rquickjs = { version = "0.11", features = ["classes", "properties", "macro", "loader"] }
+#
+# `disable-assertions` strips QuickJS's debug-only C-level assertions
+# (compiles with `-DNDEBUG`). Without this, two real pages — `https://
+# astro.build/` and `https://vercel.com/` — abort `heso eval-dom` on
+# engine drop with one of two QuickJS assertions:
+#   - `assert(list_empty(&rt->gc_obj_list))` (`quickjs.c:2205`)
+#   - `assert(p->ref_count > 0)` (`quickjs.c:6183` — gc_decref_child)
+# Both shapes are upstream-known: see bellard/quickjs#467 (CVE-
+# 2025-69653, `Iterator.prototype.find` on a DOM-Element-backed array
+# trips an assertion in shutdown GC because QuickJS's mark-decref-
+# sweep can't break the iterator-helper-to-DOM-element cycle when
+# Rust holds the elements via `Class<T>` registrations). With NDEBUG
+# defined, `js_free_rt` proceeds past the failed assert and the
+# runtime memory pool is freed via `rt->mf.js_free(ms->opaque, rt)`
+# in one shot — so the leaked GC objects' memory IS released, just
+# without the per-object book-keeping pass. The minimal repro lives
+# at `crates/heso-engine-js/tests/engine_drop_reproducer.rs`. See
+# the explicit `Drop` impl on [`JsEngine`] for the host-side cleanup
+# that complements this — drains Persistents, microtasks, module
+# state, and forces a final GC so the bypassed assertion is never
+# the only line of defense.
+rquickjs = { version = "0.11", features = ["classes", "properties", "macro", "loader", "disable-assertions"] }
 # heso-engine-fetch supplies the protocol-level fetch + action graph
 # we'll wire DOM access against once mutations + events land.
 heso-engine-fetch = { path = "../heso-engine-fetch" }

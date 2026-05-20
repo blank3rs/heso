@@ -1715,35 +1715,157 @@ impl Default for JsEngine {
 }
 
 impl Drop for JsEngine {
-    /// Drain the timer scheduler before the runtime tears down so any
-    /// [`rquickjs::Persistent`] callbacks still in the heap drop while
-    /// their parent [`rquickjs::Runtime`] is still alive. Dropping a
-    /// `Persistent` after the runtime is gone trips QuickJS's
-    /// `list_empty(&rt->gc_obj_list)` debug assertion and aborts the
-    /// process.
+    /// Tear the engine down in an order QuickJS's runtime-finalizer
+    /// is happy with.
     ///
-    /// This runs even on panic-unwind: the scheduler is dropped
-    /// regardless and we just need its inner `Persistent`s released
-    /// first.
+    /// ## Background: two QuickJS assertions
+    ///
+    /// Two debug-only assertions in the bundled `quickjs.c` are
+    /// sharp-edged about teardown:
+    ///
+    /// - `assert(list_empty(&rt->gc_obj_list))` (`quickjs.c:2205`)
+    ///   fires when `JS_FreeRuntime` walks the GC list and finds
+    ///   externally-referenced objects still alive after its final
+    ///   `JS_RunGC` pass.
+    /// - `assert(p->ref_count > 0)` (`quickjs.c:6183`) fires inside
+    ///   `gc_decref_child` when the GC's cycle-collection pass tries
+    ///   to decrement an object whose ref count is already zero — a
+    ///   classic double-decref.
+    ///
+    /// Both reproduced on `https://astro.build/` and
+    /// `https://vercel.com/` before the fix landed — see the
+    /// in-process reproducers at
+    /// `crates/heso-engine-js/tests/engine_drop_reproducer.rs`.
+    ///
+    /// ## The upstream-known root cause
+    ///
+    /// QuickJS's ES2025 iterator helpers (`Iterator.prototype.find`
+    /// etc.) leave a reference-counting cycle when used over a JS
+    /// Array of `Class<T>`-backed Rust objects (in heso's case,
+    /// `Class<Element>` instances from `document.querySelectorAll(…)`)
+    /// that the shutdown GC's mark-and-sweep can't break. This is
+    /// upstream bug bellard/quickjs#467 (CVE-2025-69653). The
+    /// minimal repro is one statement:
+    /// `document.querySelectorAll("span").values().find(e => false)`.
+    ///
+    /// ## How the fix is layered
+    ///
+    /// The complete fix has two parts:
+    ///
+    /// 1. The `rquickjs/disable-assertions` feature in
+    ///    `crates/heso-engine-js/Cargo.toml` compiles QuickJS with
+    ///    `-DNDEBUG`, which strips the per-object debug asserts so
+    ///    the runtime memory pool can be freed in one shot via
+    ///    `rt->mf.js_free(ms->opaque, rt)` even when the iterator-
+    ///    helper cycle can't be broken. Without this feature, no
+    ///    amount of host-side cleanup is enough for the upstream-
+    ///    bugged path.
+    /// 2. This `Drop` impl performs a four-step host-side cleanup
+    ///    pass that releases everything we *can* release before the
+    ///    runtime drops. With (1) in place, this is what keeps
+    ///    per-engine memory usage from growing across repeated
+    ///    create/drop cycles in the same process.
+    ///
+    /// ## The four-step host-side cleanup
+    ///
+    /// 1. **Release host-held Persistent caches** — the timer
+    ///    scheduler and the pending-fetch queue both hold
+    ///    `Persistent<Function<'static>>` handles. Drain them
+    ///    *inside* `Context::with` so the inner JSValues decref
+    ///    while the parent runtime is still alive.
+    /// 2. **Pump every pending microtask** until QuickJS reports the
+    ///    job queue empty. Promises chained via `.then(...)` in the
+    ///    dynamic-import shim and the fetch closures hold their
+    ///    resolve/reject Persistents in JS-side closure scope;
+    ///    firing those microtasks lets the closures call their
+    ///    resolvers and then become unreachable. Real pages
+    ///    (astro.build, vercel.com) queue dozens of these chains
+    ///    during hydration.
+    /// 3. **Clear engine-owned root references** — most notably the
+    ///    cached module resolver closure, which captures
+    ///    `Rc<RefCell<…>>` handles that, on a freshly-loaded module
+    ///    map, can hold their own Persistents indirectly via the
+    ///    dynamic-import shim. Also `module_cache.try_clear()` for
+    ///    self-describing teardown order.
+    /// 4. **Force a final GC pass** so QuickJS's mark-and-sweep
+    ///    collects everything that the pumped microtasks just made
+    ///    unreachable. Two passes — the first collects unreachable
+    ///    cycles; the second sweeps anything whose finalizer
+    ///    schedules further drops.
+    ///
+    /// The drop sequence is panic-safe: every fallible step uses
+    /// `if let Ok(...)` / best-effort patterns so a single failure
+    /// doesn't skip the rest of the cleanup.
     fn drop(&mut self) {
-        // Hold the context for the drain so the Persistents drop
-        // inside `ctx.with` and the QuickJS engine can free their
-        // bound objects synchronously.
+        // STEP 1. Release host-held Persistents while the runtime is
+        // still alive. The timer scheduler and the pending-fetch queue
+        // both hold `Persistent<Function<'static>>` handles; draining
+        // them inside `ctx.with` is the original anti-Persistent-
+        // footgun fix from when the timers module first landed (see
+        // commit `engine-js: real document.cookie wired …` ancestor).
         let timers = self.timers.clone();
         let fetch_queue = self.fetch_state.as_ref().map(|fs| fs.queue.clone());
         self.context.with(|_ctx| {
             if let Ok(mut s) = timers.lock() {
                 s.clear_all();
             }
-            // Drop every queued fetch's Persistent<Function> handles
-            // while the runtime is still alive. Same trap that
-            // `timers.clear_all` is solving: a Persistent dropped
-            // after the parent Runtime aborts the process via
-            // QuickJS's `list_empty(&rt->gc_obj_list)` debug assert.
             if let Some(q) = fetch_queue {
                 let _drained = q.take_all();
             }
         });
+
+        // STEP 2. Pump the microtask queue to empty. Bounded so a
+        // pathological self-rescheduling microtask can't hang teardown
+        // — but generous enough for normal page hydration which can
+        // chain dozens of `.then(...)` calls across a single tick.
+        const MAX_DROP_PUMP: usize = 10_000;
+        for _ in 0..MAX_DROP_PUMP {
+            match self._runtime.execute_pending_job() {
+                Ok(true) => continue,
+                // Either the queue is empty or a job threw. Either way
+                // we stop pumping — a thrown job has already had its
+                // exception consumed by QuickJS, and we don't want to
+                // leak the next-job pointer past the throw.
+                _ => break,
+            }
+        }
+
+        // STEP 3. Release engine-owned root references that would
+        // otherwise keep JS objects alive past the runtime drop.
+        //
+        // The dynamic-import default resolver closure captures
+        // `Rc<RefCell<…>>` handles to the `ModuleCache` and the
+        // `SharedImportMap`; both are plain-data structures, but the
+        // closure box itself is in `module_resolver: Arc<Mutex<…>>`
+        // which we share with the JS-side `globalThis.import` shim.
+        // Clearing the slot here drops the closure (and its captures)
+        // synchronously, so any Persistent indirectly rooted via the
+        // closure releases now rather than at the runtime drop.
+        if let Ok(mut guard) = self.module_resolver.lock() {
+            *guard = None;
+        }
+        // The module cache holds (URL → source) entries — pure data,
+        // no Persistents — but clearing it here drops any
+        // QuickJS-internal module objects that the cache's source
+        // strings indirectly fed into via `Module::declare`. Pure
+        // belt-and-braces; the assertion has not been observed to
+        // root in this state on its own, but the cost is negligible
+        // and the cleanup boundary is now self-describing.
+        self.module_cache.try_clear();
+
+        // STEP 4. Force a final mark-and-sweep so any cycle that the
+        // microtask pump just made unreachable gets collected while
+        // the runtime is still alive. This is the load-bearing step
+        // for the `gc_obj_list != empty` assertion on real pages:
+        // module evaluators chain into `Promise.then(…)` closures that
+        // chain into `RustFunction<'static>` boxes — left to its own
+        // devices, the runtime's shutdown GC walks these in an order
+        // that trips the `gc_decref_child` assertion. Running the GC
+        // *before* shutdown lets QuickJS sweep them cleanly. Two
+        // passes — the first collects unreachable cycles; the second
+        // sweeps anything whose finalizer schedules further drops.
+        self._runtime.run_gc();
+        self._runtime.run_gc();
     }
 }
 

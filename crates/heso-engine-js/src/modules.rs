@@ -151,6 +151,19 @@ impl ModuleCache {
     pub fn is_empty(&self) -> bool {
         self.inner.borrow().is_empty()
     }
+
+    /// Drop every cached entry. Used by [`crate::JsEngine`]'s Drop
+    /// impl to release source strings before the runtime tears
+    /// down — pure belt-and-braces, since the strings are plain data
+    /// rather than QuickJS-managed values, but the call documents the
+    /// teardown order at zero runtime cost. `try_*` semantics so a
+    /// borrow already held elsewhere (impossible in single-thread
+    /// drop today, but cheap to guard against) does not panic.
+    pub fn try_clear(&self) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.clear();
+        }
+    }
 }
 
 /// Synthesize the module specifier used to identify the *N*-th
