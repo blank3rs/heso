@@ -60,10 +60,11 @@ heso-local-data/
 /state.json
 /state.schema.json
 
-# Release pipeline lives at /scripts/. The committed surface is the
-# template + README; the filled-in script (with tokens) is local-only.
-/scripts/release.ps1
-/scripts/*.local.*
+# Release pipeline lives at /scripts/ — entire directory is local-only.
+# Holds the filled-in release.ps1 with tokens, scratch logs, anything
+# else operations-related. Never published. CI in .github/workflows/
+# is the canonical release path.
+/scripts/
 
 # Release scratch — fresh per release run.
 /dist/
@@ -132,4 +133,3 @@ identity/private/
 __pycache__/
 *.py[cod]
 *$py.class
-/scripts/release.ps1.example
