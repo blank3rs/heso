@@ -1,19 +1,17 @@
 //! # heso-cli
 //!
-//! The `heso` binary — the headless browser for the agent-relevant half of
-//! the web. Native single Rust executable, no Chromium dep, no Node dep.
-//! 8.1 MB stripped today (post-QuickJS bundling), single-file deploy
-//! anywhere. See [ADR 0016] for the positioning rationale.
+//! The `heso` binary — the agent-native web engine. No Chromium. No Node.
+//! One Rust binary, ~9 MB stripped, single-file deploy anywhere. See
+//! [ADR 0016] for the positioning rationale.
 //!
 //! Every subcommand below operates on the in/out scope from ADR 0016:
-//! fetch, parse, JS execution (Phase 1A), forms, clicks, sessions, signed
-//! receipts. No canvas, no WebGL, no video, no CSS layout — that's the bet.
+//! fetch, parse, JS execution, forms, clicks, sessions, signed receipts.
+//! No canvas, no WebGL, no video, no CSS layout — that's the bet.
 //!
 //! - `heso` — prints a banner.
 //! - `heso fetch <url>` — HTTP GET via the native [`FetchEngine`], print
 //!   `{ url, text }` JSON. Direct path — no planner, no trace runner. The
-//!   simplest surface external tools (e.g. the Flue agent's `heso_fetch`
-//!   tool) can call.
+//!   simplest surface external agents can call.
 //! - `heso tree <url>` — Fetch + build the page tree (heading-derived
 //!   sections). Print the full tree as JSON. Used by agents that want to
 //!   cache the tree once and then `ls` / `cat` over it in-memory.
@@ -127,7 +125,7 @@ const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
 
 fn print_banner() {
     let version = env!("CARGO_PKG_VERSION");
-    println!("heso {version} — headless browser for the agent-relevant half of the web");
+    println!("heso {version} — the agent-native web engine. No Chromium. No Node. One Rust binary.");
     println!();
     println!("Subcommands:");
     println!("  heso fetch <url>              GET a URL via the native fetch engine, print {{url, text}} JSON");

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Native HTTP + HTML EngineApi implementation. Single binary, no Chrome, no Node — pure Rust."
+description = "heso static path — native HTTP + HTML EngineApi. The agent-native web engine. No Chromium. No Node. One Rust binary."
 
 [dependencies]
 heso-core = { path = "../heso-core" }

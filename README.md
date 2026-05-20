@@ -1,6 +1,4 @@
-# heso
-
-A small browser for AI agents. One Rust binary. No Chromium, no Node.
+# heso — The agent-native web engine. No Chromium. No Node. One Rust binary.
 
 It fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
 

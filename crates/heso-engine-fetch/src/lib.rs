@@ -1,9 +1,9 @@
 //! # heso-engine-fetch
 //!
-//! The static path of heso — the headless browser for the agent-relevant
-//! half of the web. Native HTTP + HTML implementation of
-//! [`heso_engine_api::EngineApi`]: `reqwest` + `scraper`, no Chrome, no
-//! Node, single Rust binary, deploys anywhere `heso.exe` runs.
+//! The static path of heso — the agent-native web engine. No Chromium. No
+//! Node. One Rust binary. Native HTTP + HTML implementation of
+//! [`heso_engine_api::EngineApi`]: `reqwest` + `scraper`, deploys
+//! anywhere `heso.exe` runs.
 //!
 //! Per [ADR 0012], this is the static engine. Per [ADR 0014], the JS engine
 //! lives in the sibling crate [`heso-engine-js`](../heso_engine_js/index.html)

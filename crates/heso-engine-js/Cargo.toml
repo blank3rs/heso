@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Optional JavaScript-capable engine path: QuickJS via rquickjs + agent-shaped DOM. Sibling of heso-engine-fetch; the static path remains the default. See ADR 0014."
+description = "heso JS path — QuickJS via rquickjs + agent-shaped DOM. The agent-native web engine. No Chromium. No Node. One Rust binary."
 
 [dependencies]
 serde.workspace = true

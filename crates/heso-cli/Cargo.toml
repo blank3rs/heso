@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Command-line interface for heso. Wraps the library crates into the `heso` binary."
+description = "heso — the agent-native web engine. No Chromium. No Node. One Rust binary."
 
 [[bin]]
 name = "heso"

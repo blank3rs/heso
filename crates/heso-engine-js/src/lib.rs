@@ -1,11 +1,11 @@
 //! # heso-engine-js
 //!
-//! The JavaScript path of heso — the headless browser for the
-//! agent-relevant half of the web. Sibling of
+//! The JavaScript path of heso — the agent-native web engine. No Chromium.
+//! No Node. One Rust binary. Sibling of
 //! [`heso-engine-fetch`](../heso_engine_fetch/index.html) (the static path,
 //! ADR 0012); together they cover the in-scope half from
 //! [ADR 0016](../../decisions/0016-positioning-headless-browser-for-agents.md):
-//! fetch, parse, JS, DOM (Phase 1B), forms, clicks, sessions.
+//! fetch, parse, JS, DOM, forms, clicks, sessions.
 //!
 //! Per [ADR 0014](../../decisions/0014-bundled-quickjs-agent-dom.md), the
 //! JS engine is QuickJS via [`rquickjs`](https://crates.io/crates/rquickjs)
