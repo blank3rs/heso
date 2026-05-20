@@ -38,7 +38,8 @@ classifiers = [
 dynamic = ["version"]
 
 [project.urls]
-Homepage = "https://github.com/blank3rs/heso"
+Homepage = "https://www.heso.ca"
+Documentation = "https://www.heso.ca/docs"
 Repository = "https://github.com/blank3rs/heso"
 Issues = "https://github.com/blank3rs/heso/issues"
 

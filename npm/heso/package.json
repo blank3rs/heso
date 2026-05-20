@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "description": "The agent-native web engine. No Chromium. No Node. One Rust binary.",
   "license": "MIT OR Apache-2.0",
-  "homepage": "https://github.com/blank3rs/heso",
+  "homepage": "https://www.heso.ca",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/blank3rs/heso.git"
