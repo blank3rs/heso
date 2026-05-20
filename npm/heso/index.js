@@ -568,6 +568,14 @@ class Session {
     return this._request("submit", params);
   }
   eval(js, params = {}) {
+    // Accept both forms:
+    //   s.eval("document.title")                — positional string
+    //   s.eval({ js: "document.title" })        — options object (matches
+    //                                             s.read({...}), s.wait({...}))
+    // Picking one fixed shape would surprise users coming from either side.
+    if (typeof js === "object" && js !== null && "js" in js) {
+      return this._request("eval", { ...js, ...params });
+    }
     return this._request("eval", { js, ...params });
   }
   navigate(url, params = {}) {

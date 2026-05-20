@@ -171,6 +171,51 @@ heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
 heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
 ```
 
+## Error handling
+
+Both libraries throw a structured error (`HesoError` in Python, `HesoError extends Error` in Node) when the binary exits non-zero. Fields on the error tell you what to retry:
+
+```python
+import heso
+try:
+    page = heso.read("https://shoelace.style")
+except heso.HesoError as e:
+    print(e.returncode, e.stderr[:200])  # exit code + first 200 chars of stderr
+```
+
+```js
+import { read, HesoError } from "@ixla/heso";
+try {
+  const page = await read("https://shoelace.style");
+} catch (e) {
+  if (e instanceof HesoError) {
+    console.error(e.code, e.stderr.slice(0, 200));
+  }
+}
+```
+
+For sites that crash some scripts, use `best_effort` / `bestEffort` instead — heso exits 0 with a `partial: true` envelope so you handle the failure as data, not an exception:
+
+```python
+page = heso.read("https://shoelace.style", best_effort=True)
+if page["partial"]:
+    print("got partial:", page["partial_reason"], page["failed_scripts"])
+```
+
+## Plug into agent harnesses
+
+heso is harness-agnostic. The same package serves five integration patterns:
+
+| Harness style | How heso fits |
+|---|---|
+| **Python frameworks** (LangChain, Pydantic AI, LangGraph, smolagents, AgentScope) | `import heso`. Each function returns a `dict`. Wrap with `@tool` / `Tool(...)` / a function schema. |
+| **Node / TS frameworks** (Mastra, Vercel AI SDK, LangGraph.js, Stagehand, Browser Use TS) | `import { open, search } from "@ixla/heso"`. All async; TypeScript types ship in `index.d.ts`. |
+| **Skill-markdown harnesses** (Claude Code, Cursor, Aider, Cline, Continue, Windsurf) | Drop the manifest in the "Use as an agent skill" block below into `~/.claude/skills/heso/SKILL.md` (or the harness's skills dir). The harness auto-discovers; `heso` on PATH does the rest. |
+| **CLI-spawning harnesses** (Aider, shell-script agents, homegrown loops) | Same `heso <verb> ...` CLI used by both libraries. JSON on stdout. No special integration. |
+| **Long-running JSON-RPC harnesses** | `heso serve` is a JSON-RPC 2.0 server over stdin/stdout. Cookies + DOM state persist across calls. |
+
+The verbs are the contract (see [ADR 0017](https://github.com/blank3rs/heso/blob/main/decisions/0017-verbs-as-agent-surface.md)) — no heso-specific framework dependency, no adapter layer.
+
 ## Use as an agent skill
 
 heso is built to be a tool an agent calls, not a library a human drives. The cleanest integration is the skill markdown pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses use:
