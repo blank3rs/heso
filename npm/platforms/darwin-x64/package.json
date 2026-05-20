@@ -1,7 +1,7 @@
 {
-  "name": "@ixla/heso-win32-x64",
+  "name": "@ixla/heso-darwin-x64",
   "version": "0.0.2",
-  "description": "Windows x86_64 binary for @ixla/heso. Do not install directly.",
+  "description": "macOS x86_64 (Intel) binary for @ixla/heso. Do not install directly.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
   "repository": {
@@ -9,13 +9,13 @@
     "url": "git+https://github.com/blank3rs/heso.git"
   },
   "os": [
-    "win32"
+    "darwin"
   ],
   "cpu": [
     "x64"
   ],
   "files": [
-    "bin/heso.exe",
+    "bin/heso",
     "README.md"
   ]
 }

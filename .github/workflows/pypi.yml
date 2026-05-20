@@ -1,0 +1,467 @@
+# PyPI + npm publish, parallel to .github/workflows/release.yml (the
+# dist-generated workflow that handles GitHub Releases + shell/powershell
+# installers).
+#
+# What this workflow does on every `v*.*.*` tag push:
+#
+#   1. `build-wheel` matrix: 5 jobs in parallel, one per target triple.
+#      Each job builds `target/<triple>/release/heso[.exe]`, copies the
+#      binary into `python/heso/bin/`, then runs `python -m build` to
+#      produce a platform-tagged wheel.
+#
+#   2. `build-npm-platform` matrix: same 5 jobs, but stages the binary
+#      into `npm/platforms/<plat>-<arch>/bin/` for the per-platform
+#      npm package and tars the staged directory as an artifact.
+#
+#   3. `publish-pypi`: one job, downloads all wheels, publishes via
+#      PyPI Trusted Publishers (OIDC). No PyPI API token in repo secrets.
+#
+#   4. `publish-npm-platforms`: one job, downloads all 5 staged npm
+#      directories, `npm publish` each one (idempotent via
+#      `--access=public` and existing versions are no-ops).
+#
+#   5. `publish-npm-meta`: depends on `publish-npm-platforms` so the
+#      meta package's optionalDependencies resolve. Publishes
+#      `@ixla/heso` (the library + CLI shim).
+#
+# WHY THIS IS HAND-WRITTEN (not part of release.yml or cargo-dist):
+#
+#   - cargo-dist's npm installer publishes a SINGLE package with a
+#     postinstall script that curls the binary at install time. We
+#     instead use the biome/esbuild optionalDependencies pattern
+#     (`@ixla/heso` meta + `@ixla/heso-<plat>-<arch>` per-arch), which
+#     gives us a real Node library API and zero install-time network.
+#     The shapes conflict on the same package name (`@ixla/heso`), so
+#     we don't enable `installers = ["npm"]` in dist-workspace.toml.
+#
+#   - We use setuptools (not maturin) so the PyPI wheel can ship both
+#     a library + the binary as package data; cargo-dist doesn't have
+#     a setuptools workflow generator.
+#
+# Reference patterns:
+#   - astral-sh/uv/.github/workflows/publish-pypi.yml (PyPI OIDC)
+#   - biomejs/biome/.github/workflows/release_cli.yml (npm meta + platform ordering)
+
+name: PyPI + npm publish
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Cancel any in-progress publish for the same tag (e.g. a re-pushed
+# tag) so we don't race with ourselves. Different tags get separate
+# runs — they're independent releases.
+concurrency:
+  group: pypi-npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ----------------------------------------------------------------------
+  # 1. Build the Rust binary per target, stage into python/heso/bin/,
+  #    build a platform-tagged wheel.
+  # ----------------------------------------------------------------------
+  build-wheel:
+    name: build-wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            plat-tag: win_amd64
+            binary: heso.exe
+            cross: false
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            plat-tag: manylinux_2_17_x86_64
+            binary: heso
+            cross: false
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            # PEP 600 manylinux_2_17 aarch64 == manylinux2014_aarch64.
+            # 2.17 is the glibc on CentOS 7 / RHEL 7 — broadest reach
+            # without going to musllinux.
+            plat-tag: manylinux_2_17_aarch64
+            binary: heso
+            cross: true
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            plat-tag: macosx_11_0_x86_64
+            binary: heso
+            cross: false
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            plat-tag: macosx_11_0_arm64
+            binary: heso
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+          rustup default stable
+        shell: bash
+
+      # cross is only needed for aarch64-linux-gnu (the rest build
+      # natively on their respective runners). Install it via
+      # cargo-binstall to avoid a from-source compile that costs
+      # ~5min per job.
+      - name: Install cross (aarch64-linux only)
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build heso-cli (native)
+        if: matrix.cross == false
+        run: cargo build --release --target ${{ matrix.target }} -p heso-cli
+        shell: bash
+
+      - name: Build heso-cli (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }} -p heso-cli
+        shell: bash
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install build tools
+        run: python -m pip install --upgrade build wheel
+        shell: bash
+
+      # Stage the binary into python/heso/bin/ exactly where the
+      # setuptools package_data glob looks for it.
+      - name: Stage binary into python/heso/bin/
+        run: |
+          mkdir -p python/heso/bin
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} python/heso/bin/${{ matrix.binary }}
+          ls -la python/heso/bin/
+        shell: bash
+
+      # `python -m build --wheel` with `--config-setting=--build-option=--plat-name=<tag>`
+      # passes `--plat-name` to bdist_wheel. setup.cfg's hardcoded
+      # `plat_name = win_amd64` is removed for the multi-platform
+      # build — see commit that introduces this workflow.
+      - name: Build wheel
+        run: |
+          python -m build --wheel --config-setting=--build-option=--plat-name=${{ matrix.plat-tag }}
+          ls -la dist/
+        shell: bash
+
+      # Belt-and-braces: if setuptools still lands a `py3-none-any`
+      # wheel (we've seen this before with newer setuptools dropping
+      # the `--plat-name` build-option), rewrite the filename via
+      # `wheel tags --platform-tag <tag>` so the wheel's published
+      # platform tag matches the target.
+      - name: Force platform tag on wheel
+        run: |
+          python -m pip install --upgrade wheel
+          for whl in dist/*.whl; do
+            case "$whl" in
+              *-${{ matrix.plat-tag }}.whl) echo "Wheel already platform-tagged: $whl" ;;
+              *)
+                echo "Retagging $whl -> ${{ matrix.plat-tag }}"
+                python -m wheel tags --remove --platform-tag ${{ matrix.plat-tag }} "$whl"
+                ;;
+            esac
+          done
+          ls -la dist/
+        shell: bash
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.plat-tag }}
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # 2. Stage the per-platform npm package contents into a tar artifact.
+  #    Same binary builds as build-wheel could in theory be shared, but
+  #    cross-job artifact passing for native binaries is fragile across
+  #    runners (chmod, line endings, executable bit). Cheaper to build
+  #    twice and trade ~5min compute for reliability.
+  # ----------------------------------------------------------------------
+  build-npm-platform:
+    name: build-npm-platform (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            npm-plat: win32-x64
+            binary: heso.exe
+            cross: false
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            npm-plat: linux-x64
+            binary: heso
+            cross: false
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            npm-plat: linux-arm64
+            binary: heso
+            cross: true
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            npm-plat: darwin-x64
+            binary: heso
+            cross: false
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            npm-plat: darwin-arm64
+            binary: heso
+            cross: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add ${{ matrix.target }}
+          rustup default stable
+        shell: bash
+
+      - name: Install cross (aarch64-linux only)
+        if: matrix.cross == true
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build heso-cli (native)
+        if: matrix.cross == false
+        run: cargo build --release --target ${{ matrix.target }} -p heso-cli
+        shell: bash
+
+      - name: Build heso-cli (cross)
+        if: matrix.cross == true
+        run: cross build --release --target ${{ matrix.target }} -p heso-cli
+        shell: bash
+
+      - name: Stage binary into platform package
+        run: |
+          mkdir -p npm/platforms/${{ matrix.npm-plat }}/bin
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} npm/platforms/${{ matrix.npm-plat }}/bin/${{ matrix.binary }}
+          # The binary must be executable inside the npm tarball.
+          chmod +x npm/platforms/${{ matrix.npm-plat }}/bin/${{ matrix.binary }} || true
+          ls -la npm/platforms/${{ matrix.npm-plat }}/bin/
+        shell: bash
+
+      # Bump the version in the platform package.json to match the tag
+      # (the meta package depends on the exact version, so they must
+      # agree). The tag is `v0.0.2` -> version is `0.0.2`.
+      - name: Set platform package version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Setting @ixla/heso-${{ matrix.npm-plat }} version to $VERSION"
+          node -e "
+            const fs = require('fs');
+            const path = 'npm/platforms/${{ matrix.npm-plat }}/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          "
+          cat npm/platforms/${{ matrix.npm-plat }}/package.json
+        env:
+          VERSION: ${{ github.ref_name }}
+        shell: bash
+
+      # Tar the platform package directory so we can hand it whole to
+      # the publish job (preserves the bin/ exec bit on POSIX targets
+      # — a raw upload-artifact strips it).
+      - name: Tar platform package
+        run: |
+          tar -czf platform-${{ matrix.npm-plat }}.tar.gz -C npm/platforms ${{ matrix.npm-plat }}
+          ls -la platform-${{ matrix.npm-plat }}.tar.gz
+        shell: bash
+
+      - name: Upload platform package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-platform-${{ matrix.npm-plat }}
+          path: platform-${{ matrix.npm-plat }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # ----------------------------------------------------------------------
+  # 3. Publish all wheels to PyPI in a single job (one twine upload,
+  #    one OIDC token exchange). Trusted Publishers: no API token in
+  #    repo secrets; PyPI verifies the workflow identity by OIDC.
+  #
+  #    To bootstrap this, the PyPI side needs:
+  #      - PyPI project: "heso" (already exists from v0.0.1).
+  #      - Add a Trusted Publisher with:
+  #          owner: blank3rs
+  #          repo: heso
+  #          workflow filename: pypi.yml
+  #          environment name: pypi
+  #    Until then, set PYPI_API_TOKEN as a repo secret and uncomment
+  #    the password line below; comment out the OIDC publish step.
+  # ----------------------------------------------------------------------
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-wheel]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/heso
+    permissions:
+      id-token: write # PyPI Trusted Publishers OIDC.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: List wheels to publish
+        run: ls -la dist/
+        shell: bash
+
+      # The PyPA action is the canonical OIDC path. It auto-exchanges
+      # the GitHub Actions OIDC token for a PyPI upload token, no
+      # secrets needed.
+      - name: Publish to PyPI (Trusted Publishers)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          # Fallback while OIDC isn't fully configured: uncomment and
+          # set PYPI_API_TOKEN in repo secrets.
+          # password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  # ----------------------------------------------------------------------
+  # 4. Publish the five per-platform npm packages.
+  #
+  #    Ordering matters: the meta `@ixla/heso` package's
+  #    optionalDependencies list these by exact version. If the meta
+  #    publishes first, `npm install @ixla/heso` on any user machine
+  #    immediately fails to resolve the platform package. So this
+  #    job MUST complete before `publish-npm-meta`.
+  #
+  #    Within this job, order across the five platforms doesn't
+  #    matter (they're independent packages); we publish them in a
+  #    simple loop for predictable logs.
+  # ----------------------------------------------------------------------
+  publish-npm-platforms:
+    name: Publish per-platform npm packages
+    needs: [build-npm-platform]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: npm-platform-*
+          path: npm-platforms
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: ls -la npm-platforms/
+        shell: bash
+
+      # Extract each tarball back into npm/platforms/<plat>/ — the
+      # tar preserved the executable bit and the staged binary.
+      - name: Unpack platform packages
+        run: |
+          rm -rf npm/platforms
+          mkdir -p npm/platforms
+          for tgz in npm-platforms/*.tar.gz; do
+            echo "Unpacking $tgz"
+            tar -xzf "$tgz" -C npm/platforms
+          done
+          ls -la npm/platforms/
+        shell: bash
+
+      - name: Publish each platform package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -e
+          for dir in npm/platforms/*/; do
+            echo "::group::Publishing $dir"
+            (cd "$dir" && cat package.json && npm publish --access=public)
+            echo "::endgroup::"
+          done
+        shell: bash
+
+  # ----------------------------------------------------------------------
+  # 5. Publish the meta @ixla/heso package. Strictly last in the npm
+  #    chain so the optionalDependencies resolve immediately for any
+  #    user who runs `npm install @ixla/heso` post-publish.
+  # ----------------------------------------------------------------------
+  publish-npm-meta:
+    name: Publish @ixla/heso meta package
+    needs: [publish-npm-platforms]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
+
+      # Bump the meta package + every optionalDependency entry to the
+      # tag version in lockstep, in case the published-tag version
+      # differs from what's checked in (it always does — we keep
+      # main at 0.0.1 between releases).
+      - name: Set meta package version
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}"
+          echo "Pinning meta package + optionalDependencies to $VERSION"
+          node -e "
+            const fs = require('fs');
+            const path = 'npm/heso/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.version = process.env.VERSION;
+            for (const dep of Object.keys(pkg.optionalDependencies || {})) {
+              pkg.optionalDependencies[dep] = process.env.VERSION;
+            }
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          "
+          VERSION="$VERSION" node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('npm/heso/package.json', 'utf8'));
+            console.log(JSON.stringify(pkg, null, 2));
+          "
+        shell: bash
+
+      - name: Publish meta package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd npm/heso
+          npm publish --access=public
+        shell: bash

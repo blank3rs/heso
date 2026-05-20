@@ -133,3 +133,11 @@ identity/private/
 __pycache__/
 *.py[cod]
 *$py.class
+/npm/platforms/darwin-arm64/bin/heso
+/npm/platforms/darwin-arm64/bin/heso.exe
+/npm/platforms/darwin-x64/bin/heso
+/npm/platforms/darwin-x64/bin/heso.exe
+/npm/platforms/linux-arm64/bin/heso
+/npm/platforms/linux-arm64/bin/heso.exe
+/npm/platforms/linux-x64/bin/heso
+/npm/platforms/linux-x64/bin/heso.exe

@@ -98,14 +98,12 @@ heso = ["bin/heso", "bin/heso.exe", "bin/.gitkeep"]
 # bdist_wheel platform tag
 # ----------------------------------------------------------------------
 #
-# Without this, setuptools would label the wheel `py3-none-any` (a
-# pure-Python wheel that any OS can install). But our wheel ships a
-# Windows-only `.exe`, so we need to mark it Windows-only or pip on
-# Linux/macOS will happily install a wheel that can't actually run.
+# v0.0.1 hardcoded `plat-name = "win_amd64"` here because the only
+# published wheel was Windows. v0.0.2 onwards we publish five wheels
+# in parallel from `.github/workflows/pypi.yml`, each passing its
+# own `--plat-name=<tag>` to bdist_wheel and post-fixing the file
+# name via `wheel tags` if setuptools dropped the build option.
 #
-# The clean way is `python -m build --wheel -C--plat-name=win_amd64`,
-# but for users who run `pip wheel . -w dist/`, the [tool.distutils]
-# table below also drives the same flag. Belt and braces.
-
-[tool.distutils.bdist_wheel]
-plat-name = "win_amd64"
+# As a result there is no longer a single "right" plat_name to
+# hardcode. Local `python -m build` runs without a flag will produce
+# a `py3-none-any` wheel — fine for testing, never for publish.

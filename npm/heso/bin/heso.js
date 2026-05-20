@@ -24,15 +24,18 @@ const fs = require("fs");
 // Map (process.platform, process.arch) -> the npm package that ships
 // the matching binary, and the basename of that binary inside the
 // package's `bin/` dir. Keep entries narrow; expanding the matrix is a
-// one-line edit per target triple. (Today: Windows x64 only.)
+// one-line edit per target triple.
+//
+// Five-platform matrix as of v0.0.2: Windows x86_64, Linux x86_64 +
+// ARM64, macOS Intel + Apple Silicon. Mirror any change here in
+// `index.js`'s PLATFORMS map and the matrix in
+// `.github/workflows/pypi.yml`.
 const PLATFORMS = {
-  "win32 x64": {
-    pkg: "@ixla/heso-win32-x64",
-    bin: "heso.exe",
-  },
-  // Future targets land here, e.g.:
-  // "linux x64":  { pkg: "@ixla/heso-linux-x64",  bin: "heso" },
-  // "darwin arm64": { pkg: "@ixla/heso-darwin-arm64", bin: "heso" },
+  "win32 x64": { pkg: "@ixla/heso-win32-x64", bin: "heso.exe" },
+  "linux x64": { pkg: "@ixla/heso-linux-x64", bin: "heso" },
+  "linux arm64": { pkg: "@ixla/heso-linux-arm64", bin: "heso" },
+  "darwin x64": { pkg: "@ixla/heso-darwin-x64", bin: "heso" },
+  "darwin arm64": { pkg: "@ixla/heso-darwin-arm64", bin: "heso" },
 };
 
 function platformKey() {
@@ -89,8 +92,8 @@ function main() {
   if (resolved.error === "unsupported-platform") {
     process.stderr.write(
       `heso: no prebuilt binary for ${resolved.key}.\n` +
-        `The first release ships Windows x86_64 only — Linux and macOS are next.\n` +
-        `Track progress at https://github.com/blank3rs/heso/releases\n` +
+        `Supported: win32-x64, linux-x64, linux-arm64, darwin-x64, darwin-arm64.\n` +
+        `Track other-platform progress at https://github.com/blank3rs/heso/releases\n` +
         `or build from source: cargo install --git https://github.com/blank3rs/heso heso-cli\n`,
     );
     process.exit(1);

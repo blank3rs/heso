@@ -1,0 +1,113 @@
+# dist (cargo-dist) workspace config.
+#
+# This file is the source of truth for the GitHub-Releases side of our
+# release pipeline. On every tag matching v*.*.*, `.github/workflows/release.yml`
+# (generated from this file via `dist generate`) will:
+#
+#   1. Build `target/<triple>/release/heso[.exe]` on five runners in parallel.
+#   2. Bundle each binary into a platform-tagged archive (.zip on Windows,
+#      .tar.gz everywhere else).
+#   3. Generate `heso-installer.sh` (POSIX) and `heso-installer.ps1`
+#      (Windows) that curl-download + verify + drop the binary into
+#      $CARGO_HOME/bin.
+#   4. Publish all of the above as a GitHub Release at the tag.
+#
+# The npm + PyPI sides of the pipeline live in `.github/workflows/pypi.yml`
+# (hand-written) — see the conflict note below for why we don't let
+# cargo-dist publish to npm directly.
+#
+# Regenerate the workflow with:
+#   dist generate
+#
+# Do NOT hand-edit .github/workflows/release.yml after regeneration —
+# any changes you want must come from this file or be a sibling
+# workflow.
+#
+# Docs: https://opensource.axo.dev/cargo-dist/
+
+[workspace]
+# Tell dist "this is a Cargo workspace, root Cargo.toml is here."
+# We don't need the npm/python directories as dist members — those
+# get released by our hand-written workflow, not by dist.
+members = ["cargo:."]
+
+[dist]
+# Pin a stable version — dist regenerates differently between minors,
+# so floating tracks would silently rewrite release.yml on every
+# install. 0.31.0 is what astral-sh/uv and astral-sh/ruff pinned at
+# the time we set this up (2026-05). Bump deliberately when upgrading.
+cargo-dist-version = "0.31.0"
+
+# CI: GitHub Actions.
+ci = "github"
+
+# Installers that dist generates for the GitHub Release page.
+# - "shell": heso-installer.sh — curl | sh for macOS / Linux.
+# - "powershell": heso-installer.ps1 — irm | iex for Windows.
+#
+# We do NOT include "npm" here. cargo-dist's npm installer is a
+# SINGLE package with a postinstall script that curls the binary from
+# GitHub Releases. We already ship a biome/esbuild-style META + per-platform
+# layout (`@ixla/heso` + `@ixla/heso-<plat>-<arch>` as optionalDependencies)
+# in `npm/`, with a real Node library API (index.js / index.d.ts), not
+# just a CLI shim. The two layouts conflict on the same name (`@ixla/heso`),
+# and we want to keep the library API, so npm publishing is handled by
+# `.github/workflows/pypi.yml`'s npm-publish job (which ALSO publishes
+# the PyPI wheel — they share the same artifact-upload + Trusted-Publisher
+# layout for consistency).
+installers = ["shell", "powershell"]
+
+# Default archive format per OS family.
+windows-archive = ".zip"
+unix-archive = ".tar.gz"
+
+# Five target triples. These are the ones that have matching
+# `npm/platforms/<plat>-<arch>/` and PyPI plat-tag entries in
+# pypi.yml. Keep these in sync if you add a platform.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
+# Don't run dist on PRs — only on tag pushes. PR runs would push
+# `dist plan` output as a comment, which is noise for a single-maintainer
+# repo at this stage.
+pr-run-mode = "skip"
+
+# Tag namespace: we don't set `tag-namespace` because we want plain
+# `v0.0.2`-style tags (the leading `v` is auto-stripped by dist), and
+# setting it changes the generated workflow file name from
+# `release.yml` to `<namespace>-release.yml`, which is confusing for
+# a single-product repo. Astral (uv, ruff) skip it too — same shape
+# as ours.
+
+# Where shell/powershell installers drop the binary.
+# CARGO_HOME = $CARGO_HOME/bin (= ~/.cargo/bin by default).
+# This is the conventional spot for Rust CLIs (rustup, cargo-edit,
+# ripgrep-via-cargo, …) and means `heso` ends up on PATH for any
+# user who has Rust installed (i.e., our exact target audience for
+# the shell installer).
+install-path = "CARGO_HOME"
+
+# Don't try to ship an `axoupdate` updater binary — we don't have
+# changelog infrastructure for it yet, and the curl-installer rerun
+# is fine as a manual update.
+install-updater = false
+
+# Don't auto-include README/LICENSE/CHANGELOG.md from the workspace
+# root into the binary archive. dist's autodetection picks up dev
+# docs (AGENTS.md etc.) by accident and inflates archives. The
+# license files are tiny and we include them deliberately below if
+# we ever want to. For now: archive = single binary + nothing.
+auto-includes = false
+
+# Whether dist should auto-create the GitHub Release. Yes — that's
+# the whole point of the workflow.
+create-release = true
+
+# Pretty release notes via GitHub's auto-generated changelog. We
+# don't maintain a CHANGELOG.md yet.
+github-release = "announce"
