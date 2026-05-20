@@ -161,20 +161,31 @@ pub fn extract(doc: &Html) -> PageMetadata {
 // ============================================================================
 
 fn extract_jsonld(doc: &Html) -> Vec<serde_json::Value> {
-    doc.select(&JSONLD_SCRIPT_SEL)
-        .filter_map(|s| {
-            let raw: String = s.text().collect();
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            // Sites occasionally embed multiple top-level objects in one
-            // block by accident; we keep it simple and accept the first
-            // valid value. Multi-block pages are extremely common — sites
-            // emit a new <script> per Schema.org type instead.
-            serde_json::from_str::<serde_json::Value>(trimmed).ok()
-        })
-        .collect()
+    // Each `<script type="application/ld+json">` block used to allocate
+    // a fresh `String` via `s.text().collect()`. Schema.org-heavy pages
+    // (e-commerce, articles, FAQs) often have 5-15 blocks per page, so
+    // we reuse one growing buffer instead — `clear()` keeps the capacity
+    // and the largest seen block dictates the high-water mark.
+    let mut buf = String::new();
+    let mut out = Vec::new();
+    for s in doc.select(&JSONLD_SCRIPT_SEL) {
+        buf.clear();
+        for chunk in s.text() {
+            buf.push_str(chunk);
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Sites occasionally embed multiple top-level objects in one
+        // block by accident; we keep it simple and accept the first
+        // valid value. Multi-block pages are extremely common — sites
+        // emit a new <script> per Schema.org type instead.
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            out.push(v);
+        }
+    }
+    out
 }
 
 fn extract_meta_prefixed(doc: &Html, attr: &str, prefix: &str) -> BTreeMap<String, String> {

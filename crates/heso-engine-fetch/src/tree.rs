@@ -344,13 +344,23 @@ impl TreeBuilder {
             }
             self.close_top();
         }
-        let parent_path = self.stack.last().expect("non-empty").path.clone();
+        // Keep the parent path as a borrow into the stack. We only need
+        // an owned `String` to build the new node's `path`; the old
+        // version cloned the parent path eagerly even though
+        // `unique_slug` and the equality check only need `&str`.
+        // Split-borrow the slug_counts and stack fields explicitly so
+        // we can call the free `unique_slug` helper without an extra
+        // method indirection that would force `&mut self`.
         let base_slug = slugify(&heading);
-        let slug = self.unique_slug(&parent_path, &base_slug);
-        let path = if parent_path == "/" {
-            format!("/{slug}")
-        } else {
-            format!("{parent_path}/{slug}")
+        let (slug, path) = {
+            let parent_path = self.stack.last().expect("non-empty").path.as_str();
+            let slug = crate::tree::unique_slug(&mut self.slug_counts, parent_path, &base_slug);
+            let path = if parent_path == "/" {
+                format!("/{slug}")
+            } else {
+                format!("{parent_path}/{slug}")
+            };
+            (slug, path)
         };
         self.stack.push(TreeNode {
             path,
@@ -376,11 +386,6 @@ impl TreeBuilder {
             .expect("still non-empty after pop")
             .children
             .push(node);
-    }
-
-    fn unique_slug(&mut self, parent_path: &str, base: &str) -> String {
-        // Delegate to the free function so [`crate::actions`] can share it.
-        crate::tree::unique_slug(&mut self.slug_counts, parent_path, base)
     }
 
     fn into_root(mut self) -> TreeNode {

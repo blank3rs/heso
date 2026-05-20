@@ -188,12 +188,21 @@ pub struct LinkedPage {
 
 /// A link target after URL resolution and filter checks. Internal —
 /// the public surface is [`LinkedPage`].
+///
+/// `canonical` is the [`canonical_key`] of `url`, computed once at
+/// construction. Reusing the cached key downstream (the visited-set
+/// dedupe in [`explore`], the `seen` dedupe in [`select_links`])
+/// avoids rebuilding 3+ Strings per call across the hot path. The
+/// value is logically derived from `url` — do not mutate `url`
+/// without recomputing it.
 #[derive(Debug, Clone)]
 pub(crate) struct LinkTarget {
     /// `@eN` of the link in the parent's action graph.
     pub from_ref: String,
     /// Resolved absolute URL.
     pub url: Url,
+    /// Cached canonical comparison key for `url`. See [`canonical_key`].
+    pub canonical: String,
 }
 
 /// Walk an action graph, apply the link filters, dedupe, cap, and return
@@ -204,6 +213,9 @@ pub(crate) fn select_links(
     cap: usize,
 ) -> Vec<LinkTarget> {
     let cap = cap.min(HARD_LINK_CAP);
+    // The base's canonical key is invariant across the loop; compute it
+    // once instead of once per `should_follow` call.
+    let base_key = canonical_key(parent_url);
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<LinkTarget> = Vec::new();
     for el in actions {
@@ -219,16 +231,19 @@ pub(crate) fn select_links(
         let Some(resolved) = resolve_href(parent_url, href) else {
             continue;
         };
-        if !should_follow(parent_url, &resolved) {
+        if !should_follow_with_base_key(parent_url, &resolved, &base_key) {
             continue;
         }
+        // Cheaper filters above passed; only now build the canonical key
+        // so abandoned candidates don't pay for the allocation.
         let key = canonical_key(&resolved);
-        if !seen.insert(key) {
+        if !seen.insert(key.clone()) {
             continue;
         }
         out.push(LinkTarget {
             from_ref: el.ref_id.clone(),
             url: resolved,
+            canonical: key,
         });
     }
     out
@@ -264,7 +279,22 @@ fn resolve_href(base: &Url, href: &str) -> Option<Url> {
 /// 1. Scheme must be `http` or `https` (no `file:`, no exotic schemes).
 /// 2. Same-origin only (scheme + host + port).
 /// 3. Fragment-only links and self-links to `base` itself are skipped.
+///
+/// Kept as a convenience wrapper around
+/// [`should_follow_with_base_key`] so single-shot callers (and the
+/// module-level documentation) have a function that doesn't require
+/// precomputing the base key. The hot path in [`select_links`] uses
+/// [`should_follow_with_base_key`] directly.
+#[allow(dead_code)]
 pub(crate) fn should_follow(base: &Url, candidate: &Url) -> bool {
+    should_follow_with_base_key(base, candidate, &canonical_key(base))
+}
+
+/// Same as [`should_follow`] but takes a precomputed canonical key for
+/// `base`. Used inside hot loops where the same `base` is checked
+/// against many `candidate`s — lift the invariant out, save the
+/// per-iteration allocation.
+fn should_follow_with_base_key(base: &Url, candidate: &Url, base_key: &str) -> bool {
     let scheme = candidate.scheme();
     if !matches!(scheme, "http" | "https") {
         return false;
@@ -279,18 +309,31 @@ pub(crate) fn should_follow(base: &Url, candidate: &Url) -> bool {
     if candidate.port_or_known_default() != base.port_or_known_default() {
         return false;
     }
-    // Self-reference: same URL (path + query + no fragment) as the parent.
-    if canonical_key(candidate) == canonical_key(base) {
+    // Self-reference: same URL (path + query + no fragment) as the
+    // parent. Compute the candidate's key only after the cheap checks
+    // have all passed — otherwise we're allocating a String for a link
+    // we'd discard for some other reason.
+    if canonical_key(candidate) == base_key {
         return false;
     }
     true
 }
+
+/// Process-wide call counter for [`canonical_key`]. Atomic so the
+/// allocator stays untouched. Only updated when the `perf-trace`
+/// feature is enabled; reads are also gated behind it so the public
+/// surface doesn't grow when it's off.
+#[cfg(feature = "perf-trace")]
+pub(crate) static CANONICAL_KEY_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Canonical comparison key for a resolved URL. We strip the fragment
 /// (already stripped during resolution, but defensive) and lowercase the
 /// scheme + host. Path/query are taken verbatim — they're case-sensitive
 /// per RFC 3986 even though many servers normalize.
 fn canonical_key(u: &Url) -> String {
+    #[cfg(feature = "perf-trace")]
+    CANONICAL_KEY_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let scheme = u.scheme().to_ascii_lowercase();
     let host = u.host_str().unwrap_or("").to_ascii_lowercase();
     let port = u
@@ -371,12 +414,15 @@ pub(crate) fn explore<E: LinkFetcher>(
         }
 
         // Reserve the URLs we're about to follow against the visited set so a
-        // sibling task at the same level doesn't double-fetch.
+        // sibling task at the same level doesn't double-fetch. Each
+        // `LinkTarget` already carries its canonical key (computed once
+        // back in `select_links`); reuse it here so we don't allocate
+        // another String per candidate.
         let to_fetch: Vec<(usize, LinkTarget)> = {
             let mut guard = visited.lock().await;
             candidates
                 .into_iter()
-                .filter(|t| guard.insert(canonical_key(&t.url)))
+                .filter(|t| guard.insert(t.canonical.clone()))
                 .enumerate()
                 .collect()
         };
@@ -437,7 +483,11 @@ async fn fetch_one<E: LinkFetcher>(
     child_opts: ExploreOptions,
     visited: Arc<tokio::sync::Mutex<HashSet<String>>>,
 ) -> LinkedPage {
-    let LinkTarget { from_ref, url } = target;
+    let LinkTarget {
+        from_ref,
+        url,
+        canonical: _,
+    } = target;
     let pre_fetch_url = url.clone();
     let (final_url, body) = match engine.fetch_html(url).await {
         Ok(v) => v,
@@ -506,57 +556,62 @@ async fn fetch_one<E: LinkFetcher>(
 /// Render a [`LinkedPage`] vector into the JSON shape we expose via
 /// `heso open` and `heso serve`. Centralized so the two surfaces stay
 /// in sync without one drifting from the other.
+///
+/// **Determinism note** (ADR 0008): the final object is built on top of
+/// [`BTreeMap`] so keys come out in alphabetical order. `plat_hash` is
+/// BLAKE3 over the canonical serialized form, so swapping in a builder
+/// that preserves declaration order (e.g. `serde_json::json!`) would
+/// silently change every hash for a page that contains explored links.
+/// Stick with `BTreeMap`. The helper closures below only tighten the
+/// repetition — they do not change the output bytes.
 pub fn linked_pages_to_json(linked_pages: &[LinkedPage]) -> serde_json::Value {
-    // We could just `serde_json::to_value(linked_pages)`, but doing it
-    // ourselves means the field order on the wire is documented here
-    // (helpful when the LLM is reading the JSON cold).
-    let arr: Vec<serde_json::Value> = linked_pages
-        .iter()
-        .map(|p| {
-            let mut obj: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            obj.insert(
-                "from_ref".into(),
-                serde_json::Value::String(p.from_ref.clone()),
-            );
-            obj.insert("url".into(), serde_json::Value::String(p.url.clone()));
-            obj.insert("title".into(), serde_json::Value::String(p.title.clone()));
-            if let Some(d) = &p.description {
-                obj.insert("description".into(), serde_json::Value::String(d.clone()));
-            }
-            if let Some(t) = &p.tree {
-                obj.insert(
-                    "tree".into(),
-                    serde_json::to_value(t).unwrap_or(serde_json::Value::Null),
-                );
-            }
-            if let Some(m) = &p.metadata {
-                obj.insert(
-                    "metadata".into(),
-                    serde_json::to_value(m).unwrap_or(serde_json::Value::Null),
-                );
-            }
-            if !p.actions.is_empty() {
-                obj.insert(
-                    "actions".into(),
-                    serde_json::to_value(&p.actions).unwrap_or(serde_json::Value::Null),
-                );
-            }
-            if !p.inline_data.is_empty() {
-                obj.insert(
-                    "inline_data".into(),
-                    serde_json::to_value(&p.inline_data).unwrap_or(serde_json::Value::Null),
-                );
-            }
-            if !p.linked_pages.is_empty() {
-                obj.insert("linked_pages".into(), linked_pages_to_json(&p.linked_pages));
-            }
-            if let Some(e) = &p.error {
-                obj.insert("error".into(), serde_json::Value::String(e.clone()));
-            }
-            serde_json::Value::Object(obj.into_iter().collect())
-        })
-        .collect();
+    let arr: Vec<serde_json::Value> = linked_pages.iter().map(linked_page_to_json).collect();
     serde_json::Value::Array(arr)
+}
+
+/// Convert one [`LinkedPage`] to its JSON object. Extracted from
+/// [`linked_pages_to_json`] so each field assignment reads as a single
+/// line — same observable output, same key ordering (alphabetical via
+/// [`BTreeMap`]), just less boilerplate.
+fn linked_page_to_json(p: &LinkedPage) -> serde_json::Value {
+    let mut obj: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    // Required-string fields. `into()` lets the literal go straight
+    // into `Value::String` via `From<String>`.
+    obj.insert("from_ref".into(), p.from_ref.clone().into());
+    obj.insert("url".into(), p.url.clone().into());
+    obj.insert("title".into(), p.title.clone().into());
+    // Optional + Vec/Map fields. `to_value` only fails for non-string
+    // map keys; everything here is well-typed, so `unwrap_or(Null)`
+    // mirrors the previous behaviour exactly.
+    if let Some(d) = &p.description {
+        obj.insert("description".into(), d.clone().into());
+    }
+    if let Some(t) = &p.tree {
+        obj.insert("tree".into(), to_value_or_null(t));
+    }
+    if let Some(m) = &p.metadata {
+        obj.insert("metadata".into(), to_value_or_null(m));
+    }
+    if !p.actions.is_empty() {
+        obj.insert("actions".into(), to_value_or_null(&p.actions));
+    }
+    if !p.inline_data.is_empty() {
+        obj.insert("inline_data".into(), to_value_or_null(&p.inline_data));
+    }
+    if !p.linked_pages.is_empty() {
+        obj.insert("linked_pages".into(), linked_pages_to_json(&p.linked_pages));
+    }
+    if let Some(e) = &p.error {
+        obj.insert("error".into(), e.clone().into());
+    }
+    serde_json::Value::Object(obj.into_iter().collect())
+}
+
+/// `serde_json::to_value(v).unwrap_or(Null)` as a one-liner. Used by
+/// [`linked_page_to_json`] to keep each branch on a single line; the
+/// behaviour is identical to the inline expression it replaces.
+fn to_value_or_null<T: Serialize>(v: &T) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
 }
 
 // ============================================================================
@@ -1165,5 +1220,33 @@ mod tests {
         // Saturating sub stays at 0.
         let great = grand.child();
         assert_eq!(great.depth, 0);
+    }
+
+    // ----- perf-trace counter (off by default) ----------------------------
+    //
+    // Run with `cargo test --release -p heso-engine-fetch --features perf-trace
+    // -- canonical_key_call_count_on_link_heavy_page --nocapture`. Prints
+    // the canonical_key call count for a single `select_links` call on a
+    // fixture page with 30 links. The cassette-driven number is reported
+    // alongside in the PR description.
+    #[cfg(feature = "perf-trace")]
+    #[test]
+    fn canonical_key_call_count_on_link_heavy_page() {
+        let mut html = String::from("<html><body>");
+        for i in 0..30 {
+            html.push_str(&format!(r#"<a href="/p{i}?x={i}">link {i}</a>"#));
+        }
+        html.push_str("</body></html>");
+        let actions = extract_actions(&parse(&html));
+        let base = u("https://example.com/");
+
+        let before = CANONICAL_KEY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let picks = select_links(&actions, &base, 50);
+        let after = CANONICAL_KEY_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[perf-trace] select_links on {} links: canonical_key calls = {}",
+            picks.len(),
+            after - before,
+        );
     }
 }

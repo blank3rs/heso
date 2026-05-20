@@ -29,6 +29,13 @@ url.workspace = true
 cookie_store.workspace = true
 reqwest_cookie_store.workspace = true
 
+[features]
+# Opt-in instrumentation: when enabled, `explore::canonical_key` and a few
+# other hot helpers increment a process-wide atomic counter so a fixture
+# benchmark can measure per-page allocation pressure. Off by default —
+# no overhead, no exports — and never enabled by the shipped CLI.
+perf-trace = []
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

@@ -403,12 +403,17 @@ fn open_section(state: &mut WalkState, level: u8, text: &str) {
     state.heading_stack.push((level, path));
 }
 
-fn current_section(state: &WalkState) -> String {
+/// Path of the section currently on top of the heading stack, or `"/"`
+/// when the walker is still before any heading. Returns a borrow so the
+/// caller decides whether ownership is needed — earlier versions always
+/// cloned, which paid for an allocation per interactive element even
+/// though only `build_element_ref` actually needs the owned form.
+fn current_section(state: &WalkState) -> &str {
     state
         .heading_stack
         .last()
-        .map(|(_, p)| p.clone())
-        .unwrap_or_else(|| "/".to_owned())
+        .map(|(_, p)| p.as_str())
+        .unwrap_or("/")
 }
 
 fn heading_level(tag: &str) -> Option<u8> {
@@ -628,7 +633,10 @@ fn build_element_ref(
         role: role.to_owned(),
         tag: el.value().name().to_owned(),
         name: compute_name(el),
-        section: current_section(state),
+        // `current_section` borrows from `state.heading_stack`; clone here
+        // since the field is owned. Same observable behaviour, one less
+        // allocation when the walker is still at `/`.
+        section: current_section(state).to_owned(),
         attrs: pick_relevant_attrs(el),
     }
 }
