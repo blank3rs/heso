@@ -1318,19 +1318,25 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
 /// agent would otherwise do to reconstruct the same picture.
 async fn cmd_read(args: &[String]) -> ExitCode {
     // Order-tolerant flag walk, same shape as `cmd_open`. Positional:
-    // exactly one `<url>`. Flags: `--include CSV` (additive whitelist
-    // of optional fields), `--since <prev_content_hash>` (cross-call
-    // diff trigger — populates `delta` against the prior snapshot, or
-    // returns `delta.since_matched: false` with everything-added when
-    // no prior snapshot exists in this process), `--best-effort`
-    // (structured failure envelope + non-zero exit on script crashes),
-    // `--inject-script JS|@FILE` (repeatable: each entry runs after
-    // engine bootstrap, before page `<script>`).
+    // exactly one `<url>`. Flags:
+    //   `--include CSV` (additive whitelist of optional fields)
+    //   `--since <prev_content_hash>` (cross-call diff trigger —
+    //   populates `delta` against the prior snapshot, or returns
+    //   `delta.since_matched: false` with everything-added when no
+    //   prior snapshot exists in this process)
+    //   `--best-effort` (structured failure envelope + non-zero exit on
+    //   script crashes)
+    //   `--inject-script JS|@FILE` (repeatable: each entry runs after
+    //   engine bootstrap, before page `<script>`)
+    //   `--complete` (auto-scroll load loop: fire pending
+    //   IntersectionObservers + click any "Load more" actions and
+    //   wait for the DOM to stop changing, capped at 10 iter / 15s).
     let mut url_arg: Option<String> = None;
     let mut include_csv: Option<String> = None;
     let mut since_arg: Option<String> = None;
     let mut best_effort = false;
     let mut inject_scripts: Vec<String> = Vec::new();
+    let mut complete = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1368,9 +1374,15 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 }
                 i += 2;
             }
+            "--complete" | "--auto-scroll" => {
+                // Both names accepted; `--complete` is the documented
+                // primary, `--auto-scroll` is a friendly alias.
+                complete = true;
+                i += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... <url>");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1387,7 +1399,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         }
     }
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... <url>");
+        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] <url>");
         return ExitCode::from(2);
     };
 
@@ -1441,7 +1453,9 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // The `_with_pre_scripts` variant additionally surfaces
     // `--inject-script #N threw: ...` errors on stderr — the
     // structured message names the offending pre-script index.
-    let (session, script_outcome) = match heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
+    // `mut` so `run_auto_scroll_loop` (--complete) can pass it as
+    // `&mut JsSession`.
+    let (mut session, script_outcome) = match heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
         js_engine,
         &page.body_html,
         page.url().clone(),
@@ -1485,13 +1499,46 @@ async fn cmd_read(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let console = session.engine().drain_console();
+    let mut console = session.engine().drain_console();
     let failed_scripts = session.engine().drain_script_failures();
+    let mut post_html = session.document_html();
+    // Action graph the rest of the envelope speaks against. Starts as
+    // the static-side extraction so plain `read` matches its previous
+    // shape exactly; under `--complete` we'll re-extract after the
+    // load loop so any newly-appended interactive elements get refs.
+    let mut current_actions = page.actions.clone();
+
+    // ---- lazy_hints (always emit) ----
+    // Heuristics computed from the post-hydration DOM + JS-side IO
+    // registry. An agent reading `more_content_likely: true` should
+    // either call `read --complete` (we run the loop for them) or
+    // step the page manually with `click @eN` on the surfaced
+    // load-more refs.
+    let mut lazy_hints = compute_lazy_hints(session.engine(), &post_html, &current_actions);
+
+    // ---- --complete: run the load loop ----
+    // The loop only runs when the heuristic detected something
+    // worth loading. Otherwise we early-out with `stop_reason:
+    // "no_lazy_content"` so the agent sees an honest "I checked,
+    // there's nothing more here" signal.
+    let scroll_summary = if complete {
+        Some(run_auto_scroll_loop(
+            &mut session,
+            &mut lazy_hints,
+            &mut current_actions,
+            &mut console,
+            &mut post_html,
+        ))
+    } else {
+        None
+    };
+
+    // `console_errors_count` must be computed AFTER the load loop so
+    // post-loop errors land in the best-effort envelope too.
     let console_errors_count = console
         .iter()
         .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
         .count();
-    let post_html = session.document_html();
 
     // Build the envelope. Start from the same base as `cmd_open`,
     // then layer the agent-facing extras on top per `include`.
@@ -1501,7 +1548,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         "description": page.tree.description,
         "metadata": page.metadata,
         "tree": page.tree,
-        "actions": page.actions,
+        "actions": current_actions,
     });
     if !page.inline_data.is_empty() {
         if let Some(obj) = body.as_object_mut() {
@@ -1523,8 +1570,13 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // and the `--since` snapshot store even when the include filter
     // would have dropped them from the user-visible body. The body
     // gates them per `include`, the hash always sees them.
+    // Compute against the POST-LOOP state (`current_actions` +
+    // `post_html`) so `--complete` is reflected in the hash and in
+    // every reader-facing field. When `--complete` is off,
+    // `current_actions` == `page.actions` clone, so this is a no-op
+    // change for the plain `read` path.
     let visible_text = heso_engine_fetch::extract_visible_text(&post_html);
-    let forms_json = group_forms(&page.actions);
+    let forms_json = group_forms(&current_actions);
 
     if include.text {
         body["text"] = serde_json::Value::String(visible_text.clone());
@@ -1554,10 +1606,12 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // One-shot CLI has no snapshot store, so `--since` always yields
     // `since_matched: false` (agent treats it as "fresh page, here's
     // everything"). The serve path is where a true diff materializes.
+    // Snap is built off the post-loop `current_actions` + `forms_json`
+    // so `content_hash` shifts when --complete loaded more content.
     let snap = ReadSnapshot::from_parts(
         &page.tree.title,
         &visible_text,
-        &page.actions,
+        &current_actions,
         &forms_json,
     );
     let delta = match since_arg.as_deref() {
@@ -1590,6 +1644,13 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // above; on this path we always exit 0 anyway (the only way to
     // reach here is JsSession::open success).
     let _ = best_effort;
+
+    // lazy_hints always emits; scroll only under --complete.
+    body["lazy_hints"] = serde_json::to_value(&lazy_hints).unwrap_or(serde_json::Value::Null);
+    if let Some(s) = scroll_summary {
+        body["scroll"] = serde_json::to_value(&s).unwrap_or(serde_json::Value::Null);
+    }
+
 
     // plat_hash last — same canonical form as `heso open` so an
     // agent that already trusts an `open` plat can verify a `read`
@@ -1864,6 +1925,392 @@ pub(crate) fn delta_no_prior(current: &ReadSnapshot) -> serde_json::Value {
         "text_changed": false,
         "title_changed": false,
     })
+}
+
+// ============================================================================
+// `read` — lazy hints + auto-scroll load loop
+// ============================================================================
+
+/// One signal in `lazy_hints.load_more_actions` / `pagination_next` —
+/// just `{ref, text}` so an agent can either call `read --complete` or
+/// step the page manually with `click @eN`. Built from the action graph;
+/// `text` is the action's accessible name (already populated by
+/// [`heso_engine_fetch::actions`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LazyAction {
+    #[serde(rename = "ref")]
+    ref_id: String,
+    text: String,
+}
+
+/// Heuristic signals that say "this page is gating content behind
+/// load-on-visible / load-more / pagination." Populated unconditionally
+/// in `read` output so an agent always sees them.
+///
+/// Field-by-field semantics:
+///
+/// - `intersection_observers_pending` — sum of `(observer, target)`
+///   pairs registered via `IntersectionObserver.observe()` that haven't
+///   been delivered an `isIntersecting: true` entry. > 0 means the
+///   page is waiting on visibility to load content.
+/// - `load_more_actions` — every action with an accessible name
+///   matching `^(load|show|view|see)\s+(more|all|next)$` /i, or
+///   `"More"` / `"Show more"` exact. Buttons AND links count.
+/// - `pagination_next` — first action with `rel=next`, OR with name
+///   matching `^next( ›| >|>)?$` / `^›$`. Optional.
+/// - `lazy_images` — count of `<img loading="lazy">` in the post-
+///   hydration HTML. >= 3 is the threshold that flips
+///   `more_content_likely` on its own.
+/// - `infinite_scroll_signals` — DOM class-name signals
+///   (`infinite-scroll`, `virtual-list`, `lazy-load`, etc.) AND
+///   `data-virtualized`-shaped attribute signals. Strings, not refs,
+///   because the signal is presence-not-action.
+/// - `more_content_likely` — true if any of the above evidence-based
+///   signals fire. Single bit summarizing whether `read --complete`
+///   would actually do something.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LazyHints {
+    intersection_observers_pending: usize,
+    load_more_actions: Vec<LazyAction>,
+    pagination_next: Option<LazyAction>,
+    lazy_images: usize,
+    infinite_scroll_signals: Vec<String>,
+    more_content_likely: bool,
+}
+
+/// Compute `lazy_hints` from the post-hydration HTML, the action graph,
+/// and the JS engine's IntersectionObserver registry. Pure derivation
+/// over the inputs — no mutation.
+pub(crate) fn compute_lazy_hints(
+    engine: &heso_engine_js::JsEngine,
+    post_html: &str,
+    actions: &[ElementRef],
+) -> LazyHints {
+    let intersection_observers_pending = engine.intersection_observer_pending_count();
+    let load_more_actions = find_load_more_actions(actions);
+    let pagination_next = find_pagination_next(actions);
+    let lazy_images = count_lazy_images(post_html);
+    let infinite_scroll_signals = detect_infinite_scroll_signals(post_html);
+    let more_content_likely = intersection_observers_pending > 0
+        || !load_more_actions.is_empty()
+        || pagination_next.is_some()
+        || lazy_images >= 3
+        || !infinite_scroll_signals.is_empty();
+    LazyHints {
+        intersection_observers_pending,
+        load_more_actions,
+        pagination_next,
+        lazy_images,
+        infinite_scroll_signals,
+        more_content_likely,
+    }
+}
+
+/// Case-insensitive `^(load|show|view|see)\s+(more|all|next)$` plus the
+/// two exact-match conveniences `"More"` / `"Show more"` (the latter is
+/// already covered by the regex but kept for clarity / future hosts).
+static LOAD_MORE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^(load|show|view|see)\s+(more|all|next)$").expect("valid regex")
+});
+
+/// `^next( ›| >|>)?$` or `^›$` — case-insensitive on `next`. Picks up
+/// "Next", "Next ›", "Next >", "Next>", and lone "›".
+static NEXT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^(next( [›>]|>)?|›)$").expect("valid regex")
+});
+
+/// Find every action whose accessible `name` matches the load-more
+/// regex, in document order. Buttons and links (and anything with an
+/// accessible name) qualify.
+fn find_load_more_actions(actions: &[ElementRef]) -> Vec<LazyAction> {
+    let mut out = Vec::new();
+    for a in actions {
+        let Some(name) = a.name.as_deref() else { continue };
+        let trimmed = name.trim();
+        // Common exact-match conveniences: "More", "Show more" (also
+        // caught by the regex but inexpensive to short-circuit).
+        if trimmed.eq_ignore_ascii_case("more")
+            || trimmed.eq_ignore_ascii_case("show more")
+            || LOAD_MORE_RE.is_match(trimmed)
+        {
+            out.push(LazyAction {
+                ref_id: a.ref_id.clone(),
+                text: trimmed.to_owned(),
+            });
+        }
+    }
+    out
+}
+
+/// Find the first action with `rel=next` (HTML pagination spec) OR a
+/// next-ish accessible name. Returned as `Option` — pages without
+/// pagination get `None`.
+fn find_pagination_next(actions: &[ElementRef]) -> Option<LazyAction> {
+    for a in actions {
+        // rel="next" wins over name-based fallback because it's the
+        // explicit HTML link relation.
+        if a.attrs
+            .get("rel")
+            .map(|r| {
+                r.split_ascii_whitespace()
+                    .any(|t| t.eq_ignore_ascii_case("next"))
+            })
+            .unwrap_or(false)
+        {
+            return Some(LazyAction {
+                ref_id: a.ref_id.clone(),
+                text: a.name.as_deref().unwrap_or("").trim().to_owned(),
+            });
+        }
+    }
+    for a in actions {
+        let Some(name) = a.name.as_deref() else { continue };
+        let trimmed = name.trim();
+        if NEXT_RE.is_match(trimmed) {
+            return Some(LazyAction {
+                ref_id: a.ref_id.clone(),
+                text: trimmed.to_owned(),
+            });
+        }
+    }
+    None
+}
+
+/// Count `<img loading="lazy">` in the post-hydration HTML. Cheap regex
+/// scan — we deliberately don't re-parse the document just for one
+/// number.
+fn count_lazy_images(html: &str) -> usize {
+    static LAZY_IMG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?is)<img\b[^>]*\bloading\s*=\s*["']?lazy["']?"#).expect("valid regex")
+    });
+    LAZY_IMG_RE.find_iter(html).count()
+}
+
+/// Detect DOM-class / data-attribute signals of infinite-scroll or
+/// virtual-list patterns. Returns the matched substrings (e.g.
+/// `"class=infinite-scroll"`, `"data-virtualized"`). One regex scan,
+/// dedup'd; order matches discovery order.
+fn detect_infinite_scroll_signals(html: &str) -> Vec<String> {
+    // class="...infinite-scroll..." | "virtual-list" | "lazy-load",
+    // with separators `-` or `_`. Run inside class attributes.
+    static CLASS_SIG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?i)class\s*=\s*["'][^"']*\b((?:infinite|virtual)[-_]?(?:scroll|list)|lazy[-_]?load)\b[^"']*["']"#,
+        )
+        .expect("valid regex")
+    });
+    static DATA_VIRT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?i)\bdata-virtualized\b"#).expect("valid regex")
+    });
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for cap in CLASS_SIG_RE.captures_iter(html) {
+        if let Some(m) = cap.get(1) {
+            let token = m.as_str().to_lowercase();
+            let label = format!("class={}", token);
+            if seen.insert(label.clone()) {
+                out.push(label);
+            }
+        }
+    }
+    if DATA_VIRT_RE.is_match(html) && seen.insert("data-virtualized".to_owned()) {
+        out.push("data-virtualized".to_owned());
+    }
+    out
+}
+
+/// One summary record returned from [`run_auto_scroll_loop`]. Lives on
+/// the `scroll` key in `read --complete` output.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ScrollSummary {
+    iterations: usize,
+    stop_reason: &'static str,
+    elapsed_ms: u128,
+    final_content_hash: String,
+}
+
+/// Hard caps for the auto-scroll loop. Both serve the same purpose
+/// (don't loop forever); whichever fires first wins.
+///
+/// - `MAX_ITERATIONS = 10` — beyond ~10 "Load more" clicks a real
+///   page is either truly infinite or has degenerated into duplicates.
+///   We don't want `read --complete` to be a denial-of-service vector
+///   against pages that paginate by millions of items.
+/// - `MAX_ELAPSED_MS = 15_000` — 15 s of wall time. A read is meant
+///   to be near-interactive; longer than this and the caller should
+///   be using a different abstraction (a streaming loop, an
+///   incremental crawler).
+/// - `DOM_QUIET_MS = 200` — the "no mutations for X" window that
+///   marks the DOM as quiet. 200 ms is the Playwright-derived
+///   industry-standard quiet window for "auto-wait" loops; see
+///   `https://www.browserstack.com/guide/playwright-waitforloadstate`
+///   (network-idle uses 500 ms; we use 200 ms because we're not
+///   waiting on network here, just on a click-handler's synchronous
+///   mutations to settle).
+/// - `PER_STEP_TIMEOUT_MS = 2_000` — hard cap on a single iteration's
+///   quiet-wait. Bounds worst-case latency per step.
+const MAX_ITERATIONS: usize = 10;
+const MAX_ELAPSED_MS: u128 = 15_000;
+const DOM_QUIET_MS: u64 = 200;
+const PER_STEP_TIMEOUT_MS: u64 = 2_000;
+
+/// `read --complete`'s load loop. Mutates `session` (via clicks +
+/// IO flushes), updates `lazy_hints`, `actions`, `console`, and
+/// `post_html` in place so the caller can serialize the final state.
+///
+/// Loop body, plain English:
+///
+/// 1. If `lazy_hints.more_content_likely` is false on entry, return
+///    immediately with `stop_reason: "no_lazy_content"` and
+///    `iterations: 0`. Honest signal that there's nothing to do.
+/// 2. Up to `MAX_ITERATIONS` times:
+///    a. Hash the current `post_html`.
+///    b. Call `flush_intersection_observers()` to wake up any IO whose
+///       targets were appended since last fire.
+///    c. If there are surfaced "Load more" actions, click the first one.
+///    d. Wait for the DOM to be quiet (no new HTML for
+///       `DOM_QUIET_MS`, with a `PER_STEP_TIMEOUT_MS` ceiling).
+///    e. Re-snapshot `post_html` + the action graph.
+///    f. If the new hash equals the snapshot → `dom_quiet`, done.
+///    g. If we hit `MAX_ITERATIONS` → `max_iterations`, done.
+///    h. If we hit `MAX_ELAPSED_MS` → `timeout`, done.
+///
+/// Pagination ("Next" links) is INTENTIONALLY not clicked — that's a
+/// page transition, a different intent than "load more on this page."
+/// The hint surfaces it so the agent can choose; the loop doesn't.
+pub(crate) fn run_auto_scroll_loop(
+    session: &mut heso_engine_js::JsSession,
+    lazy_hints: &mut LazyHints,
+    actions: &mut Vec<ElementRef>,
+    console: &mut Vec<heso_engine_js::ConsoleEntry>,
+    post_html: &mut String,
+) -> ScrollSummary {
+    let start = std::time::Instant::now();
+    if !lazy_hints.more_content_likely {
+        return ScrollSummary {
+            iterations: 0,
+            stop_reason: "no_lazy_content",
+            elapsed_ms: start.elapsed().as_millis(),
+            final_content_hash: html_content_hash(post_html),
+        };
+    }
+
+    let mut iterations = 0usize;
+    let stop_reason: &'static str;
+    loop {
+        let elapsed_ms = start.elapsed().as_millis();
+        if elapsed_ms >= MAX_ELAPSED_MS {
+            stop_reason = "timeout";
+            break;
+        }
+        let snapshot_hash = html_content_hash(post_html);
+
+        // a) Fire any pending IntersectionObserver targets so JS that
+        // gates content on visibility wakes up.
+        if let Err(e) = session.engine().flush_intersection_observers() {
+            // Don't kill the loop — surface the error via console
+            // and move on. The pending count will tell us if anything
+            // is left to do.
+            eprintln!("flush IO observers failed: {e}");
+        }
+
+        // b) Click the FIRST load-more action, if any. We only click
+        // one per iteration so each "Load more" handler has a clean
+        // run + DOM-quiet wait. (Clicking all of them in a single
+        // iteration would mask which one stopped working.)
+        if let Some(la) = lazy_hints.load_more_actions.first() {
+            if let Some(el) = heso_engine_fetch::resolve_action(actions, &la.ref_id) {
+                if let Some(sel) = selector_for_action(el) {
+                    if let Err(e) = session.click(&sel) {
+                        // Same posture as IO flush: surface and
+                        // continue.
+                        eprintln!("auto-scroll click {} failed: {e}", la.ref_id);
+                    }
+                }
+            }
+        }
+
+        // c) Drain JS jobs (microtasks + queued fetches) and let the
+        // DOM-quiet window elapse. We do this in a tight wall-time
+        // loop with `PER_STEP_TIMEOUT_MS` as the ceiling. Each pass:
+        // run pending jobs; if nothing new shipped, re-snapshot and
+        // check if we've held the same hash for `DOM_QUIET_MS`.
+        wait_dom_quiet(session);
+
+        // d) Re-snapshot and re-extract actions. The post-hydration
+        // HTML may now include new buttons / links / inputs.
+        *post_html = session.document_html();
+        *actions = heso_engine_fetch::extract_actions_from_html(post_html);
+        let mut new_console = session.engine().drain_console();
+        console.append(&mut new_console);
+        *lazy_hints = compute_lazy_hints(session.engine(), post_html, actions);
+
+        iterations += 1;
+        let new_hash = html_content_hash(post_html);
+        if new_hash == snapshot_hash {
+            stop_reason = "dom_quiet";
+            break;
+        }
+        if iterations >= MAX_ITERATIONS {
+            stop_reason = "max_iterations";
+            break;
+        }
+        if start.elapsed().as_millis() >= MAX_ELAPSED_MS {
+            stop_reason = "timeout";
+            break;
+        }
+    }
+
+    ScrollSummary {
+        iterations,
+        stop_reason,
+        elapsed_ms: start.elapsed().as_millis(),
+        final_content_hash: html_content_hash(post_html),
+    }
+}
+
+/// Wait for the DOM to be quiet — no new HTML for `DOM_QUIET_MS`, with
+/// a `PER_STEP_TIMEOUT_MS` ceiling. Pumps the JS engine's microtask /
+/// fetch-job queue every iteration so async load-more handlers actually
+/// progress.
+///
+/// Returns once either:
+/// - the snapshot has not changed for `DOM_QUIET_MS` of wall time, or
+/// - `PER_STEP_TIMEOUT_MS` total has elapsed (hard ceiling).
+fn wait_dom_quiet(session: &mut heso_engine_js::JsSession) {
+    let step_start = std::time::Instant::now();
+    let tick = std::time::Duration::from_millis(25);
+    let mut last_hash = html_content_hash(&session.document_html());
+    let mut quiet_since = std::time::Instant::now();
+    loop {
+        let elapsed = step_start.elapsed().as_millis() as u64;
+        if elapsed >= PER_STEP_TIMEOUT_MS {
+            return;
+        }
+        // Pump pending jobs (microtasks, fetch callbacks). Errors here
+        // are non-fatal — they only indicate the engine returned an
+        // exception while running queued work, which the outer caller
+        // will see in `console` on the next drain.
+        let _ = session.engine().run_pending_jobs();
+        let snapshot = session.document_html();
+        let h = html_content_hash(&snapshot);
+        if h != last_hash {
+            last_hash = h;
+            quiet_since = std::time::Instant::now();
+        } else if quiet_since.elapsed().as_millis() as u64 >= DOM_QUIET_MS {
+            return;
+        }
+        std::thread::sleep(tick);
+    }
+}
+
+/// 32-bit-prefix BLAKE3 of the HTML string. We don't need the full 256
+/// bits for the "did it change?" comparison; the prefix keeps the JSON
+/// payload short while still effectively zero collision risk for
+/// a single page-load's snapshots.
+fn html_content_hash(html: &str) -> String {
+    let h = blake3::hash(html.as_bytes());
+    format!("blake3:{}", &h.to_hex().as_str()[..16])
 }
 
 /// Group the action-graph entries into `<form>` clusters. Each form's

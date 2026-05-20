@@ -1881,6 +1881,77 @@ impl JsEngine {
 
         Ok(EvalOutcome { value, console })
     }
+
+    /// Count how many `(observer, target)` pairs are currently
+    /// registered with active `IntersectionObserver` instances that
+    /// have NOT yet been delivered an `isIntersecting: true` entry.
+    ///
+    /// Returns 0 when no observer has called `observe(target)` yet,
+    /// or when every target has already been delivered (and so a
+    /// further [`Self::flush_intersection_observers`] would be a no-op).
+    ///
+    /// This is the heuristic that powers `read --complete`'s
+    /// `lazy_hints.intersection_observers_pending` field. A non-zero
+    /// count is a strong signal that the page is gating content
+    /// behind "fire when visible" — calling
+    /// [`Self::flush_intersection_observers`] is then likely to
+    /// produce new DOM mutations.
+    pub fn intersection_observer_pending_count(&self) -> usize {
+        // We count targets that have not yet been fired. The JS-side
+        // registry tracks both `_targets` (all registered) and
+        // `_fired` (delivered) — pending == |_targets - _fired|.
+        let outcome = self.eval(
+            r#"
+            (function() {
+                var obs = globalThis.__hesoIO_observers;
+                if (!Array.isArray(obs)) return 0;
+                var n = 0;
+                for (var i = 0; i < obs.length; i++) {
+                    var o = obs[i];
+                    if (!o || !o._targets) continue;
+                    for (var j = 0; j < o._targets.length; j++) {
+                        var t = o._targets[j];
+                        if (!t) continue;
+                        if (o._fired.indexOf(t) === -1) n++;
+                    }
+                }
+                return n;
+            })()
+            "#,
+        );
+        match outcome {
+            Ok(out) => out.value.as_u64().unwrap_or(0) as usize,
+            Err(_) => 0,
+        }
+    }
+
+    /// Re-deliver `isIntersecting: true` entries for every currently-
+    /// registered `IntersectionObserver` target that is connected to
+    /// the document but hasn't yet been fired.
+    ///
+    /// Returns the count of *newly* delivered entries (zero means
+    /// nothing was pending OR all pending targets were disconnected).
+    /// Used by `read --complete` between iterations of the load loop:
+    /// after a `Load more` click appends new lazy targets, the
+    /// observer that registered them needs to be re-poked so its
+    /// callback runs and the next batch of content actually loads.
+    ///
+    /// Delivery is queued as a microtask per spec; callers that need
+    /// the side effects to be visible should `run_pending_jobs()` (or
+    /// rely on the next `eval()` which drains microtasks at the end).
+    pub fn flush_intersection_observers(&self) -> Result<usize, EvalError> {
+        let outcome = self.eval(
+            r#"
+            (function() {
+                if (typeof heso === 'object' && heso && typeof heso.flushIntersectionObservers === 'function') {
+                    return heso.flushIntersectionObservers();
+                }
+                return 0;
+            })()
+            "#,
+        )?;
+        Ok(outcome.value.as_u64().unwrap_or(0) as usize)
+    }
 }
 
 impl Default for JsEngine {
@@ -3604,10 +3675,12 @@ fn install_browser_apis(
 /// stubs, `queueMicrotask`, `requestAnimationFrame` /
 /// `cancelAnimationFrame`, `matchMedia`, `localStorage`,
 /// `sessionStorage`, `heso.flush`, noop observer ctors
-/// (`MutationObserver`, `IntersectionObserver`, `ResizeObserver`,
-/// `PerformanceObserver`), the React Fizz streaming-hydration
-/// instruction set (`$RC` / `$RX` / `$RB` / `$RS` / `$RP`), and the
-/// webpack-JSONP entry points (`webpackChunk_N_E` / `_N_E`).
+/// (`MutationObserver`, `ResizeObserver`, `PerformanceObserver`),
+/// the tracking [`IntersectionObserver`] ctor + registry
+/// (`__hesoIO_observers`) + `heso.flushIntersectionObservers`, the
+/// React Fizz streaming-hydration instruction set (`$RC` / `$RX` /
+/// `$RB` / `$RS` / `$RP`), and the webpack-JSONP entry points
+/// (`webpackChunk_N_E` / `_N_E`).
 const BROWSER_APIS_BOOTSTRAP: &str = r#"
 (function() {
     // -------------------------------------------------------------
@@ -3797,14 +3870,17 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         };
     }
 
-    // MutationObserver / IntersectionObserver / ResizeObserver /
-    // PerformanceObserver — noop constructors that match the spec
-    // surface so SPA hydration code that does `new MutationObserver(cb)`
-    // doesn't ReferenceError before the rest of the page runs. We don't
-    // actually observe anything; the callback is retained per spec but
-    // never invoked, and `takeRecords()` always returns []. Shape
-    // cross-referenced against happy-dom's intersection-observer /
-    // resize-observer stubs (MIT, capricorn86/happy-dom).
+    // MutationObserver / ResizeObserver / PerformanceObserver — noop
+    // constructors that match the spec surface so SPA hydration code
+    // that does `new MutationObserver(cb)` doesn't ReferenceError
+    // before the rest of the page runs. We don't actually observe
+    // anything; the callback is retained per spec but never invoked,
+    // and `takeRecords()` always returns []. Shape cross-referenced
+    // against happy-dom's observer stubs (MIT, capricorn86/happy-dom).
+    //
+    // IntersectionObserver is special — it gates lazy content and we
+    // need to know about its targets to power `read --complete`. See
+    // the dedicated installer right after this block.
     //
     // Spec notes:
     // - Each ctor takes `(callback, options?)`. We store `callback` on
@@ -3866,7 +3942,11 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     // IntersectionObserver is NOT a noop — `crate::intersection_observer::install`
     // runs after `install_browser_apis` and registers a real
     // implementation that fires its callback (with `isIntersecting:
-    // true` for in-tree targets) on a microtask. See that module for
+    // true` for in-tree targets) on a microtask, plus a
+    // `globalThis.__hesoIO_observers` registry and a
+    // `heso.flushIntersectionObservers()` opt-in method that
+    // `JsEngine::flush_intersection_observers` drives from Rust during
+    // the `heso read --complete` auto-scroll loop. See that module for
     // the design and the agent-relevance rationale.
     defineNoopObserver('IntersectionObserver');
     defineNoopObserver('ResizeObserver');

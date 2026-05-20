@@ -427,6 +427,16 @@ pub fn extract_visible_text(html: &str) -> String {
     extract_visible_text_from_doc(&Html::parse_document(html))
 }
 
+/// Parse `html` and return the action graph. Convenience wrapper that
+/// callers (such as `heso-cli`'s `read --complete` loop) use to
+/// re-extract refs from a post-mutation DOM snapshot without having to
+/// take `scraper` as a direct dependency.
+///
+/// Same output as calling [`actions::extract`] on a parsed document.
+pub fn extract_actions_from_html(html: &str) -> Vec<ElementRef> {
+    actions::extract(&Html::parse_document(html))
+}
+
 /// Walk an already-parsed document and return the visible body text, with
 /// `<script>`, `<style>`, `<noscript>`, and `<template>` content skipped.
 /// Whitespace is normalized: runs of whitespace collapse to single spaces.

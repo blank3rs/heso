@@ -239,7 +239,25 @@ const INTERSECTION_OBSERVER_BOOTSTRAP: &str = r#"
         Object.defineProperty(this, '__callback', {
             value: callback, writable: false, enumerable: false, configurable: false,
         });
+        var targetsArr = [];
         Object.defineProperty(this, '__targets', {
+            value: targetsArr, writable: false, enumerable: false, configurable: false,
+        });
+        // `_targets` (single underscore) is the spelling
+        // `JsEngine::intersection_observer_pending_count` and the
+        // `heso.flushIntersectionObservers()` opt-in API both query.
+        // Same array as `__targets`; aliased so the host-side counter
+        // and the spec-shaped internals see one truth.
+        Object.defineProperty(this, '_targets', {
+            value: targetsArr, writable: false, enumerable: false, configurable: false,
+        });
+        // `_fired`: targets for which an entry has already been
+        // delivered. `pending_count = _targets - _fired`. Cleared on
+        // `unobserve(target)` (so a re-observe re-fires) and on
+        // `disconnect()` (so re-registration from scratch re-fires).
+        // Read by the host's auto-scroll loop to decide whether to keep
+        // pumping `heso.flushIntersectionObservers()`.
+        Object.defineProperty(this, '_fired', {
             value: [], writable: false, enumerable: false, configurable: false,
         });
         Object.defineProperty(this, '__root', {
@@ -252,6 +270,17 @@ const INTERSECTION_OBSERVER_BOOTSTRAP: &str = r#"
             value: Object.freeze(thresholds.slice()),
             writable: false, enumerable: false, configurable: false,
         });
+        // Register into the global IO registry so the host can sweep
+        // for pending targets without having to track every constructor
+        // call from Rust. Lazily ensures the registry exists; the
+        // engine.rs comment block at `defineNoopObserver('IntersectionObserver')`
+        // describes the same registry from the engine-side view.
+        if (typeof globalThis.__hesoIO_observers === 'undefined') {
+            Object.defineProperty(globalThis, '__hesoIO_observers', {
+                value: [], writable: false, enumerable: false, configurable: false,
+            });
+        }
+        globalThis.__hesoIO_observers.push(this);
     }
 
     // ----- Read-only IDL attributes (spec §3.3 "IntersectionObserver") --
@@ -364,6 +393,15 @@ const INTERSECTION_OBSERVER_BOOTSTRAP: &str = r#"
             // are dropped if disconnect was called").
             if (observer.__targets.indexOf(target) === -1) return;
             var entry = buildEntry(target);
+            // Mark this target as fired BEFORE invoking the callback —
+            // pending_count reads `_targets - _fired`, and the callback
+            // may synchronously call `flushIntersectionObservers()` (or
+            // re-observe a target) which we don't want to re-fire on
+            // the same delivery. Idempotent if the target is already
+            // listed (re-observe path).
+            if (observer._fired.indexOf(target) === -1) {
+                observer._fired.push(target);
+            }
             try {
                 callback.call(undefined, [entry], observer);
             } catch (e) {
@@ -380,11 +418,19 @@ const INTERSECTION_OBSERVER_BOOTSTRAP: &str = r#"
     };
 
     // ----- unobserve(target) --------------------------------------------
+    //
+    // Clears the target from both `__targets` AND `_fired`. The latter
+    // is necessary so a subsequent `observe(target)` will re-fire —
+    // `flushIntersectionObservers()` and the initial-notification
+    // microtask both gate on `_fired` to dedup repeat deliveries, but
+    // the spec treats unobserve+observe as a fresh registration.
     IntersectionObserver.prototype.unobserve = function (target) {
         if (target == null) return;
         var targets = this.__targets;
         var idx = targets.indexOf(target);
         if (idx !== -1) targets.splice(idx, 1);
+        var fi = this._fired.indexOf(target);
+        if (fi !== -1) this._fired.splice(fi, 1);
     };
 
     // ----- disconnect() -------------------------------------------------
@@ -392,9 +438,11 @@ const INTERSECTION_OBSERVER_BOOTSTRAP: &str = r#"
     // Per spec, also drops any queued notifications. The microtask
     // closure above re-checks `__targets.indexOf(target)` so wiping
     // the list here is sufficient: queued microtasks will see the
-    // target absent and become no-ops.
+    // target absent and become no-ops. Also wipes `_fired` so a
+    // post-disconnect re-observe sees a fresh slate.
     IntersectionObserver.prototype.disconnect = function () {
         this.__targets.length = 0;
+        this._fired.length = 0;
     };
 
     // ----- takeRecords() ------------------------------------------------
@@ -424,5 +472,81 @@ const INTERSECTION_OBSERVER_BOOTSTRAP: &str = r#"
         value: IntersectionObserver,
         writable: true, enumerable: false, configurable: true,
     });
+
+    // ===== heso.flushIntersectionObservers() ============================
+    //
+    // Opt-in re-delivery API used by `heso read --complete`'s auto-scroll
+    // loop. Walks every IO registered into `__hesoIO_observers`; for
+    // each `(observer, target)` pair where the target is currently
+    // `isConnected` and has NOT yet been delivered an entry
+    // (`observer._fired.indexOf(target) === -1`), queues a microtask
+    // that delivers an `isIntersecting: true` entry and marks the
+    // target fired.
+    //
+    // Returns the count of newly-queued deliveries — callers can stop
+    // looping when this returns 0.
+    //
+    // Idempotent: re-calling after every queued delivery has been
+    // marked fired returns 0 without scheduling anything.
+    //
+    // NOT a spec method (the W3C spec has no host-driven flush) —
+    // this is the agent seam that makes lazy-content gates resolvable
+    // without an actual scroll viewport. See ADR 0016 for the "no
+    // layout" framing.
+    if (typeof globalThis.heso !== 'object' || globalThis.heso === null) {
+        globalThis.heso = {};
+    }
+    if (typeof globalThis.heso.flushIntersectionObservers !== 'function') {
+        globalThis.heso.flushIntersectionObservers = function () {
+            var observers = globalThis.__hesoIO_observers;
+            if (!Array.isArray(observers)) return 0;
+            var delivered = 0;
+            for (var i = 0; i < observers.length; i++) {
+                var obs = observers[i];
+                if (!obs || !obs._targets) continue;
+                // Snapshot the target list — re-firing might re-observe
+                // and we don't want the iteration to chase tail-appends.
+                var targets = obs._targets.slice();
+                var cb = obs.__callback;
+                for (var j = 0; j < targets.length; j++) {
+                    var t = targets[j];
+                    if (!t) continue;
+                    var connected = false;
+                    try {
+                        // Plain objects (test fakes that lack isConnected)
+                        // fall through to false here, mirroring the
+                        // initial-notification rules. Real Element
+                        // references on a connected tree return true.
+                        connected = !!t.isConnected;
+                    } catch (_) { connected = false; }
+                    if (!connected) continue;
+                    if (obs._fired.indexOf(t) !== -1) continue;
+                    obs._fired.push(t);
+                    delivered++;
+                    (function (observer, callback, target) {
+                        Promise.resolve().then(function () {
+                            // Re-check observation; unobserve / disconnect
+                            // between flush and microtask drops delivery.
+                            if (observer.__targets.indexOf(target) === -1) {
+                                // Also retract the `_fired` mark so a
+                                // future re-observe re-fires.
+                                var fi = observer._fired.indexOf(target);
+                                if (fi !== -1) observer._fired.splice(fi, 1);
+                                return;
+                            }
+                            var entry = buildEntry(target);
+                            try {
+                                callback.call(undefined, [entry], observer);
+                            } catch (e) {
+                                // See observe() rationale.
+                                throw e;
+                            }
+                        });
+                    })(obs, cb, t);
+                }
+            }
+            return delivered;
+        };
+    }
 })();
 "#;

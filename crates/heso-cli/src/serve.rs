@@ -107,8 +107,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     attach_failure_envelope, classify_failure_envelope, collect_cookies, compute_delta,
-    delta_no_prior, detect_framework, group_forms, merge_submit_fields, parse_include_filter,
-    selector_for_action, ReadSnapshot,
+    compute_lazy_hints, delta_no_prior, detect_framework, group_forms, merge_submit_fields,
+    parse_include_filter, run_auto_scroll_loop, selector_for_action, ReadSnapshot,
 };
 
 /// Cap on the per-session `read` snapshot store. After the 8th distinct
@@ -1118,6 +1118,13 @@ struct ReadParams {
     /// the server-side filesystem.
     #[serde(default)]
     inject_scripts: Vec<String>,
+    /// When `true`, run the auto-scroll load loop after the initial
+    /// snapshot — fire pending IntersectionObservers + click any
+    /// "Load more" actions + wait for DOM-quiet, capped at 10
+    /// iterations / 15s. Matches the CLI's `--complete` flag.
+    /// Adds a `scroll` field to the response.
+    #[serde(default)]
+    complete: Option<bool>,
 }
 
 /// `read` — the agent's one-call page report against an open page_id.
@@ -1135,11 +1142,17 @@ async fn dispatch_read(
     let page_id = resolve_page_id(&state, p.page_id).await?;
     let include = parse_include_filter(p.include.as_deref());
     let since = p.since.clone();
+    let complete = p.complete.unwrap_or(false);
 
     // Phase 1: gather everything off the page record + session under
     // the `pages` lock, then DROP it before touching the snapshots
     // mutex. Same nested-lock-avoidance pattern as `dispatch_navigate`.
-    let (mut body, snap, live_url, failed_scripts, console_errors_count) = {
+    //
+    // When `--complete` is on, the auto-scroll load loop runs INSIDE
+    // this phase (it needs `&mut session`), and its post-loop console /
+    // post_html / actions all feed the same `snap`, `body`, and
+    // best-effort envelope that the non-`--complete` path produces.
+    let (mut body, snap, live_url, failed_scripts, console_errors_count, lazy_hints, scroll_summary) = {
         let mut pages = state.pages.lock().await;
         let record = pages
             .get_mut(&page_id)
@@ -1166,10 +1179,60 @@ async fn dispatch_read(
 
         // Snapshot the static fields off the cached page first, then
         // overlay the live post-hydration extras from the session.
+        // `console`, `post_html`, and `current_actions` are bound
+        // `mut` because the auto-scroll loop (when --complete is
+        // requested) appends to them between iterations.
+        let live_url = record
+            .session
+            .as_ref()
+            .expect("session ensured above")
+            .url()
+            .clone();
+        let mut console = record
+            .session
+            .as_ref()
+            .expect("session ensured above")
+            .engine()
+            .drain_console();
+        let mut post_html = record
+            .session
+            .as_ref()
+            .expect("session ensured above")
+            .document_html();
+        let mut current_actions = record.current_actions.clone();
+
+        // ---- lazy_hints (always-on, same shape as the CLI verb) ----
+        let mut lazy_hints = compute_lazy_hints(
+            record
+                .session
+                .as_ref()
+                .expect("session ensured above")
+                .engine(),
+            &post_html,
+            &current_actions,
+        );
+
+        // ---- --complete: run the load loop ----
+        let scroll_summary = if complete {
+            let session = record.session.as_mut().expect("session ensured above");
+            Some(run_auto_scroll_loop(
+                session,
+                &mut lazy_hints,
+                &mut current_actions,
+                &mut console,
+                &mut post_html,
+            ))
+        } else {
+            None
+        };
+        // Persist post-loop action graph back onto the record so any
+        // immediate write-verb call (e.g. click @e7 on a newly-loaded
+        // button) sees the same refs we just returned.
+        record.current_actions = current_actions.clone();
+
         let static_page = &record.page;
         let session = record.session.as_ref().expect("session ensured above");
 
-        let console = session.engine().drain_console();
         // Best-effort envelope — session-mode `read` peeks the script
         // failures snapshot (without clearing) so a subsequent verb on
         // the same `page_id` still sees the same failure list. This is
@@ -1180,14 +1243,12 @@ async fn dispatch_read(
             .iter()
             .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
             .count();
-        let post_html = session.document_html();
-        let live_url = session.url().clone();
 
         // Always compute visible_text + forms — they feed `content_hash`
         // and the snapshot store even when `include` would drop them
         // from the body. Identical contract to the one-shot CLI path.
         let visible_text = heso_engine_fetch::extract_visible_text(&post_html);
-        let forms_json = group_forms(&record.current_actions);
+        let forms_json = group_forms(&current_actions);
 
         let mut body = serde_json::json!({
             "url": live_url.as_str(),
@@ -1195,7 +1256,7 @@ async fn dispatch_read(
             "description": static_page.tree.description,
             "metadata": static_page.metadata,
             "tree": static_page.tree,
-            "actions": record.current_actions,
+            "actions": current_actions,
         });
         if !static_page.inline_data.is_empty() {
             if let Some(obj) = body.as_object_mut() {
@@ -1242,10 +1303,18 @@ async fn dispatch_read(
         let snap = ReadSnapshot::from_parts(
             &static_page.tree.title,
             &visible_text,
-            &record.current_actions,
+            &current_actions,
             &forms_json,
         );
-        (body, snap, live_url, failed_scripts, console_errors_count)
+        (
+            body,
+            snap,
+            live_url,
+            failed_scripts,
+            console_errors_count,
+            lazy_hints,
+            scroll_summary,
+        )
     };
 
     // Phase 2: snapshot lookup + delta. Mutex held only for this
@@ -1277,7 +1346,9 @@ async fn dispatch_read(
 
     // Structured-failure envelope — always present per the schema
     // bump. See [`classify_failure_envelope`] for the
-    // partial_reason vocabulary.
+    // partial_reason vocabulary. Body fields (text/forms/cookies/etc.)
+    // are composed inside Phase 1 above, where `current_actions` and
+    // `post_html` are still in scope.
     let (partial, partial_reason) =
         classify_failure_envelope(&failed_scripts, console_errors_count);
     attach_failure_envelope(
@@ -1287,6 +1358,11 @@ async fn dispatch_read(
         &failed_scripts,
         console_errors_count,
     );
+
+    body["lazy_hints"] = serde_json::to_value(&lazy_hints).unwrap_or(serde_json::Value::Null);
+    if let Some(s) = scroll_summary {
+        body["scroll"] = serde_json::to_value(&s).unwrap_or(serde_json::Value::Null);
+    }
 
     let hash = heso_engine_fetch::plat_hash(&body);
     if let Some(obj) = body.as_object_mut() {
