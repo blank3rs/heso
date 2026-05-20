@@ -16,12 +16,13 @@ Most of this codebase was written with help from Claude under one person's direc
 - Optional reproducibility: seed the random number generator, freeze the clock, and the same page processed the same way produces the same hash.
 - Common modern JS surface: `fetch`, `URLSearchParams`, `history.pushState`, `Blob`/`File`/`FormData`, multipart upload.
 - ES modules: `<script type="module">`, dynamic `import()`, import maps. Shared cache between the static and dynamic paths.
-- Web Components: `customElements.define`, `HTMLElement` as a base class, `connectedCallback`/`disconnectedCallback`/`attributeChangedCallback` lifecycle, `attachShadow`, `ShadowRoot`, `<slot>` with `assignedElements`.
+- Web Components: `customElements.define`, `HTMLElement` as a base class, `connectedCallback`/`disconnectedCallback`/`attributeChangedCallback` lifecycle, `HTMLTemplateElement`, `attachShadow`, `ShadowRoot`, `<slot>` with `assignedElements`. Late-upgrade re-prototyping works — elements pre-rendered in HTML get the right class when JS defines them later. `element.dataset` and `insertAdjacentHTML` also there.
 
 ## What doesn't
 
 - No rendering. No canvas, WebGL, CSS layout, or video. If your agent needs pixels, use a real browser.
-- Modern bundler-heavy SPAs aren't fully working yet. Static pages, server-rendered sites, and SPAs that don't depend on WebGL or full keyboard interaction work. React 19 with full keyboard event handling, Turbopack-chunked Next.js, and full SVG namespace support are open work.
+- Modern bundler-heavy SPAs aren't fully working yet. Static pages, server-rendered sites, and simpler SPAs work. React 19 with full keyboard interaction, Turbopack-chunked Next.js, and full SVG namespace support are open work.
+- The bigger compat blocker today is the **JS environment polyfill tail** — sites whose inline scripts assume a window global was set by a sibling script that didn't get to run, missing analytics shapes, module-loader edge cases. Real component libraries (Shoelace, lit.dev/playground) currently fail upstream of the WC layer for reasons like this, not because of the DOM/JS engine itself.
 - Compatibility breadth is well behind jsdom. jsdom has had years to handle weird real-world JavaScript. This is early.
 
 ## Demo
