@@ -1,6 +1,6 @@
 # heso — The agent-native web engine. No Chromium. No Node. One Rust binary.
 
-**Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs)
+**Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
 
 It fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
 
@@ -14,6 +14,31 @@ batch        ~1.1 s   for 8 URLs in parallel
 ![heso agent demo](demo/demo.gif)
 
 That's a real recording — Claude Code (`claude -p` from the repo root, with the heso skill loaded) discovering the verbs, navigating the page tree, and pulling the live top story off Hacker News. No edits, no replays.
+
+## Install
+
+```sh
+# Python (uv, pipx, or pip — any of them)
+uv tool install heso          # or: pipx install heso  /  pip install heso
+
+# Node
+npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example.com
+
+# Direct binary
+# Windows:
+powershell -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso.zip -OutFile heso.zip; Expand-Archive heso.zip -DestinationPath ."
+```
+
+> Currently shipping `v0.0.1` Windows-x64 only. Linux + macOS binaries land with `v0.0.2` (CI builds wiring up now). On other platforms, [build from source](#building-from-source) for now.
+
+After install, `heso` is on `$PATH`:
+
+```sh
+heso open https://example.com
+# → { url, title, description, tree, actions, plat_hash, ... }
+```
+
+You get JSON: title, description, a heading tree, and a list of clickable elements numbered `@e0`, `@e1`, and so on.
 
 ## A note before you read further
 
@@ -60,27 +85,16 @@ Most of this codebase was written with help from Claude under one person's direc
 - **Sites whose JS we can't run.** QuickJS isn't V8. Most works; some doesn't.
 - **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
 
-## Quickstart
-
-```sh
-cargo build --release -p heso-cli
-./target/release/heso open https://example.com
-```
-
-You get JSON: title, description, a heading tree, and a list of clickable elements numbered `@e0`, `@e1`, and so on.
-
-For the full walk-through — installation, every verb with its inputs and outputs, JSON-RPC integration patterns, recipes — see **[heso.ca/docs](https://www.heso.ca/docs)**.
-
 ## Use as a library
 
-The `heso` PyPI package and `@ixla/heso` npm package both ship two faces of the same bundled binary: a CLI on `PATH` (unchanged) and a programmatic API that spawns that binary under the hood and gives you back parsed JSON as native objects. No FFI, no Python extension module, no N-API addon — subprocess + JSON is the contract.
+The Python (`heso`) and Node (`@ixla/heso`) packages each ship two faces of the same bundled binary: a CLI on `$PATH` and a programmatic API that spawns that binary under the hood and gives you back parsed JSON as native objects. No FFI, no Python extension module, no N-API addon — subprocess + JSON is the contract.
 
 ```python
 # Python
 import heso
 
-page    = heso.open("https://example.com")               # -> dict
-results = heso.search("rust web scraping", limit=5)      # -> dict
+page    = heso.open("https://example.com")              # -> dict
+results = heso.search("rust web scraping", limit=5)     # -> dict
 content = heso.read("https://example.com", complete=True)
 
 # Stateful flow over one long-lived `heso serve` process:
@@ -105,7 +119,7 @@ await session(async (s) => {
 });
 ```
 
-The CLI surface keeps working as-is after install (`heso open URL`, `npx @ixla/heso open URL`). Per-language idioms: Python is `snake_case` + sync, Node is `camelCase` + Promises. Full API at **[heso.ca/docs](https://www.heso.ca/docs)**.
+Per-language idioms: Python is `snake_case` + sync, Node is `camelCase` + Promises. Full API at **[heso.ca/docs](https://www.heso.ca/docs)**.
 
 ## Examples
 
@@ -199,15 +213,9 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 
 No comparisons to other tools — different tools have different tradeoffs and "X is faster than Y" framing rarely survives contact with a real workload.
 
-## Status
+## Building from source
 
-Pre-alpha. Worth trying if the use case fits; not worth depending on in production yet.
-
-## License
-
-MIT or Apache-2.0, your choice.
-
-## Try it
+If you're on Linux/macOS today (v0.0.2 will ship prebuilt binaries) or want to hack on heso itself:
 
 ```sh
 git clone https://github.com/blank3rs/heso
@@ -216,4 +224,16 @@ cargo build --release -p heso-cli
 ./target/release/heso search "rust web scraping" --limit 5
 ```
 
-Full docs: **[heso.ca/docs](https://www.heso.ca/docs)** · Site: **[heso.ca](https://www.heso.ca)**
+Requires Rust 1.80+ (`rustup` from https://rustup.rs).
+
+## Status
+
+Pre-alpha. `v0.0.1` is on every registry. Worth trying if the use case fits; not worth depending on in production yet. Next ([`v0.0.2`](https://github.com/blank3rs/heso/milestone/2)) ships Linux + macOS binaries and the library APIs above.
+
+## License
+
+MIT or Apache-2.0, your choice.
+
+---
+
+Full docs: **[heso.ca/docs](https://www.heso.ca/docs)** · Site: **[heso.ca](https://www.heso.ca)** · npm: **[@ixla/heso](https://www.npmjs.com/package/@ixla/heso)** · PyPI: **[heso](https://pypi.org/project/heso/)**
