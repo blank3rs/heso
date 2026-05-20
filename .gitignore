@@ -132,3 +132,4 @@ identity/private/
 __pycache__/
 *.py[cod]
 *$py.class
+/scripts/release.ps1.example
