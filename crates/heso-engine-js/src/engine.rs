@@ -52,7 +52,7 @@ use crate::modules::{
     HttpFetcher, HttpLoader, HttpResolver, ModuleCache, SharedImportMap,
 };
 use crate::rng::SeededRng;
-use crate::scripts::{self, ScriptFetchPolicy, ScriptOutcome};
+use crate::scripts::{self, ScriptFailure, ScriptFetchPolicy, ScriptOutcome};
 use crate::timers::{self, TimerScheduler};
 
 /// Memory cap per [`JsEngine`]. 256 MB bounds the heap so a runaway
@@ -225,6 +225,19 @@ pub struct JsEngine {
     _runtime: Runtime,
     context: Context,
     console_buffer: Arc<Mutex<Vec<ConsoleEntry>>>,
+    /// Per-engine per-script failure buffer. Populated by the
+    /// `<script>` pump in [`crate::scripts::run_scripts`] every time a
+    /// page script crashes (or its external body fails to fetch).
+    /// Drained by [`Self::drain_script_failures`] when an agent-facing
+    /// caller (CLI verb, JSON-RPC dispatcher) builds the
+    /// `failed_scripts` field of its response envelope.
+    ///
+    /// Shape and ownership mirror [`Self::console_buffer`]: same
+    /// `Arc<Mutex<Vec<…>>>` pattern so the pump can push into it
+    /// without an exclusive engine borrow; same drain-and-clear
+    /// contract so two back-to-back `eval_with_html` calls don't
+    /// double-count earlier failures.
+    script_failures: Arc<Mutex<Vec<ScriptFailure>>>,
     /// Per-engine timer scheduler. Owns the virtual clock and the
     /// pending-timer heap; shared with the JS-side `setTimeout` /
     /// `setInterval` closures and the Rust-side `advance_clock` /
@@ -544,6 +557,10 @@ impl JsEngine {
 
         let context = Context::full(&runtime).map_err(|e| EvalError::Engine(e.to_string()))?;
         let console_buffer: Arc<Mutex<Vec<ConsoleEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        // Mirror of `console_buffer` for per-script failures. Populated
+        // by the `<script>` pump (see [`crate::scripts::run_scripts`])
+        // and drained by [`Self::drain_script_failures`].
+        let script_failures: Arc<Mutex<Vec<ScriptFailure>>> = Arc::new(Mutex::new(Vec::new()));
 
         install_console(&context, console_buffer.clone())?;
         install_dom_classes(&context)?;
@@ -778,6 +795,7 @@ impl JsEngine {
             _runtime: runtime,
             context,
             console_buffer,
+            script_failures,
             timers,
             rng,
             fetch_state,
@@ -1306,6 +1324,46 @@ impl JsEngine {
         out
     }
 
+    /// Drain and return the per-script failure buffer.
+    ///
+    /// Each entry is one [`ScriptFailure`] recorded by the
+    /// `<script>`-pump pass — see [`crate::scripts::run_scripts`] for
+    /// the population rules (synchronous throw, external-script
+    /// fetch failure, import-map parse error). Two back-to-back
+    /// [`Self::install_document`] / [`Self::eval_with_html_capture`]
+    /// calls each see a fresh empty buffer at entry, so a navigation
+    /// or re-load doesn't accumulate stale failures.
+    ///
+    /// Drained on every call (same contract as [`Self::drain_console`])
+    /// — once you read it, the buffer is empty until the next pump
+    /// pass appends to it. The agent-facing CLI verbs (`heso open` /
+    /// `heso read` / `heso wait`) use this to build the
+    /// `failed_scripts` field of their structured-failure envelope.
+    pub fn drain_script_failures(&self) -> Vec<ScriptFailure> {
+        let mut buf = self
+            .script_failures
+            .lock()
+            .expect("script failures buffer poisoned");
+        let out = buf.clone();
+        buf.clear();
+        out
+    }
+
+    /// Peek at the per-script failure buffer **without** clearing it.
+    ///
+    /// Mirror of [`Self::drain_script_failures`] for callers that need
+    /// to inspect failures multiple times in one session (e.g. a
+    /// session-mode `heso serve` RPC that returns the same envelope
+    /// to two clients). The next [`Self::install_document`] /
+    /// [`Self::eval_with_html_capture`] call still clears the buffer
+    /// at entry, so this is safe across navigations.
+    pub fn script_failures_snapshot(&self) -> Vec<ScriptFailure> {
+        self.script_failures
+            .lock()
+            .expect("script failures buffer poisoned")
+            .clone()
+    }
+
     /// Install `document` as a JS global and execute every inline
     /// `<script>` once, **without** then evaluating any user JS.
     ///
@@ -1365,11 +1423,20 @@ impl JsEngine {
             FetchMode::DeterministicNoCassette => None,
         });
         let base_url = self.base_url();
+        // Clear the per-script-failure buffer at the start of a fresh
+        // install. Callers (e.g. [`crate::JsSession::navigate`]) expect
+        // `drain_script_failures` to surface only the failures from
+        // the *current* page, not whatever the previous page produced.
+        self.script_failures
+            .lock()
+            .expect("script failures buffer poisoned")
+            .clear();
         let script_outcome = scripts::run_scripts(
             &self.context,
             &dom,
             policy,
             &self.console_buffer,
+            &self.script_failures,
             script_fetch_client.as_ref(),
             base_url.as_ref(),
             &self.module_cache,
@@ -1495,11 +1562,18 @@ impl JsEngine {
             FetchMode::DeterministicNoCassette => None,
         });
         let base_url = self.base_url();
+        // Same as [`Self::install_document`] — clear per-call so the
+        // structured failures match this eval's `<script>` pump alone.
+        self.script_failures
+            .lock()
+            .expect("script failures buffer poisoned")
+            .clear();
         let script_outcome = scripts::run_scripts(
             &self.context,
             &dom,
             policy,
             &self.console_buffer,
+            &self.script_failures,
             script_fetch_client.as_ref(),
             base_url.as_ref(),
             &self.module_cache,

@@ -106,8 +106,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::{
-    collect_cookies, compute_delta, delta_no_prior, detect_framework, group_forms,
-    merge_submit_fields, parse_include_filter, selector_for_action, ReadSnapshot,
+    attach_failure_envelope, classify_failure_envelope, collect_cookies, compute_delta,
+    delta_no_prior, detect_framework, group_forms, merge_submit_fields, parse_include_filter,
+    selector_for_action, ReadSnapshot,
 };
 
 /// Cap on the per-session `read` snapshot store. After the 8th distinct
@@ -491,6 +492,14 @@ async fn dispatch_open(
             );
         }
     }
+    // Structured-failure envelope: `dispatch_open` does not run the
+    // JS-side script pump (the page is parsed statically and the JS
+    // session is built lazily by the first write verb). We always
+    // emit the envelope per the schema bump — a future enhancement
+    // could opt into hydration here when the caller passes a
+    // best-effort flag through `OpenParams`. For now, the envelope
+    // reports the trivially-clean shape.
+    attach_failure_envelope(&mut payload, false, "ok", &[], 0);
     // Compute the plat_hash AFTER all content fields are in place but
     // BEFORE re-attaching `page_id` (which is server-instance-scoped
     // and would bias the hash). Detach `page_id` from the payload,
@@ -1093,7 +1102,7 @@ async fn dispatch_read(
     // Phase 1: gather everything off the page record + session under
     // the `pages` lock, then DROP it before touching the snapshots
     // mutex. Same nested-lock-avoidance pattern as `dispatch_navigate`.
-    let (mut body, snap, live_url) = {
+    let (mut body, snap, live_url, failed_scripts, console_errors_count) = {
         let mut pages = state.pages.lock().await;
         let record = pages
             .get_mut(&page_id)
@@ -1111,6 +1120,16 @@ async fn dispatch_read(
         let session = record.session.as_ref().expect("session ensured above");
 
         let console = session.engine().drain_console();
+        // Best-effort envelope — session-mode `read` peeks the script
+        // failures snapshot (without clearing) so a subsequent verb on
+        // the same `page_id` still sees the same failure list. This is
+        // the same data the CLI verb's `drain_script_failures` returns
+        // immediately after `JsSession::open_on_engine`.
+        let failed_scripts = session.engine().script_failures_snapshot();
+        let console_errors_count = console
+            .iter()
+            .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
+            .count();
         let post_html = session.document_html();
         let live_url = session.url().clone();
 
@@ -1176,7 +1195,7 @@ async fn dispatch_read(
             &record.current_actions,
             &forms_json,
         );
-        (body, snap, live_url)
+        (body, snap, live_url, failed_scripts, console_errors_count)
     };
 
     // Phase 2: snapshot lookup + delta. Mutex held only for this
@@ -1205,6 +1224,19 @@ async fn dispatch_read(
         );
         obj.insert("delta".to_owned(), delta);
     }
+
+    // Structured-failure envelope — always present per the schema
+    // bump. See [`classify_failure_envelope`] for the
+    // partial_reason vocabulary.
+    let (partial, partial_reason) =
+        classify_failure_envelope(&failed_scripts, console_errors_count);
+    attach_failure_envelope(
+        &mut body,
+        partial,
+        partial_reason,
+        &failed_scripts,
+        console_errors_count,
+    );
 
     let hash = heso_engine_fetch::plat_hash(&body);
     if let Some(obj) = body.as_object_mut() {
@@ -1312,7 +1344,33 @@ async fn dispatch_wait(
         heso_engine_js::wait_for::DEFAULT_TICK_MS,
     )
     .map_err(|e| format!("wait failed: {e}"))?;
-    Ok(outcome.to_json())
+
+    // Drain post-pump structured failures + console errors so the
+    // envelope shape matches `read` / `open`.
+    let console_after = session.engine().drain_console();
+    let failed_scripts = session.engine().drain_script_failures();
+    let console_errors_count = console_after
+        .iter()
+        .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
+        .count();
+
+    let mut body = outcome.to_json();
+    let (mut partial, mut partial_reason) =
+        classify_failure_envelope(&failed_scripts, console_errors_count);
+    if !outcome.ok {
+        // Timeout dominates over a stale script-crash signal — same
+        // policy as the CLI verb.
+        partial = true;
+        partial_reason = "wait_timeout";
+    }
+    attach_failure_envelope(
+        &mut body,
+        partial,
+        partial_reason,
+        &failed_scripts,
+        console_errors_count,
+    );
+    Ok(body)
 }
 
 // ============================================================================

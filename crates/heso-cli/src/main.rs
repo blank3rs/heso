@@ -491,7 +491,7 @@ async fn cmd_meta(args: &[String]) -> ExitCode {
 ///   [`DEFAULT_LINK_CAP`], hard max [`HARD_LINK_CAP`]).
 async fn cmd_open(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] <url>");
         return ExitCode::from(2);
     }
 
@@ -502,6 +502,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let mut url_arg: Option<String> = None;
     let mut explore_depth: u8 = 0;
     let mut link_cap: usize = DEFAULT_LINK_CAP;
+    let mut best_effort = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -537,9 +538,15 @@ async fn cmd_open(args: &[String]) -> ExitCode {
                 }
                 i += 2;
             }
+            "--best-effort" => {
+                best_effort = true;
+                i += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso open [--explore-links N] [--link-cap M] <url>");
+                eprintln!(
+                    "usage: heso open [--explore-links N] [--link-cap M] [--best-effort] <url>"
+                );
                 return ExitCode::from(2);
             }
             _ => {
@@ -557,7 +564,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     }
 
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] <url>");
         return ExitCode::from(2);
     };
 
@@ -585,10 +592,32 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let page = match engine.open_with_explore(&url, opts).await {
         Ok(p) => p,
         Err(e) => {
+            // Hard fetch failures (DNS, connection refused, HTTP error
+            // before any body returned) stay non-zero even under
+            // `--best-effort`: no payload was produced, so there's
+            // nothing to partially return.
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
         }
     };
+
+    // Run the JS-side hydration pump so script-pump errors and
+    // console.error counts are observable as part of the open envelope.
+    // We swallow any hydration-step engine error (rare; alloc /
+    // QuickJS internals) so the static fields still ship.
+    let (failed_scripts, console_errors_count) = hydrate_for_failure_envelope(
+        &engine,
+        &page.body_html,
+        page.url().clone(),
+    );
+    let (partial, partial_reason) =
+        classify_failure_envelope(&failed_scripts, console_errors_count);
+    // Without `--best-effort`, today's contract is "open always
+    // returns the page even if hydration errors happen" — we keep
+    // that. The new partial fields are additive; the flag only
+    // becomes load-bearing on `read` / `wait` where exit-code
+    // semantics change.
+    let _ = best_effort;
 
     // Agent-facing single payload — one subprocess gets the page URL,
     // title, description, full structured metadata, the navigable tree,
@@ -628,6 +657,13 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             );
         }
     }
+    attach_failure_envelope(
+        &mut body,
+        partial,
+        partial_reason,
+        &failed_scripts,
+        console_errors_count,
+    );
     // Compute plat_hash over the canonical form of `body`. The plat
     // module recursively strips any `plat_hash` field at every level
     // before hashing, so embedding it here doesn't poison the hash.
@@ -636,6 +672,119 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
     print_json(&body)
+}
+
+/// Hydrate `html` against a transient [`heso_engine_js::JsSession`]
+/// purely to collect [`heso_engine_js::ScriptFailure`] entries and
+/// count `console.error` calls — the two structured signals the
+/// best-effort failure envelope surfaces.
+///
+/// On success returns `(failed_scripts, console_errors_count)`. On any
+/// engine-internal error (extremely rare — runtime alloc, etc.) we
+/// degrade to `(empty, 0)` so the verb's static portion still ships.
+/// Per the best-effort contract the caller decides the
+/// `partial`/`partial_reason` envelope; this helper only gathers raw
+/// data.
+///
+/// The hydration shares the static-path's `reqwest::Client` and cookie
+/// jar so a `<script src="//cdn">` reference still resolves through
+/// the same network shim. Returned vectors are owned (no engine
+/// borrow leaks) since the transient session is dropped at function
+/// exit.
+fn hydrate_for_failure_envelope(
+    fetch_engine: &FetchEngine,
+    html: &str,
+    page_url: Url,
+) -> (Vec<heso_engine_js::ScriptFailure>, usize) {
+    let client = fetch_engine.client();
+    let cookie_jar = fetch_engine.cookie_jar();
+    let rt_handle = tokio::runtime::Handle::current();
+    let Ok(js_engine) =
+        heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar)
+    else {
+        return (Vec::new(), 0);
+    };
+    let Ok((session, _outcome)) = heso_engine_js::JsSession::open_on_engine(
+        js_engine,
+        html,
+        page_url,
+        heso_engine_js::ScriptFetchPolicy::Fetch,
+    ) else {
+        return (Vec::new(), 0);
+    };
+    let failed = session.engine().drain_script_failures();
+    let console = session.engine().drain_console();
+    let console_errors = console
+        .iter()
+        .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
+        .count();
+    (failed, console_errors)
+}
+
+/// Decide the `partial` + `partial_reason` for the structured-failure
+/// envelope based on the captured per-script failures and the count
+/// of `console.error` calls.
+///
+/// Vocabulary (single string, per the spec contract):
+///
+/// - `"ok"` — no script failures.
+/// - `"script_crash"` — at least one [`heso_engine_js::ScriptFailure`]
+///   with reason `script_crash` (or `importmap_parse_error`, which
+///   shares the shape and is reported under the same bucket because
+///   it's still a code-execution problem).
+/// - `"fetch_failed"` — at least one fetch-failed entry and no
+///   script_crash earlier in document order. A page with both
+///   surfaces `script_crash` because that's the more actionable
+///   signal (page DID run something and crashed; a fetch failure is
+///   a missing prerequisite).
+/// - Console-only errors with no failed scripts still report `"ok"`
+///   for `partial_reason` — the agent can read
+///   `console_errors_count > 0` directly. We surface only structural
+///   failures here; soft signals stay informational.
+pub(crate) fn classify_failure_envelope(
+    failed_scripts: &[heso_engine_js::ScriptFailure],
+    _console_errors_count: usize,
+) -> (bool, &'static str) {
+    for f in failed_scripts {
+        match f.reason.as_str() {
+            "script_crash" | "importmap_parse_error" => {
+                return (true, "script_crash");
+            }
+            "fetch_failed" => {
+                return (true, "fetch_failed");
+            }
+            _ => {}
+        }
+    }
+    (false, "ok")
+}
+
+/// Attach the structured-failure envelope fields to `body`. Always
+/// emits the fields (per the schema bump) — a clean run sees
+/// `partial: false`, `partial_reason: "ok"`, `failed_scripts: []`,
+/// and `console_errors_count: 0`.
+pub(crate) fn attach_failure_envelope(
+    body: &mut serde_json::Value,
+    partial: bool,
+    partial_reason: &str,
+    failed_scripts: &[heso_engine_js::ScriptFailure],
+    console_errors_count: usize,
+) {
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("partial".to_owned(), serde_json::Value::Bool(partial));
+        obj.insert(
+            "partial_reason".to_owned(),
+            serde_json::Value::String(partial_reason.to_owned()),
+        );
+        obj.insert(
+            "failed_scripts".to_owned(),
+            serde_json::to_value(failed_scripts).unwrap_or(serde_json::Value::Array(Vec::new())),
+        );
+        obj.insert(
+            "console_errors_count".to_owned(),
+            serde_json::Value::Number(serde_json::Number::from(console_errors_count)),
+        );
+    }
 }
 
 /// `heso plat-hash <file>` — compute the BLAKE3 hash of a plat JSON
@@ -1059,6 +1208,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let mut url_arg: Option<String> = None;
     let mut include_csv: Option<String> = None;
     let mut since_arg: Option<String> = None;
+    let mut best_effort = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1078,9 +1228,13 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 since_arg = Some(v.clone());
                 i += 2;
             }
+            "--best-effort" => {
+                best_effort = true;
+                i += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] <url>");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1097,7 +1251,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         }
     }
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] <url>");
+        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] <url>");
         return ExitCode::from(2);
     };
 
@@ -1144,6 +1298,10 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    // Under `--best-effort` we never let a hydration engine error
+    // sink the verb — agent can still use the static portion of the
+    // page (title/tree/actions/cookies). Without the flag, today's
+    // behavior was to bail on a hydrate failure; we preserve that.
     let (session, script_outcome) = match heso_engine_js::JsSession::open_on_engine(
         js_engine,
         &page.body_html,
@@ -1152,11 +1310,44 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     ) {
         Ok(pair) => pair,
         Err(e) => {
+            if best_effort {
+                // Surface a synthetic failure envelope and exit 0 with
+                // the static fields the static fetch already produced.
+                // No DOM session means no post-hydration text/forms/
+                // cookies — we still ship the static tree + plat_hash
+                // so the agent has something to inspect.
+                let mut body = serde_json::json!({
+                    "url": page.url().as_str(),
+                    "title": page.tree.title,
+                    "description": page.tree.description,
+                    "metadata": page.metadata,
+                    "tree": page.tree,
+                    "actions": page.actions,
+                });
+                let synthetic_failure = heso_engine_js::ScriptFailure {
+                    url: None,
+                    reason: "script_crash".to_owned(),
+                    message: format!("hydrate failed: {e}"),
+                    line: None,
+                };
+                let failed = vec![synthetic_failure];
+                attach_failure_envelope(&mut body, true, "script_crash", &failed, 0);
+                let hash = heso_engine_fetch::plat_hash(&body);
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+                }
+                return print_json(&body);
+            }
             eprintln!("hydrate failed: {e}");
             return ExitCode::FAILURE;
         }
     };
     let console = session.engine().drain_console();
+    let failed_scripts = session.engine().drain_script_failures();
+    let console_errors_count = console
+        .iter()
+        .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
+        .count();
     let post_html = session.document_html();
 
     // Build the envelope. Start from the same base as `cmd_open`,
@@ -1237,6 +1428,25 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         );
         obj.insert("delta".to_owned(), delta);
     }
+
+    // Structured-failure envelope (`partial`, `partial_reason`,
+    // `failed_scripts`, `console_errors_count`). Always present per
+    // the schema bump. Under `--best-effort` we additionally guarantee
+    // exit 0 — the existing happy path already returns success here
+    // since `JsSession::open_on_engine` succeeded.
+    let (partial, partial_reason) =
+        classify_failure_envelope(&failed_scripts, console_errors_count);
+    attach_failure_envelope(
+        &mut body,
+        partial,
+        partial_reason,
+        &failed_scripts,
+        console_errors_count,
+    );
+    // `best_effort` is consumed in the hydrate-failure short-circuit
+    // above; on this path we always exit 0 anyway (the only way to
+    // reach here is JsSession::open success).
+    let _ = best_effort;
 
     // plat_hash last — same canonical form as `heso open` so an
     // agent that already trusts an `open` plat can verify a `read`
@@ -1744,6 +1954,7 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
     let mut idle_window: Option<u64> = None;
     let mut time_value: Option<String> = None;
     let mut timeout: Option<String> = None;
+    let mut best_effort = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1805,9 +2016,13 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
                 timeout = Some(v.clone());
                 i += 2;
             }
+            "--best-effort" => {
+                best_effort = true;
+                i += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso wait <url> [--selector-exists CSS | --text-contains STR | --url-matches REGEX | --network-idle | --time DUR] [--timeout DUR]");
+                eprintln!("usage: heso wait <url> [--selector-exists CSS | --text-contains STR | --url-matches REGEX | --network-idle | --time DUR] [--timeout DUR] [--best-effort]");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1954,8 +2169,41 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
         }
     };
 
-    let body = outcome.to_json();
-    let exit = if outcome.ok {
+    // Drain post-pump structured failures + console errors so the
+    // wait envelope carries the same shape as `read`/`open` outputs.
+    let console_after = session.engine().drain_console();
+    let failed_scripts = session.engine().drain_script_failures();
+    let console_errors_count = console_after
+        .iter()
+        .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
+        .count();
+
+    let mut body = outcome.to_json();
+    // Default partial classification follows the same rules as
+    // `cmd_open` / `cmd_read` for the script-error case. Wait-timeout
+    // is the wait-specific reason — overlay it AFTER so a timeout
+    // dominates over a stale script-crash signal from earlier in
+    // the page lifecycle (the spec is: "timeout-with-best-effort →
+    // partial_reason wait_timeout").
+    let (mut partial, mut partial_reason): (bool, &'static str) =
+        classify_failure_envelope(&failed_scripts, console_errors_count);
+    if !outcome.ok {
+        partial = true;
+        partial_reason = "wait_timeout";
+    }
+    attach_failure_envelope(
+        &mut body,
+        partial,
+        partial_reason,
+        &failed_scripts,
+        console_errors_count,
+    );
+
+    // Exit-code policy:
+    //   - outcome.ok          → exit 0 (always; same as today).
+    //   - timeout + best-effort → exit 0 (new contract).
+    //   - timeout, no best-effort → exit 1 (today's behavior).
+    let exit = if outcome.ok || best_effort {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)

@@ -331,6 +331,43 @@ pub struct ScriptOutcome {
     pub skipped_non_script_type: usize,
 }
 
+/// One captured per-script failure — surfaced into the `failed_scripts`
+/// field of the `heso open` / `heso read` / `heso wait` envelope when
+/// the agent passes `--best-effort` (or unconditionally as a
+/// `failed_scripts` companion to the same envelope's `console` entries).
+///
+/// Categorical `reason` values keep the agent-facing surface narrow:
+///
+/// - `"script_crash"` — an inline or external script threw a synchronous
+///   exception (`throw new Error(...)`, syntax error, non-Error throw).
+///   This is the dominant failure mode for broken hydration.
+/// - `"fetch_failed"` — an external `<script src=...>` couldn't be
+///   downloaded (HTTP error, DNS, body decode). The script was never
+///   executed.
+/// - `"importmap_parse_error"` — a `<script type="importmap">` data
+///   block failed to parse as a valid import map. The pump continued
+///   with no map installed.
+///
+/// `url` is the resolved (absolute) URL for external scripts, and
+/// `None` for inline scripts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScriptFailure {
+    /// Resolved URL of the failed script — `None` for inline scripts.
+    pub url: Option<String>,
+    /// Categorical failure reason (one of `"script_crash"`,
+    /// `"fetch_failed"`, `"importmap_parse_error"`).
+    pub reason: String,
+    /// Human-readable message — the exception message for crashes, the
+    /// HTTP/transport error text for fetch failures. Always present;
+    /// truncated by the per-throw formatter when long.
+    pub message: String,
+    /// 1-indexed line number inside the script where the exception was
+    /// thrown, when QuickJS provided one. `None` when the engine
+    /// couldn't recover a line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
 /// Run every `<script>` element in `document` against `context`, in
 /// document order, recording outcomes per [`ScriptOutcome`].
 ///
@@ -362,6 +399,7 @@ pub fn run_scripts(
     document: &dom_query::Document,
     policy: ScriptFetchPolicy,
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+    failures: &Arc<Mutex<Vec<ScriptFailure>>>,
     fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
     base_url: Option<&url::Url>,
     module_cache: &ModuleCache,
@@ -404,7 +442,7 @@ pub fn run_scripts(
     // importmap counts"; we just walk the classified vector here.
     for script in &scripts {
         if let ScriptKind::ImportMap { source } = &script.kind {
-            install_import_map(import_map, source, base_url, console_buffer);
+            install_import_map(import_map, source, base_url, console_buffer, failures);
             break;
         }
     }
@@ -422,6 +460,15 @@ pub fn run_scripts(
                 match eval_result? {
                     Some(err_msg) => {
                         outcome.executed_with_error += 1;
+                        push_failure(
+                            failures,
+                            ScriptFailure {
+                                url: None,
+                                reason: "script_crash".to_owned(),
+                                message: err_msg.clone(),
+                                line: extract_line_from_message(&err_msg),
+                            },
+                        );
                         push_console(console_buffer, ConsoleLevel::Error, err_msg);
                     }
                     None => {
@@ -444,6 +491,15 @@ pub fn run_scripts(
                 match eval_one_module(context, &specifier, &source)? {
                     Some(err_msg) => {
                         outcome.executed_with_error += 1;
+                        push_failure(
+                            failures,
+                            ScriptFailure {
+                                url: None,
+                                reason: "script_crash".to_owned(),
+                                message: err_msg.clone(),
+                                line: extract_line_from_message(&err_msg),
+                            },
+                        );
                         push_console(console_buffer, ConsoleLevel::Error, err_msg);
                     }
                     None => {
@@ -457,6 +513,7 @@ pub fn run_scripts(
                     context,
                     policy,
                     console_buffer,
+                    failures,
                     fetch_client,
                     base_url,
                     &src,
@@ -469,6 +526,7 @@ pub fn run_scripts(
                     context,
                     policy,
                     console_buffer,
+                    failures,
                     fetch_client,
                     base_url,
                     &src,
@@ -509,6 +567,7 @@ fn install_import_map(
     source: &str,
     base_url: Option<&url::Url>,
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+    failures: &Arc<Mutex<Vec<ScriptFailure>>>,
 ) {
     // `parse_import_map` needs a base URL to normalize keys + scope
     // prefixes. Without a page URL (bare `eval-js` / similar), fall
@@ -529,11 +588,17 @@ fn install_import_map(
             *import_map.borrow_mut() = map;
         }
         Err(e) => {
-            push_console(
-                console_buffer,
-                ConsoleLevel::Error,
-                format!("heso: <script type=\"importmap\"> failed to parse: {e}"),
+            let msg = format!("heso: <script type=\"importmap\"> failed to parse: {e}");
+            push_failure(
+                failures,
+                ScriptFailure {
+                    url: None,
+                    reason: "importmap_parse_error".to_owned(),
+                    message: msg.clone(),
+                    line: None,
+                },
             );
+            push_console(console_buffer, ConsoleLevel::Error, msg);
         }
     }
 }
@@ -547,6 +612,7 @@ fn handle_external_classic(
     context: &Context,
     policy: ScriptFetchPolicy,
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+    failures: &Arc<Mutex<Vec<ScriptFailure>>>,
     fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
     base_url: Option<&url::Url>,
     src: &str,
@@ -594,6 +660,15 @@ fn handle_external_classic(
                     match eval_result? {
                         Some(err_msg) => {
                             outcome.executed_with_error += 1;
+                            push_failure(
+                                failures,
+                                ScriptFailure {
+                                    url: Some(resolved.clone()),
+                                    reason: "script_crash".to_owned(),
+                                    message: err_msg.clone(),
+                                    line: extract_line_from_message(&err_msg),
+                                },
+                            );
                             push_console(
                                 console_buffer,
                                 ConsoleLevel::Error,
@@ -606,6 +681,16 @@ fn handle_external_classic(
                     }
                 }
                 Err(e) => {
+                    let resolved = resolve_script_src(src, base_url);
+                    push_failure(
+                        failures,
+                        ScriptFailure {
+                            url: Some(resolved),
+                            reason: "fetch_failed".to_owned(),
+                            message: e.clone(),
+                            line: None,
+                        },
+                    );
                     push_console(
                         console_buffer,
                         ConsoleLevel::Error,
@@ -638,6 +723,7 @@ fn handle_external_module(
     context: &Context,
     policy: ScriptFetchPolicy,
     console_buffer: &Arc<Mutex<Vec<ConsoleEntry>>>,
+    failures: &Arc<Mutex<Vec<ScriptFailure>>>,
     fetch_client: Option<&(Arc<reqwest::Client>, tokio::runtime::Handle)>,
     base_url: Option<&url::Url>,
     src: &str,
@@ -685,6 +771,15 @@ fn handle_external_module(
                     match eval_one_module(context, &resolved, &source)? {
                         Some(err_msg) => {
                             outcome.executed_with_error += 1;
+                            push_failure(
+                                failures,
+                                ScriptFailure {
+                                    url: Some(resolved.clone()),
+                                    reason: "script_crash".to_owned(),
+                                    message: err_msg.clone(),
+                                    line: extract_line_from_message(&err_msg),
+                                },
+                            );
                             push_console(
                                 console_buffer,
                                 ConsoleLevel::Error,
@@ -697,6 +792,15 @@ fn handle_external_module(
                     }
                 }
                 Err(e) => {
+                    push_failure(
+                        failures,
+                        ScriptFailure {
+                            url: Some(resolved.clone()),
+                            reason: "fetch_failed".to_owned(),
+                            message: e.clone(),
+                            line: None,
+                        },
+                    );
                     push_console(
                         console_buffer,
                         ConsoleLevel::Error,
@@ -1269,6 +1373,54 @@ fn push_console(buffer: &Arc<Mutex<Vec<ConsoleEntry>>>, level: ConsoleLevel, mes
             args: vec![serde_json::Value::String(message)],
         });
     }
+}
+
+/// Append one [`ScriptFailure`] to the shared failures buffer. Used
+/// by every per-script failure path (inline crash, external crash,
+/// fetch error, import-map parse error) so the agent-facing
+/// `failed_scripts` array carries the same data structure regardless
+/// of which step failed.
+///
+/// Lock-poison-safe in the same shape as [`push_console`] — a
+/// poisoned mutex (extremely rare; happens only if another thread
+/// panicked while holding it) is silently swallowed because losing
+/// one failure record is strictly better than aborting the pump.
+fn push_failure(buffer: &Arc<Mutex<Vec<ScriptFailure>>>, failure: ScriptFailure) {
+    if let Ok(mut buf) = buffer.lock() {
+        buf.push(failure);
+    }
+}
+
+/// Try to recover a 1-indexed line number from an exception message
+/// in the shape [`format_script_error`] produces. The QuickJS stack
+/// format that ships through `exc.stack()` is one of:
+///
+/// ```text
+///     at <eval> (eval_script.js:3)
+///     at fn (eval_script.js:7:5)
+/// ```
+///
+/// The simplest extraction that handles both shapes: find the FIRST
+/// `:NNN` sequence after `eval_script.js` (or `<eval>`) in the second
+/// line of the message — which is where [`format_script_error`]
+/// puts the stack. Returns `None` if no match — the agent still gets
+/// the message, just without a structured line hint.
+fn extract_line_from_message(msg: &str) -> Option<u32> {
+    // Look for a `eval_script.js:NN` substring; that's where QuickJS
+    // emits the line for an anonymous eval. We accept either the
+    // `:LINE` or `:LINE:COL` form.
+    let marker = "eval_script.js:";
+    let start = msg.find(marker)?;
+    let after = &msg[start + marker.len()..];
+    // Take leading digits up to `:` / newline / space / `)`.
+    let digits: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 #[cfg(test)]
