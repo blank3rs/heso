@@ -71,6 +71,42 @@ You get JSON: title, description, a heading tree, and a list of clickable elemen
 
 For the full walk-through — installation, every verb with its inputs and outputs, JSON-RPC integration patterns, recipes — see **[heso.ca/docs](https://www.heso.ca/docs)**.
 
+## Use as a library
+
+The `heso` PyPI package and `@ixla/heso` npm package both ship two faces of the same bundled binary: a CLI on `PATH` (unchanged) and a programmatic API that spawns that binary under the hood and gives you back parsed JSON as native objects. No FFI, no Python extension module, no N-API addon — subprocess + JSON is the contract.
+
+```python
+# Python
+import heso
+
+page    = heso.open("https://example.com")               # -> dict
+results = heso.search("rust web scraping", limit=5)      # -> dict
+content = heso.read("https://example.com", complete=True)
+
+# Stateful flow over one long-lived `heso serve` process:
+with heso.session() as s:
+    s.open("https://example.com")
+    s.click(text="More information...")
+    page = s.read()
+```
+
+```js
+// Node
+import { open, search, read, session } from "@ixla/heso";
+
+const page    = await open("https://example.com");
+const results = await search("rust web scraping", { limit: 5 });
+const content = await read("https://example.com", { complete: true });
+
+await session(async (s) => {
+  await s.open("https://example.com");
+  await s.click({ text: "More information..." });
+  const page = await s.read();
+});
+```
+
+The CLI surface keeps working as-is after install (`heso open URL`, `npx @ixla/heso open URL`). Per-language idioms: Python is `snake_case` + sync, Node is `camelCase` + Promises. Full API at **[heso.ca/docs](https://www.heso.ca/docs)**.
+
 ## Examples
 
 Search the web, then read the top hits in parallel:

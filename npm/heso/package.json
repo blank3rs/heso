@@ -19,11 +19,13 @@
     "automation"
   ],
   "main": "index.js",
+  "types": "index.d.ts",
   "bin": {
     "heso": "bin/heso.js"
   },
   "files": [
     "index.js",
+    "index.d.ts",
     "bin/heso.js",
     "README.md"
   ],

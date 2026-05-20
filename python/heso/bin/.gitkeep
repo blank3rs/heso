@@ -1,0 +1,4 @@
+# This directory is populated at release time by scripts/release.ps1
+# (it copies target/release/heso.exe in here before `python -m build`).
+# Empty in the repo so editable installs from a fresh checkout still
+# work (the library falls back to `heso` on PATH).

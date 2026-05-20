@@ -1,25 +1,39 @@
-# Maturin config for PyPI distribution of the heso CLI.
+# Setuptools config for the `heso` PyPI distribution.
 #
-# This file lives at the workspace root so `maturin build` finds it,
-# but it only describes the PyPI wheel — the Rust workspace itself is
-# still driven by Cargo. The wheel is a binary-only ("bindings = bin")
-# wheel: maturin compiles the `heso` binary from crates/heso-cli and
-# embeds it in the wheel's `scripts/` dir so `pip install heso` puts
-# `heso` on PATH inside the active venv. No Python source.
+# What changed in v0.0.2:
+#   v0.0.1 shipped a binary-only wheel via maturin (`bindings = bin`).
+#   That gave us `heso open URL` on PATH after `pip install heso` but
+#   left zero room for a Python library API. Users asked for both —
+#   subprocess wrapper + import surface.
 #
-# Same pattern as ruff (astral-sh/ruff), uv, deno (sort of), etc.
-# Pinned reference: https://www.maturin.rs/bindings#binary
+# Now: setuptools assembles a *normal* Python package at `python/heso/`
+# that bundles the prebuilt `heso(.exe)` binary as package data under
+# `heso/bin/`. The library (`heso.open`, `heso.read`, etc.) shells out
+# to that bundled binary; the CLI entry point (`[project.scripts]
+# heso`) generates a tiny wrapper that exec's the same binary. Same
+# binary, two faces.
 #
-# The version comes from crates/heso-cli/Cargo.toml (via the workspace
-# version in the root Cargo.toml). Bumping the workspace version is
-# the single edit needed before a release; this file never moves.
+# Build flow:
+#   1. `scripts/release.ps1` builds `target/release/heso.exe` first.
+#   2. The script copies that binary into `python/heso/bin/heso.exe`.
+#   3. `python -m build --wheel --no-isolation` (or `pip wheel . -w
+#      dist/python/`) produces a wheel.
+#   4. The wheel platform tag is fixed up to `py3-none-win_amd64` (the
+#      build script passes `--config-setting=--plat-name=win_amd64`
+#      to bdist_wheel; if the wheel still comes out as `py3-none-any`,
+#      `wheel tags --platform-tag win_amd64 *.whl` rewrites it).
+#   5. `twine upload dist/python/*.whl`.
+#
+# No Rust compilation in the wheel build. The wheel is "pure Python"
+# from setuptools' perspective; the binary is just a data file.
 
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
-build-backend = "maturin"
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "heso"
+version = "0.0.2"
 description = "The agent-native web engine. No Chromium. No Node. One Rust binary."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -31,11 +45,12 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Rust",
     "Topic :: Internet :: WWW/HTTP :: Browsers",
     "Topic :: Software Development :: Libraries",
 ]
-dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://www.heso.ca"
@@ -43,13 +58,54 @@ Documentation = "https://www.heso.ca/docs"
 Repository = "https://github.com/blank3rs/heso"
 Issues = "https://github.com/blank3rs/heso/issues"
 
-[tool.maturin]
-# `bindings = "bin"` tells maturin to produce a wheel that ships the
-# compiled Rust binary as a `scripts/heso` entry. No Python module.
-bindings = "bin"
-# Compile the `heso` binary out of the heso-cli crate. maturin resolves
-# this path relative to the directory containing pyproject.toml.
-manifest-path = "crates/heso-cli/Cargo.toml"
-# Strip debug symbols — release profile already does this, but maturin
-# re-strips after copying so the wheel is as small as possible.
-strip = true
+[project.scripts]
+# `pip install heso` generates a launcher (`heso.exe` on Windows, a
+# shebanged shim on POSIX) that imports this module and calls main().
+# main() exec's into the bundled binary. Net: `heso open URL` works
+# on PATH after install, identical UX to the v0.0.1 maturin wheel.
+heso = "heso.__main__:main"
+
+# ----------------------------------------------------------------------
+# setuptools section — package layout
+# ----------------------------------------------------------------------
+#
+# `package-dir` maps the import name `heso` to the `python/heso`
+# directory in the source tree. This keeps the Rust workspace
+# (`crates/`, `target/`, `Cargo.toml`) at the repo root and the Python
+# wrapper in its own sibling `python/` subdir, which matches the layout
+# astral-sh/ruff, prefix-dev/pixi, and a few other Rust+Python projects
+# settled on.
+#
+# `package-data` ships `bin/heso(.exe)` and the `.gitkeep` inside the
+# wheel. The release script populates `python/heso/bin/heso.exe`
+# before invoking `python -m build`, so the resulting wheel will
+# include the binary alongside the Python source.
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["heso*"]
+
+[tool.setuptools.package-dir]
+"" = "python"
+
+[tool.setuptools.package-data]
+heso = ["bin/heso", "bin/heso.exe", "bin/.gitkeep"]
+
+# ----------------------------------------------------------------------
+# bdist_wheel platform tag
+# ----------------------------------------------------------------------
+#
+# Without this, setuptools would label the wheel `py3-none-any` (a
+# pure-Python wheel that any OS can install). But our wheel ships a
+# Windows-only `.exe`, so we need to mark it Windows-only or pip on
+# Linux/macOS will happily install a wheel that can't actually run.
+#
+# The clean way is `python -m build --wheel -C--plat-name=win_amd64`,
+# but for users who run `pip wheel . -w dist/`, the [tool.distutils]
+# table below also drives the same flag. Belt and braces.
+
+[tool.distutils.bdist_wheel]
+plat-name = "win_amd64"

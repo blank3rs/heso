@@ -50,10 +50,31 @@ function resolveBinary() {
   // package.json (always present) and then derive the bin path next to
   // it — cleaner than asking for `${pkg}/bin/heso.exe` directly since
   // some package managers (pnpm) symlink differently.
+  //
+  // The `paths` option keeps the lookup working when the heso package
+  // itself is symlinked (e.g. `npm install ./local-path` during dev) —
+  // without it, the resolver only walks up from the package's real
+  // dir, which is somewhere else entirely from the consumer's
+  // node_modules/.
+  const lookupRoots = [__dirname, process.cwd()];
+  if (require.main && require.main.filename) lookupRoots.push(path.dirname(require.main.filename));
   let pkgJsonPath;
   try {
-    pkgJsonPath = require.resolve(`${entry.pkg}/package.json`);
+    pkgJsonPath = require.resolve(`${entry.pkg}/package.json`, { paths: lookupRoots });
   } catch (err) {
+    // Last-ditch: walk upward from each candidate root looking for
+    // node_modules/<pkg>/bin/<bin>. Catches hoisted / monorepo
+    // layouts the require.resolve sweep missed.
+    for (const root of lookupRoots) {
+      let dir = root;
+      for (let i = 0; i < 12; i++) {
+        const candidate = path.join(dir, "node_modules", entry.pkg, "bin", entry.bin);
+        if (fs.existsSync(candidate)) return { binPath: candidate };
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    }
     return { error: "missing-platform-package", key, pkg: entry.pkg };
   }
   const binPath = path.join(path.dirname(pkgJsonPath), "bin", entry.bin);

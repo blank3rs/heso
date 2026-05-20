@@ -109,3 +109,26 @@ heso-local-data/
 identity/private/
 *.priv
 *.pem
+
+# Bundled-binary slots — populated at release time, never committed.
+# The PyPI wheel build copies target/release/heso.exe into
+# python/heso/bin/; the npm publish step does the same for the
+# per-platform package. Source-tree checkouts keep these slots empty
+# (the .gitkeep is what's committed) so library callers fall back to
+# `heso` on PATH while developing.
+/python/heso/bin/heso
+/python/heso/bin/heso.exe
+/python/heso/bin/*.pdb
+/npm/platforms/win32-x64/bin/heso
+/npm/platforms/win32-x64/bin/heso.exe
+
+# setuptools build artifacts (from `python -m build` etc.)
+/build/
+/dist/python/
+/python/heso.egg-info/
+*.egg-info/
+
+# Python bytecode caches (from `pip install -e .` and import-time)
+__pycache__/
+*.py[cod]
+*$py.class
