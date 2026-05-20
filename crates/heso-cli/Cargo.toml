@@ -35,6 +35,20 @@ regex.workspace = true
 # same crate `heso-engine-fetch` uses for `plat_hash`, no new
 # top-level dep introduced.
 blake3.workspace = true
+# `reqwest` powers the `heso search` verb's standalone HTTP client.
+# We can't reuse `FetchEngine::client()` for DDG/Wiki because that
+# client identifies as `heso/<version>` — DDG HTML serves anti-bot
+# pages to non-browser-shaped UAs. Search builds its own client with
+# the `Mozilla/5.0 (compatible; heso/0.0.1)` UA that matches what JS
+# already exposes via `navigator.userAgent`. Workspace dep.
+reqwest.workspace = true
+# `scraper` is used by the search verb's DuckDuckGo HTML parser. Same
+# crate `heso-engine-fetch` uses for the action graph and tree
+# extraction — no new top-level dep introduced.
+scraper.workspace = true
+# `url::form_urlencoded` is used by the search verb to build the DDG
+# POST body and unwrap the `uddg=` redirect parameter.
+url.workspace = true
 # Global allocator: mimalloc beats Windows' UCRT allocator by
 # 20–50% on alloc-heavy workloads (reqwest body buffers, scraper
 # tree, serde_json, canonical-JSON writes) and has near-zero init

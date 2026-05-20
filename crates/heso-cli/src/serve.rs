@@ -165,7 +165,7 @@ const INTERNAL_ERROR: i32 = -32603;
 /// `match` arms in [`handle`].
 const ADVERTISED_METHODS: &[&str] = &[
     "open", "ls", "cat", "find", "close", "ping", "fill", "click", "submit", "eval", "navigate",
-    "read", "wait",
+    "read", "wait", "search",
 ];
 
 // ============================================================================
@@ -414,6 +414,7 @@ async fn handle(state: Arc<ServerState>, line: &str) -> Response {
         "navigate" => dispatch_navigate(state.clone(), req.params).await,
         "read" => dispatch_read(state.clone(), req.params).await,
         "wait" => dispatch_wait(state.clone(), req.params).await,
+        "search" => dispatch_search(req.params).await,
         m => {
             return error_response(id, METHOD_NOT_FOUND, format!("unknown method `{m}`"));
         }
@@ -1510,6 +1511,62 @@ async fn dispatch_wait(
         console_errors_count,
     );
     Ok(body)
+}
+
+// ============================================================================
+// `search` method — stateless (no `page_id`)
+// ============================================================================
+
+/// JSON-RPC params for the `search` method. Stateless — no `page_id`,
+/// no session, no `engine` reuse with the rest of the server. Defaults
+/// match the CLI verb: 30-result cap, `ddg,wiki` engines, SearXNG only
+/// if a URL is supplied (or `HESO_SEARX_URL` is set in the parent
+/// process env).
+#[derive(Deserialize)]
+struct SearchParams {
+    query: String,
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Comma-separated string like `"ddg,wiki"`, OR a JSON array of
+    /// strings. Either shape is accepted to keep RPC clients honest —
+    /// JSON arrays are the obvious form, but TOML / env / config-file
+    /// callers that already have a string can pass that too.
+    #[serde(default)]
+    engines: Option<serde_json::Value>,
+    #[serde(default)]
+    searx_url: Option<String>,
+}
+
+async fn dispatch_search(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let p: SearchParams =
+        serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
+    let query = p.query.trim().to_owned();
+    if query.is_empty() {
+        return Err("search: `query` must not be empty".to_owned());
+    }
+    let limit = p
+        .limit
+        .unwrap_or(crate::search::DEFAULT_LIMIT)
+        .clamp(1, crate::search::MAX_LIMIT);
+    let engines = match p.engines {
+        None => vec![crate::search::Engine::Ddg, crate::search::Engine::Wiki],
+        Some(v) => crate::search::parse_engines_value(&v)?,
+    };
+    let searx_url = match p.searx_url {
+        Some(s) if !s.trim().is_empty() => Some(s),
+        _ => std::env::var(crate::search::SEARX_URL_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+    };
+    let req = crate::search::SearchRequest {
+        query,
+        limit,
+        engines,
+        searx_url,
+    };
+    crate::search::run_search(&req).await
 }
 
 // ============================================================================

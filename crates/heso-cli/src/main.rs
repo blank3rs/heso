@@ -59,6 +59,13 @@
 //!   are recorded individually; only the initial fetch failing fails the
 //!   call. Useful for handing the agent a static map of a small subset of
 //!   the site in one round-trip.
+//! - `heso search <query>` — First-class multi-source web search verb.
+//!   DDG HTML + Wikipedia REST summary by default (no API keys);
+//!   optional SearXNG via `--searx-url` or `HESO_SEARX_URL`. Pure HTTP
+//!   + HTML parsing — no JS engine. Round-robin ranked merge across
+//!   engines, dedupe by canonical URL. Wikipedia goes in the
+//!   top-level `knowledge` block, not in `results`. See
+//!   [`crate::search`] for the full design.
 //! - `heso plat-hash <file>` — Compute the BLAKE3 hash of a plat JSON
 //!   file (the output of `heso open`). Any embedded `plat_hash` field
 //!   is IGNORED during hashing; the printed value is the hash of the
@@ -87,6 +94,7 @@
 //! [ADR 0016]: ../../decisions/0016-positioning-headless-browser-for-agents.md
 
 mod batch;
+mod search;
 mod serve;
 
 // Replace the system allocator with mimalloc. Windows' UCRT
@@ -160,6 +168,14 @@ fn print_banner() {
     println!("                                --field name=value     repeatable; matched by input `name` attribute.");
     println!("                                --data '{{\"k\":\"v\"}}'    JSON dict alternative; --field wins on the same name.");
     println!("                                File inputs are skipped (PR-X4 will ship FormData/Blob/File globals).");
+    println!("  heso search <query>           Multi-backend web search: DDG HTML + Wikipedia summary (default).");
+    println!("                                Pure HTTP + HTML — no JS engine spin-up. No API key required.");
+    println!("    [--limit N]                    Max merged results (default 30, max 100). Wikipedia goes in");
+    println!("                                   the top-level `knowledge` block, not in `results`.");
+    println!("    [--engines ddg,wiki,searxng]   Pick subset (default ddg,wiki). Round-robin ranked merge,");
+    println!("                                   dedupe by canonical URL.");
+    println!("    [--searx-url URL]              Optional SearXNG base URL. Also reads HESO_SEARX_URL env.");
+    println!("                                   Most public instances disable JSON output by default.");
     println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
     println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
     println!("  heso eval-js [--seed N] <js>  [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
@@ -4833,6 +4849,7 @@ async fn main() -> ExitCode {
         Some("click") => cmd_click(&args[1..]).await,
         Some("fill") => cmd_fill(&args[1..]).await,
         Some("submit") => cmd_submit(&args[1..]).await,
+        Some("search") => search::cmd_search(&args[1..]).await,
         Some("serve") => serve::run().await,
         Some("action-hash") => cmd_action_hash(&args[1..]).await,
         Some("action-hash-verify") => cmd_action_hash_verify(&args[1..]).await,

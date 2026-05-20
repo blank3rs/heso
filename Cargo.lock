@@ -829,10 +829,13 @@ dependencies = [
  "heso-trace-exec",
  "mimalloc",
  "regex",
+ "reqwest",
+ "scraper",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
  "wiremock",
 ]
 
