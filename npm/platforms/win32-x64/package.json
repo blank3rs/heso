@@ -1,6 +1,6 @@
 {
   "name": "@ixla/heso-win32-x64",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Windows x86_64 binary for @ixla/heso. Do not install directly.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
