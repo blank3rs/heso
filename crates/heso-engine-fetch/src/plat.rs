@@ -349,6 +349,64 @@ mod tests {
         assert_ne!(before, hash(&v));
     }
 
+    // ------------------------------------------------------------------
+    // URL-in-hash invariant tests. These exist because the public
+    // contract "different URLs produce different plat hashes" is the
+    // load-bearing claim behind plat-hash content addressing. If any
+    // future refactor adds `url` / `input_url` to EPHEMERAL_OBJECT_KEYS,
+    // changes the canonical-form pass to normalize URLs aggressively,
+    // or drops either field from the hash input, these tests trip.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn different_urls_produce_different_plat_hashes() {
+        let a = json!({
+            "url": "https://example.com/a",
+            "title": "X", "tree": [], "actions": [],
+        });
+        let b = json!({
+            "url": "https://example.com/b",
+            "title": "X", "tree": [], "actions": [],
+        });
+        assert_ne!(
+            hash(&a), hash(&b),
+            "different `url` MUST yield different plat_hash"
+        );
+    }
+
+    #[test]
+    fn different_input_urls_produce_different_plat_hashes() {
+        // heso emits both `url` (post-redirect, normalized) and
+        // `input_url` (verbatim user input). Casing-only differences
+        // in the user input would collapse on `url` (Url::as_str()
+        // lowercases the host), but `input_url` preserves them — so
+        // the hash still differentiates the two callers.
+        let a = json!({
+            "url": "https://x.com/",
+            "input_url": "https://X.com/",
+            "title": "X",
+        });
+        let b = json!({
+            "url": "https://x.com/",
+            "input_url": "https://x.com/",
+            "title": "X",
+        });
+        assert_ne!(
+            hash(&a), hash(&b),
+            "different `input_url` MUST yield different plat_hash"
+        );
+    }
+
+    #[test]
+    fn url_and_input_url_keys_are_not_ephemeral() {
+        // Source-of-truth pin: the two tests above could pass by
+        // accident if any other field varied. This checks the
+        // ephemeral-keys list directly so a careless "add url to the
+        // stripped set" PR fails the suite at the moment of edit.
+        assert!(!is_ephemeral("url"),       "`url` MUST NOT be ephemeral");
+        assert!(!is_ephemeral("input_url"), "`input_url` MUST NOT be ephemeral");
+    }
+
     #[test]
     fn verify_round_trip_passes() {
         let mut v = sample();
