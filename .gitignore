@@ -141,7 +141,9 @@ __pycache__/
 /npm/platforms/linux-arm64/bin/heso.exe
 /npm/platforms/linux-x64/bin/heso
 /npm/platforms/linux-x64/bin/heso.exe
-bug-reports/scratch/
-bug-reports/raw/
-bug-reports/triage/*.raw
-bug-reports/triage/*.json
+# Agent-authored research / bug reports / triage / regression notes —
+# never published. ANY .md or scratch artifact an agent writes for
+# investigation purposes belongs in a gitignored dir like /research/,
+# /.agent/, /proposals/, or /bug-reports/. See AGENTS.md → "Where
+# transient agent reports go" and CLAUDE.md → "Don't" for the rule.
+/bug-reports/
