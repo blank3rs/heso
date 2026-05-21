@@ -185,6 +185,13 @@ fn set_current_script(context: &Context, shape: CurrentScriptShape<'_>) -> Resul
             if (typeof document !== 'undefined') {
                 document.currentScript = {
                     tagName: 'SCRIPT',
+                    // `localName` lowercased — the HTMLScriptElement
+                    // hasInstance discriminator (custom_elements.rs)
+                    // matches on the lowercase form, so a synthetic
+                    // currentScript shim missing this fails the
+                    // `currentScript instanceof HTMLScriptElement`
+                    // check Next.js's webpack runtime does.
+                    localName: 'script',
                     nodeName: 'SCRIPT',
                     nodeType: 1,
                     src: '',
@@ -221,6 +228,10 @@ fn set_current_script(context: &Context, shape: CurrentScriptShape<'_>) -> Resul
                 var __hesoCsRes = {resolved_lit};
                 document.currentScript = {{
                     tagName: 'SCRIPT',
+                    // See InlineClassic branch: localName is the
+                    // discriminator HTMLScriptElement's hasInstance
+                    // checks against.
+                    localName: 'script',
                     nodeName: 'SCRIPT',
                     nodeType: 1,
                     src: __hesoCsRes,
