@@ -918,6 +918,97 @@ impl Document {
         }
     }
 
+    /// `document.getElementsByClassName(className)` — return every
+    /// element whose `class` attribute contains every token in
+    /// `className` (whitespace-separated). Document order.
+    ///
+    /// Bug-report 03 cluster P0: HN's `hn.js`, Sphinx-generated
+    /// python docs, k8s docs, anthropic docs, and every page that
+    /// ships pre-jQuery legacy script all start with
+    /// `document.getElementsByClassName("...")` calls; without this
+    /// method the first inline script crashes immediately and the
+    /// rest of hydration never runs.
+    ///
+    /// Per the WHATWG DOM spec, multiple class tokens may be passed
+    /// separated by ASCII whitespace; the returned collection is the
+    /// intersection (every element must have *all* tokens). Empty
+    /// `className` returns an empty collection (DOM spec: "If
+    /// classes is the empty set, return an empty HTMLCollection").
+    ///
+    /// Like [`Self::get_elements_by_tag_name`], we return a plain
+    /// array rather than a live `HTMLCollection` — real-world callers
+    /// (the report-cited scripts) iterate immediately, and the
+    /// liveness property has no observable difference on a
+    /// single-pass extraction.
+    ///
+    /// Spec: <https://dom.spec.whatwg.org/#dom-document-getelementsbyclassname>.
+    fn get_elements_by_class_name(&self, class_name: String) -> Vec<Element> {
+        let tokens: Vec<&str> = class_name.split_ascii_whitespace().collect();
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        // Build a single compound CSS selector `.a.b.c` so dom_query's
+        // selector engine does the matching in one pass. The class
+        // tokens are passed verbatim — CSS already accepts almost the
+        // same set of identifier characters as the HTML class
+        // attribute. If a token contains characters CSS rejects (e.g.
+        // a literal dot or bracket), `try_select` returns None and we
+        // fall back to a manual walk so the agent still gets matches.
+        let css = tokens
+            .iter()
+            .map(|t| format!(".{t}"))
+            .collect::<String>();
+        if let Some(sel) = self.doc.try_select(&css) {
+            return sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect();
+        }
+        // Manual fallback: walk every element and intersect the
+        // attribute's class list with `tokens`. Slow but correct for
+        // dotted/quoted class names the CSS path rejects.
+        let mut out = Vec::new();
+        let root = self.doc.tree.root();
+        for descendant in root.descendants_it() {
+            if !descendant.is_element() {
+                continue;
+            }
+            let class_attr = match descendant.attr("class") {
+                Some(c) => c.to_string(),
+                None => continue,
+            };
+            let have: Vec<&str> = class_attr.split_ascii_whitespace().collect();
+            if tokens.iter().all(|t| have.iter().any(|h| h == t)) {
+                out.push(Element::from_id(self.doc.clone(), descendant.id));
+            }
+        }
+        out
+    }
+
+    /// `document.getElementsByName(name)` — return every element whose
+    /// `name` content attribute matches `name`, in document order.
+    ///
+    /// Per WHATWG HTML §3.1.4, returns a live NodeList; we return a
+    /// plain array for parity with the sibling accessors. Useful for
+    /// legacy forms code that walks named inputs (`document.getElementsByName('username')[0]`).
+    ///
+    /// Spec: <https://html.spec.whatwg.org/multipage/dom.html#dom-document-getelementsbyname>.
+    fn get_elements_by_name(&self, name: String) -> Vec<Element> {
+        // CSS attribute selector handles the simple case. The value
+        // is wrapped in double-quotes so attribute values containing
+        // hyphens / dots round-trip cleanly.
+        let css = format!("[name=\"{}\"]", name.replace('"', "\\\""));
+        match self.doc.try_select(&css) {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|n| Element::from_id(self.doc.clone(), n.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     // ===== HTMLCollection accessors (WHATWG HTML §3.1.4) =====================
     //
     // `document.scripts` / `.forms` / `.images` / `.links` /
@@ -1620,6 +1711,40 @@ impl Element {
         Ok(proxy)
     }
 
+    /// `element.style = "color: red; display: none"` — string-coercion
+    /// setter. Per CSSOM §6 ("CSS declaration blocks"), assigning a
+    /// string to `.style` is equivalent to setting `.style.cssText`
+    /// (parse the value as a CSS declaration list and replace the
+    /// inline `style="..."` attribute). Without this setter, QuickJS
+    /// rejects the assignment with `no setter for property` — which
+    /// is what `docs.rs/serde`'s `menu.js` and the Reuters DataDome
+    /// captcha agent both crash on (bug-report 03 P1, bug-report 01
+    /// P1).
+    ///
+    /// The accepted shape is whatever JS coerces to a string:
+    /// `el.style = "color: red"`, `el.style = ""` (clear), `el.style =
+    /// null` / `undefined` (also clear per spec — null and undefined
+    /// stringify to "null" / "undefined", but our `Option<Coerced>`
+    /// route maps them to "" so the cleared-state matches author
+    /// intent).
+    ///
+    /// We do *not* re-parse the input to validate — we mirror the
+    /// HTML attribute layer's loose acceptance. The downstream
+    /// `__hesoMakeStyleProxy` reads/serializes via the same
+    /// `parseStyle` / `serializeStyle` pair, so subsequent property
+    /// reads round-trip correctly through the same kebab-case
+    /// normalization.
+    ///
+    /// Spec: <https://drafts.csswg.org/cssom/#dom-elementcssinlinestyle-style>.
+    #[qjs(set, rename = "style")]
+    fn set_style(&self, value: Option<rquickjs::Coerced<String>>) {
+        let Some(n) = self.node_ref() else { return };
+        match value {
+            Some(s) => n.set_attr("style", &s.0),
+            None => n.set_attr("style", ""),
+        }
+    }
+
     /// `element.getAttribute(name)` — return the attribute value, or
     /// `null` if not present.
     fn get_attribute(&self, name: String) -> Option<String> {
@@ -1691,6 +1816,52 @@ impl Element {
             Some(n) => n,
             None => return Vec::new(),
         };
+        match dom_query::Selection::from(n).try_select(&selector) {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|nr| Element::from_id(self.doc.clone(), nr.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `element.getElementsByClassName(className)` — descendants of
+    /// this element whose `class` attribute contains every token in
+    /// `className`. See [`Document::get_elements_by_class_name`] for
+    /// the spec rationale; this is the element-rooted form.
+    fn get_elements_by_class_name(&self, class_name: String) -> Vec<Element> {
+        let tokens: Vec<&str> = class_name.split_ascii_whitespace().collect();
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let n = match self.node_ref() {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+        let css = tokens
+            .iter()
+            .map(|t| format!(".{t}"))
+            .collect::<String>();
+        match dom_query::Selection::from(n).try_select(&css) {
+            Some(sel) => sel
+                .nodes()
+                .iter()
+                .map(|nr| Element::from_id(self.doc.clone(), nr.id))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `element.getElementsByTagName(name)` — descendants of this
+    /// element whose tag matches `name`, in document order. `"*"`
+    /// matches every descendant element.
+    fn get_elements_by_tag_name(&self, name: String) -> Vec<Element> {
+        let n = match self.node_ref() {
+            Some(n) => n,
+            None => return Vec::new(),
+        };
+        let selector = if name == "*" { "*".to_owned() } else { name };
         match dom_query::Selection::from(n).try_select(&selector) {
             Some(sel) => sel
                 .nodes()

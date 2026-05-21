@@ -262,6 +262,10 @@ pub struct JsEngine {
     /// construction — the QuickJS runtime is `!Send`, so the engine
     /// never crosses a thread boundary.
     fetch_state: Option<FetchState>,
+    /// Per-engine pending-XHR queue + XHR mode. Same shape as
+    /// [`Self::fetch_state`]; populated only when the host built the
+    /// engine with a fetch client (see [`crate::xhr`]).
+    xhr_state: Option<XhrState>,
     /// Per-engine "current page URL" — used to resolve relative
     /// `<script src="...">` references during inline-script execution
     /// and as the referrer for dynamic `import(...)` calls.
@@ -369,6 +373,14 @@ pub type ModuleResolveFn = Box<dyn Fn(&str, &Url) -> Result<(Url, String), Strin
 /// Bundles a per-engine fetch queue with the mode that drives it.
 pub(crate) struct FetchState {
     pub(crate) queue: Arc<FetchQueue>,
+    pub(crate) mode: FetchMode,
+}
+
+/// Bundles a per-engine XHR queue with the mode that drives it. Same
+/// shape as [`FetchState`]; lives alongside it so XHR and fetch can
+/// be drained independently in [`JsEngine::run_pending_jobs`].
+pub(crate) struct XhrState {
+    pub(crate) queue: Arc<crate::xhr::XhrQueue>,
     pub(crate) mode: FetchMode,
 }
 
@@ -683,6 +695,24 @@ impl JsEngine {
             None
         };
 
+        // Install `XMLHttpRequest` global. Backed by the same fetch
+        // mode (and reqwest client when Live) so cookies, the
+        // User-Agent, and recorded-network playback stay coherent
+        // with the rest of the workspace. See [`crate::xhr`].
+        // Closes bug-report 03 P1 / bug-report 01 P0 cluster — every
+        // analytics SDK feature-detects on `typeof XMLHttpRequest`.
+        let xhr_state = if let Some(fs) = fetch_state.as_ref() {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let queue = Arc::new(crate::xhr::XhrQueue::new());
+            crate::xhr::install_xhr(&context, fs.mode.clone(), queue.clone())?;
+            Some(XhrState {
+                queue,
+                mode: fs.mode.clone(),
+            })
+        } else {
+            None
+        };
+
         // Install `__hesoFormSubmitNow(form)` — the JS-side IDL method
         // `HTMLFormElement.prototype.submit()` calls into this helper
         // to issue the HTTP request without firing the `submit` event
@@ -800,6 +830,7 @@ impl JsEngine {
             timers,
             rng,
             fetch_state,
+            xhr_state,
             base_url,
             module_cache,
             module_resolver,
@@ -1070,25 +1101,33 @@ impl JsEngine {
             //    `.then` callbacks as new microtasks, which the next
             //    iteration's pump will drain.
             let drained = fetch::drain_pending(&self.context, &fs.queue, &fs.mode)?;
-            if drained == 0 {
-                // No fetches queued during this round. One more
-                // pump for microtasks the previous drain's resolves
-                // may have scheduled, then check if any setTimeout(0)
-                // callbacks are due (bug-report 03 P2 — Promise
+            // 2b. Drain any XHRs queued via `xhr.send()`. Same pump
+            //     shape as fetch — `onreadystatechange` callbacks fire
+            //     synchronously inside `xhr::drain_pending`.
+            let xhr_drained = if let Some(xs) = self.xhr_state.as_ref() {
+                crate::xhr::drain_pending(&self.context, &xs.queue, &xs.mode)?
+            } else {
+                0
+            };
+            if drained == 0 && xhr_drained == 0 {
+                // No fetches or XHRs queued. Pump microtasks, then
+                // fire any due-now timers (bug-report 03 P2 — Promise
                 // resolvers handed off via `new Promise(r =>
                 // setTimeout(r, 0))` land on the timer queue, NOT
-                // the microtask queue).
+                // the microtask queue), then drain follow-on microtasks.
                 self.execute_pending_jobs_until_idle()?;
                 self.fire_due_timers_and_drain_microtasks()?;
-                // Belt-and-braces: a `.then` on a just-resolved
-                // fetch could in principle queue another fetch.
-                // If so, loop. Otherwise we're idle.
-                if fs.queue.len() == 0 {
+                let xhr_pending = self
+                    .xhr_state
+                    .as_ref()
+                    .map(|xs| xs.queue.len())
+                    .unwrap_or(0);
+                if fs.queue.len() == 0 && xhr_pending == 0 {
                     return Ok(total);
                 }
                 continue;
             }
-            total += drained;
+            total += drained + xhr_drained;
         }
         Err(EvalError::Engine(format!(
             "pending-jobs pump exceeded {MAX_PUMP_ROUNDS} rounds - possible infinite fetch loop"
@@ -3875,6 +3914,176 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     if (typeof globalThis.cancelAnimationFrame !== 'function') {
         globalThis.cancelAnimationFrame = function(id) {
             clearTimeout(id);
+        };
+    }
+
+    // -------------------------------------------------------------
+    // performance.mark / .measure / .clearMarks / .clearMeasures /
+    // .getEntriesByName / .getEntriesByType / .getEntries
+    //
+    // WHATWG performance-timeline:
+    //   <https://w3c.github.io/performance-timeline/>
+    //   <https://w3c.github.io/user-timing/>
+    //
+    // Bug-report 03 cluster P0: every github-assets bundle starts with
+    // `performance.mark("js-parse-end:high-contrast-cookie...")`; SPA
+    // framework runtimes (Next.js, Vue's dev probes, Sentry, Datadog
+    // RUM) sprinkle `performance.mark`/`measure` throughout boot.
+    // Before this fix 93/93 external scripts on github.com died on
+    // line 1 with `not a function`. Implementing the mark/measure
+    // arithmetic deterministically (against the VirtualClock-backed
+    // performance.now()) is cheap and unblocks the whole class.
+    //
+    // The entries buffer is per-engine; the simple in-memory shape
+    // matches the spec's PerformanceEntry interface enough that the
+    // sniffer-shaped reads (`getEntriesByType('mark').length > 0`,
+    // `getEntriesByName(name).pop().duration`) work as expected.
+    //
+    // We hang the entries off the existing `performance` POJO via a
+    // closure-private array so other code can't accidentally clobber
+    // them. Marks set duration: 0 by spec; measures compute it from
+    // the start/end mark timestamps (or `performance.now()` when a
+    // mark name is omitted, mirroring the spec's missing-argument
+    // branches).
+    // -------------------------------------------------------------
+    if (typeof globalThis.performance === 'object'
+        && typeof globalThis.performance.mark !== 'function') {
+        var perfEntries = [];
+
+        function findLastEntryNamed(name) {
+            for (var i = perfEntries.length - 1; i >= 0; i--) {
+                if (perfEntries[i].name === name) return perfEntries[i];
+            }
+            return null;
+        }
+
+        function PerformanceEntry(name, entryType, startTime, duration, detail) {
+            this.name = name;
+            this.entryType = entryType;
+            this.startTime = startTime;
+            this.duration = duration;
+            if (detail !== undefined) this.detail = detail;
+            // toJSON per spec: same fields as the constructor.
+            this.toJSON = function() {
+                return {
+                    name: name,
+                    entryType: entryType,
+                    startTime: startTime,
+                    duration: duration
+                };
+            };
+        }
+
+        // performance.mark(name, options?) — store a zero-duration
+        // entry under `entryType: "mark"`. Returns the new entry per
+        // the WHATWG user-timing 2 spec (level 2 returns the entry;
+        // level 1 returned void — modern call-sites assume level 2).
+        globalThis.performance.mark = function(name, options) {
+            var n = String(name == null ? '' : name);
+            var detail = (options && typeof options === 'object')
+                ? options.detail : undefined;
+            var startTime = (options && typeof options === 'object'
+                            && typeof options.startTime === 'number')
+                ? options.startTime
+                : globalThis.performance.now();
+            var entry = new PerformanceEntry(n, 'mark', startTime, 0, detail);
+            perfEntries.push(entry);
+            return entry;
+        };
+
+        // performance.measure(name, startMark?, endMark?) — spec also
+        // accepts a single object-options form, which we honor too.
+        // Returns the new entry (user-timing level 2).
+        globalThis.performance.measure = function(name, startOrOpts, endMark) {
+            var n = String(name == null ? '' : name);
+            var startTime, endTime, detail;
+            if (startOrOpts !== undefined && typeof startOrOpts === 'object'
+                && startOrOpts !== null) {
+                // Options form: { start?, end?, duration?, detail? }
+                detail = startOrOpts.detail;
+                var startSpec = startOrOpts.start;
+                var endSpec = startOrOpts.end;
+                var durSpec = startOrOpts.duration;
+                if (typeof startSpec === 'number') {
+                    startTime = startSpec;
+                } else if (typeof startSpec === 'string') {
+                    var sMark = findLastEntryNamed(startSpec);
+                    startTime = sMark ? sMark.startTime : 0;
+                } else {
+                    startTime = 0;
+                }
+                if (typeof endSpec === 'number') {
+                    endTime = endSpec;
+                } else if (typeof endSpec === 'string') {
+                    var eMark = findLastEntryNamed(endSpec);
+                    endTime = eMark ? eMark.startTime : globalThis.performance.now();
+                } else if (typeof durSpec === 'number') {
+                    endTime = startTime + durSpec;
+                } else {
+                    endTime = globalThis.performance.now();
+                }
+            } else {
+                // Positional form: performance.measure(name, startMark?, endMark?).
+                if (typeof startOrOpts === 'string') {
+                    var sMark2 = findLastEntryNamed(startOrOpts);
+                    startTime = sMark2 ? sMark2.startTime : 0;
+                } else {
+                    startTime = 0;
+                }
+                if (typeof endMark === 'string') {
+                    var eMark2 = findLastEntryNamed(endMark);
+                    endTime = eMark2 ? eMark2.startTime : globalThis.performance.now();
+                } else {
+                    endTime = globalThis.performance.now();
+                }
+            }
+            var duration = endTime - startTime;
+            if (duration < 0) duration = 0; // spec clamps to >= 0
+            var entry = new PerformanceEntry(n, 'measure', startTime, duration, detail);
+            perfEntries.push(entry);
+            return entry;
+        };
+
+        globalThis.performance.clearMarks = function(name) {
+            if (name === undefined) {
+                perfEntries = perfEntries.filter(function(e) {
+                    return e.entryType !== 'mark';
+                });
+                return;
+            }
+            var n = String(name);
+            perfEntries = perfEntries.filter(function(e) {
+                return !(e.entryType === 'mark' && e.name === n);
+            });
+        };
+
+        globalThis.performance.clearMeasures = function(name) {
+            if (name === undefined) {
+                perfEntries = perfEntries.filter(function(e) {
+                    return e.entryType !== 'measure';
+                });
+                return;
+            }
+            var n = String(name);
+            perfEntries = perfEntries.filter(function(e) {
+                return !(e.entryType === 'measure' && e.name === n);
+            });
+        };
+
+        globalThis.performance.getEntries = function() {
+            return perfEntries.slice();
+        };
+        globalThis.performance.getEntriesByName = function(name, type) {
+            var n = String(name);
+            return perfEntries.filter(function(e) {
+                if (e.name !== n) return false;
+                if (type !== undefined && e.entryType !== String(type)) return false;
+                return true;
+            });
+        };
+        globalThis.performance.getEntriesByType = function(type) {
+            var t = String(type);
+            return perfEntries.filter(function(e) { return e.entryType === t; });
         };
     }
 

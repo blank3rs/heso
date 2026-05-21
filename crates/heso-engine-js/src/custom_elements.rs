@@ -376,6 +376,205 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
     } catch (e) { /* leave default proto-chain instanceof */ }
     globalThis.HTMLTemplateElement = HTMLTemplateElement;
 
+    // ---------------------------------------------------------------
+    // HTML*Element subclass family — bug-report 03 P1 / bug-report 01
+    // P0 cluster.
+    //
+    // Real-world repros:
+    //   - linear.app:  webpack chunk does `instanceof HTMLScriptElement`
+    //                  during bootstrap to detect its own runtime
+    //   - docs.rs/serde: `instanceof HTMLLinkElement` from a navigation
+    //                    shim
+    //   - cloudflare.com: hero-video hydration uses
+    //                    `instanceof HTMLVideoElement`
+    //   - slack.com:  lazy-loader uses `instanceof HTMLImageElement`
+    //   - theguardian.com: framework code uses `instanceof NodeList`
+    //
+    // Each constructor:
+    //   1. Throws `TypeError: Illegal constructor` on direct `new`
+    //      (`makeIllegalConstructor`).
+    //   2. Shares `Element.prototype` so `el instanceof HTMLXxxElement`
+    //      walks the prototype chain successfully when fast paths via
+    //      `hasInstance` don't trip.
+    //   3. Overrides `Symbol.hasInstance` to return true when the
+    //      tested object's `tagName` matches one of the spec's mapped
+    //      HTML elements (e.g. HTMLAnchorElement matches `<a>`,
+    //      HTMLInputElement matches `<input>`, HTMLImageElement
+    //      matches `<img>`).
+    //
+    // Why `hasInstance` instead of separate prototypes: heso has one
+    // Rust-side Element type (phase 1B punt). Separate prototype
+    // chains would require either splitting that into multiple
+    // `#[rquickjs::class]` types or re-pointing `__proto__` per node
+    // — both bigger lifts than needed for the load-bearing surface,
+    // which is *just* the instanceof check.
+    //
+    // Spec refs:
+    //   <https://html.spec.whatwg.org/multipage/dom.html#interface-htmlelement>
+    //   <https://html.spec.whatwg.org/multipage/sections.html#htmldivelement>
+    //   …one row per WHATWG HTML interface section.
+    // ---------------------------------------------------------------
+    //
+    // tag-name -> constructor-name map. Source: HTML spec § elements.
+    // Each entry: [interface-name, tag-name (lowercase, the spec's
+    // localName for the element)]. For interfaces that match multiple
+    // tags (HTMLTableSectionElement → thead/tbody/tfoot; HTMLAnchor /
+    // HTMLAreaElement single each; HTMLQuoteElement → blockquote/q;
+    // HTMLTableCellElement → td/th), we pass a list.
+    var HTML_INTERFACES = [
+        ['HTMLDivElement',       ['div']],
+        ['HTMLSpanElement',      ['span']],
+        ['HTMLAnchorElement',    ['a']],
+        ['HTMLAreaElement',      ['area']],
+        ['HTMLButtonElement',    ['button']],
+        ['HTMLInputElement',     ['input']],
+        ['HTMLTextAreaElement',  ['textarea']],
+        ['HTMLSelectElement',    ['select']],
+        ['HTMLOptionElement',    ['option']],
+        ['HTMLOptGroupElement',  ['optgroup']],
+        ['HTMLLabelElement',     ['label']],
+        ['HTMLFormElement',      ['form']],
+        ['HTMLFieldSetElement',  ['fieldset']],
+        ['HTMLLegendElement',    ['legend']],
+        ['HTMLOutputElement',    ['output']],
+        ['HTMLProgressElement',  ['progress']],
+        ['HTMLMeterElement',     ['meter']],
+        ['HTMLDataListElement',  ['datalist']],
+        ['HTMLImageElement',     ['img']],
+        ['HTMLPictureElement',   ['picture']],
+        ['HTMLSourceElement',    ['source']],
+        ['HTMLVideoElement',     ['video']],
+        ['HTMLAudioElement',     ['audio']],
+        ['HTMLMediaElement',     ['video', 'audio']], // abstract base for video+audio
+        ['HTMLCanvasElement',    ['canvas']],
+        ['HTMLIFrameElement',    ['iframe']],
+        ['HTMLEmbedElement',     ['embed']],
+        ['HTMLObjectElement',    ['object']],
+        ['HTMLParamElement',     ['param']],
+        ['HTMLScriptElement',    ['script']],
+        ['HTMLStyleElement',     ['style']],
+        ['HTMLLinkElement',      ['link']],
+        ['HTMLMetaElement',      ['meta']],
+        ['HTMLTitleElement',     ['title']],
+        ['HTMLBaseElement',      ['base']],
+        ['HTMLHeadElement',      ['head']],
+        ['HTMLBodyElement',      ['body']],
+        ['HTMLHtmlElement',      ['html']],
+        ['HTMLUListElement',     ['ul']],
+        ['HTMLOListElement',     ['ol']],
+        ['HTMLLIElement',        ['li']],
+        ['HTMLDListElement',     ['dl']],
+        ['HTMLParagraphElement', ['p']],
+        ['HTMLPreElement',       ['pre']],
+        ['HTMLQuoteElement',     ['blockquote', 'q']],
+        ['HTMLHRElement',        ['hr']],
+        ['HTMLBRElement',        ['br']],
+        ['HTMLHeadingElement',   ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']],
+        ['HTMLTableElement',     ['table']],
+        ['HTMLTableRowElement',  ['tr']],
+        ['HTMLTableCellElement', ['td', 'th']],
+        ['HTMLTableSectionElement', ['thead', 'tbody', 'tfoot']],
+        ['HTMLTableColElement',  ['col', 'colgroup']],
+        ['HTMLTableCaptionElement', ['caption']],
+        ['HTMLDialogElement',    ['dialog']],
+        ['HTMLDetailsElement',   ['details']],
+        ['HTMLMenuElement',      ['menu']],
+        ['HTMLMapElement',       ['map']],
+        ['HTMLLegendElement',    ['legend']],
+        ['HTMLModElement',       ['ins', 'del']],
+        ['HTMLTimeElement',      ['time']],
+        ['HTMLDataElement',      ['data']],
+        ['HTMLTrackElement',     ['track']],
+    ];
+
+    function defineHtmlSubclass(name, tagNamesLower) {
+        // Avoid clobbering pre-existing globals (HTMLTemplateElement,
+        // HTMLSlotElement are installed elsewhere with their own
+        // hasInstance shape; idempotent re-install gates on existence).
+        if (typeof globalThis[name] !== 'undefined') return;
+        var ctor = makeIllegalConstructor(name, elementProto);
+        try {
+            Object.defineProperty(ctor, Symbol.hasInstance, {
+                value: function(instance) {
+                    if (!instance || typeof instance !== 'object') return false;
+                    try {
+                        // The Rust-side Element.tagName returns
+                        // uppercase; localName is lowercase. Use
+                        // localName for the comparison so spec
+                        // discrimination matches WHATWG's per-element
+                        // mappings (HTMLAnchorElement → "a", etc.).
+                        var ln = instance.localName;
+                        if (typeof ln !== 'string') return false;
+                        var lnLower = ln.toLowerCase();
+                        for (var i = 0; i < tagNamesLower.length; i++) {
+                            if (tagNamesLower[i] === lnLower) return true;
+                        }
+                        return false;
+                    } catch (e) { return false; }
+                },
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+        } catch (e) { /* leave default proto-chain instanceof */ }
+        globalThis[name] = ctor;
+    }
+
+    for (var hi = 0; hi < HTML_INTERFACES.length; hi++) {
+        defineHtmlSubclass(HTML_INTERFACES[hi][0], HTML_INTERFACES[hi][1]);
+    }
+
+    // NodeList — bug-report 01 P0 (cluster: HTMLLinkElement etc.).
+    // theguardian.com hits `instanceof NodeList`. The interface is
+    // technically a separate type from Array (querySelectorAll returns
+    // a NodeList in real browsers), but our `querySelectorAll` returns
+    // a plain array. Expose an `Illegal constructor` shim + a
+    // `Symbol.hasInstance` that accepts any array-like object with
+    // numeric `length`, so the guarded `if (x instanceof NodeList)`
+    // branches don't ReferenceError.
+    if (typeof globalThis.NodeList === 'undefined') {
+        var NodeList = makeIllegalConstructor('NodeList', Object.create(Object.prototype));
+        try {
+            Object.defineProperty(NodeList, Symbol.hasInstance, {
+                value: function(instance) {
+                    if (instance == null) return false;
+                    // Real Arrays returned from querySelectorAll.
+                    if (Array.isArray(instance)) return true;
+                    // Array-likes with numeric length.
+                    return typeof instance === 'object'
+                        && typeof instance.length === 'number';
+                },
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+        } catch (e) { /* */ }
+        globalThis.NodeList = NodeList;
+    }
+
+    // HTMLCollection — same logic as NodeList; the .scripts /
+    // .forms / .images / .links accessors return plain arrays.
+    if (typeof globalThis.HTMLCollection === 'undefined') {
+        var HTMLCollection = makeIllegalConstructor(
+            'HTMLCollection',
+            Object.create(Object.prototype)
+        );
+        try {
+            Object.defineProperty(HTMLCollection, Symbol.hasInstance, {
+                value: function(instance) {
+                    if (instance == null) return false;
+                    if (Array.isArray(instance)) return true;
+                    return typeof instance === 'object'
+                        && typeof instance.length === 'number';
+                },
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            });
+        } catch (e) { /* */ }
+        globalThis.HTMLCollection = HTMLCollection;
+    }
+
     // ===============================================================
     // HTMLElement + customElements registry
     // ===============================================================
