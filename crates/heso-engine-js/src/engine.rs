@@ -6150,37 +6150,16 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             } catch (e) {}
         }
     }
-    if (typeof globalThis.XMLHttpRequest === 'function' && globalThis.XMLHttpRequest.prototype) {
-        // XHR exposes readyState / response / responseText / responseType / withCredentials
-        // as data properties on the instance (per src/xhr.rs); the
-        // ACCESSOR descriptor is missing from the prototype.
-        // Frameworks (airgap, jQuery legacy) read it off the
-        // prototype at module-init time. Bridge via property
-        // lookups.
-        var xhrProto = globalThis.XMLHttpRequest.prototype;
-        ['readyState', 'response', 'responseText', 'responseURL', 'responseXML',
-         'responseType', 'status', 'statusText', 'withCredentials', 'timeout', 'upload']
-            .forEach(function (name) {
-                if (!Object.getOwnPropertyDescriptor(xhrProto, name)) {
-                    try {
-                        Object.defineProperty(xhrProto, name, {
-                            get: function () {
-                                if (this == null) return undefined;
-                                return this[name];
-                            },
-                            set: function (v) {
-                                if (this == null) return;
-                                this[name] = v;
-                            },
-                            enumerable: false, configurable: true,
-                        });
-                    } catch (e) {}
-                }
-            });
-    }
+    // Note: XHR.prototype accessors are installed by a separate
+    // XHR_PROTO_ACCESSOR_BOOTSTRAP pass AFTER install_xhr (which
+    // runs after install_browser_apis). The bootstrap-time
+    // attempt here would no-op (XMLHttpRequest is undefined at
+    // this point) and was previously recursive on read.
+
     if (typeof globalThis.Request === 'function' && globalThis.Request.prototype) {
         // url / method / headers / body — accessors that delegate
-        // to instance fields.
+        // to instance fields. We read the own-property descriptor
+        // via Reflect to avoid recursing through this accessor.
         ['url', 'method', 'headers', 'body', 'bodyUsed', 'cache', 'credentials',
          'destination', 'integrity', 'mode', 'redirect', 'referrer', 'referrerPolicy', 'signal']
             .forEach(function (name) {
@@ -6189,7 +6168,11 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
                         Object.defineProperty(globalThis.Request.prototype, name, {
                             get: function () {
                                 if (this == null) return undefined;
-                                return this['_' + name] !== undefined ? this['_' + name] : this[name];
+                                var d = Reflect.getOwnPropertyDescriptor(this, name);
+                                if (d && 'value' in d) return d.value;
+                                var d2 = Reflect.getOwnPropertyDescriptor(this, '_' + name);
+                                if (d2 && 'value' in d2) return d2.value;
+                                return undefined;
                             },
                             set: function () {},
                             enumerable: false, configurable: true,
@@ -6581,6 +6564,15 @@ const XHR_PROTO_ACCESSOR_BOOTSTRAP: &str = r#"
     if (typeof globalThis.XMLHttpRequest !== 'function') return;
     var proto = globalThis.XMLHttpRequest.prototype;
     if (!proto) return;
+    // Each instance-side data property lives at the actual own
+    // slot on the XHR instance (xhr.rs initializes them inline
+    // on construction). Reading `this.readyState` from inside a
+    // prototype getter would recurse forever (own-prop lookup
+    // walks to the prototype, which is the getter we're in).
+    // Instead, snapshot the own-prop descriptor via
+    // `Reflect.getOwnPropertyDescriptor` and read from it
+    // directly. If the instance lacks the own prop (a fresh
+    // wrapper before XHR construction), fall back to undefined.
     ['readyState', 'response', 'responseText', 'responseURL', 'responseXML',
      'responseType', 'status', 'statusText', 'withCredentials', 'timeout', 'upload']
         .forEach(function (name) {
@@ -6589,11 +6581,21 @@ const XHR_PROTO_ACCESSOR_BOOTSTRAP: &str = r#"
                 Object.defineProperty(proto, name, {
                     get: function () {
                         if (this == null) return undefined;
-                        return this[name];
+                        // Read the OWN-property slot via the
+                        // descriptor — avoids re-entering the
+                        // accessor we're installing right now.
+                        var d = Reflect.getOwnPropertyDescriptor(this, name);
+                        if (!d) return undefined;
+                        if ('value' in d) return d.value;
+                        if (typeof d.get === 'function') return d.get.call(this);
+                        return undefined;
                     },
                     set: function (v) {
                         if (this == null) return;
-                        this[name] = v;
+                        Object.defineProperty(this, name, {
+                            value: v, writable: true,
+                            enumerable: true, configurable: true,
+                        });
                     },
                     enumerable: false, configurable: true,
                 });
