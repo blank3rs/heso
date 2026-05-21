@@ -4162,6 +4162,52 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         };
     }
 
+    // getComputedStyle(element, pseudoElt?) — CSSOM §7.2. We do not run
+    // a layout engine, so we can't compute cascaded values. We return a
+    // CSSStyleDeclaration-shaped object that mirrors the element's
+    // inline `style` for any property the page explicitly set, and
+    // returns the empty string otherwise (per CSSOM §6.6: "if the
+    // property is not set, return the empty string").
+    //
+    // This is enough to satisfy jQuery 3.x's `getStyles()` hook chain
+    // (`.css(prop)` → `Be(elem, prop, false) → getStyles(elem) →
+    // getComputedStyle(elem).getPropertyValue(prop)`) without crashing.
+    // Sites that read getter values for properties they never set
+    // (e.g. `getComputedStyle(el).width` on a stylesheet-styled box)
+    // see '' rather than a layout-derived px value — same as
+    // a real browser with `display:none` ancestry.
+    if (typeof globalThis.getComputedStyle !== 'function') {
+        globalThis.getComputedStyle = function(element, pseudoElt) {
+            var inline = (element && element.style) ? element.style : null;
+            function camel(prop) {
+                // 'background-color' -> 'backgroundColor'
+                return String(prop).replace(/-([a-z])/g, function(_, c) {
+                    return c.toUpperCase();
+                });
+            }
+            return {
+                getPropertyValue: function(prop) {
+                    if (inline == null) return '';
+                    var p = String(prop);
+                    try {
+                        var direct = inline.getPropertyValue ? inline.getPropertyValue(p) : null;
+                        if (direct != null && direct !== '') return direct;
+                    } catch (_) {}
+                    var v = inline[camel(p)];
+                    return (v == null) ? '' : String(v);
+                },
+                getPropertyPriority: function() { return ''; },
+                setProperty: function() {},
+                removeProperty: function() { return ''; },
+                item: function() { return ''; },
+                length: 0,
+                cssText: '',
+                cssFloat: '',
+                parentRule: null
+            };
+        };
+    }
+
     // localStorage / sessionStorage — in-memory Map per engine. ADR
     // 0014 commits to this shape (in-memory, deterministic, no
     // persistence yet). Closure-private Map keeps JS from poking at
@@ -4839,10 +4885,23 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         var etProto = globalThis.EventTarget.prototype;
         var ET_LISTENERS_KEY = '__hesoEtListeners';
         try {
+            // DOM §2.7: a listener is either a callable Function OR
+            // an object exposing a `handleEvent` method. GitHub
+            // Catalyst, Stencil, and Lit all hand event handlers as
+            // `{handleEvent: fn}` objects. The earlier strict
+            // `typeof listener !== 'function'` check silently dropped
+            // those, which surfaced downstream as "not a function" or
+            // "Error converting from js 'object' into type 'function'".
+            function isValidEventListener(l) {
+                if (typeof l === 'function') return true;
+                if (l && typeof l === 'object'
+                    && typeof l.handleEvent === 'function') return true;
+                return false;
+            }
             Object.defineProperty(etProto, 'addEventListener', {
                 value: function (type, listener, options) {
                     if (this == null || typeof type !== 'string'
-                        || typeof listener !== 'function') return;
+                        || !isValidEventListener(listener)) return;
                     var store = this[ET_LISTENERS_KEY];
                     if (!store) {
                         try {
@@ -4878,7 +4937,7 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             Object.defineProperty(etProto, 'removeEventListener', {
                 value: function (type, listener, options) {
                     if (this == null || typeof type !== 'string'
-                        || typeof listener !== 'function') return;
+                        || !isValidEventListener(listener)) return;
                     var store = this[ET_LISTENERS_KEY];
                     if (!store || !store[type]) return;
                     var capture = typeof options === 'boolean'
@@ -4964,7 +5023,18 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
                                 };
                                 event.__hesoStopImmediatePatched = true;
                             }
-                            listenerRec.listener.call(this, event);
+                            // DOM §2.9 step 11: invoke either the
+                            // function listener or the object form's
+                            // current `.handleEvent`. Object form
+                            // re-reads handleEvent each dispatch so
+                            // callers can swap implementations after
+                            // registering.
+                            var cb = listenerRec.listener;
+                            if (typeof cb === 'function') {
+                                cb.call(this, event);
+                            } else if (cb && typeof cb.handleEvent === 'function') {
+                                cb.handleEvent(event);
+                            }
                         } catch (e) {
                             if (typeof console !== 'undefined' && console.error) {
                                 console.error('EventTarget dispatch listener threw:',
@@ -4986,6 +5056,138 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             }
         }
     }
+
+    // -------------------------------------------------------------
+    // addEventListener handleEvent-object form, for Rust-backed
+    // prototypes that shadow EventTarget.prototype.
+    //
+    // Element / HTMLElement / Document / Window / AbortSignal each
+    // expose their own `addEventListener` via the rquickjs Bind macro,
+    // which strictly types `listener` as `Function<'js>`. When a site
+    // (GitHub Catalyst, Stencil, Lit, …) hands an EventListenerObject
+    // like `{handleEvent: fn}` to addEventListener — perfectly valid
+    // per DOM §2.7 — the rquickjs conversion raises "Error converting
+    // from js 'object' into type 'function'" and the entire bundle
+    // bails.
+    //
+    // We patch each affected prototype to demux at the JS layer:
+    //   - function listener → pass straight to the native binding
+    //   - object listener with handleEvent → synthesize a closure that
+    //     re-reads `.handleEvent` on every dispatch (spec semantics:
+    //     callers may swap handleEvent post-registration), pass that
+    //     closure to native add, and stash it for the matching
+    //     removeEventListener call.
+    //
+    // Identity preservation: the per-target wrapper map lives on the
+    // listener object under a non-enumerable hidden slot. Spec §2.7
+    // step 6 also says "duplicate (callback, capture) is a no-op",
+    // which falls out of refusing to overwrite an existing wrapper.
+    // -------------------------------------------------------------
+    (function () {
+        var AEL_TARGETS_KEY = '__hesoAelTargets';
+        function keyFor(type, options) {
+            var capture = false;
+            if (typeof options === 'boolean') capture = options;
+            else if (options && typeof options === 'object') capture = !!options.capture;
+            return String(type) + '|' + (capture ? '1' : '0');
+        }
+        function patchProto(proto) {
+            if (!proto) return;
+            if (proto.__hesoAelPatched) return;
+            var nativeAdd, nativeRemove;
+            try {
+                var addDesc = Object.getOwnPropertyDescriptor(proto, 'addEventListener');
+                var rmDesc  = Object.getOwnPropertyDescriptor(proto, 'removeEventListener');
+                if (!addDesc || typeof addDesc.value !== 'function') return;
+                nativeAdd    = addDesc.value;
+                nativeRemove = rmDesc && rmDesc.value;
+            } catch (_) { return; }
+            try {
+                Object.defineProperty(proto, '__hesoAelPatched', {
+                    value: true, writable: false,
+                    enumerable: false, configurable: true,
+                });
+            } catch (_) {}
+            try {
+                Object.defineProperty(proto, 'addEventListener', {
+                    value: function (type, listener, options) {
+                        if (typeof listener === 'function') {
+                            return nativeAdd.call(this, type, listener, options);
+                        }
+                        if (listener != null
+                            && typeof listener === 'object'
+                            && typeof listener.handleEvent === 'function') {
+                            var perListener;
+                            try {
+                                perListener = listener[AEL_TARGETS_KEY];
+                                if (!perListener) {
+                                    Object.defineProperty(listener, AEL_TARGETS_KEY, {
+                                        value: new WeakMap(), writable: true,
+                                        enumerable: false, configurable: true,
+                                    });
+                                    perListener = listener[AEL_TARGETS_KEY];
+                                }
+                            } catch (_) { return; }
+                            var perTarget = perListener.get(this);
+                            if (!perTarget) {
+                                perTarget = Object.create(null);
+                                perListener.set(this, perTarget);
+                            }
+                            var k = keyFor(type, options);
+                            if (perTarget[k]) return; // spec dedup
+                            var captured = listener;
+                            var wrapper = function (event) {
+                                var fn = captured && captured.handleEvent;
+                                if (typeof fn === 'function') {
+                                    return fn.call(captured, event);
+                                }
+                            };
+                            perTarget[k] = wrapper;
+                            return nativeAdd.call(this, type, wrapper, options);
+                        }
+                        // not callable, not handleEvent — spec: no-op
+                    },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                if (typeof nativeRemove === 'function') {
+                    Object.defineProperty(proto, 'removeEventListener', {
+                        value: function (type, listener, options) {
+                            if (typeof listener === 'function') {
+                                return nativeRemove.call(this, type, listener, options);
+                            }
+                            if (listener != null && typeof listener === 'object') {
+                                var perListener = listener[AEL_TARGETS_KEY];
+                                if (!perListener) return;
+                                var perTarget = perListener.get(this);
+                                if (!perTarget) return;
+                                var k = keyFor(type, options);
+                                var wrapper = perTarget[k];
+                                if (!wrapper) return;
+                                delete perTarget[k];
+                                return nativeRemove.call(this, type, wrapper, options);
+                            }
+                        },
+                        writable: true, enumerable: false, configurable: true,
+                    });
+                }
+            } catch (e) {
+                if (typeof console !== 'undefined' && console.warn) {
+                    console.warn('heso: addEventListener handleEvent patch failed:',
+                        e && e.message ? e.message : e);
+                }
+            }
+        }
+        var protos = [];
+        try { if (globalThis.Element        && globalThis.Element.prototype)        protos.push(globalThis.Element.prototype);        } catch (_) {}
+        try { if (globalThis.HTMLElement    && globalThis.HTMLElement.prototype)    protos.push(globalThis.HTMLElement.prototype);    } catch (_) {}
+        try { if (globalThis.Node           && globalThis.Node.prototype)           protos.push(globalThis.Node.prototype);           } catch (_) {}
+        try { if (globalThis.Document       && globalThis.Document.prototype)       protos.push(globalThis.Document.prototype);       } catch (_) {}
+        try { if (globalThis.Window         && globalThis.Window.prototype)         protos.push(globalThis.Window.prototype);         } catch (_) {}
+        try { if (globalThis.AbortSignal    && globalThis.AbortSignal.prototype)    protos.push(globalThis.AbortSignal.prototype);    } catch (_) {}
+        try { if (globalThis.XMLHttpRequest && globalThis.XMLHttpRequest.prototype) protos.push(globalThis.XMLHttpRequest.prototype); } catch (_) {}
+        for (var i = 0; i < protos.length; i++) patchProto(protos[i]);
+    })();
+
     if (typeof globalThis.cookieStore === 'undefined') {
         // Lowercase: the live singleton (per spec, `window.cookieStore`
         // is the instance — like `navigator` or `location`). Returns
@@ -5042,22 +5244,56 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             }
         );
     }
+    // WHATWG Streams — real (no-op) constructors instead of the
+    // illegal-constructor stub. Bundles (Next.js webpack runtime,
+    // Linear's, Astro's) do `new ReadableStream(...)` for feature
+    // detection or pass-through plumbing; throwing on `new` aborts
+    // the entire chunk. Returning an inert reader that immediately
+    // signals `{done: true}` is closer to "no data" than to a hard
+    // error — which is the safe failure mode for read-only scraping.
     if (typeof globalThis.ReadableStream === 'undefined') {
-        // WHATWG Streams §3.2. Methods: cancel, getReader,
-        // pipeThrough, pipeTo, tee.
-        globalThis.ReadableStream = makeStubCtor(
-            'ReadableStream',
-            ['cancel', 'getReader', 'pipeThrough', 'pipeTo', 'tee']
-        );
+        var RS = function ReadableStream(_src, _strat) {
+            this.locked = false;
+        };
+        RS.prototype.cancel = function() { return Promise.resolve(); };
+        RS.prototype.getReader = function() {
+            return {
+                closed: Promise.resolve(),
+                read: function() { return Promise.resolve({ value: undefined, done: true }); },
+                cancel: function() { return Promise.resolve(); },
+                releaseLock: function() {}
+            };
+        };
+        RS.prototype.pipeThrough = function(t) { return t && t.readable ? t.readable : new RS(); };
+        RS.prototype.pipeTo = function() { return Promise.resolve(); };
+        RS.prototype.tee = function() { return [new RS(), new RS()]; };
+        globalThis.ReadableStream = RS;
     }
     if (typeof globalThis.WritableStream === 'undefined') {
-        globalThis.WritableStream = makeStubCtor(
-            'WritableStream',
-            ['abort', 'close', 'getWriter']
-        );
+        var WS = function WritableStream(_sink, _strat) {
+            this.locked = false;
+        };
+        WS.prototype.abort = function() { return Promise.resolve(); };
+        WS.prototype.close = function() { return Promise.resolve(); };
+        WS.prototype.getWriter = function() {
+            return {
+                closed: Promise.resolve(),
+                desiredSize: 1,
+                ready: Promise.resolve(),
+                write: function() { return Promise.resolve(); },
+                close: function() { return Promise.resolve(); },
+                abort: function() { return Promise.resolve(); },
+                releaseLock: function() {}
+            };
+        };
+        globalThis.WritableStream = WS;
     }
     if (typeof globalThis.TransformStream === 'undefined') {
-        globalThis.TransformStream = makeStubCtor('TransformStream', []);
+        var TS = function TransformStream(_xform, _ws, _rs) {
+            this.readable = new globalThis.ReadableStream();
+            this.writable = new globalThis.WritableStream();
+        };
+        globalThis.TransformStream = TS;
     }
     if (typeof globalThis.NamedNodeMap === 'undefined') {
         globalThis.NamedNodeMap = makeStubCtor(
@@ -5086,6 +5322,60 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     if (typeof globalThis.Comment === 'undefined') {
         globalThis.Comment = makeStubCtor('Comment', []);
     }
+
+    // Legacy element constructors — WHATWG HTML §4.8.5 (img), §4.8.10
+    // (audio), §4.10.10 (option). These predate the modern
+    // `document.createElement('img')` form and many sites in the wild
+    // still write `new Image()` (Wikipedia portal uses it for
+    // device-pixel-ratio sniffing) or `new Option(text, value)` in
+    // `<select>` builders. Spec semantics: each constructor delegates
+    // to `document.createElement` with the corresponding local name
+    // and then sets attributes from the constructor args.
+    //
+    // The createElement lookup happens at CONSTRUCT time, not install
+    // time — install_browser_apis runs once at engine init, when no
+    // document is loaded yet. By the time site JS calls `new Image()`,
+    // the document is parsed and `globalThis.document.createElement`
+    // is bound.
+    if (typeof globalThis.Image === 'undefined') {
+        globalThis.Image = function Image(width, height) {
+            var d = globalThis.document;
+            if (!d || typeof d.createElement !== 'function') {
+                throw new TypeError('Image: no document available');
+            }
+            var el = d.createElement('img');
+            if (width  != null) { try { el.width  = width;  } catch (_) {} }
+            if (height != null) { try { el.height = height; } catch (_) {} }
+            return el;
+        };
+    }
+    if (typeof globalThis.Audio === 'undefined') {
+        globalThis.Audio = function Audio(src) {
+            var d = globalThis.document;
+            if (!d || typeof d.createElement !== 'function') {
+                throw new TypeError('Audio: no document available');
+            }
+            var el = d.createElement('audio');
+            try { el.preload = 'auto'; } catch (_) {}
+            if (src != null) { try { el.src = String(src); } catch (_) {} }
+            return el;
+        };
+    }
+    if (typeof globalThis.Option === 'undefined') {
+        globalThis.Option = function Option(text, value, defaultSelected, selected) {
+            var d = globalThis.document;
+            if (!d || typeof d.createElement !== 'function') {
+                throw new TypeError('Option: no document available');
+            }
+            var el = d.createElement('option');
+            if (text != null)  { try { el.text  = String(text);  } catch (_) {} }
+            if (value != null) { try { el.value = String(value); } catch (_) {} }
+            if (defaultSelected) { try { el.defaultSelected = !!defaultSelected; } catch (_) {} }
+            if (selected)        { try { el.selected        = !!selected;        } catch (_) {} }
+            return el;
+        };
+    }
+
     if (typeof globalThis.DOMParser === 'undefined') {
         // WHATWG DOM Parsing & Serialization §2.1. Method:
         // parseFromString(string, type) — returns Document.
@@ -5370,24 +5660,171 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             { data: null, origin: '', lastEventId: '', source: null, ports: [] }
         );
     }
+    // WHATWG Fetch — real constructors so libraries that build
+    // `new Request(url, init)` ahead of a fetch call (GitHub's
+    // include-fragment-element, the Next.js webpack runtime, the
+    // Workbox SW polyfill) don't crash on construction. heso's
+    // own fetch() returns Response-shaped objects from Rust; the
+    // JS constructors below exist as construction targets and
+    // feature-detection anchors.
+    //
+    // Each instance carries `_url`, `_method`, etc. private slots
+    // that the prototype accessors near line 6449 surface.
+    if (typeof globalThis.Headers === 'undefined') {
+        var Headers = function Headers(init) {
+            var map = Object.create(null);
+            this._map = map;
+            if (init == null) return;
+            if (Array.isArray(init)) {
+                for (var i = 0; i < init.length; i++) {
+                    var pair = init[i];
+                    if (pair && pair.length >= 2) {
+                        map[String(pair[0]).toLowerCase()] = String(pair[1]);
+                    }
+                }
+            } else if (typeof init === 'object') {
+                for (var k in init) {
+                    if (Object.prototype.hasOwnProperty.call(init, k)) {
+                        map[String(k).toLowerCase()] = String(init[k]);
+                    }
+                }
+            }
+        };
+        Headers.prototype.append = function (k, v) {
+            var key = String(k).toLowerCase();
+            var existing = this._map[key];
+            this._map[key] = (existing == null) ? String(v) : (existing + ', ' + String(v));
+        };
+        Headers.prototype.delete = function (k) { delete this._map[String(k).toLowerCase()]; };
+        Headers.prototype.get    = function (k) {
+            var v = this._map[String(k).toLowerCase()];
+            return (v == null) ? null : v;
+        };
+        Headers.prototype.has    = function (k) {
+            return Object.prototype.hasOwnProperty.call(this._map, String(k).toLowerCase());
+        };
+        Headers.prototype.set    = function (k, v) { this._map[String(k).toLowerCase()] = String(v); };
+        Headers.prototype.forEach = function (cb, thisArg) {
+            for (var k in this._map) {
+                if (Object.prototype.hasOwnProperty.call(this._map, k)) {
+                    cb.call(thisArg, this._map[k], k, this);
+                }
+            }
+        };
+        Headers.prototype.keys    = function () { return Object.keys(this._map)[Symbol.iterator](); };
+        Headers.prototype.values  = function () { return Object.values(this._map)[Symbol.iterator](); };
+        Headers.prototype.entries = function () { return Object.entries(this._map)[Symbol.iterator](); };
+        Headers.prototype[Symbol.iterator] = Headers.prototype.entries;
+        globalThis.Headers = Headers;
+    }
     if (typeof globalThis.Response === 'undefined') {
-        // WHATWG Fetch §5. Methods bundles reach for off
-        // Response.prototype: `.json()`, `.text()`, `.arrayBuffer()`,
-        // `.blob()`, `.formData()`, `.clone()`. heso's fetch()
-        // returns a real Response-shaped object today (see
-        // src/fetch.rs), so the stub here is a feature-detect
-        // fallback for code that captures references on
-        // Response.prototype directly at module-init time.
-        globalThis.Response = makeStubCtor(
-            'Response',
-            ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'clone']
-        );
+        var Response = function Response(body, init) {
+            init = init || {};
+            this._body   = (body == null) ? null : body;
+            this._status = (init.status != null) ? (init.status | 0) : 200;
+            this._statusText = String(init.statusText != null ? init.statusText : '');
+            this._headers = (init.headers instanceof globalThis.Headers)
+                ? init.headers
+                : new globalThis.Headers(init.headers);
+            this._url = '';
+            this._type = 'default';
+            this._redirected = false;
+            this._bodyUsed = false;
+            this._ok = this._status >= 200 && this._status < 300;
+        };
+        function bodyAsText(self) {
+            if (self._body == null) return '';
+            if (typeof self._body === 'string') return self._body;
+            try { return String(self._body); } catch (_) { return ''; }
+        }
+        Response.prototype.clone = function () {
+            return new Response(this._body, {
+                status: this._status, statusText: this._statusText, headers: this._headers,
+            });
+        };
+        Response.prototype.text       = function () { this._bodyUsed = true; return Promise.resolve(bodyAsText(this)); };
+        Response.prototype.json       = function () {
+            this._bodyUsed = true;
+            try { return Promise.resolve(JSON.parse(bodyAsText(this))); }
+            catch (e) { return Promise.reject(e); }
+        };
+        Response.prototype.arrayBuffer = function () {
+            this._bodyUsed = true;
+            var s = bodyAsText(this);
+            var buf = new ArrayBuffer(s.length);
+            var view = new Uint8Array(buf);
+            for (var i = 0; i < s.length; i++) view[i] = s.charCodeAt(i) & 0xff;
+            return Promise.resolve(buf);
+        };
+        Response.prototype.blob     = function () { this._bodyUsed = true; return Promise.resolve(bodyAsText(this)); };
+        Response.prototype.formData = function () { return Promise.reject(new TypeError('Response.formData: not supported')); };
+        Object.defineProperty(Response.prototype, 'status',     { get: function () { return this._status; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'statusText', { get: function () { return this._statusText; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'ok',         { get: function () { return this._ok; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'headers',    { get: function () { return this._headers; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'url',        { get: function () { return this._url; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'type',       { get: function () { return this._type; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'redirected', { get: function () { return this._redirected; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'bodyUsed',   { get: function () { return this._bodyUsed; }, configurable: true });
+        Object.defineProperty(Response.prototype, 'body',       { get: function () { return null; }, configurable: true });
+        globalThis.Response = Response;
     }
     if (typeof globalThis.Request === 'undefined') {
-        globalThis.Request = makeStubCtor(
-            'Request',
-            ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'clone']
-        );
+        var Request = function Request(input, init) {
+            init = init || {};
+            var inputUrl = '';
+            var copiedInit = {};
+            if (input != null && typeof input === 'object' && input instanceof globalThis.Request) {
+                inputUrl = input._url || '';
+                copiedInit.method      = input._method;
+                copiedInit.headers     = input._headers;
+                copiedInit.body        = input._body;
+                copiedInit.credentials = input._credentials;
+                copiedInit.cache       = input._cache;
+                copiedInit.mode        = input._mode;
+                copiedInit.redirect    = input._redirect;
+                copiedInit.referrer    = input._referrer;
+            } else if (input != null) {
+                inputUrl = String(input);
+            }
+            this._url         = String(init.url != null ? init.url : inputUrl);
+            this._method      = String(init.method != null ? init.method : (copiedInit.method || 'GET')).toUpperCase();
+            this._headers     = (init.headers instanceof globalThis.Headers)
+                ? init.headers
+                : new globalThis.Headers(init.headers || copiedInit.headers);
+            this._body        = (init.body != null) ? init.body : (copiedInit.body != null ? copiedInit.body : null);
+            this._credentials = init.credentials || copiedInit.credentials || 'same-origin';
+            this._cache       = init.cache       || copiedInit.cache       || 'default';
+            this._mode        = init.mode        || copiedInit.mode        || 'cors';
+            this._redirect    = init.redirect    || copiedInit.redirect    || 'follow';
+            this._referrer    = init.referrer    || copiedInit.referrer    || 'about:client';
+            this._referrerPolicy = init.referrerPolicy || '';
+            this._integrity   = init.integrity   || '';
+            this._signal      = init.signal      || null;
+            this._bodyUsed    = false;
+            this._destination = '';
+        };
+        Request.prototype.clone = function () { return new Request(this); };
+        Request.prototype.text  = function () {
+            this._bodyUsed = true;
+            return Promise.resolve(this._body == null ? '' : String(this._body));
+        };
+        Request.prototype.json  = function () {
+            this._bodyUsed = true;
+            try { return Promise.resolve(JSON.parse(this._body == null ? 'null' : String(this._body))); }
+            catch (e) { return Promise.reject(e); }
+        };
+        Request.prototype.arrayBuffer = function () {
+            this._bodyUsed = true;
+            var s = this._body == null ? '' : String(this._body);
+            var buf = new ArrayBuffer(s.length);
+            var view = new Uint8Array(buf);
+            for (var i = 0; i < s.length; i++) view[i] = s.charCodeAt(i) & 0xff;
+            return Promise.resolve(buf);
+        };
+        Request.prototype.blob     = function () { this._bodyUsed = true; return Promise.resolve(this._body == null ? '' : String(this._body)); };
+        Request.prototype.formData = function () { return Promise.reject(new TypeError('Request.formData: not supported')); };
+        globalThis.Request = Request;
     }
     if (typeof globalThis.TextEncoder === 'undefined') {
         // WHATWG Encoding §6. The constructor returns an instance

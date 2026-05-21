@@ -141,3 +141,7 @@ __pycache__/
 /npm/platforms/linux-arm64/bin/heso.exe
 /npm/platforms/linux-x64/bin/heso
 /npm/platforms/linux-x64/bin/heso.exe
+bug-reports/scratch/
+bug-reports/raw/
+bug-reports/triage/*.raw
+bug-reports/triage/*.json

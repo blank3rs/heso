@@ -885,7 +885,7 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
         } catch (e) { return null; }
     }
 
-    function safeInvoke(el, fn, args) {
+    function safeInvoke(el, fn, args, callbackName) {
         if (typeof fn !== 'function') return;
         try {
             fn.apply(el, args || []);
@@ -893,7 +893,13 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
             // Match the spec's "report exception" — surface via
             // console.error if present, otherwise swallow.
             if (typeof console !== 'undefined' && typeof console.error === 'function') {
-                console.error('custom element callback threw:', e && e.message ? e.message : e);
+                var tag = '';
+                try { tag = el && el.tagName ? String(el.tagName).toLowerCase() : ''; } catch (_) {}
+                var label = '<' + (tag || '?') + '>.' + (callbackName || 'callback');
+                var name = (e && e.name) || 'Error';
+                var msg  = (e && e.message != null) ? String(e.message) : '';
+                var stack = (e && e.stack) ? String(e.stack) : '';
+                console.error(label + ' threw: ' + name + ': ' + msg + '\n' + stack);
             }
         }
     }
@@ -902,14 +908,14 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
         var def = el && el[CE_DEFINITION] ? el[CE_DEFINITION] : getDefinitionForElement(el);
         if (!def) return;
         var fn = lookupCallbackOnDefinition(def, 'connectedCallback');
-        safeInvoke(el, fn);
+        safeInvoke(el, fn, null, 'connectedCallback');
     }
 
     function fireDisconnected(el) {
         var def = el && el[CE_DEFINITION] ? el[CE_DEFINITION] : getDefinitionForElement(el);
         if (!def) return;
         var fn = lookupCallbackOnDefinition(def, 'disconnectedCallback');
-        safeInvoke(el, fn);
+        safeInvoke(el, fn, null, 'disconnectedCallback');
     }
 
     function fireAttributeChanged(el, name, oldValue, newValue) {
@@ -917,7 +923,7 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
         if (!def) return;
         if (!def.observedAttributes || !def.observedAttributes[name]) return;
         var fn = lookupCallbackOnDefinition(def, 'attributeChangedCallback');
-        safeInvoke(el, fn, [name, oldValue, newValue, null]);
+        safeInvoke(el, fn, [name, oldValue, newValue, null], 'attributeChangedCallback');
     }
 
     // -----------------------------------------------------------------
