@@ -261,6 +261,10 @@ pub struct JsEngine {
     /// construction — the QuickJS runtime is `!Send`, so the engine
     /// never crosses a thread boundary.
     fetch_state: Option<FetchState>,
+    /// Per-engine pending-XHR queue + XHR mode. Same shape as
+    /// [`Self::fetch_state`]; populated only when the host built the
+    /// engine with a fetch client (see [`crate::xhr`]).
+    xhr_state: Option<XhrState>,
     /// Per-engine "current page URL" — used to resolve relative
     /// `<script src="...">` references during inline-script execution
     /// and as the referrer for dynamic `import(...)` calls.
@@ -368,6 +372,14 @@ pub type ModuleResolveFn = Box<dyn Fn(&str, &Url) -> Result<(Url, String), Strin
 /// Bundles a per-engine fetch queue with the mode that drives it.
 pub(crate) struct FetchState {
     pub(crate) queue: Arc<FetchQueue>,
+    pub(crate) mode: FetchMode,
+}
+
+/// Bundles a per-engine XHR queue with the mode that drives it. Same
+/// shape as [`FetchState`]; lives alongside it so XHR and fetch can
+/// be drained independently in [`JsEngine::run_pending_jobs`].
+pub(crate) struct XhrState {
+    pub(crate) queue: Arc<crate::xhr::XhrQueue>,
     pub(crate) mode: FetchMode,
 }
 
@@ -682,6 +694,24 @@ impl JsEngine {
             None
         };
 
+        // Install `XMLHttpRequest` global. Backed by the same fetch
+        // mode (and reqwest client when Live) so cookies, the
+        // User-Agent, and recorded-network playback stay coherent
+        // with the rest of the workspace. See [`crate::xhr`].
+        // Closes bug-report 03 P1 / bug-report 01 P0 cluster — every
+        // analytics SDK feature-detects on `typeof XMLHttpRequest`.
+        let xhr_state = if let Some(fs) = fetch_state.as_ref() {
+            #[allow(clippy::arc_with_non_send_sync)]
+            let queue = Arc::new(crate::xhr::XhrQueue::new());
+            crate::xhr::install_xhr(&context, fs.mode.clone(), queue.clone())?;
+            Some(XhrState {
+                queue,
+                mode: fs.mode.clone(),
+            })
+        } else {
+            None
+        };
+
         // Install `__hesoFormSubmitNow(form)` — the JS-side IDL method
         // `HTMLFormElement.prototype.submit()` calls into this helper
         // to issue the HTTP request without firing the `submit` event
@@ -799,6 +829,7 @@ impl JsEngine {
             timers,
             rng,
             fetch_state,
+            xhr_state,
             base_url,
             module_cache,
             module_resolver,
@@ -1059,20 +1090,35 @@ impl JsEngine {
             //    `.then` callbacks as new microtasks, which the next
             //    iteration's pump will drain.
             let drained = fetch::drain_pending(&self.context, &fs.queue, &fs.mode)?;
-            if drained == 0 {
-                // No fetches queued during this round. One more
-                // pump for microtasks the previous drain's resolves
-                // may have scheduled, then we're done.
+            // 2b. Drain any XHRs queued via `xhr.send()`. Same pump
+            //     shape as fetch — `onreadystatechange` callbacks fire
+            //     synchronously inside `xhr::drain_pending`, and any
+            //     microtasks they schedule are picked up by the next
+            //     iteration's `execute_pending_jobs_until_idle`.
+            let xhr_drained = if let Some(xs) = self.xhr_state.as_ref() {
+                crate::xhr::drain_pending(&self.context, &xs.queue, &xs.mode)?
+            } else {
+                0
+            };
+            if drained == 0 && xhr_drained == 0 {
+                // No fetches or XHRs queued during this round. One
+                // more pump for microtasks the previous drain's
+                // resolves may have scheduled, then we're done.
                 self.execute_pending_jobs_until_idle()?;
-                // Belt-and-braces: a `.then` on a just-resolved
-                // fetch could in principle queue another fetch.
-                // If so, loop. Otherwise we're idle.
-                if fs.queue.len() == 0 {
+                // Belt-and-braces: a `.then` / `onload` could in
+                // principle queue another request. If so, loop;
+                // otherwise we're idle.
+                let xhr_pending = self
+                    .xhr_state
+                    .as_ref()
+                    .map(|xs| xs.queue.len())
+                    .unwrap_or(0);
+                if fs.queue.len() == 0 && xhr_pending == 0 {
                     return Ok(total);
                 }
                 continue;
             }
-            total += drained;
+            total += drained + xhr_drained;
         }
         Err(EvalError::Engine(format!(
             "pending-jobs pump exceeded {MAX_PUMP_ROUNDS} rounds - possible infinite fetch loop"

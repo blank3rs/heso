@@ -103,6 +103,7 @@ pub mod timers;
 pub mod url_search_params;
 pub mod wait_for;
 pub mod web_apis;
+pub mod xhr;
 
 pub use dom::{Document, DomTokenList, Element, ShadowRoot};
 pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};
