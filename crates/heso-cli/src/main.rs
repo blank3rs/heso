@@ -2425,7 +2425,7 @@ fn starts_with_section(child: &str, form: &str) -> bool {
 }
 
 /// Render the non-HttpOnly cookies the **response** set into the
-/// agent-facing JSON shape `{name, value, domain, path}`.
+/// agent-facing JSON shape `{name, value, domain, path, host_only}`.
 ///
 /// **Determinism.** The input is
 /// [`heso_engine_fetch::FetchPage::response_cookies`], which is
@@ -2437,20 +2437,40 @@ fn starts_with_section(child: &str, form: &str) -> bool {
 /// `batch read --parallel N`, where URL #1's row could absorb cookies
 /// set by URL #2 if #2 finished first. See `bug-reports/04-long-running.md`.
 ///
+/// **Host-only.** `host_only: true` marks RFC 6265 §5.3 step 6 cookies
+/// — the server sent `Set-Cookie` with no `Domain=` attribute, so the
+/// cookie's effective scope is the request URL's host, not any
+/// sub-domains. We fill `domain` with that effective host so the
+/// agent-facing shape is unambiguous (the previous code emitted an
+/// empty string here, which collided with the "server explicitly sent
+/// `Domain=` blank" undefined-behavior case). See bug-report 04-A.
+///
 /// **HttpOnly filter.** Cookies with `HttpOnly` are dropped, matching
 /// the WHATWG HTML §6.1 `document.cookie` visibility rule a real
 /// browser applies.
 pub(crate) fn collect_cookies(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
+    let url_host = page.url().host_str().unwrap_or("").to_owned();
     let mut out = Vec::new();
     for c in &page.response_cookies {
         if c.http_only {
             continue;
         }
+        // Host-only: the response did NOT carry a non-empty Domain=
+        // attribute. Render the effective scope (the request URL's
+        // host) and tag with `host_only: true` so the agent can
+        // distinguish "host-only via the RFC default" from
+        // "domain-wide cookie set by the server."
+        let (domain, host_only) = if c.host_only {
+            (url_host.clone(), true)
+        } else {
+            (c.domain.clone().unwrap_or_default(), false)
+        };
         out.push(serde_json::json!({
             "name": c.name,
             "value": c.value,
-            "domain": c.domain.clone().unwrap_or_default(),
+            "domain": domain,
             "path": c.path.clone().unwrap_or_else(|| "/".to_owned()),
+            "host_only": host_only,
         }));
     }
     serde_json::Value::Array(out)
