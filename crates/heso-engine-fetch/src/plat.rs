@@ -26,18 +26,19 @@
 //!    request.
 //! 2. **Per-request session/state envelopes.** Fields like
 //!    `inline_data`, `data_attrs` (hydration JSON blobs that often
-//!    embed request IDs / sessions / build hashes), `console`,
-//!    `cookies`, `scripts`, `lazy_hints`, `scroll`, `http_status`,
-//!    the failure envelope (`partial`, `partial_reason`,
-//!    `failed_scripts`, `console_errors_count`), and derived fields
-//!    like `content_hash` / `delta` / `framework` / `forms` are
-//!    pruned at every level so the hash is over the *agent-visible
-//!    content surface*, not the per-run telemetry that rides
-//!    alongside it.
+//!    embed request IDs / sessions / build hashes), `metadata`
+//!    (GitHub-style `<meta name="request-id">` / `html-safe-nonce` /
+//!    `visitor-payload` tags), `console`, `cookies`, `scripts`,
+//!    `lazy_hints`, `scroll`, `http_status`, the failure envelope
+//!    (`partial`, `partial_reason`, `failed_scripts`,
+//!    `console_errors_count`), and derived fields like
+//!    `content_hash` / `delta` / `framework` / `forms` are pruned at
+//!    every level so the hash is over the *agent-visible content
+//!    surface*, not the per-run telemetry that rides alongside it.
 //!
 //! What stays in the hash: `url`, `title`, `description`, `tree`,
-//! `actions` (with `attrs` filtered per item 1), `metadata`, `text`,
-//! `linked_pages` (recursively hashed by the same rules).
+//! `actions` (with `attrs` filtered per item 1), `linked_pages`
+//! (recursively hashed by the same rules).
 //!
 //! ## What the hash does NOT name
 //!
@@ -156,6 +157,15 @@ pub const EPHEMERAL_OBJECT_KEYS: &[&str] = &[
     // Hydration JSON; often embeds requestId / sessionId / build IDs.
     "inline_data",
     "lazy_hints",
+    // Page-level structured metadata (OpenGraph, Twitter, JSON-LD,
+    // `<meta>` bag). Real sites pack per-request entropy in here —
+    // GitHub's `html-safe-nonce`, `request-id`, `visitor-hmac`,
+    // `visitor-payload`, `fetch-nonce` are all `<meta>` tags. Two
+    // back-to-back fetches of the same page produce different values
+    // for these. Strip the whole `metadata` blob rather than
+    // chase the list per-site — the agent-observable surface lives
+    // in `title` / `description` / `tree` / `actions` regardless.
+    "metadata",
     "nonce",
     "partial",
     "partial_reason",
