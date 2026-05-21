@@ -1711,6 +1711,40 @@ impl Element {
         Ok(proxy)
     }
 
+    /// `element.style = "color: red; display: none"` — string-coercion
+    /// setter. Per CSSOM §6 ("CSS declaration blocks"), assigning a
+    /// string to `.style` is equivalent to setting `.style.cssText`
+    /// (parse the value as a CSS declaration list and replace the
+    /// inline `style="..."` attribute). Without this setter, QuickJS
+    /// rejects the assignment with `no setter for property` — which
+    /// is what `docs.rs/serde`'s `menu.js` and the Reuters DataDome
+    /// captcha agent both crash on (bug-report 03 P1, bug-report 01
+    /// P1).
+    ///
+    /// The accepted shape is whatever JS coerces to a string:
+    /// `el.style = "color: red"`, `el.style = ""` (clear), `el.style =
+    /// null` / `undefined` (also clear per spec — null and undefined
+    /// stringify to "null" / "undefined", but our `Option<Coerced>`
+    /// route maps them to "" so the cleared-state matches author
+    /// intent).
+    ///
+    /// We do *not* re-parse the input to validate — we mirror the
+    /// HTML attribute layer's loose acceptance. The downstream
+    /// `__hesoMakeStyleProxy` reads/serializes via the same
+    /// `parseStyle` / `serializeStyle` pair, so subsequent property
+    /// reads round-trip correctly through the same kebab-case
+    /// normalization.
+    ///
+    /// Spec: <https://drafts.csswg.org/cssom/#dom-elementcssinlinestyle-style>.
+    #[qjs(set, rename = "style")]
+    fn set_style(&self, value: Option<rquickjs::Coerced<String>>) {
+        let Some(n) = self.node_ref() else { return };
+        match value {
+            Some(s) => n.set_attr("style", &s.0),
+            None => n.set_attr("style", ""),
+        }
+    }
+
     /// `element.getAttribute(name)` — return the attribute value, or
     /// `null` if not present.
     fn get_attribute(&self, name: String) -> Option<String> {
