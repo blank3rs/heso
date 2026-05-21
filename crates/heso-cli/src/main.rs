@@ -1599,7 +1599,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         body["forms"] = forms_json.clone();
     }
     if include.cookies {
-        body["cookies"] = collect_cookies(&fetch_engine, page.url());
+        body["cookies"] = collect_cookies(&page);
     }
     if include.console {
         body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);
@@ -2424,28 +2424,33 @@ fn starts_with_section(child: &str, form: &str) -> bool {
     child == form || child.starts_with(&format!("{form}/"))
 }
 
-/// Walk the fetch engine's cookie jar and emit the non-HttpOnly
-/// cookies that match `url`, in the same order
-/// `cookie_store::CookieStore::matches` produces. Each entry is the
-/// agent-facing shape `{name, value, domain, path}` — HttpOnly is
-/// dropped per WHATWG HTML §6.1 (the same filter `document.cookie`
-/// applies in a real browser).
-pub(crate) fn collect_cookies(engine: &FetchEngine, url: &Url) -> serde_json::Value {
-    let jar = engine.cookie_jar();
-    let guard = match jar.lock() {
-        Ok(g) => g,
-        Err(_) => return serde_json::Value::Array(Vec::new()),
-    };
+/// Render the non-HttpOnly cookies the **response** set into the
+/// agent-facing JSON shape `{name, value, domain, path}`.
+///
+/// **Determinism.** The input is
+/// [`heso_engine_fetch::FetchPage::response_cookies`], which is
+/// captured eagerly in the fetch engine's open path right after
+/// `reqwest::Client::send` resolves — i.e. **before** any concurrent
+/// task can land another `Set-Cookie` on the shared jar. This
+/// eliminates the read-after-write race that the previous
+/// `jar.matches(url)`-at-serialize-time scan exhibited under
+/// `batch read --parallel N`, where URL #1's row could absorb cookies
+/// set by URL #2 if #2 finished first. See `bug-reports/04-long-running.md`.
+///
+/// **HttpOnly filter.** Cookies with `HttpOnly` are dropped, matching
+/// the WHATWG HTML §6.1 `document.cookie` visibility rule a real
+/// browser applies.
+pub(crate) fn collect_cookies(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
     let mut out = Vec::new();
-    for c in guard.matches(url) {
-        if matches!(c.http_only(), Some(true)) {
+    for c in &page.response_cookies {
+        if c.http_only {
             continue;
         }
         out.push(serde_json::json!({
-            "name": c.name(),
-            "value": c.value(),
-            "domain": c.domain().unwrap_or(""),
-            "path": c.path().unwrap_or("/"),
+            "name": c.name,
+            "value": c.value,
+            "domain": c.domain.clone().unwrap_or_default(),
+            "path": c.path.clone().unwrap_or_else(|| "/".to_owned()),
         }));
     }
     serde_json::Value::Array(out)

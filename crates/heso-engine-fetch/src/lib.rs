@@ -84,6 +84,10 @@ pub use plat::{
     VerifyError as PlatVerifyError,
 };
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
+// `ResponseCookie` is defined inline below alongside `FetchPage` and is
+// already public via its `pub struct` declaration. The CLI uses it to
+// render a deterministic per-URL `cookies` field without re-reading the
+// shared cookie jar (which is a race surface under `batch read --parallel N`).
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -93,6 +97,7 @@ use heso_engine_api::{EngineApi, Page};
 use reqwest::Client;
 use reqwest_cookie_store::CookieStoreMutex;
 use scraper::{ElementRef as ScraperElementRef, Html, Node};
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // Error type
@@ -281,6 +286,16 @@ impl FetchEngine {
         let final_url_str = response.url().as_str().to_owned();
         let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
 
+        // Snapshot the cookies this response set BEFORE `response.text()`
+        // consumes the body — the per-task, race-free counterpart to
+        // scanning the shared cookie jar at JSON-serialize time. Per
+        // reqwest's source, `Set-Cookie` headers are also written into
+        // the shared jar eagerly during `.send()`, so both pathways
+        // ingest the same cookies; the `response_cookies` snapshot is
+        // what lets callers serialize them per-URL without
+        // sibling-task contamination.
+        let response_cookies = snapshot_response_cookies(&response);
+
         let html_text = response.text().await.map_err(Error::from)?;
 
         // Past the last `.await`; `scraper::Html` is `!Send` but that's
@@ -303,6 +318,7 @@ impl FetchEngine {
             linked_pages: Vec::new(),
             inline_data,
             data_attrs,
+            response_cookies,
         })
     }
 }
@@ -330,6 +346,98 @@ impl Default for FetchEngine {
     fn default() -> Self {
         Self::new().expect("default reqwest Client should always build")
     }
+}
+
+// ============================================================================
+// ResponseCookie
+// ============================================================================
+
+/// A single `Set-Cookie` header value the server returned with **this**
+/// response, copied into an owned form so it survives past the response
+/// body's drop point.
+///
+/// Captured eagerly in [`FetchEngine::open_static`] from
+/// [`reqwest::Response::cookies`] so callers that want to know "what
+/// cookies did *this* response set?" get a deterministic, per-task answer
+/// — independent of any subsequent writes other tasks make to the shared
+/// `Arc<CookieStoreMutex>`.
+///
+/// The shape is intentionally `{name, value, domain, path, host_only,
+/// http_only, secure}`:
+///
+/// - `domain` is `None` when the server's `Set-Cookie` had no `Domain=`
+///   attribute. RFC 6265 §5.3 step 6 calls this the *host-only* case —
+///   the cookie's effective scope is the request URL's host, not any
+///   sub-domains.
+/// - `host_only` is the boolean that lets a caller distinguish "the
+///   server sent `Domain=`" (`host_only = false`) from "the server
+///   omitted `Domain=`" (`host_only = true`) without ambiguity. Without
+///   this boolean, an empty `domain` field looks the same as a missing
+///   one.
+/// - `http_only` is the `HttpOnly` directive — set by servers that want
+///   the cookie hidden from JS `document.cookie`. Heso strips
+///   HttpOnly cookies from the agent-facing JSON (matching the WHATWG
+///   HTML §6.1 filter `document.cookie` applies in a real browser).
+/// - `secure` is the `Secure` directive — only sent over HTTPS.
+///
+/// Field order matches the JSON shape `collect_cookies` emits — keep
+/// them in sync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseCookie {
+    /// Cookie name (`name=value` from the `Set-Cookie` header).
+    pub name: String,
+    /// Cookie value.
+    pub value: String,
+    /// `Domain=` attribute value — `None` when the server's `Set-Cookie`
+    /// omitted `Domain=` (the "host-only" case, RFC 6265 §5.3 step 6).
+    /// `host_only` is the disambiguating flag — see the struct comment.
+    pub domain: Option<String>,
+    /// `Path=` attribute value — defaults to `/` if the server omitted
+    /// it.
+    pub path: Option<String>,
+    /// `true` iff the server's `Set-Cookie` had **no** `Domain=`
+    /// attribute (or the attribute value was empty). RFC 6265 calls
+    /// this a "host-only" cookie: the cookie's effective scope is the
+    /// request URL's host, not any sub-domains.
+    pub host_only: bool,
+    /// `HttpOnly` directive — when `true`, the cookie is hidden from JS
+    /// `document.cookie`. Heso strips HttpOnly cookies from the
+    /// agent-facing JSON.
+    pub http_only: bool,
+    /// `Secure` directive — when `true`, the cookie only travels over
+    /// HTTPS.
+    pub secure: bool,
+}
+
+/// Snapshot the cookies this **response** set, copying owned data out
+/// of the borrowed [`reqwest::cookie::Cookie`] iterator into
+/// [`ResponseCookie`]s.
+///
+/// Per RFC 6265 §5.3 step 6, a cookie whose `Set-Cookie` carried no
+/// `Domain=` attribute is *host-only* — its effective scope is the
+/// request URL's host. `reqwest::cookie::Cookie::domain()` returns
+/// `None` for the host-only case; we surface that through
+/// [`ResponseCookie::host_only`] so the agent-facing JSON can render
+/// `host_only: true` (and substitute the request URL's host for
+/// `domain`) instead of the empty-string sentinel the previous
+/// `cookie_store`-side scan produced.
+fn snapshot_response_cookies(response: &reqwest::Response) -> Vec<ResponseCookie> {
+    response
+        .cookies()
+        .map(|c| {
+            let domain = c.domain().map(str::to_owned);
+            let host_only = domain.as_deref().is_none_or(str::is_empty);
+            ResponseCookie {
+                name: c.name().to_owned(),
+                value: c.value().to_owned(),
+                domain,
+                path: c.path().map(str::to_owned),
+                host_only,
+                http_only: c.http_only(),
+                secure: c.secure(),
+            }
+        })
+        .collect()
 }
 
 // ============================================================================
@@ -386,6 +494,19 @@ pub struct FetchPage {
     /// values are document-ordered lists of (tag, JSON) records.
     /// See [`crate::data_attrs`].
     pub data_attrs: std::collections::BTreeMap<String, Vec<DataAttrValue>>,
+    /// Cookies the server set with **this specific response**, captured
+    /// eagerly via [`reqwest::Response::cookies`] before any other
+    /// concurrent task could land a `Set-Cookie` on the shared jar.
+    /// This is the deterministic, race-free counterpart to scanning the
+    /// shared `Arc<CookieStoreMutex>` at JSON-serialize time — used by
+    /// the CLI's `--include cookies` to emit a per-URL snapshot that
+    /// reflects what *this* response asked for, not whatever the jar
+    /// happens to contain when the row gets serialized.
+    ///
+    /// Includes `HttpOnly` cookies; the CLI filters those out at
+    /// serialize time to match the WHATWG HTML §6.1 `document.cookie`
+    /// visibility rule.
+    pub response_cookies: Vec<ResponseCookie>,
 }
 
 impl Page for FetchPage {

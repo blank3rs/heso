@@ -436,3 +436,138 @@ async fn batch_open_invalid_url_emits_classified_error() {
         "expected `invalid_url:` tag, got: {tag}"
     );
 }
+
+// ============================================================================
+// Test 10 (bug-report 04, Bug B): `batch read --include cookies --parallel N`
+// emits a per-URL cookies snapshot that reflects *only this response's*
+// `Set-Cookie` headers — sibling tasks finishing first cannot leak their
+// cookies into our row.
+//
+// Fixture: two URLs, each setting a distinct cookie. With the old
+// `jar.matches(url)` scan at JSON-serialize time, a row's `cookies`
+// would contain both cookies whenever the sibling completed first.
+// With the eager `FetchPage::response_cookies` snapshot, each row sees
+// only the cookies its own response set, regardless of completion
+// ordering.
+// ============================================================================
+
+#[tokio::test]
+async fn batch_read_cookies_are_per_response_not_jar_snapshot() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Set-Cookie", "cook_a=A; Path=/")
+                .set_body_string("<title>A</title><body>page A</body>"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/b"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Set-Cookie", "cook_b=B; Path=/")
+                .set_body_string("<title>B</title><body>page B</body>"),
+        )
+        .mount(&server)
+        .await;
+
+    let url_a = format!("{}/a", server.uri());
+    let url_b = format!("{}/b", server.uri());
+    let out = run_batch(&[
+        "read",
+        "--parallel",
+        "4",
+        "--include",
+        "cookies",
+        &url_a,
+        &url_b,
+    ]);
+
+    assert!(
+        out.status.success(),
+        "expected success; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = parse_jsonl(&out);
+    assert_eq!(rows.len(), 2, "expected 2 rows: {rows:?}");
+
+    let row_a = rows
+        .iter()
+        .find(|r| r["url"].as_str().unwrap_or("").ends_with("/a"))
+        .expect("a row");
+    let row_b = rows
+        .iter()
+        .find(|r| r["url"].as_str().unwrap_or("").ends_with("/b"))
+        .expect("b row");
+
+    let a_cookies = row_a["cookies"].as_array().expect("a.cookies array");
+    let b_cookies = row_b["cookies"].as_array().expect("b.cookies array");
+    assert_eq!(
+        a_cookies.len(),
+        1,
+        "row A's cookies should contain only cook_a; got: {a_cookies:?}"
+    );
+    assert_eq!(
+        b_cookies.len(),
+        1,
+        "row B's cookies should contain only cook_b; got: {b_cookies:?}"
+    );
+    assert_eq!(a_cookies[0]["name"].as_str(), Some("cook_a"));
+    assert_eq!(b_cookies[0]["name"].as_str(), Some("cook_b"));
+}
+
+// ============================================================================
+// Test 11 (bug-report 04, Bug B determinism): the same fixture as Test 10,
+// run twice. Both runs must emit identical cookie counts per row even
+// though task completion order varies under `--parallel`. This is the
+// determinism property the race fix establishes.
+// ============================================================================
+
+#[tokio::test]
+async fn batch_read_cookies_are_deterministic_across_runs() {
+    let server = MockServer::start().await;
+    for (p, name) in [("/c1", "c1"), ("/c2", "c2"), ("/c3", "c3"), ("/c4", "c4")] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Set-Cookie",
+                        format!("{name}=v; Path=/").as_str(),
+                    )
+                    .set_body_string("<title>x</title>"),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let urls: Vec<String> = (1..=4).map(|i| format!("{}/c{i}", server.uri())).collect();
+    let mut args = vec!["read", "--parallel", "4", "--include", "cookies"];
+    for u in &urls {
+        args.push(u.as_str());
+    }
+
+    let r1 = run_batch(&args);
+    assert!(r1.status.success(), "run 1 failed: {}", String::from_utf8_lossy(&r1.stderr));
+    let rows_1 = parse_jsonl(&r1);
+
+    let r2 = run_batch(&args);
+    assert!(r2.status.success(), "run 2 failed: {}", String::from_utf8_lossy(&r2.stderr));
+    let rows_2 = parse_jsonl(&r2);
+
+    assert_eq!(rows_1.len(), 4);
+    assert_eq!(rows_2.len(), 4);
+    for rows in [&rows_1, &rows_2] {
+        for row in rows {
+            assert_eq!(row["ok"], serde_json::json!(true));
+            let cookies = row["cookies"].as_array().expect("cookies array");
+            assert_eq!(
+                cookies.len(),
+                1,
+                "expected exactly one per-response cookie; got: {row:?}"
+            );
+        }
+    }
+}
