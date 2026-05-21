@@ -812,24 +812,35 @@ mod tests {
     /// argument(s) while 2 where expected" at the binding boundary.
     /// After fix: `delay: Opt<f64>` maps to `ParamRequirement::optional()`
     /// and a missing arg clamps to 0 via `clamp_delay(None)`.
+    ///
+    /// Note: per the bug-report 03 P2 (Bug C) fix
+    /// `JsEngine::fire_due_timers_and_drain_microtasks`, a
+    /// `setTimeout(fn)` queued at clock-zero is fired before
+    /// [`JsEngine::eval`] returns. That makes the assertion shape
+    /// `flag === 1` immediately after the schedule call, with
+    /// `pending_timers == 0` — no explicit `advance_clock` needed.
     #[test]
     fn set_timeout_one_arg_form_defaults_delay_to_zero() {
         let e = engine();
-        let _ = e
+        let out = e
             .eval(
                 r#"
                 globalThis.flag = 0;
                 // No delay arg — must be treated as 0.
                 setTimeout(function () { globalThis.flag = 1; });
+                globalThis.flag
                 "#,
             )
             .expect("setTimeout(fn) must not throw");
-        // Pending timer is queued at fire_at=0; advance_clock(0)
-        // drains it just like the 2-arg `setTimeout(fn, 0)` shape.
-        assert_eq!(e.pending_timers(), 1);
-        e.advance_clock(0).expect("advance ok");
-        let out = e.eval("globalThis.flag").expect("eval ok");
-        assert_eq!(out.value, serde_json::json!(1));
+        // The setTimeout(0) callback fires inside `engine.eval` via
+        // `run_pending_jobs` → `fire_due_timers_and_drain_microtasks`
+        // (the Bug C drain). The synchronous return value is still 0
+        // because the timer hasn't fired *yet* when the statement
+        // `globalThis.flag` is evaluated mid-eval, but a follow-up
+        // eval observes the post-fire state.
+        assert_eq!(out.value, serde_json::json!(0));
+        let observe = e.eval("globalThis.flag").expect("eval ok");
+        assert_eq!(observe.value, serde_json::json!(1));
         assert_eq!(e.pending_timers(), 0);
     }
 
