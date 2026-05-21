@@ -1,4 +1,4 @@
-﻿[workspace]
+[workspace]
 resolver = "2"
 members = [
     "crates/heso-core",
@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.8"
+version = "0.0.9"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"

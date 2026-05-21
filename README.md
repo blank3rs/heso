@@ -29,7 +29,7 @@ npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example
 powershell -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso.zip -OutFile heso.zip; Expand-Archive heso.zip -DestinationPath ."
 ```
 
-> Shipping `v0.0.8` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.0.9` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 
 After install, `heso` is on `$PATH`:
 
