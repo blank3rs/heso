@@ -11,6 +11,7 @@ description = "heso static path — native HTTP + HTML EngineApi. The agent-nati
 [dependencies]
 heso-core = { path = "../heso-core" }
 heso-engine-api = { path = "../heso-engine-api" }
+base64.workspace = true
 blake3.workspace = true
 reqwest.workspace = true
 scraper.workspace = true

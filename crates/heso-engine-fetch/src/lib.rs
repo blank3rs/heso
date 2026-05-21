@@ -62,6 +62,7 @@
 #![warn(missing_docs)]
 
 pub mod actions;
+pub mod cassette;
 pub mod data_attrs;
 pub mod explore;
 pub mod inline_data;
@@ -73,6 +74,7 @@ pub use actions::{
     extract as extract_actions, filter as filter_actions, resolve as resolve_action,
     resolve_locator, resolve_locator_from_html, ElementRef, LocatorError,
 };
+pub use cassette::{Cassette, CassetteMiss, Record as CassetteRecord};
 pub use data_attrs::{extract as extract_data_attrs, DataAttrValue};
 pub use explore::{
     linked_pages_to_json, ExploreOptions, LinkedPage, DEFAULT_LINK_CAP, HARD_LINK_CAP,
