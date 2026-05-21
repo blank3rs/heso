@@ -78,7 +78,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use rquickjs::{CatchResultExt, CaughtError, Context, Function, Module, Value};
+use rquickjs::{
+    context::EvalOptions, CatchResultExt, CaughtError, Context, Function, Module, Value,
+};
 
 use crate::engine::{ConsoleEntry, ConsoleLevel, EvalError};
 use crate::import_map::parse_import_map;
@@ -1098,9 +1100,34 @@ fn is_import_map_script_type(type_attr: Option<&str>) -> bool {
 /// `Ok(None)` if the script ran without throwing, `Ok(Some(msg))` if
 /// it threw a recoverable JS exception (the caller turns this into a
 /// `console.error`), `Err(_)` only for engine-internal failures.
+///
+/// **Sloppy-mode evaluation.** Classic `<script>` bodies run in
+/// **sloppy mode** by default per WHATWG HTML §16.1.3 (a classic
+/// script is "non-strict" unless its source begins with the
+/// `"use strict"` directive). Real browsers therefore accept the
+/// shape `RLCONF = {...}` (Wikipedia's MediaWiki ResourceLoader) and
+/// `require = function(){...}` (Apple's browserify-style UMD on
+/// `ac-target.js`) as a top-level assignment that creates a global
+/// property on first run. rquickjs's `Ctx::eval` defaults to *strict*
+/// (`EvalOptions::default()` sets `strict: true`), which turned those
+/// same lines into a `ReferenceError: <name> is not defined`. We
+/// pass an explicit `EvalOptions { strict: false, .. }` here to match
+/// the spec. ES modules (handled in [`eval_one_module`]) stay strict
+/// per ECMA-262 §16.2.2 — module code is always strict regardless of
+/// any directive.
 fn eval_one(context: &Context, source: &str) -> Result<Option<String>, EvalError> {
     context.with(|ctx| -> Result<Option<String>, EvalError> {
-        match ctx.eval::<Value, _>(source).catch(&ctx) {
+        // `EvalOptions` is `#[non_exhaustive]` in rquickjs 0.11 — struct-literal
+        // construction is forbidden across crate boundaries. Build via `default()`
+        // then flip the strict bit; the other fields (`global: true`,
+        // `backtrace_barrier: false`, `promise: false`, `filename: None`) stay at
+        // their spec-matching defaults.
+        let mut options = EvalOptions::default();
+        options.strict = false;
+        match ctx
+            .eval_with_options::<Value, _>(source, options)
+            .catch(&ctx)
+        {
             Ok(_) => Ok(None),
             Err(CaughtError::Exception(exc)) => {
                 let msg = match exc.message() {
@@ -1655,5 +1682,96 @@ mod tests {
             .expect("eval ok");
         // After pump: currentScript exists and is null (not undefined).
         assert_eq!(out.value, serde_json::json!(["object", true]));
+    }
+
+    /// Regression for bug-report 03 P0: classic `<script>` bodies run
+    /// in **sloppy mode** by default. A bare top-level assignment to
+    /// a non-declared identifier (`RLCONF = {...}` — what MediaWiki's
+    /// ResourceLoader emits on Wikipedia; `require = function(){}` —
+    /// what Apple's browserify-style UMD bundles emit) must create a
+    /// global property, NOT throw `ReferenceError: <name> is not
+    /// defined`.
+    ///
+    /// Before fix: `ctx.eval(...)` ran with `EvalOptions { strict: true,
+    /// .. }` (rquickjs's default) and rejected the bare assignment.
+    /// After fix: `eval_one` routes through `ctx.eval_with_options(...,
+    /// EvalOptions { strict: false, .. })` so the spec-mandated classic
+    /// sloppy semantics apply.
+    #[test]
+    fn classic_script_runs_in_sloppy_mode_bare_assign_succeeds() {
+        let engine = crate::JsEngine::new().expect("engine builds");
+        // Wikipedia-shape: `RLCONF = {x: 1}` at top level. In strict
+        // mode this throws "RLCONF is not defined"; in sloppy mode it
+        // creates `globalThis.RLCONF = {x:1}` (the historic
+        // implicit-global rule).
+        let html = r#"<!doctype html><html><body>
+            <script>RLCONF = {x: 1}; window.RLCONF = RLCONF;</script>
+        </body></html>"#;
+        let out = engine
+            .eval_with_html_policy(
+                html,
+                "[typeof RLCONF, RLCONF && RLCONF.x, typeof window.RLCONF]",
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        assert_eq!(
+            out.value,
+            serde_json::json!(["object", 1, "object"]),
+            "RLCONF must have been created as a global by the sloppy-mode <script>"
+        );
+        // No console-error entries — strict mode would have produced
+        // a "RLCONF is not defined" error.
+        let any_strict_error = out
+            .console
+            .iter()
+            .any(|c| matches!(c.level, ConsoleLevel::Error));
+        assert!(
+            !any_strict_error,
+            "no console.error expected from sloppy-mode classic script; got console: {:?}",
+            out.console
+        );
+        // And no script-failure either.
+        let failures = engine.script_failures_snapshot();
+        assert!(
+            failures.is_empty(),
+            "no script failures expected; got: {failures:?}"
+        );
+    }
+
+    /// Complement to the previous test: ES modules MUST stay strict
+    /// per ECMA-262 §16.2.2 even after the classic-script sloppy fix.
+    /// Same bare-assign body inside `<script type="module">` must
+    /// reject with a ReferenceError — observable as `RLCONF` and
+    /// `window.RLCONF` both staying `undefined` (the assignment
+    /// throws before reaching the `window.RLCONF = ...` line).
+    ///
+    /// Note: a top-level module throw rejects the Promise that
+    /// `Module::evaluate` returned rather than throwing synchronously;
+    /// the current `eval_one_module` only routes the synchronous-throw
+    /// path into `script_failures`, so we assert the observable
+    /// state-of-the-globals here rather than the failure-bucket
+    /// contents. The important property the test guards against is
+    /// *strict-mode regression* — if modules ever flipped to sloppy,
+    /// `RLCONF` would become a defined global on the assignment line
+    /// and this `["undefined", "undefined"]` assert would fail loudly.
+    #[test]
+    fn module_script_stays_strict_bare_assign_errors() {
+        let engine = crate::JsEngine::new().expect("engine builds");
+        let html = r#"<!doctype html><html><body>
+            <script type="module">RLCONF = {x: 1}; window.RLCONF = RLCONF;</script>
+        </body></html>"#;
+        let out = engine
+            .eval_with_html_policy(
+                html,
+                "[typeof RLCONF, typeof window.RLCONF]",
+                ScriptFetchPolicy::Skip,
+            )
+            .expect("eval ok");
+        // RLCONF must NOT have been created — module bodies are strict.
+        assert_eq!(
+            out.value,
+            serde_json::json!(["undefined", "undefined"]),
+            "module body's bare assignment must have thrown — RLCONF must NOT be a global"
+        );
     }
 }

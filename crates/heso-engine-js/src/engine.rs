@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 
 use reqwest_cookie_store::CookieStoreMutex;
 use rquickjs::{
+    context::EvalOptions,
     prelude::{Func, Rest, This},
     CatchResultExt, CaughtError, Class, Context, Ctx, Function, Object, Runtime, Value,
 };
@@ -1015,6 +1016,16 @@ impl JsEngine {
             // sets `globalThis.X = ...`) wouldn't be observable
             // from a subsequent `eval`.
             self.execute_pending_jobs_until_idle()?;
+            // bug-report 03 P2: also pump any setTimeout(0) /
+            // setInterval(0) callbacks that the synchronous prefix
+            // scheduled. A Promise like `new Promise(r => setTimeout(
+            // r, 0))` deposits its resolver on the timer queue, NOT
+            // on the microtask queue — so the bare microtask drain
+            // above never settles it. One `advance_clock(0)` round
+            // fires every already-due timer (fire_at_ms <= now), and
+            // the resulting microtasks (the timer's `.then` chain) are
+            // drained by the trailing pump.
+            self.fire_due_timers_and_drain_microtasks()?;
             return Ok(0);
         };
         let mut total = 0;
@@ -1062,8 +1073,13 @@ impl JsEngine {
             if drained == 0 {
                 // No fetches queued during this round. One more
                 // pump for microtasks the previous drain's resolves
-                // may have scheduled, then we're done.
+                // may have scheduled, then check if any setTimeout(0)
+                // callbacks are due (bug-report 03 P2 — Promise
+                // resolvers handed off via `new Promise(r =>
+                // setTimeout(r, 0))` land on the timer queue, NOT
+                // the microtask queue).
                 self.execute_pending_jobs_until_idle()?;
+                self.fire_due_timers_and_drain_microtasks()?;
                 // Belt-and-braces: a `.then` on a just-resolved
                 // fetch could in principle queue another fetch.
                 // If so, loop. Otherwise we're idle.
@@ -1130,6 +1146,45 @@ impl JsEngine {
         )))
     }
 
+    /// Fire every timer that is **already due** (`fire_at_ms <= now`)
+    /// without advancing the virtual clock past `now`, then drain
+    /// every microtask the fires queued.
+    ///
+    /// Internal helper used by [`Self::run_pending_jobs`] to settle
+    /// Promises whose resolvers were handed to `setTimeout(r, 0)` —
+    /// the resolver is queued on the timer wheel rather than the
+    /// microtask queue, so the bare microtask drain alone can't
+    /// settle them (bug-report 03 P2).
+    ///
+    /// `advance_clock(0)` is the key shape: it adds 0 to the virtual
+    /// clock (so it stays at `now`) but the pump inside
+    /// [`crate::timers::advance_clock`] still pops every entry whose
+    /// `fire_at_ms <= now`. This catches the canonical
+    /// `setTimeout(r, 0)` scheduled at clock-zero, plus any 0-delay
+    /// callbacks the page may have queued. A `setTimeout(r, 100)` is
+    /// NOT triggered — its `fire_at_ms = 100 > now = 0` — so
+    /// determinism is preserved.
+    ///
+    /// We then run one more microtask drain to deliver the `.then`
+    /// chain of any newly-resolved Promise, since
+    /// [`crate::timers::advance_clock`] only invokes the user's
+    /// timer callback (e.g. the Promise `resolve`) and leaves the
+    /// follow-on microtask (the `.then(...)` callback that observes
+    /// the resolution) queued.
+    fn fire_due_timers_and_drain_microtasks(&self) -> Result<(), EvalError> {
+        // Skip the lock+pump round trip if nothing is queued. `advance_clock`
+        // is correct on an empty scheduler but the early-exit keeps the hot
+        // path (every `engine.eval` that didn't touch a timer) free of any
+        // timer interaction.
+        if self.pending_timers() == 0 {
+            return Ok(());
+        }
+        timers::advance_clock(&self.context, &self.timers, &self.console_buffer, 0)
+            .map_err(|e| EvalError::Engine(format!("fire_due_timers: {e}")))?;
+        self.execute_pending_jobs_until_idle()?;
+        Ok(())
+    }
+
     /// Eval `code` and capture its completion value as JSON.
     ///
     /// Two synchronous steps inside one [`rquickjs::Context::with`]:
@@ -1174,7 +1229,24 @@ impl JsEngine {
         let needs_pump = self
             .context
             .with(|ctx| -> Result<bool, EvalError> {
-                let raw = match ctx.eval::<Value, _>(code).catch(&ctx) {
+                // Sloppy-mode eval. Matches the WHATWG-classic-script
+                // contract enforced in [`crate::scripts::eval_one`] for
+                // page-served `<script>` bodies — user `eval-js` source
+                // is by convention "what the page would have run", so
+                // pre-strict idioms like `RLCONF = {...}` work without
+                // an explicit `"use strict"` directive. ES modules
+                // ([`crate::scripts::eval_one_module`]) stay strict per
+                // ECMA-262.
+                //
+                // `EvalOptions` is `#[non_exhaustive]` in rquickjs 0.11 —
+                // can't be struct-literal-built outside the crate; mutate
+                // a `default()` value instead.
+                let mut sloppy_opts = EvalOptions::default();
+                sloppy_opts.strict = false;
+                let raw = match ctx
+                    .eval_with_options::<Value, _>(code, sloppy_opts)
+                    .catch(&ctx)
+                {
                     Ok(v) => v,
                     Err(CaughtError::Exception(exc)) => {
                         return Err(EvalError::Exception {
@@ -1465,7 +1537,20 @@ impl JsEngine {
             let outcome = self
                 .context
                 .with(|ctx| -> Result<Option<EvalError>, EvalError> {
-                    match ctx.eval::<Value, _>(source.as_str()).catch(&ctx) {
+                    // Inject-scripts mirror inline-`<script>` semantics
+                    // (sloppy mode by default — see
+                    // [`crate::scripts::eval_one`]) so an agent's
+                    // `--inject-script` payload can use the same
+                    // pre-strict idioms a page might.
+                    //
+                    // `EvalOptions` is `#[non_exhaustive]` in rquickjs 0.11 —
+                    // can't be struct-literal-built outside the crate.
+                    let mut sloppy_opts = EvalOptions::default();
+                    sloppy_opts.strict = false;
+                    match ctx
+                        .eval_with_options::<Value, _>(source.as_str(), sloppy_opts)
+                        .catch(&ctx)
+                    {
                         Ok(_) => Ok(None),
                         Err(CaughtError::Exception(exc)) => {
                             let msg = exc.message().unwrap_or_default();
@@ -6004,5 +6089,81 @@ mod tests {
         assert_eq!(script_outcome.executed_with_error, 0);
         assert_eq!(out.value["neType"], "object");
         assert_eq!(out.value["neResult"], "ok");
+    }
+
+    /// Regression for bug-report 03 P0 at the `eval-js` (top-level
+    /// user-eval) layer: `engine.eval(source)` runs in sloppy mode so
+    /// `eval-js "MY_BARE_ASSIGN = 1; MY_BARE_ASSIGN"` returns `1`
+    /// instead of throwing `MY_BARE_ASSIGN is not defined`. The CLI
+    /// `cmd_eval_js` calls straight through `engine.eval(...)`, so
+    /// this is the direct repro the bug report flagged.
+    #[test]
+    fn eval_value_with_promise_await_is_sloppy_by_default() {
+        let e = engine();
+        let outcome = e
+            .eval("MY_BARE_ASSIGN = 7; MY_BARE_ASSIGN")
+            .expect("sloppy mode accepts implicit global creation");
+        assert_eq!(outcome.value, serde_json::json!(7));
+    }
+
+    /// Regression for bug-report 03 P2: a Promise whose resolver is
+    /// handed to `setTimeout(r, 0)` must settle by the time
+    /// [`JsEngine::eval`] returns. Before the fix, the eval-dom
+    /// drain pumped only the QuickJS microtask queue — the Promise
+    /// resolver lived on the timer wheel, never got fired, and the
+    /// settle slot for the outer `.then(resolve, reject)` stayed
+    /// empty so the returned value was `null`.
+    ///
+    /// After the fix, [`JsEngine::run_pending_jobs`] calls
+    /// [`JsEngine::fire_due_timers_and_drain_microtasks`] which fires
+    /// every already-due timer (fire_at_ms <= now) without advancing
+    /// the virtual clock past `now`. A `setTimeout(r, 0)` scheduled
+    /// at clock-zero gets popped + invoked, the Promise resolves,
+    /// the `.then` chain runs as a microtask, and the outer settle
+    /// slot picks up the resolved value.
+    #[test]
+    fn eval_drain_resolves_promise_via_set_timeout_zero() {
+        let e = engine();
+        // The "canonical" repro from the bug report: a Promise that
+        // resolves only when its setTimeout(0) callback fires.
+        let outcome = e
+            .eval(
+                r#"
+                let p = new Promise(r => setTimeout(() => r('m_ok'), 0));
+                p
+                "#,
+            )
+            .expect("setTimeout-resolved promise must settle in the drain");
+        assert_eq!(
+            outcome.value,
+            serde_json::json!("m_ok"),
+            "setTimeout(r, 0) deposit on the timer wheel must be drained \
+             alongside the microtask pump"
+        );
+    }
+
+    /// Sibling case: a deeply-nested
+    /// `Promise.resolve(new Promise(r => setTimeout(r, 0)))` round-trip
+    /// must also surface the inner resolution. The deep-resolve helper
+    /// installed at engine boot unwraps nested Promises before
+    /// serialization; that path also routes through
+    /// [`JsEngine::run_pending_jobs`] and so benefits from the same
+    /// timer-pump fix.
+    #[test]
+    fn eval_drain_resolves_nested_promise_via_set_timeout_zero() {
+        let e = engine();
+        let outcome = e
+            .eval(
+                r#"
+                Promise.resolve(new Promise(r => setTimeout(() => r('nested_ok'), 0)))
+                "#,
+            )
+            .expect("nested setTimeout-resolved promise must settle");
+        assert_eq!(
+            outcome.value,
+            serde_json::json!("nested_ok"),
+            "nested Promise.resolve(new Promise(r => setTimeout(r, 0))) \
+             must surface the inner resolution after the timer pump fires"
+        );
     }
 }

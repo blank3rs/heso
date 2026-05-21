@@ -78,7 +78,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rquickjs::{
-    prelude::{Func, Rest},
+    prelude::{Func, Opt, Rest},
     CatchResultExt, CaughtError, Context, Ctx, Function, Persistent, Value,
 };
 
@@ -359,7 +359,7 @@ pub(crate) fn install_timers(
     context.with(|ctx| -> rquickjs::Result<()> {
         let globals = ctx.globals();
 
-        // setTimeout(callback, delay_ms)
+        // setTimeout(callback [, delay_ms])
         //
         // We avoid taking a separate `Ctx` closure parameter because
         // rquickjs gives `Ctx<'_>` and `Function<'_>` independent
@@ -368,19 +368,38 @@ pub(crate) fn install_timers(
         // Instead we take just the [`Function`], which carries its
         // parent [`Ctx`] inside, and reach for `cb.ctx()` to bind
         // the persistent.
+        //
+        // The delay arg uses [`Opt<f64>`] (rquickjs' optional-arg
+        // wrapper), NOT `Option<f64>`. They look interchangeable but
+        // route through different `FromParam` impls:
+        // - `Option<T>` → `ParamRequirement::single()` (REQUIRED arg,
+        //   `None` only when the JS side passes literal `undefined`)
+        // - `Opt<T>`    → `ParamRequirement::optional()` (truly
+        //   optional, accepts a missing arg)
+        // Per WHATWG HTML `setTimeout(handler)` defaults the timeout
+        // to 0; the 1-arg call shape is used by fathom, Apple's
+        // globalheader.umd.js, and many analytics SDKs. The old
+        // `Option<f64>` signature rejected the 1-arg call with
+        // "Error calling function with 1 argument(s) while 2 where
+        // expected" — bug-report 03 P2.
         let set_timeout_scheduler = scheduler.clone();
-        let set_timeout = Func::from(move |cb: Function, delay: Option<f64>| {
+        let set_timeout = Func::from(move |cb: Function, delay: Opt<f64>| {
             let ctx = cb.ctx().clone();
-            schedule_from_js(&ctx, &set_timeout_scheduler, cb, delay, None)
+            schedule_from_js(&ctx, &set_timeout_scheduler, cb, delay.0, None)
         });
         globals.set("setTimeout", set_timeout)?;
 
-        // setInterval(callback, period_ms)
+        // setInterval(callback [, period_ms]) — same `Opt<f64>`
+        // contract as `setTimeout` so the 1-arg `setInterval(fn)`
+        // form (rare but spec-allowed) also works. A missing period
+        // clamps to 0 and is then bumped to a 1-ms tick by
+        // [`TimerScheduler::requeue_interval`] to avoid an infinite
+        // same-tick loop.
         let set_interval_scheduler = scheduler.clone();
-        let set_interval = Func::from(move |cb: Function, period: Option<f64>| {
+        let set_interval = Func::from(move |cb: Function, period: Opt<f64>| {
             // setInterval treats the delay as both the initial delay
             // *and* the repeat period — matches the browser.
-            let period_ms = clamp_delay(period);
+            let period_ms = clamp_delay(period.0);
             let ctx = cb.ctx().clone();
             schedule_from_js(
                 &ctx,
@@ -778,6 +797,78 @@ mod tests {
         e.advance_clock(0).expect("advance ok");
         let out = e.eval("globalThis.touched").expect("eval ok");
         assert_eq!(out.value, serde_json::json!(true));
+    }
+
+    /// Regression for bug-report 03 P2: `setTimeout(handler)` with no
+    /// delay argument must default the timeout to 0 per WHATWG HTML
+    /// `setTimeout` step 4 ("If timeout was not given, let timeout be
+    /// 0."). The 1-arg form is used by fathom (`setTimeout(function(){
+    /// window.fathom.trackPageview() })`), Apple's globalheader.umd.js,
+    /// and many analytics SDKs.
+    ///
+    /// Before fix: `delay: Option<f64>` in the rquickjs `Func::from`
+    /// signature mapped to `ParamRequirement::single()` (REQUIRED) so
+    /// JS-side `setTimeout(fn)` threw "Error calling function with 1
+    /// argument(s) while 2 where expected" at the binding boundary.
+    /// After fix: `delay: Opt<f64>` maps to `ParamRequirement::optional()`
+    /// and a missing arg clamps to 0 via `clamp_delay(None)`.
+    ///
+    /// Note: per the bug-report 03 P2 (Bug C) fix
+    /// `JsEngine::fire_due_timers_and_drain_microtasks`, a
+    /// `setTimeout(fn)` queued at clock-zero is fired before
+    /// [`JsEngine::eval`] returns. That makes the assertion shape
+    /// `flag === 1` immediately after the schedule call, with
+    /// `pending_timers == 0` — no explicit `advance_clock` needed.
+    #[test]
+    fn set_timeout_one_arg_form_defaults_delay_to_zero() {
+        let e = engine();
+        let out = e
+            .eval(
+                r#"
+                globalThis.flag = 0;
+                // No delay arg — must be treated as 0.
+                setTimeout(function () { globalThis.flag = 1; });
+                globalThis.flag
+                "#,
+            )
+            .expect("setTimeout(fn) must not throw");
+        // The setTimeout(0) callback fires inside `engine.eval` via
+        // `run_pending_jobs` → `fire_due_timers_and_drain_microtasks`
+        // (the Bug C drain). The synchronous return value is still 0
+        // because the timer hasn't fired *yet* when the statement
+        // `globalThis.flag` is evaluated mid-eval, but a follow-up
+        // eval observes the post-fire state.
+        assert_eq!(out.value, serde_json::json!(0));
+        let observe = e.eval("globalThis.flag").expect("eval ok");
+        assert_eq!(observe.value, serde_json::json!(1));
+        assert_eq!(e.pending_timers(), 0);
+    }
+
+    /// Sibling spec: `setInterval(handler)` must also work with one
+    /// argument (rare in the wild but the WHATWG IDL marks the delay
+    /// as optional with default 0). Mirrors the `setTimeout` 1-arg
+    /// fix.
+    #[test]
+    fn set_interval_one_arg_form_does_not_throw() {
+        let e = engine();
+        let _ = e
+            .eval(
+                r#"
+                globalThis.cnt = 0;
+                // No period arg — must be treated as 0 → minimum 1ms
+                // tick via requeue_interval.
+                globalThis.id = setInterval(function () { globalThis.cnt += 1; });
+                // Immediately clear so the determinism test doesn't
+                // run a runaway interval; we only care that the
+                // 1-arg call shape didn't throw at binding time.
+                clearInterval(globalThis.id);
+                "#,
+            )
+            .expect("setInterval(fn) must not throw");
+        // Cleared before any advance, so no fires expected.
+        e.advance_clock(0).expect("advance ok");
+        let out = e.eval("globalThis.cnt").expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(0));
     }
 
     #[test]
