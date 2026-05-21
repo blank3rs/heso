@@ -4669,29 +4669,49 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         var ctor;
         // Use a plain function so we work even when the host
         // Event base class lacks subclass-via-class syntax.
+        // We MUST construct via `Reflect.construct(Event, args,
+        // newTarget)` rather than `Event.call(this, ...)` because
+        // the rquickjs Event class enforces its `this` is a real
+        // Event instance — a `.call` with a fresh JS object on
+        // the LHS throws "Error converting from js 'object' into
+        // type 'Event'". `Reflect.construct` allocates a real
+        // Event but reparents its prototype to our subclass.
         if (typeof globalThis.Event === 'function') {
             ctor = function (type, init) {
-                globalThis.Event.call(this, type, init || {});
-                if (init) {
-                    for (var k in init) {
-                        if (Object.prototype.hasOwnProperty.call(init, k)) {
-                            try {
-                                // Stash under a parallel hidden slot
-                                // so the prototype accessor can read
-                                // it back without recursing.
-                                Object.defineProperty(this, '__' + k, {
-                                    value: init[k],
-                                    writable: true, enumerable: false, configurable: true,
-                                });
-                            } catch (e) {}
-                        }
+                init = init || {};
+                var inst;
+                try {
+                    inst = Reflect.construct(globalThis.Event, [type, init], ctor);
+                } catch (e) {
+                    // Fallback: hand-rolled instance if Reflect
+                    // path fails (e.g. on a future rquickjs that
+                    // rejects subclass new-targets).
+                    inst = Object.create(ctor.prototype);
+                    inst.type = type || '';
+                    inst.bubbles = !!init.bubbles;
+                    inst.cancelable = !!init.cancelable;
+                    inst.composed = !!init.composed;
+                    inst.isTrusted = false;
+                    inst.defaultPrevented = false;
+                }
+                for (var k in init) {
+                    if (Object.prototype.hasOwnProperty.call(init, k)) {
+                        try {
+                            // Stash under a parallel hidden slot
+                            // so the prototype accessor can read
+                            // it back without recursing.
+                            Object.defineProperty(inst, '__' + k, {
+                                value: init[k],
+                                writable: true, enumerable: false, configurable: true,
+                            });
+                        } catch (e) {}
                     }
                 }
                 if (defaultMembers) {
                     for (var dk in defaultMembers) {
-                        if (typeof this['__' + dk] === 'undefined') {
+                        if (typeof inst['__' + dk] === 'undefined') {
                             try {
-                                Object.defineProperty(this, '__' + dk, {
+                                Object.defineProperty(inst, '__' + dk, {
                                     value: defaultMembers[dk],
                                     writable: true, enumerable: false, configurable: true,
                                 });
@@ -4699,6 +4719,7 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
                         }
                     }
                 }
+                return inst;
             };
             try {
                 ctor.prototype = Object.create(globalThis.Event.prototype);
@@ -4840,6 +4861,16 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
                         once = !!options.once;
                         passive = !!options.passive;
                     }
+                    // WHATWG DOM §2.7 step 6: deduplicate by
+                    // (callback, capture). Avoids the "duplicate-add
+                    // fires twice" bug; spec lets the second add
+                    // be a silent no-op.
+                    for (var j = 0; j < store[type].length; j++) {
+                        if (store[type][j].listener === listener
+                            && store[type][j].capture === capture) {
+                            return;
+                        }
+                    }
                     store[type].push({ listener: listener, capture: capture, once: once, passive: passive });
                 },
                 writable: true, enumerable: false, configurable: true,
@@ -4861,23 +4892,87 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             });
             Object.defineProperty(etProto, 'dispatchEvent', {
                 value: function (event) {
-                    if (this == null || event == null) return true;
+                    if (this == null) return true;
+                    // WHATWG DOM §2.9: dispatchEvent must throw
+                    // TypeError if the argument isn't a real Event
+                    // instance. Real heso has Event / CustomEvent /
+                    // MouseEvent / etc. as separate rquickjs classes
+                    // — `event instanceof Event` is false for
+                    // siblings of Event, so we can't gate strictly.
+                    // Instead, accept any non-null object whose
+                    // `type` is a string AND whose constructor
+                    // declares an Event-class ancestry by exposing
+                    // a known set of spec properties (eventPhase,
+                    // bubbles, cancelable). POJOs lacking these
+                    // are rejected with a TypeError so the dispatch
+                    // contract still surfaces "not an Event".
+                    if (event == null
+                        || typeof event !== 'object'
+                        || typeof event.type !== 'string'
+                        // Spec-shape duck check: real Event-shaped
+                        // objects always have `bubbles` as a
+                        // boolean. POJOs with just `.type` fail
+                        // here.
+                        || typeof event.bubbles !== 'boolean') {
+                        throw new TypeError(
+                            "Failed to execute 'dispatchEvent' on 'EventTarget': "
+                            + 'parameter 1 is not of type \'Event\'.'
+                        );
+                    }
                     var type = event && event.type;
                     if (typeof type !== 'string') return true;
                     var store = this[ET_LISTENERS_KEY];
                     if (!store || !store[type]) return true;
                     var arr = store[type].slice();
+                    // Honor stopImmediatePropagation: set a flag
+                    // on the event when a listener calls it, and
+                    // break out of the loop on the next iteration.
+                    // Real browsers set an internal flag the dispatch
+                    // walker checks; we simulate via a sentinel
+                    // property the JS spec already requires the
+                    // Event class to expose (cancelBubble /
+                    // _stopImmediate). The rquickjs Event class
+                    // exposes `cancelBubble` as a getter that
+                    // returns the internal state; we can also call
+                    // a custom `__hesoStopImmediate` slot, but
+                    // since real Events have stopImmediatePropagation
+                    // already, we'll re-check the event's standard
+                    // property after each listener.
                     for (var i = 0; i < arr.length; i++) {
+                        // If a prior listener called
+                        // stopImmediatePropagation, bail.
                         try {
-                            arr[i].listener.call(this, event);
+                            if (event.__hesoImmediatePropagationStopped) break;
+                        } catch (e) {}
+                        // Wrap the listener to detect a
+                        // stopImmediatePropagation call. Real Events
+                        // already track this internally — we patch
+                        // the event's method temporarily so we can
+                        // catch the flag without depending on the
+                        // rquickjs Event class internals.
+                        var listenerRec = arr[i];
+                        try {
+                            // Patch stopImmediatePropagation to also
+                            // set our sentinel. Preserve the original
+                            // method semantics.
+                            if (typeof event.stopImmediatePropagation === 'function'
+                                && !event.__hesoStopImmediatePatched) {
+                                var orig = event.stopImmediatePropagation.bind(event);
+                                event.stopImmediatePropagation = function () {
+                                    event.__hesoImmediatePropagationStopped = true;
+                                    return orig();
+                                };
+                                event.__hesoStopImmediatePatched = true;
+                            }
+                            listenerRec.listener.call(this, event);
                         } catch (e) {
                             if (typeof console !== 'undefined' && console.error) {
                                 console.error('EventTarget dispatch listener threw:',
                                     e && e.message ? e.message : e);
                             }
                         }
-                        if (arr[i].once) {
-                            this.removeEventListener(type, arr[i].listener, arr[i].capture);
+                        if (listenerRec.once) {
+                            this.removeEventListener(type, listenerRec.listener, listenerRec.capture);
                         }
                     }
                     return !event.defaultPrevented;
