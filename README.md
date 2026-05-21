@@ -171,6 +171,75 @@ heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
 heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
 ```
 
+## Signed receipts
+
+Every `heso open` / `heso read` call can emit a **signed receipt** alongside its JSON output — an Ed25519-signed envelope describing what was run, what came back, and the BLAKE3 trace hash. The recipient verifies the signature against an allowlist of trusted public keys (or rejects the receipt). Per [ADR 0005](decisions/0005-ed25519-identity.md) + [ADR 0008](decisions/0008-deterministic-execution.md).
+
+One-time setup — generate a local Ed25519 identity:
+
+```sh
+heso identity init
+# → {"path": "heso-local-data/identity.key", "public_key": "fdibx2...IE=", "algorithm": "Ed25519"}
+```
+
+Sign a receipt on every call by passing `--receipt PATH`:
+
+```sh
+heso open https://example.com/ --receipt receipt.json
+# stdout: the normal page JSON
+# receipt.json (sibling file):
+# {
+#   "trace": [{"op": "cd", "target": {"kind": "url", "url": "https://example.com/"}}],
+#   "results": [{"op": "cd", "url": "https://example.com/"}],
+#   "trace_hash": "7e501fac...",
+#   "seed": 0, "mode": "deterministic", "cost": {...},
+#   "signature": {"algorithm": "Ed25519", "public_key": "fdibx2...IE=", "signature": "bNBb...Cg=="}
+# }
+```
+
+Verify the receipt — bind it to a trusted signer with `--trusted-keys`:
+
+```sh
+# trusted.json is a JSON array of base64 pubkeys you accept signatures from.
+echo '["fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE="]' > trusted.json
+
+heso receipt-verify --trusted-keys trusted.json receipt.json
+# → OK fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE=
+# exit 0
+```
+
+Or via the `HESO_TRUSTED_KEYS=<path>` env var if you'd rather not pass the flag every call.
+
+Verify enforces three rejections:
+
+```sh
+# 1. Tampered receipt — any byte change invalidates the signature
+sed -i 's/"seed": 0/"seed": 999/' receipt.json
+heso receipt-verify --trusted-keys trusted.json receipt.json
+# → INVALID: signature verification failed       (exit 1)
+
+# 2. Wrong signer — receipt is well-formed but the pubkey isn't allowlisted
+heso receipt-verify --trusted-keys other_keys.json receipt.json
+# → INVALID: signing pubkey `...` is not in the trusted-keys allowlist   (exit 1)
+
+# 3. `mode: live` — live runs use real time + real network and aren't
+#    replay-safe, so the signature has no replay value (ADR 0008)
+heso open https://example.com/ --receipt live.json --mode live
+heso receipt-verify --trusted-keys trusted.json live.json
+# → INVALID: receipt `mode: live` is not replay-safe — per ADR 0008 ...   (exit 1)
+```
+
+Verify without an allowlist still works for backwards compatibility, but emits a stderr warning so the missing trust anchor isn't silent:
+
+```sh
+heso receipt-verify receipt.json
+# stderr: warning: no pubkey allowlist configured (pass --trusted-keys PATH or set HESO_TRUSTED_KEYS ...)
+# stdout: OK fdibx2...IE=
+# exit 0
+```
+
+Exit codes: `0` valid + (allowlist empty OR pubkey allowlisted), `1` invalid (tampered, wrong signer, or `mode: live`), `2` missing/malformed receipt or `--trusted-keys` load failure.
+
 ## Error handling
 
 Both libraries throw a structured error (`HesoError` in Python, `HesoError extends Error` in Node) when the binary exits non-zero. Fields on the error tell you what to retry:
