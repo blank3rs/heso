@@ -286,14 +286,14 @@ impl FetchEngine {
         let final_url_str = response.url().as_str().to_owned();
         let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
 
-        // Snapshot the cookies this response set BEFORE `response.text()`
-        // consumes the body — the per-task, race-free counterpart to
-        // scanning the shared cookie jar at JSON-serialize time. Per
-        // reqwest's source, `Set-Cookie` headers are also written into
-        // the shared jar eagerly during `.send()`, so both pathways
-        // ingest the same cookies; the `response_cookies` snapshot is
-        // what lets callers serialize them per-URL without
-        // sibling-task contamination.
+        // Snapshot the cookies this response set BEFORE
+        // `response.text()` consumes the body. `Response::cookies()`
+        // iterates the final response's Set-Cookie headers — exactly
+        // the cookies the server asked us to store on this fetch.
+        // Bug-04-B race closure: any other task's writes to the
+        // shared cookie jar can no longer leak into this row's
+        // serialization, because we own a Vec of copied data instead
+        // of re-scanning the jar at JSON-emit time.
         let response_cookies = snapshot_response_cookies(&response);
 
         let html_text = response.text().await.map_err(Error::from)?;
@@ -352,15 +352,23 @@ impl Default for FetchEngine {
 // ResponseCookie
 // ============================================================================
 
-/// A single `Set-Cookie` header value the server returned with **this**
-/// response, copied into an owned form so it survives past the response
-/// body's drop point.
+/// A single `Set-Cookie` header value the server returned with
+/// **this** response, copied into an owned form so it survives past
+/// the response body's drop point.
 ///
 /// Captured eagerly in [`FetchEngine::open_static`] from
 /// [`reqwest::Response::cookies`] so callers that want to know "what
-/// cookies did *this* response set?" get a deterministic, per-task answer
-/// — independent of any subsequent writes other tasks make to the shared
-/// `Arc<CookieStoreMutex>`.
+/// cookies did *this* response set?" get a deterministic, per-task
+/// answer — independent of any subsequent writes other tasks make to
+/// the shared `Arc<CookieStoreMutex>`.
+///
+/// Trade-off: `Response::cookies()` only sees the **final** response's
+/// `Set-Cookie` headers. Intermediate redirect responses' cookies
+/// are written to the shared jar by reqwest but don't appear in this
+/// snapshot. For the agent-facing `--include cookies` shape this is
+/// the right call: the LLM wants "what cookies did the response I
+/// just fetched ask me to store" rather than the full effective
+/// cookie set spanning the redirect history.
 ///
 /// The shape is intentionally `{name, value, domain, path, host_only,
 /// http_only, secure}`:
@@ -409,9 +417,20 @@ pub struct ResponseCookie {
     pub secure: bool,
 }
 
-/// Snapshot the cookies this **response** set, copying owned data out
+/// Snapshot the cookies **this response** set, copying owned data out
 /// of the borrowed [`reqwest::cookie::Cookie`] iterator into
 /// [`ResponseCookie`]s.
+///
+/// `response.cookies()` iterates the final response's `Set-Cookie`
+/// headers — exactly the cookies the server asked for on **this**
+/// fetch. Importantly, it does NOT see `Set-Cookie` headers from
+/// intermediate redirect responses (reqwest discards those on the
+/// final `Response` object after writing them to the shared jar);
+/// callers who need redirect-chain cookies have to consult the jar
+/// separately. For the agent-facing `--include cookies` shape this
+/// is the correct trade-off — the LLM cares about "what cookies did
+/// the response I just fetched ask me to store?", not the full
+/// effective cookie set across the redirect history.
 ///
 /// Per RFC 6265 §5.3 step 6, a cookie whose `Set-Cookie` carried no
 /// `Domain=` attribute is *host-only* — its effective scope is the
@@ -419,8 +438,8 @@ pub struct ResponseCookie {
 /// `None` for the host-only case; we surface that through
 /// [`ResponseCookie::host_only`] so the agent-facing JSON can render
 /// `host_only: true` (and substitute the request URL's host for
-/// `domain`) instead of the empty-string sentinel the previous
-/// `cookie_store`-side scan produced.
+/// `domain`) instead of the empty-string sentinel the previous code
+/// produced.
 fn snapshot_response_cookies(response: &reqwest::Response) -> Vec<ResponseCookie> {
     response
         .cookies()
