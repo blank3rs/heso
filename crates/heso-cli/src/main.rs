@@ -110,8 +110,8 @@ use std::process::ExitCode;
 use heso_core::{IdentityKey, Url};
 use heso_engine_api::{EngineApi, Page};
 use heso_engine_fetch::{
-    linked_pages_to_json, resolve_action, resolve_locator_from_html, ElementRef, ExploreOptions,
-    FetchEngine, LocatorError, DEFAULT_LINK_CAP, HARD_LINK_CAP,
+    resolve_action, resolve_locator_from_html, ElementRef, ExploreOptions, FetchEngine, FetchPage,
+    LocatorError, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use heso_trace::{
     parse_actions, trace_fingerprint, verify_fingerprint, verify_receipt, Action,
@@ -201,12 +201,17 @@ fn print_banner() {
     println!("                                JSON with site_id / action_ids[] / trace_id (the headline hash).");
     println!("  heso action-hash-verify <file>");
     println!("                                Verify a saved fingerprint file (exit 0 valid, 1 invalid, 2 malformed)");
-    println!("  heso replay <fingerprint.json>");
-    println!("                                Re-execute every action in a saved fingerprint against the live");
-    println!("                                site. Refuses tampered files. Actions must use the canonical");
-    println!("                                schema ({{verb: open|click|fill|submit, ...}}). Outputs a per-step");
-    println!("                                session log. Stateless: each step re-fetches; URL navigation");
-    println!("                                IS tracked across steps, in-page DOM mutations are not.");
+    println!("  heso stamp  [--seed N] <plan-or-plat.json>");
+    println!("                                Execute a plan against the live web and mint a fresh plat that");
+    println!("                                embeds the plan. Accepts a bare Action[] array, a plat with a");
+    println!("                                `plan` field, or a fingerprint. Exit 0 ok / 1 if any step failed");
+    println!("                                (still emits the partial plat with `error` + `steps`).");
+    println!("  heso replay [--seed N] <plan-plat-or-fingerprint.json>");
+    println!("                                Re-execute the plan, print a per-step session log. No plat output —");
+    println!("                                use `stamp` for that. Refuses tampered fingerprints. Stateful:");
+    println!("                                one JsSession carries DOM mutations / RNG / cookies across steps.");
+    println!("  heso unpack <plat.json>       Extract the `plan` field from a plat (errors if none). Pipes into");
+    println!("                                an editor or back into `stamp` for the edit/re-mint loop.");
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
     println!(
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
@@ -605,13 +610,10 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
-    let url = match Url::parse(&url_str) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("invalid URL `{url_str}`: {e}");
-            return ExitCode::from(2);
-        }
-    };
+    if let Err(e) = Url::parse(&url_str) {
+        eprintln!("invalid URL `{url_str}`: {e}");
+        return ExitCode::from(2);
+    }
 
     let engine = match FetchEngine::new() {
         Ok(e) => e,
@@ -626,7 +628,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         link_cap,
     };
 
-    let page = match engine.open_with_explore(&url, opts).await {
+    let page = match engine.open_with_explore(&url_str, opts).await {
         Ok(p) => p,
         Err(e) => {
             // Hard fetch failures (DNS, connection refused, HTTP error
@@ -727,38 +729,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     // `plat_hash` BLAKE3 fingerprint is computed last over the canonical
     // form of everything-except-itself, so anyone holding this JSON can
     // recompute it and verify the plat hasn't been tampered with.
-    let mut body = serde_json::json!({
-        "url": page.url().as_str(),
-        "title": page.tree.title,
-        "description": page.tree.description,
-        "metadata": page.metadata,
-        "tree": page.tree,
-        "actions": page.actions,
-    });
-    if !page.inline_data.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "inline_data".to_owned(),
-                serde_json::to_value(&page.inline_data).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-    if !page.data_attrs.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "data_attrs".to_owned(),
-                serde_json::to_value(&page.data_attrs).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-    if !page.linked_pages.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "linked_pages".to_owned(),
-                linked_pages_to_json(&page.linked_pages),
-            );
-        }
-    }
+    let mut body = page.plat_body_base();
     attach_failure_envelope(
         &mut body,
         partial,
@@ -1484,14 +1455,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 // No DOM session means no post-hydration text/forms/
                 // cookies — we still ship the static tree + plat_hash
                 // so the agent has something to inspect.
-                let mut body = serde_json::json!({
-                    "url": page.url().as_str(),
-                    "title": page.tree.title,
-                    "description": page.tree.description,
-                    "metadata": page.metadata,
-                    "tree": page.tree,
-                    "actions": page.actions,
-                });
+                let mut body = page.plat_body_base();
                 let synthetic_failure = heso_engine_js::ScriptFailure {
                     url: None,
                     reason: "script_crash".to_owned(),
@@ -1554,32 +1518,12 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
         .count();
 
-    // Build the envelope. Start from the same base as `cmd_open`,
-    // then layer the agent-facing extras on top per `include`.
-    let mut body = serde_json::json!({
-        "url": page.url().as_str(),
-        "title": page.tree.title,
-        "description": page.tree.description,
-        "metadata": page.metadata,
-        "tree": page.tree,
-        "actions": current_actions,
-    });
-    if !page.inline_data.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "inline_data".to_owned(),
-                serde_json::to_value(&page.inline_data).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-    if !page.data_attrs.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "data_attrs".to_owned(),
-                serde_json::to_value(&page.data_attrs).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
+    // Same canonical base as `cmd_open`. Override `actions` with the
+    // post-load action graph (which may differ from `page.actions`
+    // under `--complete`).
+    let mut body = page.plat_body_base();
+    body["actions"] = serde_json::to_value(&current_actions)
+        .unwrap_or(serde_json::Value::Null);
     // Always compute visible_text + forms — they feed `content_hash`
     // and the `--since` snapshot store even when the include filter
     // would have dropped them from the user-visible body. The body
@@ -3983,6 +3927,280 @@ async fn cmd_plat_verify(args: &[String]) -> ExitCode {
     }
 }
 
+// ============================================================================
+// Plan lifecycle: stamp / replay / unpack
+// ============================================================================
+//
+// A *plat* is the static observation. A *plan* is the action sequence
+// that produced it. The three verbs below close the loop:
+//
+//   stamp  plan -> plat   (execute + validate + mint)
+//   replay plat -> log    (re-execute, report what happened)
+//   unpack plat -> plan   (extract the plan field, copyable)
+//
+// `stamp` and `replay` share `run_plan`. `unpack` is a thin field
+// extractor. All three accept the same plan-bearing inputs (plat with
+// embedded `plan`, bare action array, or `TraceFingerprint`) so a user
+// can compose them freely.
+
+/// Input shape accepted by `stamp` / `replay`. Holds the parsed plan
+/// plus the entry URL the plan starts from.
+struct PlanInput {
+    /// The action sequence to execute.
+    actions: Vec<Action>,
+    /// The URL the plan starts from. For a bare plan or a plat, this
+    /// is the first `Open` action's URL. For a `TraceFingerprint`,
+    /// it's `fp.url`.
+    start_url: Url,
+    /// The raw `actions` JSON, in the shape that goes onto a stamped
+    /// plat's `"plan"` field verbatim. Preserved separately so a
+    /// round-trip stamp → unpack → stamp yields identical bytes.
+    actions_json: serde_json::Value,
+    /// Origin of this plan — for logging / error context.
+    source: &'static str,
+}
+
+/// Detect a plan inside any of the three accepted JSON shapes:
+/// `TraceFingerprint`, plat (object with `"plan"` field), bare action
+/// array. Returns a parsed [`PlanInput`] or a usage-style error string.
+fn extract_plan(value: &serde_json::Value) -> Result<PlanInput, String> {
+    // Bare array: just an `Action[]`.
+    if let serde_json::Value::Array(_) = value {
+        let actions = parse_actions(value)
+            .map_err(|e| format!("plan array is not a canonical Action[]: {e}"))?;
+        let start = first_open_url(&actions).ok_or_else(|| {
+            "a bare plan must start with an `open` action so we know the entry URL"
+                .to_owned()
+        })?;
+        return Ok(PlanInput {
+            actions,
+            start_url: start,
+            actions_json: value.clone(),
+            source: "plan-array",
+        });
+    }
+    // Object: either a TraceFingerprint or a plat.
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "plan input must be a JSON array or object".to_owned())?;
+    if obj.contains_key("trace_id") && obj.contains_key("algorithm") {
+        let fp: TraceFingerprint = serde_json::from_value(value.clone())
+            .map_err(|e| format!("looks like a fingerprint but failed to parse: {e}"))?;
+        match verify_fingerprint(&fp) {
+            FingerprintOutcome::Valid => {}
+            FingerprintOutcome::Mismatch => {
+                return Err("fingerprint integrity check failed (file was modified after creation)".to_owned());
+            }
+            FingerprintOutcome::WrongAlgorithm(tag) => {
+                return Err(format!("unknown fingerprint algorithm `{tag}`"));
+            }
+            FingerprintOutcome::Malformed(reason) => {
+                return Err(format!("malformed fingerprint: {reason}"));
+            }
+        }
+        let actions = parse_actions(&fp.actions)
+            .map_err(|e| format!("fingerprint actions are not canonical: {e}"))?;
+        let start = Url::parse(&fp.url)
+            .map_err(|e| format!("fingerprint url unparseable: {e}"))?;
+        return Ok(PlanInput {
+            actions,
+            start_url: start,
+            actions_json: fp.actions,
+            source: "fingerprint",
+        });
+    }
+    if let Some(plan_value) = obj.get("plan") {
+        let actions = parse_actions(plan_value)
+            .map_err(|e| format!("plat's `plan` field is not a canonical Action[]: {e}"))?;
+        let start = first_open_url(&actions).ok_or_else(|| {
+            "plat's `plan` must start with an `open` action so we know the entry URL"
+                .to_owned()
+        })?;
+        return Ok(PlanInput {
+            actions,
+            start_url: start,
+            actions_json: plan_value.clone(),
+            source: "plat",
+        });
+    }
+    Err("input is neither a fingerprint, a plat with a `plan` field, nor a bare Action[] array".to_owned())
+}
+
+/// First `Action::Open` URL in the plan, parsed.
+fn first_open_url(actions: &[Action]) -> Option<Url> {
+    for a in actions {
+        if let Action::Open { url } = a {
+            return Url::parse(url).ok();
+        }
+    }
+    None
+}
+
+/// `heso stamp [--seed N] <plan-or-plat.json>` — execute a plan
+/// against the live web and emit a fresh plat that embeds the plan.
+///
+/// Accepts the same three input shapes as [`cmd_replay`]: a bare
+/// action array, a plat with a `"plan"` field, or a `TraceFingerprint`.
+/// Exits 0 on a clean run with the stamped plat on stdout; exits 1 if
+/// any action failed (still prints the partial plat with an `error`
+/// field so the caller can see how far it got).
+async fn cmd_stamp(args: &[String]) -> ExitCode {
+    let (seed, path) = match parse_seed_and_path(args, "stamp") {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read `{path}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{path}` is not valid JSON: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let plan = match extract_plan(&value) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("stamp: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let fetch = match FetchEngine::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("engine init failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = run_plan(&fetch, &plan.actions, seed, plan.start_url.clone()).await;
+
+    // Build a FetchPage from the post-execution DOM (live JS state).
+    // When the session is `None` the plan was a no-op; fall back to
+    // an empty FetchPage at start_url so the plat still has a valid
+    // shape.
+    let html = outcome
+        .session
+        .as_ref()
+        .map(|s| s.document_html())
+        .unwrap_or_default();
+    let mut page = FetchPage::from_html(
+        plan.start_url.as_str().to_owned(),
+        outcome.final_url.clone(),
+        html,
+    );
+    // Action graph captured at the most-recent navigation supersedes
+    // the one extracted from the post-JS HTML, because refs are tied
+    // to the navigation snapshot the executor itself used.
+    if !outcome.final_actions.is_empty() {
+        page.actions = outcome.final_actions;
+    }
+    page.plan = Some(plan.actions_json);
+    let mut body = page.plat_body_base();
+    if !outcome.ok {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "error".to_owned(),
+                serde_json::Value::String(format!(
+                    "stamp aborted at step {}: see `steps`",
+                    outcome.steps.len().saturating_sub(1)
+                )),
+            );
+            obj.insert(
+                "steps".to_owned(),
+                serde_json::Value::Array(outcome.steps.clone()),
+            );
+        }
+    }
+    let hash = heso_engine_fetch::plat_hash(&body);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+    }
+    let _ = print_json(&body);
+    if outcome.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `heso unpack <plat.json>` — extract the `plan` array from a plat
+/// and print it. Exits 2 if the file has no `plan` field (a plat that
+/// was produced by single-URL `heso open` instead of `heso stamp`).
+async fn cmd_unpack(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: heso unpack <plat.json>");
+        eprintln!();
+        eprintln!("Extracts the `plan` array from a plat so it can be edited");
+        eprintln!("standalone and stamped back into a fresh plat with `heso stamp`.");
+        return ExitCode::from(2);
+    }
+    let path = &args[0];
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read `{path}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{path}` is not valid JSON: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(plan) = value.get("plan") else {
+        eprintln!("`{path}` has no `plan` field — it was not produced by `heso stamp`");
+        eprintln!("(plats minted by single-URL `heso open` carry no plan).");
+        return ExitCode::from(2);
+    };
+    print_json(plan)
+}
+
+/// Shared `--seed N <path>` flag walker used by `stamp` and the
+/// extended `replay` variants. Mirrors `cmd_replay`'s style.
+fn parse_seed_and_path(args: &[String], verb: &str) -> Result<(Option<u64>, String), ExitCode> {
+    let mut seed: Option<u64> = None;
+    let mut path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seed" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--seed needs a value");
+                    return Err(ExitCode::from(2));
+                };
+                match v.parse::<u64>() {
+                    Ok(n) => seed = Some(n),
+                    Err(e) => {
+                        eprintln!("--seed: invalid u64 `{v}`: {e}");
+                        return Err(ExitCode::from(2));
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("unexpected positional `{other}`");
+                    return Err(ExitCode::from(2));
+                }
+                path = Some(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("usage: heso {verb} [--seed N] <file.json>");
+        return Err(ExitCode::from(2));
+    };
+    Ok((seed, path))
+}
+
 /// `heso action-hash <url> [actions-json | -]` — derive a keyless,
 /// tamper-evident fingerprint for an intended `(URL, actions)` pair.
 ///
@@ -4158,97 +4376,29 @@ async fn cmd_action_hash_verify(args: &[String]) -> ExitCode {
 ///   (`verb: open|click|fill|submit`). Schema-free fingerprints hash
 ///   fine but can't be auto-replayed; exit `2` with a clear message.
 async fn cmd_replay(args: &[String]) -> ExitCode {
-    // Parse optional `--seed N` flag (order-tolerant) and the
-    // positional fingerprint path.
-    let mut seed: Option<u64> = None;
-    let mut path: Option<&String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--seed" => {
-                let Some(v) = args.get(i + 1) else {
-                    eprintln!("--seed needs a value");
-                    return ExitCode::from(2);
-                };
-                match v.parse::<u64>() {
-                    Ok(n) => seed = Some(n),
-                    Err(e) => {
-                        eprintln!("--seed: invalid u64 `{v}`: {e}");
-                        return ExitCode::from(2);
-                    }
-                }
-                i += 2;
-            }
-            other => {
-                if path.is_some() {
-                    eprintln!("unexpected positional `{other}`");
-                    return ExitCode::from(2);
-                }
-                path = Some(&args[i]);
-                i += 1;
-            }
-        }
-    }
-    let Some(path) = path else {
-        eprintln!("usage: heso replay [--seed N] <fingerprint.json>");
-        eprintln!();
-        eprintln!("Re-executes every action in a saved fingerprint against the live");
-        eprintln!("site. Refuses tampered files. Schema must be {{verb: open|click|fill|submit, ...}}.");
-        eprintln!("--seed N seeds JsSession::open_with_seed for deterministic Math.random / crypto / timers.");
-        return ExitCode::from(2);
+    let (seed, path) = match parse_seed_and_path(args, "replay") {
+        Ok(v) => v,
+        Err(code) => return code,
     };
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot read `{path}`: {e}");
             return ExitCode::from(2);
         }
     };
-    let fp: TraceFingerprint = match serde_json::from_str(&contents) {
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{path}` is not a fingerprint JSON: {e}");
+            eprintln!("`{path}` is not valid JSON: {e}");
             return ExitCode::from(2);
         }
     };
-
-    // Refuse to replay a fingerprint that doesn't pass its own integrity
-    // check — we don't want to be a tool that re-executes tampered traces.
-    match verify_fingerprint(&fp) {
-        FingerprintOutcome::Valid => {}
-        FingerprintOutcome::Mismatch => {
-            eprintln!(
-                "refusing to replay: fingerprint integrity check failed (file was modified after creation)"
-            );
-            return ExitCode::from(1);
-        }
-        FingerprintOutcome::WrongAlgorithm(tag) => {
-            eprintln!("refusing to replay: unknown algorithm tag `{tag}`");
-            return ExitCode::from(1);
-        }
-        FingerprintOutcome::Malformed(reason) => {
-            eprintln!("refusing to replay: {reason}");
-            return ExitCode::from(2);
-        }
-    }
-
-    let actions = match parse_actions(&fp.actions) {
-        Ok(a) => a,
+    let plan = match extract_plan(&value) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("cannot replay: {e}");
-            eprintln!();
-            eprintln!("Replay handles only fingerprints whose actions use the canonical");
-            eprintln!("schema: {{\"verb\": \"open|click|fill|submit\", ...}}. Hashing accepts");
-            eprintln!("any JSON; replay does not.");
+            eprintln!("replay: {e}");
             return ExitCode::from(2);
-        }
-    };
-
-    let mut current_url = match Url::parse(&fp.url) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("fingerprint url unparseable: {e}");
-            return ExitCode::FAILURE;
         }
     };
 
@@ -4260,25 +4410,60 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
         }
     };
 
-    let mut steps: Vec<serde_json::Value> = Vec::with_capacity(actions.len());
-    let mut all_ok = true;
+    let outcome = run_plan(&fetch, &plan.actions, seed, plan.start_url.clone()).await;
 
-    // One JsSession is carried across every step so that imperative DOM
-    // mutations from earlier clicks/fills/submits remain visible to
-    // later ones. Initialized lazily — on first `Open`, or on the first
-    // non-Open action (by fetching `current_url` and `open`-ing it).
+    let session = serde_json::json!({
+        "source": plan.source,
+        "start_url": plan.start_url.to_string(),
+        "final_url": outcome.final_url.to_string(),
+        "steps_run": outcome.steps.len(),
+        "steps_total": plan.actions.len(),
+        "ok": outcome.ok,
+        "note": "stateful replay — one JsSession carries DOM mutations, RNG, virtual clock, and cookies (via shared reqwest::Client) across all steps. Navigation (Open, or an <a href> click) replaces the document but keeps the engine. Refs (`@e7`) are resolved against the action graph captured at the most-recent navigation — between navigations the live DOM has been mutated, so a ref may point to an element whose attributes have shifted. Submit still has the no-real-POST limitation: JsSession::submit dispatches a click on the form's submit button rather than issuing an HTTP POST. For byte-identical replay against recorded network responses, see ADR 0008 (not yet implemented).",
+        "steps": outcome.steps,
+    });
+    if !outcome.ok {
+        let _ = print_json(&session);
+        return ExitCode::FAILURE;
+    }
+    print_json(&session)
+}
+
+/// Result of running a plan against the live web.
+struct PlanOutcome {
+    /// Per-step log entries (one per attempted action).
+    steps: Vec<serde_json::Value>,
+    /// True iff every step succeeded.
+    ok: bool,
+    /// Last URL the engine was on. Either the starting URL (if the
+    /// plan ran nothing) or the URL after the most-recent navigation.
+    final_url: Url,
+    /// Action graph captured at the most-recent navigation.
+    final_actions: Vec<ElementRef>,
+    /// Live JS session at the end of execution. Moved out so a stamping
+    /// caller can extract `document_html()` for plat construction.
+    session: Option<heso_engine_js::JsSession>,
+}
+
+/// Execute a sequence of canonical actions and return the per-step log
+/// plus the post-execution session state. Shared by every verb that
+/// runs a plan (replay, stamp, …).
+async fn run_plan(
+    fetch: &FetchEngine,
+    actions: &[Action],
+    seed: Option<u64>,
+    start_url: Url,
+) -> PlanOutcome {
+    let mut current_url = start_url;
     let mut session: Option<heso_engine_js::JsSession> = None;
-    // `current_actions` is the action graph captured at the most-recent
-    // navigation. It's used to resolve `@e7`-style refs. Between
-    // navigations, the live in-memory DOM has been mutated by JS, so a
-    // ref may point at something whose attributes have changed — that's
-    // an inherent limitation of stateless refs.
     let mut current_actions: Vec<ElementRef> = Vec::new();
+    let mut steps: Vec<serde_json::Value> = Vec::with_capacity(actions.len());
+    let mut ok = true;
 
     for (i, action) in actions.iter().enumerate() {
         let url_before = current_url.clone();
         let res = execute_step_session(
-            &fetch,
+            fetch,
             &mut session,
             &mut current_url,
             &mut current_actions,
@@ -4308,30 +4493,17 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
         };
         steps.push(step);
         if res.is_err() {
-            all_ok = false;
+            ok = false;
             break;
         }
     }
-
-    let session = serde_json::json!({
-        "algorithm": fp.algorithm,
-        "trace_id": fp.trace_id,
-        "fingerprint_valid": true,
-        "start_url": fp.url,
-        "final_url": current_url.to_string(),
-        "steps_run": steps.len(),
-        "steps_total": actions.len(),
-        "ok": all_ok,
-        "note": "stateful replay — one JsSession carries DOM mutations, RNG, virtual clock, and cookies (via shared reqwest::Client) across all steps. Navigation (Open, or an <a href> click) replaces the document but keeps the engine. Refs (`@e7`) are resolved against the action graph captured at the most-recent navigation — between navigations the live DOM has been mutated, so a ref may point to an element whose attributes have shifted. Submit still has the no-real-POST limitation: JsSession::submit dispatches a click on the form's submit button rather than issuing an HTTP POST. For byte-identical replay against recorded network responses, see ADR 0008 (not yet implemented).",
-        "steps": steps,
-    });
-    if !all_ok {
-        // Print the session log on stdout even on failure (the caller
-        // wants to see WHICH step failed and why), but exit non-zero.
-        let _ = print_json(&session);
-        return ExitCode::FAILURE;
+    PlanOutcome {
+        steps,
+        ok,
+        final_url: current_url,
+        final_actions: current_actions,
+        session,
     }
-    print_json(&session)
 }
 
 /// Ensure `*session` is `Some` before a non-Open action runs. If the
@@ -4852,6 +5024,8 @@ async fn main() -> ExitCode {
         Some("action-hash") => cmd_action_hash(&args[1..]).await,
         Some("action-hash-verify") => cmd_action_hash_verify(&args[1..]).await,
         Some("replay") => cmd_replay(&args[1..]).await,
+        Some("stamp") => cmd_stamp(&args[1..]).await,
+        Some("unpack") => cmd_unpack(&args[1..]).await,
         Some("identity") => cmd_identity(&args[1..]),
         Some("receipt-verify") => cmd_receipt_verify(&args[1..]).await,
         Some(other) => {

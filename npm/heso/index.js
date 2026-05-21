@@ -432,6 +432,20 @@ function tree(url, options) {
   return _spawnJson(["tree", url, ..._optsToArgv(options)]);
 }
 
+// Plan lifecycle: stamp / replay / unpack. See README — `stamp` mints
+// a plat from a plan, `replay` re-runs a plat's embedded plan and
+// returns the per-step log (no plat output), `unpack` extracts the
+// plan field for editing.
+function stamp(filePath, options) {
+  return _spawnJson(["stamp", String(filePath), ..._optsToArgv(options)]);
+}
+function replay(filePath, options) {
+  return _spawnJson(["replay", String(filePath), ..._optsToArgv(options)]);
+}
+function unpack(filePath) {
+  return _spawnJson(["unpack", String(filePath)]);
+}
+
 // ---------------------------------------------------------------------------
 // Stateful session (wraps `heso serve`)
 // ---------------------------------------------------------------------------
@@ -659,6 +673,9 @@ module.exports = {
   find,
   fetch: fetchUrl,
   tree,
+  stamp,
+  replay,
+  unpack,
   // session
   Session,
   session,

@@ -614,39 +614,7 @@ fn build_open_payload(page: &heso_engine_fetch::FetchPage) -> serde_json::Value 
 /// stamp — the `read` path needs to layer extra fields on first, then
 /// compute the hash over the full result.
 fn build_open_payload_without_hash(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
-    let mut body = serde_json::json!({
-        "url": page.url().as_str(),
-        "title": page.tree.title,
-        "description": page.tree.description,
-        "metadata": page.metadata,
-        "tree": page.tree,
-        "actions": page.actions,
-    });
-    if !page.inline_data.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "inline_data".to_owned(),
-                serde_json::to_value(&page.inline_data).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-    if !page.data_attrs.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "data_attrs".to_owned(),
-                serde_json::to_value(&page.data_attrs).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-    if !page.linked_pages.is_empty() {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert(
-                "linked_pages".to_owned(),
-                heso_engine_fetch::linked_pages_to_json(&page.linked_pages),
-            );
-        }
-    }
-    body
+    page.plat_body_base()
 }
 
 /// Map a fetch-engine error string onto one of the classified tags

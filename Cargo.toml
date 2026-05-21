@@ -29,6 +29,10 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# RFC 8785 JSON Canonicalization Scheme. The exact byte string used as
+# the input to BLAKE3 and Ed25519 — vetted spec, vetted impl, no
+# homegrown escape rules in load-bearing crypto paths.
+serde_jcs = "0.2"
 url = { version = "2", features = ["serde"] }
 tracing = "0.1"
 blake3 = "1"

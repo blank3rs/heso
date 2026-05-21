@@ -73,6 +73,9 @@ __all__ = [
     "find",
     "fetch",
     "tree",
+    "stamp",
+    "replay",
+    "unpack",
     "run",
 ]
 
@@ -539,6 +542,46 @@ def fetch(url: str, **kwargs: Any) -> dict:
 def tree(url: str, **kwargs: Any) -> dict:
     """``heso tree <url>`` — full heading-derived page tree as JSON."""
     return run("tree", url, *_kwargs_to_argv(kwargs))
+
+
+def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
+    """``heso stamp <plan-or-plat.json>`` — execute a plan against the
+    live web and mint a fresh plat that embeds the plan.
+
+    Accepts a bare ``Action[]`` JSON array, a plat with a ``"plan"``
+    field, or a ``TraceFingerprint``. Returns the stamped plat as a
+    ``dict``. On a partial run the returned plat carries ``error`` and
+    ``steps`` fields documenting which step failed, and ``run`` raises
+    :class:`HesoError` (with the partial plat still on ``stdout``).
+
+    Keyword arguments (e.g. ``seed=42``) become CLI flags via the same
+    rules as every other verb.
+    """
+    return run("stamp", str(path), *_kwargs_to_argv(kwargs))
+
+
+def replay(path: Union[str, Path], **kwargs: Any) -> dict:
+    """``heso replay <plan-plat-or-fingerprint.json>`` — re-execute a
+    plan and return a per-step session log. **Does not** produce a plat
+    — use :func:`stamp` for that.
+
+    Accepts the same three input shapes as :func:`stamp`. Returns a
+    dict shaped ``{source, start_url, final_url, steps_run,
+    steps_total, ok, steps}``. Raises :class:`HesoError` on any failed
+    step (the log is still on ``stdout``).
+    """
+    return run("replay", str(path), *_kwargs_to_argv(kwargs))
+
+
+def unpack(path: Union[str, Path]) -> list:
+    """``heso unpack <plat.json>`` — extract the ``plan`` field of a
+    plat for editing. Returns the action list directly.
+
+    Raises :class:`HesoError` when the file has no ``plan`` field
+    (i.e. it was produced by single-URL ``heso open`` rather than by
+    :func:`stamp`).
+    """
+    return run("unpack", str(path))
 
 
 # ---------------------------------------------------------------------------

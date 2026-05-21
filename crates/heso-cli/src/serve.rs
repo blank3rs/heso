@@ -97,8 +97,8 @@ use std::sync::Arc;
 use heso_core::Url;
 use heso_engine_api::{EngineApi, Page};
 use heso_engine_fetch::{
-    linked_pages_to_json, resolve_action, resolve_locator_from_html, ElementRef, ExploreOptions,
-    FetchEngine, FetchPage, LocatorError, DEFAULT_LINK_CAP, HARD_LINK_CAP,
+    resolve_action, resolve_locator_from_html, ElementRef, ExploreOptions, FetchEngine, FetchPage,
+    LocatorError, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use heso_engine_js::{JsEngine, JsSession, ScriptFetchPolicy, WaitCondition};
 use serde::{Deserialize, Serialize};
@@ -474,49 +474,20 @@ async fn dispatch_open(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let p: OpenParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
-    let url = Url::parse(&p.url).map_err(|e| format!("invalid URL: {e}"))?;
+    Url::parse(&p.url).map_err(|e| format!("invalid URL: {e}"))?;
     let opts = ExploreOptions {
         depth: p.explore_links_depth,
         link_cap: p.link_cap.unwrap_or(DEFAULT_LINK_CAP).min(HARD_LINK_CAP),
     };
     let page = state
         .engine
-        .open_with_explore(&url, opts)
+        .open_with_explore(&p.url, opts)
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;
     let page_id = state.next_id();
-    let mut payload = serde_json::json!({
-        "page_id": &page_id,
-        "url": page.url().as_str(),
-        "title": page.tree.title,
-        "description": page.tree.description,
-        "metadata": page.metadata,
-        "tree": page.tree,
-        "actions": page.actions,
-    });
-    if !page.inline_data.is_empty() {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "inline_data".to_owned(),
-                serde_json::to_value(&page.inline_data).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-    if !page.data_attrs.is_empty() {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "data_attrs".to_owned(),
-                serde_json::to_value(&page.data_attrs).unwrap_or(serde_json::Value::Null),
-            );
-        }
-    }
-    if !page.linked_pages.is_empty() {
-        if let Some(obj) = payload.as_object_mut() {
-            obj.insert(
-                "linked_pages".to_owned(),
-                linked_pages_to_json(&page.linked_pages),
-            );
-        }
+    let mut payload = page.plat_body_base();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("page_id".to_owned(), serde_json::Value::String(page_id.clone()));
     }
     // Structured-failure envelope: `dispatch_open` does not run the
     // JS-side script pump (the page is parsed statically and the JS

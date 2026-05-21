@@ -80,8 +80,9 @@ pub use explore::{
 pub use inline_data::extract as extract_inline_data;
 pub use metadata::{extract as extract_metadata, PageMetadata};
 pub use plat::{
-    canonical_json as plat_canonical_json, hash as plat_hash, verify as plat_verify,
-    VerifyError as PlatVerifyError,
+    canonical_json as plat_canonical_json, hash as plat_hash, open as plat_open,
+    seal as plat_seal, verify as plat_verify, OpenOutcome as PlatOpenOutcome,
+    SealedPlat, VerifyError as PlatVerifyError,
 };
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
 
@@ -218,10 +219,10 @@ impl FetchEngine {
     /// See [`crate::explore`] for the full algorithm + filter rules.
     pub async fn open_with_explore(
         &self,
-        url: &Url,
+        input: &str,
         opts: ExploreOptions,
     ) -> HesoResult<FetchPage> {
-        let mut page = self.open_static(url).await?;
+        let mut page = self.open_static(input).await?;
         if opts.is_disabled() {
             return Ok(page);
         }
@@ -270,40 +271,19 @@ impl FetchEngine {
     /// [`FetchEngine::open_with_explore`] can compose it without
     /// re-dispatching through the trait (which lacks an options
     /// parameter).
-    async fn open_static(&self, url: &Url) -> HesoResult<FetchPage> {
+    async fn open_static(&self, input: &str) -> HesoResult<FetchPage> {
+        let parsed = Url::parse(input).map_err(Error::from)?;
         let response = self
             .client
-            .get(url.as_str())
+            .get(parsed.as_str())
             .send()
             .await
             .map_err(Error::from)?;
 
         let final_url_str = response.url().as_str().to_owned();
         let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
-
         let html_text = response.text().await.map_err(Error::from)?;
-
-        // Past the last `.await`; `scraper::Html` is `!Send` but that's
-        // fine for sync work done in-frame.
-        let doc = Html::parse_document(&html_text);
-        let body_text = extract_visible_text_from_doc(&doc);
-        let metadata = metadata::extract(&doc);
-        let tree = tree::build_tree_from_doc(&doc, &final_url);
-        let actions = actions::extract(&doc);
-        let inline_data = inline_data::extract(&doc);
-        let data_attrs = data_attrs::extract(&doc);
-
-        Ok(FetchPage {
-            url: final_url,
-            body_text,
-            body_html: html_text,
-            tree,
-            metadata,
-            actions,
-            linked_pages: Vec::new(),
-            inline_data,
-            data_attrs,
-        })
+        Ok(FetchPage::from_html(input.to_owned(), final_url, html_text))
     }
 }
 
@@ -349,6 +329,14 @@ impl Default for FetchEngine {
 /// [`EngineApi::open`] it's always empty.
 #[derive(Debug, Clone)]
 pub struct FetchPage {
+    /// Verbatim URL string the caller asked the engine to open, before
+    /// any parsing or normalization. Two byte-different requests
+    /// produce two byte-different `input_url`s, even when both parse
+    /// to the same [`Url`] (case-folded host, default-port stripping)
+    /// or both follow redirects to the same final [`url`](Self::url).
+    /// Load-bearing for plat identity: every plat emitted from a
+    /// [`FetchPage`] includes this string in its canonical bytes.
+    pub input_url: String,
     url: Url,
     body_text: String,
     /// The raw HTML body of the response, exactly as it came over the
@@ -386,6 +374,14 @@ pub struct FetchPage {
     /// values are document-ordered lists of (tag, JSON) records.
     /// See [`crate::data_attrs`].
     pub data_attrs: std::collections::BTreeMap<String, Vec<DataAttrValue>>,
+    /// The action sequence that produced this page, when the page was
+    /// minted by replaying a plan (`heso stamp` / `heso replay`).
+    /// Always [`None`] for pages produced by a single one-shot
+    /// [`FetchEngine::open_with_explore`]. When [`Some`], the value is
+    /// the JSON array of canonical actions exactly as it was executed;
+    /// [`Self::plat_body_base`] surfaces it as the plat's `"plan"`
+    /// field so the resulting plat is replayable.
+    pub plan: Option<serde_json::Value>,
 }
 
 impl Page for FetchPage {
@@ -395,6 +391,93 @@ impl Page for FetchPage {
 
     async fn text(&self) -> HesoResult<String> {
         Ok(self.body_text.clone())
+    }
+}
+
+impl FetchPage {
+    /// Construct a [`FetchPage`] from an already-fetched HTML string —
+    /// the same extraction pipeline `open_static` uses, but without the
+    /// network round-trip. Callers supply `input_url` (the caller's
+    /// verbatim request) and `final_url` (post-redirect / post-action).
+    ///
+    /// Used by `open_static` for the network path and by the replay /
+    /// stamp verbs to mint a [`FetchPage`] from a post-execution DOM.
+    pub fn from_html(input_url: String, final_url: Url, html: String) -> Self {
+        let doc = Html::parse_document(&html);
+        let body_text = extract_visible_text_from_doc(&doc);
+        let metadata = metadata::extract(&doc);
+        let tree = tree::build_tree_from_doc(&doc, &final_url);
+        let actions = actions::extract(&doc);
+        let inline_data = inline_data::extract(&doc);
+        let data_attrs = data_attrs::extract(&doc);
+        FetchPage {
+            input_url,
+            url: final_url,
+            body_text,
+            body_html: html,
+            tree,
+            metadata,
+            actions,
+            linked_pages: Vec::new(),
+            inline_data,
+            data_attrs,
+            plan: None,
+        }
+    }
+
+    /// Canonical opening shape of a plat body for this page. Always
+    /// carries `input_url` (the caller's verbatim request) and `url`
+    /// (the parsed, post-redirect URL of the page that served). Two
+    /// byte-different `input_url`s produce two byte-different bodies
+    /// regardless of how they normalize.
+    ///
+    /// Callers layer post-hydration fields, console buffers, forms,
+    /// cookies, etc. on top before stamping `plat_hash`. This is the
+    /// one place `input_url` enters a plat body — the type system
+    /// makes it impossible to emit a plat from a [`FetchPage`] without
+    /// it.
+    pub fn plat_body_base(&self) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "input_url": &self.input_url,
+            "url": self.url.as_str(),
+            "title": self.tree.title,
+            "description": self.tree.description,
+            "metadata": self.metadata,
+            "tree": self.tree,
+            "actions": self.actions,
+        });
+        if !self.inline_data.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "inline_data".to_owned(),
+                    serde_json::to_value(&self.inline_data)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        if !self.data_attrs.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "data_attrs".to_owned(),
+                    serde_json::to_value(&self.data_attrs)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+        if !self.linked_pages.is_empty() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "linked_pages".to_owned(),
+                    linked_pages_to_json(&self.linked_pages),
+                );
+            }
+        }
+        if let Some(plan) = &self.plan {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("plan".to_owned(), plan.clone());
+            }
+        }
+        body
     }
 }
 
@@ -408,7 +491,7 @@ impl EngineApi for FetchEngine {
     /// Trait-shaped entry — no exploration. For link-graph cartography,
     /// call [`FetchEngine::open_with_explore`] directly.
     async fn open(&self, url: &Url) -> HesoResult<Self::Page> {
-        self.open_static(url).await
+        self.open_static(url.as_str()).await
     }
 }
 
@@ -545,5 +628,80 @@ mod tests {
             "expected an /example-domain row, got: {:?}",
             rows.iter().map(|r| &r.slug).collect::<Vec<_>>()
         );
+    }
+
+    /// Build a synthetic [`FetchPage`] without hitting the network.
+    /// Two pages from the same `final_url` but different `input_url`
+    /// values share every other field by construction.
+    fn synthetic_page(input: &str, final_url: &str) -> FetchPage {
+        let parsed = Url::parse(final_url).unwrap();
+        FetchPage::from_html(input.to_owned(), parsed, String::new())
+    }
+
+    #[test]
+    fn plat_body_base_always_carries_input_url() {
+        let p = synthetic_page("https://Example.com/", "https://example.com/");
+        let body = p.plat_body_base();
+        assert_eq!(body["input_url"], "https://Example.com/");
+        assert_eq!(body["url"], "https://example.com/");
+    }
+
+    #[test]
+    fn plan_field_appears_in_plat_body_when_set() {
+        let mut p = synthetic_page("https://x/", "https://x/");
+        let plan_json = serde_json::json!([
+            {"verb": "open", "url": "https://x/"},
+            {"verb": "click", "ref": "@e0"},
+        ]);
+        p.plan = Some(plan_json.clone());
+        let body = p.plat_body_base();
+        assert_eq!(body["plan"], plan_json);
+    }
+
+    #[test]
+    fn plan_field_omitted_from_plat_body_when_unset() {
+        let p = synthetic_page("https://x/", "https://x/");
+        let body = p.plat_body_base();
+        assert!(
+            body.as_object().map(|o| !o.contains_key("plan")).unwrap_or(false),
+            "plan key must be absent when self.plan is None"
+        );
+    }
+
+    #[test]
+    fn plat_hash_changes_when_plan_changes() {
+        // A plat that embeds a plan must commit to it in the hash —
+        // editing the plan and forgetting to re-stamp must be detectable.
+        let mut a = synthetic_page("https://x/", "https://x/");
+        let mut b = synthetic_page("https://x/", "https://x/");
+        a.plan = Some(serde_json::json!([{"verb": "open", "url": "https://x/"}]));
+        b.plan = Some(serde_json::json!([
+            {"verb": "open", "url": "https://x/"},
+            {"verb": "click", "ref": "@e0"},
+        ]));
+        assert_ne!(plat::hash(&a.plat_body_base()), plat::hash(&b.plat_body_base()));
+    }
+
+    #[test]
+    fn different_inputs_same_final_url_produce_different_plat_hashes() {
+        // The headline guarantee: byte-different `input_url` ⇒
+        // byte-different canonical bytes ⇒ different plat_hash, even
+        // when the parsed + post-redirect `url` is identical.
+        let variants = [
+            "https://Example.com/",
+            "https://EXAMPLE.com/",
+            "https://example.com:443/",
+            "HTTPS://example.com/",
+            "https://example.com/",
+        ];
+        let mut seen = std::collections::HashMap::<String, &str>::new();
+        for raw in variants {
+            let body = synthetic_page(raw, "https://example.com/").plat_body_base();
+            let h = plat::hash(&body);
+            if let Some(prev) = seen.insert(h.clone(), raw) {
+                panic!("collision: `{prev}` and `{raw}` both hash to {h}");
+            }
+        }
+        assert_eq!(seen.len(), variants.len());
     }
 }

@@ -64,6 +64,30 @@ Most of this codebase was written with help from Claude under one person's direc
 - `heso navigate` — change URL within a session.
 - `heso eval-dom <url> "<js>"` — fetch, run scripts, then run your JS against the resulting DOM.
 
+**Bundle, edit, and replay action sequences.**
+
+A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`). A *plat* is an observation. The three verbs below close the loop:
+
+- `heso stamp <plan.json>` — executes the plan against the live web and mints a fresh plat that embeds the plan. Accepts a bare `Action[]` array, a plat with a `"plan"` field, or a `TraceFingerprint`. Exit 0 on a clean run; 1 if any step failed (still prints the partial plat with `error` + `steps`).
+- `heso replay <plat.json>` — re-executes the embedded plan and prints a per-step session log. No plat output — use `stamp` for that. Stateful: one `JsSession` carries DOM mutations / RNG / cookies across steps.
+- `heso unpack <plat.json>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint.
+
+```sh
+cat > plan.json <<EOF
+[
+  {"verb": "open",   "url": "https://news.ycombinator.com/"},
+  {"verb": "click",  "ref": "@e3"},
+  {"verb": "fill",   "ref": "@e7", "value": "claude"},
+  {"verb": "submit", "ref": "@form1"}
+]
+EOF
+heso stamp plan.json > plat.json          # plan → plat
+heso replay plat.json                     # plat → step log (no artifact)
+heso unpack plat.json > plan-again.json   # plat → plan (edit, restamp)
+```
+
+The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to both the plan AND the observed content. Edit either and the hash no longer matches. `heso plat-verify` will say so.
+
 **Recover from broken sites.**
 
 - `--best-effort` on `open` / `read` / `wait` — exit 0 even when scripts crash. Output includes `partial: true`, `partial_reason: "script_crash" | "wait_timeout" | "fetch_failed" | "parse_error"`, and `failed_scripts: [...]`. The agent sees what broke and decides what to try next.

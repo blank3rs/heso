@@ -192,6 +192,41 @@ export function fetch(url: string, options?: CommonOptions): Promise<Record<stri
 /** `heso tree <url>` — full heading-derived page tree. */
 export function tree(url: string, options?: CommonOptions): Promise<Record<string, unknown>>;
 
+/** Options unique to `stamp` / `replay`. */
+export interface PlanOptions extends CommonOptions {
+  /** Seeds determinism shims (`Math.random`, `crypto.getRandomValues`, timers). */
+  seed?: number;
+}
+
+/**
+ * `heso stamp <plan-or-plat.json>` — execute a plan against the live
+ * web and mint a fresh plat that embeds the plan. Accepts a bare
+ * `Action[]` JSON array, a plat with a `"plan"` field, or a
+ * `TraceFingerprint`. Rejects with `HesoError` if any step failed
+ * (the partial plat is still on `error.stdout`).
+ */
+export function stamp(
+  file: string,
+  options?: PlanOptions,
+): Promise<Record<string, unknown>>;
+
+/**
+ * `heso replay <plan-plat-or-fingerprint.json>` — re-execute a plan
+ * and return a per-step session log. Does **not** produce a plat — use
+ * `stamp` for that. Rejects with `HesoError` on any failed step.
+ */
+export function replay(
+  file: string,
+  options?: PlanOptions,
+): Promise<Record<string, unknown>>;
+
+/**
+ * `heso unpack <plat.json>` — extract the `plan` field of a plat for
+ * editing. Returns the action array directly. Rejects with
+ * `HesoError` when the file has no `plan` field.
+ */
+export function unpack(file: string): Promise<unknown[]>;
+
 /** Low-level: spawn `heso <args>` and parse stdout. */
 export function run(
   args: string[],

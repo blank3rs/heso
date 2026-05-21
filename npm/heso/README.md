@@ -36,6 +36,10 @@ heso click https://news.ycombinator.com --text "More"
 heso wait https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
 heso open https://x.com --best-effort --inject-script "window.lunr = (() => ({}))()"
 heso serve     # JSON-RPC over stdio for multi-step sessions
+
+heso stamp  plan.json > plat.json   # plan → plat (executes + mints)
+heso replay plat.json               # plat → per-step log (no artifact)
+heso unpack plat.json > plan.json   # plat → plan (edit, restamp)
 ```
 
 Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.
@@ -43,7 +47,11 @@ Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.
 ## Use as a library
 
 ```js
-import { open, search, read, evalDom, session, wait, HesoError } from "@ixla/heso";
+import {
+  open, search, read, evalDom, session, wait,
+  stamp, replay, unpack,
+  HesoError,
+} from "@ixla/heso";
 
 // One-shot calls
 const page    = await open("https://example.com");
