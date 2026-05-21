@@ -21,8 +21,18 @@
 //! flag-only variant (Option A) would either mutate the stdout shape
 //! (breaking) or push receipts to a sibling file with a name we'd have
 //! to invent (less control).
+//!
+//! ## Verify-side trust anchor
+//!
+//! [`load_trusted_keys`] reads a JSON allowlist of base64-encoded
+//! Ed25519 public keys from a path (CLI: `--trusted-keys`) or env var
+//! (`HESO_TRUSTED_KEYS`). When the allowlist is non-empty,
+//! `receipt-verify` rejects any receipt whose signing pubkey isn't on
+//! the list. When the allowlist is empty (default), verify still
+//! accepts any pubkey but prints a stderr warning so the caller can't
+//! silently lose the trust anchor.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use heso_core::{IdentityKey, Url};
@@ -224,10 +234,119 @@ pub(crate) async fn emit_signed_receipt<E: EngineApi>(
     Ok(())
 }
 
+// ============================================================================
+// Pubkey allowlist for `receipt-verify`
+// ============================================================================
+
+/// Env var name for the pubkey allowlist path. Read when the
+/// `--trusted-keys` CLI flag isn't supplied.
+pub(crate) const TRUSTED_KEYS_ENV: &str = "HESO_TRUSTED_KEYS";
+
+/// Outcome of resolving a `--trusted-keys` allowlist source. The CLI
+/// only treats an explicitly-supplied source that fails to load as
+/// fatal — when nothing is supplied at all, [`AllowlistResult::Empty`]
+/// lets the caller keep the legacy "any-pubkey OK" behavior with a
+/// stderr warning.
+#[derive(Debug)]
+pub(crate) enum AllowlistResult {
+    /// User supplied a source (CLI flag or env var) and the keys
+    /// loaded successfully. Holds the parsed allowlist.
+    Loaded(Vec<String>),
+    /// No source supplied. `receipt-verify` will emit a stderr
+    /// warning and accept any signature.
+    Empty,
+    /// User supplied a source but loading failed. The caller exits
+    /// non-zero with a clear error — silently downgrading to
+    /// "no allowlist" would defeat the point of the flag.
+    Error(String),
+}
+
+/// Read a JSON pubkey allowlist from `path`. The file shape is either:
+///
+/// - A bare array of base64-encoded public-key strings:
+///   `["pk1Base64==", "pk2Base64=="]`
+/// - Or an object with a `keys` field of the same shape:
+///   `{"keys": ["pk1Base64==", "pk2Base64=="]}`
+///
+/// The object form leaves room to add fields (e.g. labels, expiry)
+/// without breaking the array shape.
+fn read_allowlist_file(path: &Path) -> Result<Vec<String>, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read trusted-keys file `{}`: {e}", path.display()))?;
+    parse_allowlist_json(&contents)
+        .map_err(|e| format!("trusted-keys file `{}` is malformed: {e}", path.display()))
+}
+
+/// Parse the JSON body of an allowlist file. Accepts either the bare
+/// array `["pk1", "pk2"]` or `{"keys": ["pk1", "pk2"]}`.
+pub(crate) fn parse_allowlist_json(json: &str) -> Result<Vec<String>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("not valid JSON: {e}"))?;
+    let arr = match &value {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(obj) => match obj.get("keys") {
+            Some(serde_json::Value::Array(a)) => a,
+            _ => {
+                return Err(
+                    "expected an array of base64 pubkey strings, or `{\"keys\": [...]}` object"
+                        .to_owned(),
+                );
+            }
+        },
+        _ => {
+            return Err(
+                "expected an array of base64 pubkey strings, or `{\"keys\": [...]}` object"
+                    .to_owned(),
+            );
+        }
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        match v.as_str() {
+            Some(s) if !s.trim().is_empty() => out.push(s.trim().to_owned()),
+            Some(_) => return Err(format!("entry [{i}] is an empty string")),
+            None => return Err(format!("entry [{i}] is not a string")),
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the pubkey allowlist for `receipt-verify`. Precedence:
+///
+/// 1. `--trusted-keys PATH` (when `flag_value` is `Some`).
+/// 2. `HESO_TRUSTED_KEYS=PATH` env var.
+/// 3. Nothing → [`AllowlistResult::Empty`].
+pub(crate) fn load_trusted_keys(flag_value: Option<&Path>) -> AllowlistResult {
+    if let Some(path) = flag_value {
+        return match read_allowlist_file(path) {
+            Ok(keys) => AllowlistResult::Loaded(keys),
+            Err(e) => AllowlistResult::Error(e),
+        };
+    }
+    if let Ok(env_path) = std::env::var(TRUSTED_KEYS_ENV) {
+        let trimmed = env_path.trim();
+        if !trimmed.is_empty() {
+            return match read_allowlist_file(Path::new(trimmed)) {
+                Ok(keys) => AllowlistResult::Loaded(keys),
+                Err(e) => AllowlistResult::Error(e),
+            };
+        }
+    }
+    AllowlistResult::Empty
+}
+
+/// Check whether `pubkey` (base64 of the 32-byte Ed25519 public key,
+/// matching the format `Signature::public_key` stores) appears in
+/// `allowlist`. Both sides are compared as exact-byte strings; the
+/// allowlist parser already trimmed surrounding whitespace at load
+/// time.
+pub(crate) fn pubkey_in_allowlist(pubkey: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|k| k == pubkey)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn url_trace_has_one_cd_op() {
@@ -295,5 +414,74 @@ mod tests {
         let mut flags = SignFlags::default();
         let err = try_consume_sign_flag(&args, 0, &mut flags).expect_err("rejects");
         assert_eq!(format!("{err:?}"), format!("{:?}", ExitCode::from(2)));
+    }
+
+    // --- allowlist tests ---
+
+    #[test]
+    fn parse_array_form() {
+        let json = r#"["aaa=", "bbb="]"#;
+        let out = parse_allowlist_json(json).expect("parses");
+        assert_eq!(out, vec!["aaa=".to_owned(), "bbb=".to_owned()]);
+    }
+
+    #[test]
+    fn parse_object_form() {
+        let json = r#"{"keys": ["xyz="]}"#;
+        let out = parse_allowlist_json(json).expect("parses");
+        assert_eq!(out, vec!["xyz=".to_owned()]);
+    }
+
+    #[test]
+    fn parse_rejects_non_string_entry() {
+        let json = r#"["aaa=", 42]"#;
+        let err = parse_allowlist_json(json).expect_err("rejects");
+        assert!(err.contains("[1]"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_empty_string_entry() {
+        let json = r#"["aaa=", ""]"#;
+        let err = parse_allowlist_json(json).expect_err("rejects");
+        assert!(err.contains("[1]"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_rejects_bare_string() {
+        let json = r#""just a string""#;
+        let err = parse_allowlist_json(json).expect_err("rejects");
+        assert!(err.contains("array"), "got: {err}");
+    }
+
+    #[test]
+    fn pubkey_match_is_exact() {
+        let allow = vec!["alpha".to_owned(), "beta".to_owned()];
+        assert!(pubkey_in_allowlist("alpha", &allow));
+        assert!(pubkey_in_allowlist("beta", &allow));
+        assert!(!pubkey_in_allowlist("gamma", &allow));
+        assert!(!pubkey_in_allowlist("ALPHA", &allow), "case-sensitive");
+    }
+
+    #[test]
+    fn load_trusted_keys_empty_when_no_source() {
+        // SAFETY: tests in this binary all see one process; we save +
+        // restore the env var around the assertion so a concurrent
+        // test (cargo test runs by default with multiple threads) that
+        // touches the same env doesn't poison this one. The
+        // `set_var/remove_var` API is `unsafe` in Edition 2024 — the
+        // unsafe block opt-in matches the lint-deny in this crate.
+        let prev = std::env::var(TRUSTED_KEYS_ENV).ok();
+        // SAFETY: single-threaded scope inside a test, no other thread
+        // reads HESO_TRUSTED_KEYS during this function.
+        unsafe { std::env::remove_var(TRUSTED_KEYS_ENV) };
+        let r = load_trusted_keys(None);
+        assert!(
+            matches!(r, AllowlistResult::Empty),
+            "expected Empty, got {r:?}"
+        );
+        // SAFETY: see above.
+        if let Some(v) = prev {
+            unsafe { std::env::set_var(TRUSTED_KEYS_ENV, v) };
+        }
     }
 }

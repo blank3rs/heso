@@ -218,6 +218,9 @@ fn print_banner() {
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
     );
     println!("  heso receipt-verify <file>    Verify a signed receipt (exit 0 valid, 1 invalid, 2 missing/malformed)");
+    println!("    [--trusted-keys PATH]          JSON file of allowlisted base64 pubkeys (also reads HESO_TRUSTED_KEYS env).");
+    println!("                                   Receipts NOT signed by an allowlist key are rejected (exit 1).");
+    println!("                                   Empty allowlist (default) warns to stderr — no trust anchor configured.");
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See state.json + decisions/0012-fetch-only-native-engine.md (static engine) and");
@@ -4837,15 +4840,80 @@ fn cmd_identity_show(args: &[String]) -> ExitCode {
     }
 }
 
-/// `heso receipt-verify <file>` — read a receipt JSON, verify its
-/// embedded Ed25519 signature. Exit 0 if valid, 1 if invalid
-/// (tampered/wrong key), 2 if the receipt has no signature or fails to
-/// parse.
+/// `heso receipt-verify <file> [--trusted-keys PATH]` — read a receipt
+/// JSON, verify its embedded Ed25519 signature against an optional
+/// pubkey allowlist.
+///
+/// Exit codes:
+/// - 0 — signature valid AND (allowlist empty OR signing pubkey present
+///   in the allowlist).
+/// - 1 — signature invalid (tampered receipt, wrong key, or signing
+///   pubkey not in the supplied allowlist).
+/// - 2 — receipt missing/malformed/no `signature` field, OR
+///   `--trusted-keys` source failed to load.
+///
+/// The allowlist source precedence is `--trusted-keys PATH` >
+/// `HESO_TRUSTED_KEYS=PATH` env var > no allowlist (with a stderr
+/// warning).
 async fn cmd_receipt_verify(args: &[String]) -> ExitCode {
-    let Some(file) = args.first() else {
-        eprintln!("usage: heso receipt-verify <file>");
+    // Parse `--trusted-keys PATH` (order-tolerant) plus the positional
+    // receipt file. Keep the surface minimal — no `clap` here, same
+    // shape as the rest of the heso CLI verbs.
+    let mut file: Option<&String> = None;
+    let mut trusted_keys: Option<std::path::PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--trusted-keys" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--trusted-keys needs a value (path to JSON allowlist)");
+                    return ExitCode::from(2);
+                };
+                trusted_keys = Some(std::path::PathBuf::from(v));
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                eprintln!("usage: heso receipt-verify [--trusted-keys PATH] <file>");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if file.is_some() {
+                    eprintln!("unexpected extra argument `{}`; pass a single <file>", args[i]);
+                    return ExitCode::from(2);
+                }
+                file = Some(&args[i]);
+                i += 1;
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("usage: heso receipt-verify [--trusted-keys PATH] <file>");
         return ExitCode::from(2);
     };
+
+    // Resolve the allowlist before reading the receipt — a bad
+    // `--trusted-keys` source is a usage error (exit 2) regardless
+    // of whether the receipt itself is valid.
+    let allowlist = match receipts::load_trusted_keys(trusted_keys.as_deref()) {
+        receipts::AllowlistResult::Loaded(v) => Some(v),
+        receipts::AllowlistResult::Empty => {
+            // Inform the user that the trust anchor is unset. This
+            // converts the previous silent "any-pubkey passes" gap
+            // into something the operator can't miss in their logs.
+            eprintln!(
+                "warning: no pubkey allowlist configured (pass --trusted-keys PATH or set {} \
+                 to bind receipts to a known signer; verifying signatures without identity)",
+                receipts::TRUSTED_KEYS_ENV
+            );
+            None
+        }
+        receipts::AllowlistResult::Error(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::from(2);
+        }
+    };
+
     let contents = match tokio::fs::read_to_string(file).await {
         Ok(s) => s,
         Err(e) => {
@@ -4867,6 +4935,20 @@ async fn cmd_receipt_verify(args: &[String]) -> ExitCode {
                 .as_ref()
                 .map(|s| s.public_key.as_str())
                 .unwrap_or("(unknown)");
+            // Allowlist gate (P1 fix): when a non-empty allowlist is
+            // configured, the signing pubkey MUST appear in it.
+            // Otherwise the receipt comes from an unknown signer and
+            // is rejected with exit 1 — the same exit code as a bad
+            // signature, since both are "I don't trust this receipt"
+            // outcomes from the verifier's perspective.
+            if let Some(allow) = allowlist.as_ref() {
+                if !allow.is_empty() && !receipts::pubkey_in_allowlist(pk, allow) {
+                    eprintln!(
+                        "INVALID: signing pubkey `{pk}` is not in the trusted-keys allowlist"
+                    );
+                    return ExitCode::from(1);
+                }
+            }
             println!("OK {pk}");
             ExitCode::SUCCESS
         }
