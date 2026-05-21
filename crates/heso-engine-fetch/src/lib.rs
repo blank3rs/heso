@@ -263,6 +263,7 @@ impl FetchEngine {
             .map_err(Error::from)?;
         let final_url_str = response.url().as_str().to_owned();
         let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
+        
         let html_text = response.text().await.map_err(Error::from)?;
         Ok((final_url, html_text))
     }
@@ -282,8 +283,9 @@ impl FetchEngine {
 
         let final_url_str = response.url().as_str().to_owned();
         let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
+        let http_status = response.status().as_u16();
         let html_text = response.text().await.map_err(Error::from)?;
-        Ok(FetchPage::from_html(input.to_owned(), final_url, html_text))
+        Ok(FetchPage::from_html(input.to_owned(), final_url, http_status, html_text))
     }
 }
 
@@ -345,6 +347,14 @@ pub struct FetchPage {
     /// engine (for `<script>` execution, DOM mutation, etc.) don't
     /// have to issue a second HTTP round-trip via [`FetchEngine::fetch_text`].
     pub body_html: String,
+    /// The HTTP status code of the final response (after redirects).
+    /// `200` for a clean fetch, `4xx`/`5xx` when the server returned an
+    /// error page. The body is still extracted into `body_text`,
+    /// `tree`, `actions`, etc. — heso's contract is "always return the
+    /// payload so the agent can decide" — but the status is the honest
+    /// signal callers use to distinguish "real empty page" from
+    /// "server blocked us with a 403 + interstitial body."
+    pub http_status: u16,
     /// The page expressed as a navigable tree of sections, built from the
     /// HTML's heading structure. See [`crate::tree`].
     pub tree: HtmlTree,
@@ -402,7 +412,7 @@ impl FetchPage {
     ///
     /// Used by `open_static` for the network path and by the replay /
     /// stamp verbs to mint a [`FetchPage`] from a post-execution DOM.
-    pub fn from_html(input_url: String, final_url: Url, html: String) -> Self {
+    pub fn from_html(input_url: String, final_url: Url, http_status: u16, html: String) -> Self {
         let doc = Html::parse_document(&html);
         let body_text = extract_visible_text_from_doc(&doc);
         let metadata = metadata::extract(&doc);
@@ -415,6 +425,7 @@ impl FetchPage {
             url: final_url,
             body_text,
             body_html: html,
+            http_status,
             tree,
             metadata,
             actions,
@@ -519,6 +530,50 @@ pub fn extract_visible_text(html: &str) -> String {
 pub fn extract_actions_from_html(html: &str) -> Vec<ElementRef> {
     actions::extract(&Html::parse_document(html))
 }
+
+/// `true` if `html` looks like a Cloudflare / generic anti-bot
+/// interstitial page rather than the real content the agent asked for.
+pub fn is_bot_challenge(html: &str) -> bool {
+    if html.contains("__cf_chl_opt") || html.contains("cf_chl_jschl_tk__") {
+        return true;
+    }
+    if let Some(idx) = html.find("<title>") {
+        let after = &html[idx + "<title>".len()..];
+        let probe_end = after.len().min(64);
+        let probe = &after[..probe_end];
+        let lowered: String = probe.chars().map(|c| c.to_ascii_lowercase()).collect();
+        if lowered.starts_with("just a moment") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Map an HTTP status + body to an optional `partial_reason` token.
+/// `None` means "clean 2xx"; `Some(...)` is the failure-envelope token
+/// the agent surface uses: `http_403`, `http_5xx`, `bot_challenge`, ...
+pub fn partial_reason_for_status(http_status: u16, body_html: &str) -> Option<String> {
+    if (200..300).contains(&http_status) {
+        if is_bot_challenge(body_html) {
+            return Some("bot_challenge".to_owned());
+        }
+        return None;
+    }
+    if (400..500).contains(&http_status) {
+        return Some(format!("http_{http_status}"));
+    }
+    if (500..600).contains(&http_status) {
+        return Some("http_5xx".to_owned());
+    }
+    if (300..400).contains(&http_status) {
+        return Some(format!("http_{http_status}"));
+    }
+    if (100..200).contains(&http_status) {
+        return Some(format!("http_{http_status}"));
+    }
+    Some(format!("http_{http_status}"))
+}
+
 
 /// Walk an already-parsed document and return the visible body text, with
 /// `<script>`, `<style>`, `<noscript>`, and `<template>` content skipped.
@@ -635,7 +690,7 @@ mod tests {
     /// values share every other field by construction.
     fn synthetic_page(input: &str, final_url: &str) -> FetchPage {
         let parsed = Url::parse(final_url).unwrap();
-        FetchPage::from_html(input.to_owned(), parsed, String::new())
+        FetchPage::from_html(input.to_owned(), parsed, 200, String::new())
     }
 
     #[test]
