@@ -221,6 +221,7 @@ fn print_banner() {
     println!("    [--trusted-keys PATH]          JSON file of allowlisted base64 pubkeys (also reads HESO_TRUSTED_KEYS env).");
     println!("                                   Receipts NOT signed by an allowlist key are rejected (exit 1).");
     println!("                                   Empty allowlist (default) warns to stderr — no trust anchor configured.");
+    println!("                                   Receipts with `mode: live` are rejected (not replay-safe — ADR 0008).");
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See state.json + decisions/0012-fetch-only-native-engine.md (static engine) and");
@@ -4842,13 +4843,15 @@ fn cmd_identity_show(args: &[String]) -> ExitCode {
 
 /// `heso receipt-verify <file> [--trusted-keys PATH]` — read a receipt
 /// JSON, verify its embedded Ed25519 signature against an optional
-/// pubkey allowlist.
+/// pubkey allowlist, and refuse any receipt that's structurally
+/// unverifiable (e.g. `mode: live`).
 ///
 /// Exit codes:
 /// - 0 — signature valid AND (allowlist empty OR signing pubkey present
 ///   in the allowlist).
-/// - 1 — signature invalid (tampered receipt, wrong key, or signing
-///   pubkey not in the supplied allowlist).
+/// - 1 — signature invalid (tampered receipt, wrong key, signing
+///   pubkey not in the supplied allowlist, OR `mode: live` — live-mode
+///   runs aren't replay-safe per ADR 0008).
 /// - 2 — receipt missing/malformed/no `signature` field, OR
 ///   `--trusted-keys` source failed to load.
 ///
@@ -4928,6 +4931,25 @@ async fn cmd_receipt_verify(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Live-mode rejection (P1 fix): per ADR 0008 the deterministic
+    // execution guarantees that make a Receipt replay-safe (fake
+    // clock, seeded RNG, recorded network) don't apply in
+    // `Mode::Live` — wall-clock time, real RNG, real network. The
+    // signature is over the *trace + per-op results* the live run
+    // produced, but those results aren't reproducible. A verifier
+    // that "OK"s a `mode: live` receipt has no way to check the
+    // receipt against a replay. Refuse the file before we even get
+    // to the signature check.
+    if matches!(receipt.mode, heso_trace::Mode::Live) {
+        eprintln!(
+            "INVALID: receipt `mode: live` is not replay-safe — per ADR 0008, only \
+             `deterministic` and `recording` receipts can be verified (live runs use \
+             wall-clock time and real network, so the signature has no replay value)"
+        );
+        return ExitCode::from(1);
+    }
+
     match verify_receipt(&receipt) {
         VerifyOutcome::Valid => {
             let pk = receipt
