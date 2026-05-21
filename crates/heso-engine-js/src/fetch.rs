@@ -765,17 +765,25 @@ fn build_response<'js>(
     Ok(obj)
 }
 
-/// Decoded `data:` URL.
-struct DataPayload {
-    mime: String,
-    body: Vec<u8>,
+/// Decoded `data:` URL. `pub(crate)` so the inline-`<script
+/// src="data:...">` path in [`crate::scripts::fetch_script_source`]
+/// can reuse the same parser — see bug-report 01 P1 (reddit ships
+/// three `data:text/javascript,...` `<script src>` tags).
+pub(crate) struct DataPayload {
+    pub(crate) mime: String,
+    pub(crate) body: Vec<u8>,
 }
 
 /// Parse a `data:[<mime>][;base64],<payload>` URL into its mime type
 /// and body bytes. Returns `None` if `url` isn't a data URL. Keeps
 /// our test shape (`fetch("data:text/plain,hello")`) working without
 /// pulling in another crate.
-fn parse_data_url(url: &str) -> Option<DataPayload> {
+///
+/// `pub(crate)` because the inline-script src loader (reddit, twitter,
+/// etc. inline tiny runtime-config blobs as `data:text/javascript,...`
+/// `<script src=...>`) hooks into this same parser before falling
+/// through to reqwest. See [`crate::scripts::fetch_script_source`].
+pub(crate) fn parse_data_url(url: &str) -> Option<DataPayload> {
     let rest = url.strip_prefix("data:")?;
     let comma = rest.find(',')?;
     let meta = &rest[..comma];

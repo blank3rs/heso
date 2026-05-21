@@ -839,6 +839,23 @@ fn fetch_script_source(
     src: &str,
     base_url: Option<&url::Url>,
 ) -> Result<String, String> {
+    // `data:` URL fast path. Bug-report 01 P1: reddit (and a growing
+    // share of modern SPAs) inline runtime-config bootstrap scripts via
+    // `<script src="data:text/javascript,window.STICKY_CANARY=...">`.
+    // reqwest only speaks HTTP(S), so handing it `data:...` produced
+    // `send: builder error for url (data:text/javascript,...)`. Parse
+    // inline via the same RFC-2397 decoder the in-JS `fetch()` global
+    // uses; decode base64 / percent-encoding; hand the body straight
+    // to the script engine without a network round-trip.
+    if src.starts_with("data:") {
+        if let Some(payload) = crate::fetch::parse_data_url(src) {
+            return String::from_utf8(payload.body).map_err(|e| {
+                format!("data: URL body is not valid UTF-8 (script must be text): {e}")
+            });
+        }
+        return Err(format!("malformed data: URL `{src}`"));
+    }
+
     // Resolve relative src against base. `Url::join` handles both
     // absolute src (returns src) and relative (joins). If parsing
     // fails outright, fall back to the raw src so reqwest can produce
