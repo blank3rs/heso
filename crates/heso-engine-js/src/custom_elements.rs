@@ -1404,10 +1404,31 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
     // `Symbol.hasInstance` path on user ctors instead.
     // ===============================================================
 
+    // One-time warn dedup so a missing prototype method surfaces once
+    // in console instead of silently no-op'ing. Lesson from v0.0.5/0.0.6:
+    // wrapReturnsElement was the silent grave for `Element.prototype.X`
+    // gaps — Catalyst's connectedCallback calls would throw deep inside
+    // user bundles with "not a function" and no breadcrumb pointing
+    // back at heso. Surface the gap at install time instead.
+    var __missingProtoMethodWarned = {};
+    function warnMissingProtoMethod(protoName, method) {
+        try {
+            if (typeof console === 'undefined' || !console.warn) return;
+            var key = protoName + '.' + method;
+            if (__missingProtoMethodWarned[key]) return;
+            __missingProtoMethodWarned[key] = true;
+            console.warn('heso: ' + protoName + '.prototype.' + method
+                + ' is not implemented; lifecycle code may throw');
+        } catch (_) {}
+    }
+
     function wrapReturnsElement(proto, method) {
         if (!proto) return;
         var orig = proto[method];
-        if (typeof orig !== 'function') return;
+        if (typeof orig !== 'function') {
+            warnMissingProtoMethod(proto === documentProto ? 'Document' : 'Element', method);
+            return;
+        }
         proto[method] = function() {
             var result = orig.apply(this, arguments);
             return stampPrototypeIfRegistered(result);
@@ -1417,7 +1438,10 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
     function wrapReturnsElementArray(proto, method) {
         if (!proto) return;
         var orig = proto[method];
-        if (typeof orig !== 'function') return;
+        if (typeof orig !== 'function') {
+            warnMissingProtoMethod(proto === documentProto ? 'Document' : 'Element', method);
+            return;
+        }
         proto[method] = function() {
             var result = orig.apply(this, arguments);
             return stampArrayPrototypes(result);

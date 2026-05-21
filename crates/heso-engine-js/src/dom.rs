@@ -840,6 +840,21 @@ impl Document {
         }
     }
 
+    /// `document.location` — alias for `globalThis.location`. The DOM
+    /// spec ([HTML §7.4](https://html.spec.whatwg.org/#the-location-interface))
+    /// requires the same `Location` object on both `window.location`
+    /// and `document.location`. mdbook's `<mdbook-sidebar-scrollbox>`
+    /// connectedCallback opens with `document.location.href.toString()`,
+    /// so a missing alias surfaces as
+    /// `TypeError: cannot read 'href' of undefined` on
+    /// doc.rust-lang.org. Returning the global means router code that
+    /// holds either reference still sees the same `href`/`pathname`
+    /// pair after navigation.
+    #[qjs(get)]
+    fn location<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        ctx.globals().get("location")
+    }
+
     /// `document.createElement(tagName)` — create a fresh orphan
     /// element with the given tag, no parent, no children, no
     /// attributes.
@@ -1928,6 +1943,84 @@ impl Element {
         if let Some(n) = self.node_ref() {
             n.remove_attr(&name);
         }
+    }
+
+    /// `element.toggleAttribute(name, force?)` — DOM Element §7. If
+    /// `force` is true the attribute is added (with empty value) and
+    /// `true` is returned; if `force` is false the attribute is removed
+    /// and `false` is returned; if `force` is omitted the attribute's
+    /// presence is flipped and the new state is returned.
+    ///
+    /// Catalyst's `connectedCallback` wrapper opens with
+    /// `instance.toggleAttribute('data-catalyst', true)` so every
+    /// `@controller`-decorated element on a GitHub page hits this on
+    /// upgrade. Without it the wrapper at custom_elements.rs's
+    /// `wrapReturnsElement` silently no-ops and lifecycle code throws
+    /// `TypeError: not a function` deep inside user bundles.
+    fn toggle_attribute(&self, name: String, force: Option<bool>) -> bool {
+        let has = self.node_ref().map(|n| n.has_attr(&name)).unwrap_or(false);
+        let target = match force {
+            Some(t) => t,
+            None => !has,
+        };
+        if let Some(n) = self.node_ref() {
+            if target && !has {
+                n.set_attr(&name, "");
+            } else if !target && has {
+                n.remove_attr(&name);
+            }
+        }
+        target
+    }
+
+    /// `element.matches(selector)` — DOM Element §7. `true` iff this
+    /// element would be selected by `selector` if it were the root of
+    /// a query. Invalid selectors return `false` (real browsers throw
+    /// `SyntaxError`; alignment is a Phase 1C polish item — non-throw
+    /// is the safer default for hydration code that probes broad
+    /// selector sets).
+    fn matches(&self, selector: String) -> bool {
+        let Some(n) = self.node_ref() else {
+            return false;
+        };
+        dom_query::Selection::from(n).is(&selector)
+    }
+
+    /// `element.closest(selector)` — DOM Element §7. Walks self plus
+    /// ancestors and returns the first element matching `selector`,
+    /// or `null`. Catalyst's `bind.ts` and most event-delegation code
+    /// reaches for this in hot paths.
+    fn closest(&self, selector: String) -> Option<Element> {
+        let start = self.node_ref()?;
+        let mut cur_id = Some(start.id);
+        while let Some(id) = cur_id {
+            let node = self.doc.tree.get(&id)?;
+            let parent_id = node.parent().map(|p| p.id);
+            if node.is_element() && dom_query::Selection::from(node).is(&selector) {
+                return Some(Element::from_id(self.doc.clone(), id));
+            }
+            cur_id = parent_id;
+        }
+        None
+    }
+
+    /// `element.getRootNode(options?)` — DOM Node §4.4. Phase 1B
+    /// returns the owner `document` for every element. Shadow-root
+    /// attribution (returning the host's `ShadowRoot` when this
+    /// element lives inside one) is deferred — heso's shadow-root
+    /// registry is keyed by host `NodeId` and per-call `Element`
+    /// wrappers do not carry that attribution today. Returning the
+    /// document is safer than returning a stub `ShadowRoot` that
+    /// would misroute event-delegation lookups in Catalyst's
+    /// `bindShadow` branch. The `composed: true` option is accepted
+    /// and ignored — same result either way under the Phase 1B model.
+    #[qjs(rename = "getRootNode")]
+    fn get_root_node<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        _options: Opt<Value<'js>>,
+    ) -> rquickjs::Result<Value<'js>> {
+        ctx.globals().get("document")
     }
 
     /// `element.querySelector(selector)` — return the first descendant
