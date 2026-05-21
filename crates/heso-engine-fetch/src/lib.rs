@@ -587,6 +587,7 @@ impl FetchPage {
             "metadata": self.metadata,
             "tree": self.tree,
             "actions": self.actions,
+            "http_status": self.http_status,
         });
         if !self.inline_data.is_empty() {
             if let Some(obj) = body.as_object_mut() {
