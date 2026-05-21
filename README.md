@@ -5,9 +5,9 @@
 It fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
 
 ```
-binary       9.2 MB
-cold start   ~80 ms   (open https://example.com, network included)
-engine only  ~35 ms   (no network)
+binary       9.6 MB
+cold start   ~77 ms   (open https://example.com, network included)
+engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
 ```
 
@@ -29,7 +29,7 @@ npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example
 powershell -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso.zip -OutFile heso.zip; Expand-Archive heso.zip -DestinationPath ."
 ```
 
-> Currently shipping `v0.0.1` Windows-x64 only. Linux + macOS binaries land with `v0.0.2` (CI builds wiring up now). On other platforms, [build from source](#building-from-source) for now.
+> Shipping `v0.0.5` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 
 After install, `heso` is on `$PATH`:
 
