@@ -462,26 +462,11 @@ mod tests {
         assert!(!pubkey_in_allowlist("ALPHA", &allow), "case-sensitive");
     }
 
-    #[test]
-    fn load_trusted_keys_empty_when_no_source() {
-        // SAFETY: tests in this binary all see one process; we save +
-        // restore the env var around the assertion so a concurrent
-        // test (cargo test runs by default with multiple threads) that
-        // touches the same env doesn't poison this one. The
-        // `set_var/remove_var` API is `unsafe` in Edition 2024 — the
-        // unsafe block opt-in matches the lint-deny in this crate.
-        let prev = std::env::var(TRUSTED_KEYS_ENV).ok();
-        // SAFETY: single-threaded scope inside a test, no other thread
-        // reads HESO_TRUSTED_KEYS during this function.
-        unsafe { std::env::remove_var(TRUSTED_KEYS_ENV) };
-        let r = load_trusted_keys(None);
-        assert!(
-            matches!(r, AllowlistResult::Empty),
-            "expected Empty, got {r:?}"
-        );
-        // SAFETY: see above.
-        if let Some(v) = prev {
-            unsafe { std::env::set_var(TRUSTED_KEYS_ENV, v) };
-        }
-    }
+    // Note: `load_trusted_keys(None)` env-var behavior is covered by
+    // the round-trip integration tests in
+    // `tests/receipts_round_trip.rs`, which control the env via
+    // `Command::env`/`env_remove` per child process and avoid
+    // mutating the test process's env at all. The Edition-2024
+    // `unsafe` requirement on `set_var`/`remove_var` is forbidden in
+    // this crate (`#![forbid(unsafe_code)]`).
 }
