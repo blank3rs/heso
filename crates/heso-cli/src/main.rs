@@ -739,8 +739,13 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             hydrate_for_failure_envelope(&engine, &page.body_html, page.url().clone());
         (failed, console_errors, None)
     };
-    let (partial, partial_reason) =
+    let (js_partial, js_reason) =
         classify_failure_envelope(&failed_scripts, console_errors_count);
+    // HTTP truthfulness wins over JS classification — a 403 with a
+    // Cloudflare challenge body shouldn't pretend to be a `script_crash`
+    // from the missing CF JS. Same upstream signal for 5xx, etc.
+    let (partial, partial_reason) =
+        apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
     // Without `--best-effort`, today's contract is "open always
     // returns the page even if hydration errors happen" — we keep
     // that. The new partial fields are additive; the flag only
@@ -758,7 +763,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     attach_failure_envelope(
         &mut body,
         partial,
-        partial_reason,
+        &partial_reason,
         &failed_scripts,
         console_errors_count,
     );
@@ -897,6 +902,31 @@ pub(crate) fn classify_failure_envelope(
         }
     }
     (false, "ok")
+}
+
+/// Merge the JS-side `classify_failure_envelope` output with the
+/// HTTP-side `partial_reason_for_status` signal. HTTP status / bot-
+/// challenge wins over JS classification: a 403 with a Cloudflare
+/// challenge body should report `partial_reason: "bot_challenge"`,
+/// not `"script_crash"` from a downstream missing-CF-JS error. The
+/// agent wants the network signal, not the hydration symptom.
+///
+/// Returns `(partial, partial_reason)` where `partial_reason` is an
+/// owned `String` (the HTTP path may produce `http_403` / `http_5xx`
+/// dynamically; the JS path returns static strings — both flow
+/// through this helper).
+pub(crate) fn apply_http_truthfulness(
+    js_partial: bool,
+    js_reason: &str,
+    http_status: u16,
+    body_html: &str,
+) -> (bool, String) {
+    if let Some(http_reason) =
+        heso_engine_fetch::partial_reason_for_status(http_status, body_html)
+    {
+        return (true, http_reason);
+    }
+    (js_partial, js_reason.to_owned())
 }
 
 /// Attach the structured-failure envelope fields to `body`. Always
@@ -1638,12 +1668,14 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // the schema bump. Under `--best-effort` we additionally guarantee
     // exit 0 — the existing happy path already returns success here
     // since `JsSession::open_on_engine` succeeded.
-    let (partial, partial_reason) =
+    let (js_partial, js_reason) =
         classify_failure_envelope(&failed_scripts, console_errors_count);
+    let (partial, partial_reason) =
+        apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
     attach_failure_envelope(
         &mut body,
         partial,
-        partial_reason,
+        &partial_reason,
         &failed_scripts,
         console_errors_count,
     );

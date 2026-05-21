@@ -97,6 +97,16 @@ The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to both
 
 - `heso read` always returns a `content_hash`. Pass `--since <prev_hash>` to get a `delta` describing what changed (`actions_added`, `actions_removed`, `forms_changed`, `text_changed`, `title_changed`).
 
+**Honest about failure.**
+
+- Every `open` / `read` / `fetch` response carries `http_status` (200, 403, 503, ...) — captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Cloudflare-style "Just a moment..." interstitials are detected via `__cf_chl_opt` / challenge-token markers and surfaced as `partial_reason: "bot_challenge"`. No more silent "I got something" when the server returned an error page.
+- `heso click @e7` on an `<a href="...">` actually follows the link — the response carries the destination page's `title`, `tree`, `actions`, and `http_status`, not the source page.
+
+**Web platform coverage.**
+
+- `XMLHttpRequest` (sync + async, backed by the same `reqwest` client as `fetch`), `performance.mark` / `performance.measure`, `document.getElementsByClassName` / `getElementsByName` / `getElementsByTagName`, 60+ `HTMLElement` subclass constructors (`new HTMLDivElement()` works, `instanceof HTMLScriptElement` works), `element.style = "color: red"` string-coercion setter, `data:` URL fast path in `<script src>`.
+- `MutationObserver` + `IntersectionObserver` fire on real DOM mutations and viewport intersections; `setTimeout` / `setInterval` accept the 1-arg form per WHATWG HTML; classic `<script>` runs sloppy-mode per spec (so sites like Apple and Wikipedia that use `var = ...` at the top level work); ES modules (`<script type="module">`) stay strict per ECMA-262.
+
 **Stateful sessions.**
 
 - `heso serve` — JSON-RPC over stdin/stdout. Cookies, DOM mutations, listeners, and history persist across calls. Useful for login → navigate → scrape flows.
@@ -104,7 +114,7 @@ The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to both
 ## What it can't do
 
 - **No rendering.** No canvas, WebGL, CSS layout, or video. If the meaning is in pixels, use a real browser.
-- **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `Mozilla/5.0 (compatible; heso/0.0.1)` so anything fingerprinting will see us coming.
+- **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `heso/<version>` so anything fingerprinting will see us coming. We detect Cloudflare interstitials and surface them as `partial_reason: "bot_challenge"` rather than pretending the page loaded.
 - **Pages built on tech we don't simulate.** Service Workers, WebRTC, WebUSB, WebBluetooth — not supported.
 - **Sites whose JS we can't run.** QuickJS isn't V8. Most works; some doesn't.
 - **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
