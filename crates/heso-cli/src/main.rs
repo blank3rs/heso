@@ -217,6 +217,9 @@ fn print_banner() {
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
     );
     println!("  heso receipt-verify <file>    Verify a signed receipt (exit 0 valid, 1 invalid, 2 missing/malformed)");
+    println!("    [--trusted-keys PATH]          JSON file of allowlisted base64 pubkeys; receipts NOT signed by an allowlist key are rejected");
+    println!("                                   (also reads HESO_TRUSTED_KEYS env var; empty allowlist warns to stderr).");
+    println!("                                   Receipts with mode: live are rejected (not replay-safe — ADR 0008).");
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See state.json + decisions/0012-fetch-only-native-engine.md (static engine) and");
@@ -3332,7 +3335,7 @@ where
 
     match op(&js_engine, &html, &selector) {
         Ok(outcome) => {
-            let body = serde_json::json!({
+            let mut body = serde_json::json!({
                 "ok": true,
                 "op": op_name,
                 "url": final_url.to_string(),
@@ -3341,6 +3344,33 @@ where
                 "value": outcome.value,
                 "console": outcome.console,
             });
+            // Bug A fix: when the clicked element is an `<a href>`,
+            // also resolve the href against the page URL, fetch the
+            // destination, and surface the destination page on the
+            // response. Today's behavior was to return `value: true`
+            // and leave the agent staring at the same page — every
+            // multi-step navigation chain hit this footgun (HN,
+            // GitHub, Stripe, lobste.rs). For non-anchor clicks
+            // (button, form-submit-button, JS-only handler) we leave
+            // the response shape alone — `submit` is the right tool
+            // for forms; pure JS handlers may not navigate at all.
+            //
+            // Behavioral notes:
+            // - Empty href, `href="#"`, and `javascript:` URLs are
+            //   skipped (no real navigation to perform).
+            // - `target="_blank"` etc. are ignored — we follow the
+            //   href in-process regardless. Agents don't have window
+            //   semantics; the destination is the destination.
+            // - If the navigation fetch fails (DNS, TLS, status
+            //   error per the engine's reqwest semantics), we
+            //   surface `navigated: false` with a `nav_error` field
+            //   so the agent can see what happened. The original
+            //   click result (`value: true`, console) is preserved.
+            if op_name == "click" && action.tag == "a" {
+                if let Some(dest_url) = follow_anchor_href(&action, &final_url) {
+                    body = augment_click_with_destination(body, &engine, &dest_url).await;
+                }
+            }
             match serde_json::to_string_pretty(&body) {
                 Ok(s) => println!("{s}"),
                 Err(e) => {
@@ -3384,6 +3414,127 @@ where
             ExitCode::FAILURE
         }
     }
+}
+
+/// Bug A helper: parse the `<a>`'s `href` attribute and resolve it
+/// against the page URL. Returns `None` when the href is missing,
+/// empty, a bare fragment (`#`), a `javascript:` pseudo-URL, or
+/// otherwise unfollowable. Relative URLs are resolved against
+/// `page_url` per WHATWG URL spec.
+fn follow_anchor_href(
+    action: &heso_engine_fetch::ElementRef,
+    page_url: &Url,
+) -> Option<Url> {
+    let href = action.attrs.get("href")?;
+    let trimmed = href.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    // Drop `javascript:` / `mailto:` / `tel:` / `data:` schemes —
+    // these don't navigate the page in the sense the agent means.
+    // `data:` URLs would need the inline-script handler (bug report
+    // 01 item #5); navigation `data:` URLs are exotic enough to
+    // skip here.
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("javascript:")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("tel:")
+        || lower.starts_with("data:")
+    {
+        return None;
+    }
+    // `Url::join` handles relative-URL resolution per WHATWG URL
+    // (item-25 / RFC 3986 §5.2). Strips fragments only when the
+    // input is purely a fragment; preserves the rest.
+    match page_url.join(trimmed) {
+        Ok(u) => Some(u),
+        Err(_) => None,
+    }
+}
+
+/// Bug A helper: fetch the click destination and fold its page into
+/// the click response. Adds `navigated: true`, `navigated_to: <url>`,
+/// plus the destination's `title`, `description`, `tree`, `actions`,
+/// `metadata`, and `http_status`. On fetch failure, sets
+/// `navigated: false` + `nav_error: <msg>` and leaves the original
+/// click body intact.
+async fn augment_click_with_destination(
+    mut body: serde_json::Value,
+    engine: &FetchEngine,
+    dest_url: &Url,
+) -> serde_json::Value {
+    match engine.open(dest_url).await {
+        Ok(dest_page) => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "navigated".to_owned(),
+                    serde_json::Value::Bool(true),
+                );
+                obj.insert(
+                    "navigated_to".to_owned(),
+                    serde_json::Value::String(dest_page.url().as_str().to_owned()),
+                );
+                obj.insert(
+                    "title".to_owned(),
+                    serde_json::Value::String(dest_page.tree.title.clone()),
+                );
+                obj.insert(
+                    "description".to_owned(),
+                    serde_json::to_value(&dest_page.tree.description)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "tree".to_owned(),
+                    serde_json::to_value(&dest_page.tree).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "actions".to_owned(),
+                    serde_json::to_value(&dest_page.actions).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "metadata".to_owned(),
+                    serde_json::to_value(&dest_page.metadata).unwrap_or(serde_json::Value::Null),
+                );
+                obj.insert(
+                    "http_status".to_owned(),
+                    serde_json::Value::Number(serde_json::Number::from(dest_page.http_status)),
+                );
+                // Surface HTTP / bot-challenge truthfulness on the
+                // navigated page so a click that lands on a 403 or
+                // a CF challenge doesn't lie about success.
+                if let Some(reason) = heso_engine_fetch::partial_reason_for_status(
+                    dest_page.http_status,
+                    &dest_page.body_html,
+                ) {
+                    obj.insert(
+                        "partial".to_owned(),
+                        serde_json::Value::Bool(true),
+                    );
+                    obj.insert(
+                        "partial_reason".to_owned(),
+                        serde_json::Value::String(reason),
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "navigated".to_owned(),
+                    serde_json::Value::Bool(false),
+                );
+                obj.insert(
+                    "navigated_to".to_owned(),
+                    serde_json::Value::String(dest_url.as_str().to_owned()),
+                );
+                obj.insert(
+                    "nav_error".to_owned(),
+                    serde_json::Value::String(e.to_string()),
+                );
+            }
+        }
+    }
+    body
 }
 
 /// `heso click <url> <@ref>` — fetch <url>, locate the element with
