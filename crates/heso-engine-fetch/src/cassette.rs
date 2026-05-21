@@ -65,10 +65,16 @@ pub struct Record {
     /// HTTP method, uppercase canonical form: `"GET"`, `"POST"`,
     /// `"PUT"`, `"DELETE"`, `"PATCH"`, `"HEAD"`, `"OPTIONS"`.
     pub method: String,
-    /// Final URL as the engine saw it, after `Url::parse`
-    /// normalization (lowercase scheme + host, percent-encoding
-    /// canonicalized).
+    /// The URL the engine was asked to fetch — the lookup key.
+    /// Pre-redirect; identical to whatever string the agent (or the
+    /// page) passed to `reqwest::Client::get`.
     pub url: String,
+    /// The URL the response actually came from, after any redirect
+    /// chain reqwest followed. Equals `url` when no redirect was
+    /// involved. Preserved so replay can fill in the
+    /// [`crate::FetchPage::url`] field with the same value Live mode
+    /// would have produced.
+    pub final_url: String,
     /// Base64 of the request body bytes. Empty string for `GET` /
     /// `HEAD` / any request without a body.
     pub request_body_b64: String,
@@ -110,10 +116,14 @@ impl Cassette {
     /// Headers are stored verbatim. Bodies are base64-encoded at
     /// store time. Method is uppercased (HTTP method names are case-
     /// insensitive per RFC 9110 §9.1 but the wire form is uppercase).
+    /// `final_url` is the post-redirect URL the response came from;
+    /// pass the same value as `url` when no redirect was followed.
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
         method: &str,
         url: &str,
+        final_url: &str,
         request_body: &[u8],
         status: u16,
         response_headers: Vec<(String, String)>,
@@ -122,6 +132,7 @@ impl Cassette {
         self.records.push(Record {
             method: method.to_ascii_uppercase(),
             url: url.to_owned(),
+            final_url: final_url.to_owned(),
             request_body_b64: B64.encode(request_body),
             status,
             response_headers,
@@ -208,6 +219,7 @@ mod tests {
         c.record(
             "GET",
             "https://example.com/a",
+            "https://example.com/a",
             &[],
             200,
             vec![("content-type".into(), "text/html".into())],
@@ -215,6 +227,7 @@ mod tests {
         );
         c.record(
             "GET",
+            "https://example.com/b",
             "https://example.com/b",
             &[],
             404,
@@ -229,7 +242,7 @@ mod tests {
     #[test]
     fn method_is_uppercased_at_record() {
         let mut c = Cassette::new();
-        c.record("get", "https://x/", &[], 200, vec![], b"");
+        c.record("get", "https://x/", "https://x/", &[], 200, vec![], b"");
         assert_eq!(c.records[0].method, "GET");
     }
 
@@ -238,6 +251,7 @@ mod tests {
         let mut c = Cassette::new();
         c.record(
             "GET",
+            "https://example.com/",
             "https://example.com/",
             &[],
             200,
@@ -253,7 +267,7 @@ mod tests {
     #[test]
     fn lookup_method_is_case_insensitive() {
         let mut c = Cassette::new();
-        c.record("POST", "https://x/", b"hi", 201, vec![], b"ok");
+        c.record("POST", "https://x/", "https://x/", b"hi", 201, vec![], b"ok");
         assert!(c.lookup("post", "https://x/", b"hi").is_some());
         assert!(c.lookup("Post", "https://x/", b"hi").is_some());
         assert!(c.lookup("POST", "https://x/", b"hi").is_some());
@@ -262,7 +276,7 @@ mod tests {
     #[test]
     fn lookup_url_is_byte_exact() {
         let mut c = Cassette::new();
-        c.record("GET", "https://example.com/", &[], 200, vec![], b"");
+        c.record("GET", "https://example.com/", "https://example.com/", &[], 200, vec![], b"");
         assert!(c.lookup("GET", "https://example.com/", &[]).is_some());
         // Trailing-slash difference is a different URL byte-wise; the
         // caller is expected to normalize before lookup.
@@ -272,8 +286,8 @@ mod tests {
     #[test]
     fn lookup_body_is_byte_exact() {
         let mut c = Cassette::new();
-        c.record("POST", "https://x/", b"alpha", 200, vec![], b"a");
-        c.record("POST", "https://x/", b"beta", 200, vec![], b"b");
+        c.record("POST", "https://x/", "https://x/", b"alpha", 200, vec![], b"a");
+        c.record("POST", "https://x/", "https://x/", b"beta", 200, vec![], b"b");
         let a = c.lookup("POST", "https://x/", b"alpha").expect("alpha hit");
         let b = c.lookup("POST", "https://x/", b"beta").expect("beta hit");
         assert_eq!(B64.decode(&a.response_body_b64).unwrap(), b"a");
@@ -290,8 +304,8 @@ mod tests {
         // future refinement (track a cursor per (method,url,body) so
         // poll loops replay deterministically).
         let mut c = Cassette::new();
-        c.record("GET", "https://x/", &[], 200, vec![], b"first");
-        c.record("GET", "https://x/", &[], 200, vec![], b"second");
+        c.record("GET", "https://x/", "https://x/", &[], 200, vec![], b"first");
+        c.record("GET", "https://x/", "https://x/", &[], 200, vec![], b"second");
         let r = c.lookup("GET", "https://x/", &[]).expect("hit");
         assert_eq!(B64.decode(&r.response_body_b64).unwrap(), b"first");
     }
@@ -300,7 +314,7 @@ mod tests {
     fn decode_response_body_round_trips() {
         let mut c = Cassette::new();
         let payload = vec![0u8, 1, 2, 255, 254, 253]; // arbitrary binary
-        c.record("GET", "https://x/", &[], 200, vec![], &payload);
+        c.record("GET", "https://x/", "https://x/", &[], 200, vec![], &payload);
         let r = &c.records[0];
         assert_eq!(Cassette::decode_response_body(r).unwrap(), payload);
     }
@@ -310,6 +324,7 @@ mod tests {
         let mut c = Cassette::new();
         c.record(
             "GET",
+            "https://example.com/",
             "https://example.com/",
             &[],
             200,
@@ -331,7 +346,7 @@ mod tests {
         // same canonical bytes. Plat-hash determinism relies on this.
         let mk = || {
             let mut c = Cassette::new();
-            c.record("GET", "https://example.com/", &[], 200, vec![], b"hi");
+            c.record("GET", "https://example.com/", "https://example.com/", &[], 200, vec![], b"hi");
             c
         };
         let a = serde_jcs::to_string(&mk()).expect("jcs a");

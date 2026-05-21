@@ -894,6 +894,7 @@ dependencies = [
 name = "heso-engine-fetch"
 version = "0.0.7"
 dependencies = [
+ "base64",
  "blake3",
  "cookie_store 0.21.1",
  "ego-tree",

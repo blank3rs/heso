@@ -558,12 +558,72 @@ pub(crate) fn drain_pending(
                 resolve_one(context, p, outcome)?;
             }
         }
+        FetchMode::Recording {
+            client,
+            rt_handle,
+            cassette,
+        } => {
+            for p in pending {
+                let outcome = perform_request(client, rt_handle, &p);
+                if let XhrOutcome::Ok {
+                    status,
+                    final_url,
+                    headers,
+                    body,
+                    ..
+                } = &outcome
+                {
+                    cassette
+                        .lock()
+                        .expect("cassette mutex poisoned")
+                        .record(
+                            &p.method,
+                            &p.url,
+                            final_url,
+                            &p.body,
+                            *status,
+                            headers.clone(),
+                            body,
+                        );
+                }
+                resolve_one(context, p, outcome)?;
+            }
+        }
+        FetchMode::Replaying { cassette } => {
+            for p in pending {
+                let outcome = match cassette.lookup(&p.method, &p.url, &p.body) {
+                    Some(record) => match heso_engine_fetch::Cassette::decode_response_body(record)
+                    {
+                        Ok(body) => XhrOutcome::Ok {
+                            status: record.status,
+                            status_text: reqwest::StatusCode::from_u16(record.status)
+                                .ok()
+                                .and_then(|s| s.canonical_reason())
+                                .unwrap_or("")
+                                .to_owned(),
+                            final_url: record.final_url.clone(),
+                            headers: record.response_headers.clone(),
+                            body,
+                        },
+                        Err(e) => XhrOutcome::Err(format!(
+                            "cassette decode error for {} {}: {}",
+                            p.method, p.url, e
+                        )),
+                    },
+                    None => XhrOutcome::Err(format!(
+                        "cassette miss: {} {} not recorded (cassette has {} entries)",
+                        p.method,
+                        p.url,
+                        cassette.len()
+                    )),
+                };
+                resolve_one(context, p, outcome)?;
+            }
+        }
         FetchMode::DeterministicNoCassette => {
             for p in pending {
                 let url = p.url.clone();
-                let msg = format!(
-                    "xhr to {url} not in cassette - heso run with --record first"
-                );
+                let msg = format!("xhr to {url} not in cassette - heso run with --record first");
                 resolve_one(context, p, XhrOutcome::Err(msg))?;
             }
         }

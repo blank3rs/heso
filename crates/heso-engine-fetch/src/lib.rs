@@ -116,12 +116,57 @@ pub enum Error {
     /// A URL string could not be parsed.
     #[error("URL parse error: {0}")]
     BadUrl(#[from] url::ParseError),
+
+    /// Replay mode could not find a matching record in the cassette.
+    /// Either the cassette was tampered, the page changed since
+    /// stamping, or stamp was run without `--record`.
+    #[error("{0}")]
+    CassetteMiss(#[from] cassette::CassetteMiss),
+
+    /// Cassette response-body base64 could not be decoded — corrupted
+    /// cassette. Surfaces as a hard error rather than degrading to
+    /// a live fetch, per ADR 0008.
+    #[error("cassette decode error: {0}")]
+    CassetteDecode(String),
 }
 
 impl From<Error> for heso_core::Error {
     fn from(e: Error) -> Self {
         heso_core::Error::Io(std::io::Error::other(e.to_string()))
     }
+}
+
+// ============================================================================
+// CassetteMode — how the engine handles HTTP requests
+// ============================================================================
+
+/// Cassette behavior for a [`FetchEngine`]. Each variant determines
+/// whether HTTP requests hit the network and whether they are
+/// recorded into / served from a [`Cassette`].
+///
+/// Cloning a `FetchEngine` clones the `CassetteMode` too, so spawned
+/// sub-fetches (the [`explore`] module, the JS engine's `fetch`
+/// global) inherit the same recording/replaying behavior as the
+/// parent. The recording-side cassette is shared by `Arc<Mutex<…>>`
+/// so concurrent recordings from sub-fetches all land in one log.
+#[derive(Debug, Clone, Default)]
+pub enum CassetteMode {
+    /// Live HTTP, no cassette involvement. Default for `heso open`,
+    /// `heso read`, the dev-loop. This is the variant
+    /// [`FetchEngine::new`] produces.
+    #[default]
+    Live,
+    /// Live HTTP with a sidecar recorder: every request goes to the
+    /// wire as in `Live`, and every (request, response) pair is
+    /// appended to the shared `Cassette`. Used by `heso stamp` to
+    /// produce a cassette inside the resulting plat.
+    Recording(Arc<std::sync::Mutex<Cassette>>),
+    /// Cassette-only: no network access at all. Every HTTP request
+    /// looks up `(method, url, request-body)` in the cassette;
+    /// matches return the recorded response, misses return
+    /// [`Error::CassetteMiss`] so the caller can surface a clean
+    /// error instead of a quiet drift. Used by `heso replay`.
+    Replaying(Arc<Cassette>),
 }
 
 // ============================================================================
@@ -143,6 +188,9 @@ pub struct FetchEngine {
     /// store. RFC 6265 parsing + path/domain matching lives inside
     /// `cookie_store::CookieStore`.
     cookie_jar: Arc<CookieStoreMutex>,
+    /// How HTTP requests are routed — live, recording into a
+    /// cassette, or playing back from one. See [`CassetteMode`].
+    cassette_mode: CassetteMode,
 }
 
 impl FetchEngine {
@@ -152,6 +200,40 @@ impl FetchEngine {
     /// `reqwest::Client` via `cookie_provider`. Cookies persist for the
     /// lifetime of this `FetchEngine` (and any clone — `Arc` semantics).
     pub fn new() -> HesoResult<Self> {
+        Self::build(CassetteMode::Live)
+    }
+
+    /// Construct a `FetchEngine` whose HTTP traffic is mirrored into
+    /// `cassette`. Equivalent to [`Self::new`] but every `GET` (and,
+    /// once Phase 2.5 lands, every JS-side `fetch()`) records a
+    /// (request, response) pair into the cassette before returning.
+    ///
+    /// Used by `heso stamp` to produce a plat whose cassette field
+    /// can later be replayed byte-identically by `heso replay`.
+    pub fn with_recording_cassette(cassette: Arc<std::sync::Mutex<Cassette>>) -> HesoResult<Self> {
+        Self::build(CassetteMode::Recording(cassette))
+    }
+
+    /// Construct a `FetchEngine` that serves every HTTP request from
+    /// `cassette` instead of the network. Misses surface as
+    /// [`Error::CassetteMiss`]; the engine never falls through to a
+    /// live fetch under Replaying mode (ADR 0008 §"Network requests"
+    /// — "Hash mismatch on a request that wasn't recorded → error,
+    /// not a real fetch").
+    ///
+    /// The `reqwest::Client` is still built (the cookie jar lives
+    /// inside it and the JS engine still expects one). It's just not
+    /// reached for HTTP under Replaying mode.
+    pub fn with_replaying_cassette(cassette: Arc<Cassette>) -> HesoResult<Self> {
+        Self::build(CassetteMode::Replaying(cassette))
+    }
+
+    /// Internal: the constructor body shared by [`Self::new`],
+    /// [`Self::with_recording_cassette`], and
+    /// [`Self::with_replaying_cassette`]. Centralizes the client +
+    /// cookie-jar build so the three entry points stay byte-identical
+    /// on the live-HTTP side.
+    fn build(cassette_mode: CassetteMode) -> HesoResult<Self> {
         let cookie_jar = Arc::new(CookieStoreMutex::default());
         let client = Client::builder()
             .user_agent(concat!("heso/", env!("CARGO_PKG_VERSION")))
@@ -167,7 +249,18 @@ impl FetchEngine {
             .cookie_provider(cookie_jar.clone())
             .build()
             .map_err(Error::from)?;
-        Ok(Self { client, cookie_jar })
+        Ok(Self {
+            client,
+            cookie_jar,
+            cassette_mode,
+        })
+    }
+
+    /// Read the cassette mode the engine is operating in. Used by the
+    /// CLI to introspect Recording mode for the post-run cassette
+    /// extraction.
+    pub fn cassette_mode(&self) -> &CassetteMode {
+        &self.cassette_mode
     }
 
     /// Access the underlying [`reqwest::Client`]. Used by the [`explore`]
@@ -262,17 +355,9 @@ impl FetchEngine {
     /// path) without paying the cost of metadata/tree/actions
     /// extraction.
     pub async fn fetch_text(&self, url: &Url) -> HesoResult<(Url, String)> {
-        let response = self
-            .client
-            .get(url.as_str())
-            .send()
-            .await
-            .map_err(Error::from)?;
-        let final_url_str = response.url().as_str().to_owned();
-        let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
-        
-        let html_text = response.text().await.map_err(Error::from)?;
-        Ok((final_url, html_text))
+        let raw = self.do_http_get(url).await?;
+        let html_text = String::from_utf8_lossy(&raw.body_bytes).into_owned();
+        Ok((raw.final_url, html_text))
     }
 
     /// Internal: the original static `open` path, factored out so
@@ -281,20 +366,125 @@ impl FetchEngine {
     /// parameter).
     async fn open_static(&self, input: &str) -> HesoResult<FetchPage> {
         let parsed = Url::parse(input).map_err(Error::from)?;
+        let raw = self.do_http_get(&parsed).await?;
+        let html_text = String::from_utf8_lossy(&raw.body_bytes).into_owned();
+        Ok(FetchPage::from_html(
+            input.to_owned(),
+            raw.final_url,
+            raw.http_status,
+            raw.response_cookies,
+            html_text,
+        ))
+    }
+
+    /// Centralized HTTP GET that all the engine's static-fetch paths
+    /// (`open_static`, `fetch_text`, and `explore` via `client_ref`)
+    /// route through when they touch the network. Dispatches on
+    /// [`Self::cassette_mode`]:
+    ///
+    /// - [`CassetteMode::Live`]: hit the network as before.
+    /// - [`CassetteMode::Recording`]: hit the network, then append a
+    ///   record to the shared cassette.
+    /// - [`CassetteMode::Replaying`]: skip the network entirely, look
+    ///   up the cassette, return the recorded response. Misses
+    ///   surface as [`Error::CassetteMiss`].
+    async fn do_http_get(&self, url: &Url) -> HesoResult<HttpFetchResult> {
+        match &self.cassette_mode {
+            CassetteMode::Live => self.live_get(url).await,
+            CassetteMode::Recording(cassette) => {
+                let raw = self.live_get(url).await?;
+                let headers: Vec<(String, String)> = raw
+                    .response_headers
+                    .iter()
+                    .cloned()
+                    .collect();
+                // Lock briefly — no await held while locked.
+                cassette
+                    .lock()
+                    .expect("cassette mutex poisoned")
+                    .record(
+                        "GET",
+                        url.as_str(),
+                        raw.final_url.as_str(),
+                        &[],
+                        raw.http_status,
+                        headers,
+                        &raw.body_bytes,
+                    );
+                Ok(raw)
+            }
+            CassetteMode::Replaying(cassette) => {
+                let record = cassette.lookup("GET", url.as_str(), &[]).ok_or_else(|| {
+                    Error::CassetteMiss(cassette::CassetteMiss {
+                        method: "GET".to_owned(),
+                        url: url.as_str().to_owned(),
+                        recorded_count: cassette.len(),
+                    })
+                })?;
+                let body_bytes = Cassette::decode_response_body(record)
+                    .map_err(|e| Error::CassetteDecode(e.to_string()))?;
+                let final_url = Url::parse(&record.final_url).map_err(Error::from)?;
+                Ok(HttpFetchResult {
+                    final_url,
+                    http_status: record.status,
+                    response_cookies: Vec::new(),
+                    response_headers: record.response_headers.clone(),
+                    body_bytes,
+                })
+            }
+        }
+    }
+
+    /// Hit the wire via reqwest. Used by [`Self::do_http_get`]'s Live
+    /// and Recording branches; never reached under Replaying.
+    async fn live_get(&self, url: &Url) -> HesoResult<HttpFetchResult> {
         let response = self
             .client
-            .get(parsed.as_str())
+            .get(url.as_str())
             .send()
             .await
             .map_err(Error::from)?;
-
         let final_url_str = response.url().as_str().to_owned();
         let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
         let http_status = response.status().as_u16();
         let response_cookies = snapshot_response_cookies(&response);
-        let html_text = response.text().await.map_err(Error::from)?;
-        Ok(FetchPage::from_html(input.to_owned(), final_url, http_status, response_cookies, html_text))
+        // Capture headers BEFORE consuming the response body — reqwest's
+        // `bytes()` consumes the response, after which `.headers()` is gone.
+        let response_headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_owned(), s.to_owned()))
+            })
+            .collect();
+        let body_bytes = response.bytes().await.map_err(Error::from)?.to_vec();
+        Ok(HttpFetchResult {
+            final_url,
+            http_status,
+            response_cookies,
+            response_headers,
+            body_bytes,
+        })
     }
+}
+
+/// Raw HTTP response data captured by [`FetchEngine::do_http_get`].
+/// Internal — `open_static`/`fetch_text` consume it and project
+/// down to the [`FetchPage`] / `(Url, String)` shapes their callers
+/// expect.
+struct HttpFetchResult {
+    final_url: Url,
+    http_status: u16,
+    response_cookies: Vec<ResponseCookie>,
+    /// Response headers as `(name, value)` pairs. Used by the
+    /// Recording branch to feed the cassette; not consumed by the
+    /// Live branch yet (today's callers only need `response_cookies`
+    /// for the `cookies` projection).
+    #[allow(dead_code)]
+    response_headers: Vec<(String, String)>,
+    body_bytes: Vec<u8>,
 }
 
 /// Canonical comparison key for a base URL — same shape

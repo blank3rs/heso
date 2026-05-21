@@ -512,6 +512,42 @@ impl JsEngine {
         Self::new_inner(seed, Some(FetchMode::Live { client, rt_handle }), None)
     }
 
+    /// Seeded PRNG + live fetch with sidecar cassette recording.
+    /// Every JS-side `fetch(...)` call hits the network like
+    /// [`Self::new_with_seed_and_live_fetch`] and additionally
+    /// appends a record to the shared cassette. Used by `heso stamp`
+    /// to mint a plat that carries a replayable network trace.
+    pub fn new_with_recording_cassette(
+        seed: u64,
+        client: Arc<reqwest::Client>,
+        rt_handle: tokio::runtime::Handle,
+        cassette: Arc<std::sync::Mutex<heso_engine_fetch::Cassette>>,
+        cookie_jar: Option<Arc<CookieStoreMutex>>,
+    ) -> Result<Self, EvalError> {
+        Self::new_inner(
+            seed,
+            Some(FetchMode::Recording {
+                client,
+                rt_handle,
+                cassette,
+            }),
+            cookie_jar,
+        )
+    }
+
+    /// Seeded PRNG + cassette-only fetch. Every JS-side `fetch(...)`
+    /// call looks up the request in the supplied cassette; matches
+    /// resolve, misses reject with a structured "cassette miss"
+    /// error so the page's `.catch(...)` runs naturally. Used by
+    /// `heso replay`.
+    pub fn new_with_replaying_cassette(
+        seed: u64,
+        cassette: Arc<heso_engine_fetch::Cassette>,
+        cookie_jar: Option<Arc<CookieStoreMutex>>,
+    ) -> Result<Self, EvalError> {
+        Self::new_inner(seed, Some(FetchMode::Replaying { cassette }), cookie_jar)
+    }
+
     /// Internal constructor — the single place that wires up all
     /// globals so the public `new_*` variants don't drift.
     ///
@@ -557,11 +593,16 @@ impl JsEngine {
         let module_cache = ModuleCache::new();
         let import_map = empty_shared_import_map();
         let http_fetcher: Option<HttpFetcher> = match fetch_mode.as_ref() {
-            Some(FetchMode::Live { client, rt_handle }) => Some(HttpFetcher {
+            Some(FetchMode::Live { client, rt_handle })
+            | Some(FetchMode::Recording {
+                client, rt_handle, ..
+            }) => Some(HttpFetcher {
                 client: client.clone(),
                 rt: rt_handle.clone(),
             }),
-            Some(FetchMode::DeterministicNoCassette) | None => None,
+            Some(FetchMode::Replaying { .. })
+            | Some(FetchMode::DeterministicNoCassette)
+            | None => None,
         };
         let base_url: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
         runtime.set_loader(
@@ -746,7 +787,17 @@ impl JsEngine {
         // Without one, `form.submit()` JS-side becomes a silent
         // no-op — matching the spec's "no browsing context" branch.
         if let Some(fs) = fetch_state.as_ref() {
-            if let FetchMode::Live { client, rt_handle } = &fs.mode {
+            // Recording mode installs the live submit shim too — the
+            // form POST will be recorded into the cassette like any
+            // other request. Replaying mode skips: forms cannot
+            // round-trip a real POST off-network, and a submit
+            // attempt should surface as a cassette miss rather than
+            // silently no-op.
+            if let FetchMode::Live { client, rt_handle }
+            | FetchMode::Recording {
+                client, rt_handle, ..
+            } = &fs.mode
+            {
                 install_form_submit_now(&context, client.clone(), rt_handle.clone())?;
             }
         }
@@ -1642,8 +1693,11 @@ impl JsEngine {
         }
 
         let script_fetch_client = self.fetch_state.as_ref().and_then(|fs| match &fs.mode {
-            FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
-            FetchMode::DeterministicNoCassette => None,
+            FetchMode::Live { client, rt_handle }
+            | FetchMode::Recording {
+                client, rt_handle, ..
+            } => Some((client.clone(), rt_handle.clone())),
+            FetchMode::Replaying { .. } | FetchMode::DeterministicNoCassette => None,
         });
         let base_url = self.base_url();
         // Clear the per-script-failure buffer at the start of a fresh
@@ -1781,8 +1835,11 @@ impl JsEngine {
         // for the rest of the page — see `crate::fetch` for the
         // determinism-gate rules.
         let script_fetch_client = self.fetch_state.as_ref().and_then(|fs| match &fs.mode {
-            FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
-            FetchMode::DeterministicNoCassette => None,
+            FetchMode::Live { client, rt_handle }
+            | FetchMode::Recording {
+                client, rt_handle, ..
+            } => Some((client.clone(), rt_handle.clone())),
+            FetchMode::Replaying { .. } | FetchMode::DeterministicNoCassette => None,
         });
         let base_url = self.base_url();
         // Same as [`Self::install_document`] — clear per-call so the

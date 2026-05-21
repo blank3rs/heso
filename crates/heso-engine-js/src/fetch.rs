@@ -108,9 +108,35 @@ pub enum FetchMode {
     /// Deterministic mode (`--seed N`) without a network-recording
     /// cassette. Every `fetch(url, ...)` call rejects with a clear
     /// error pointing the user at `heso run --record` (per ADR 0008).
-    /// This is the explicit gate before item M lands the full
-    /// record/replay layer.
+    /// This is the legacy gate left in place for the seed-only path;
+    /// the modern surface is [`Self::Recording`] + [`Self::Replaying`].
     DeterministicNoCassette,
+    /// Live network access PLUS sidecar recording: every (request,
+    /// response) tuple is appended to the shared cassette as soon as
+    /// the live response lands. Used by `heso stamp` to produce a
+    /// plat that carries a replayable network trace.
+    Recording {
+        /// Shared HTTP client — same shape as [`Self::Live`].
+        client: Arc<reqwest::Client>,
+        /// Tokio runtime handle — same shape as [`Self::Live`].
+        rt_handle: tokio::runtime::Handle,
+        /// Shared cassette. The same `Arc<Mutex<Cassette>>` is held
+        /// by the static [`heso_engine_fetch::FetchEngine`] in
+        /// `CassetteMode::Recording`, so both layers append into one
+        /// log in arrival order.
+        cassette: Arc<std::sync::Mutex<heso_engine_fetch::Cassette>>,
+    },
+    /// Cassette-only mode: no network access at all. Every
+    /// `fetch(url, ...)` looks up the request in the cassette;
+    /// matches resolve the Promise with the recorded response,
+    /// misses reject with a structured `Error("cassette miss: …")`
+    /// so the page's `.catch(…)` runs naturally instead of the
+    /// engine hard-crashing.
+    Replaying {
+        /// Shared cassette. Same `Arc<Cassette>` as the static
+        /// engine's `CassetteMode::Replaying`.
+        cassette: Arc<heso_engine_fetch::Cassette>,
+    },
 }
 
 /// A pending fetch — the JS side has called `fetch(...)` and we owe
@@ -201,8 +227,14 @@ pub(crate) fn install_fetch(
 ) -> Result<(), EvalError> {
     context
         .with(|ctx| -> rquickjs::Result<()> {
+            // Live, Recording, and Replaying all use the same queuing
+            // closure — the recording / lookup split happens later in
+            // `drain_pending` where we already have the request bytes
+            // resolved off the JS side.
             let fetch_fn = match mode {
-                FetchMode::Live { .. } => make_fetch_live(&ctx, queue.clone())?,
+                FetchMode::Live { .. }
+                | FetchMode::Recording { .. }
+                | FetchMode::Replaying { .. } => make_fetch_live(&ctx, queue.clone())?,
                 FetchMode::DeterministicNoCassette => make_fetch_deterministic(&ctx)?,
             };
             ctx.globals().set("fetch", fetch_fn)?;
@@ -483,6 +515,81 @@ pub(crate) fn drain_pending(
                 resolve_one(context, p, outcome)?;
             }
         }
+        FetchMode::Recording {
+            client,
+            rt_handle,
+            cassette,
+        } => {
+            for p in pending {
+                let outcome = perform_request(client, rt_handle, &p.request);
+                // Record only successful responses — a connection
+                // failure means there's no response payload to log,
+                // and recording the error message would just bloat
+                // the cassette with a string that replay can't
+                // meaningfully reproduce.
+                if let FetchOutcome::Ok {
+                    status,
+                    final_url,
+                    headers,
+                    body,
+                    ..
+                } = &outcome
+                {
+                    let body_bytes = match &p.request.body {
+                        FetchBody::Bytes(b) => b.clone(),
+                        FetchBody::None | FetchBody::Multipart(_) => Vec::new(),
+                    };
+                    cassette
+                        .lock()
+                        .expect("cassette mutex poisoned")
+                        .record(
+                            &p.request.method,
+                            &p.request.url,
+                            final_url,
+                            &body_bytes,
+                            *status,
+                            headers.clone(),
+                            body,
+                        );
+                }
+                resolve_one(context, p, outcome)?;
+            }
+        }
+        FetchMode::Replaying { cassette } => {
+            for p in pending {
+                let body_bytes: Vec<u8> = match &p.request.body {
+                    FetchBody::Bytes(b) => b.clone(),
+                    FetchBody::None | FetchBody::Multipart(_) => Vec::new(),
+                };
+                let outcome = match cassette.lookup(
+                    &p.request.method,
+                    &p.request.url,
+                    &body_bytes,
+                ) {
+                    Some(record) => match heso_engine_fetch::Cassette::decode_response_body(record)
+                    {
+                        Ok(body) => FetchOutcome::Ok {
+                            status: record.status,
+                            status_text: status_canonical_reason(record.status).to_owned(),
+                            final_url: record.final_url.clone(),
+                            headers: record.response_headers.clone(),
+                            body,
+                        },
+                        Err(e) => FetchOutcome::Err(format!(
+                            "cassette decode error for {} {}: {}",
+                            p.request.method, p.request.url, e
+                        )),
+                    },
+                    None => FetchOutcome::Err(format!(
+                        "cassette miss: {} {} not recorded (cassette has {} entries); the page may have changed since stamping",
+                        p.request.method,
+                        p.request.url,
+                        cassette.len()
+                    )),
+                };
+                resolve_one(context, p, outcome)?;
+            }
+        }
         FetchMode::DeterministicNoCassette => {
             // Should never queue in deterministic mode (the
             // closure rejects synchronously), but be defensive.
@@ -499,6 +606,17 @@ pub(crate) fn drain_pending(
         }
     }
     Ok(n)
+}
+
+/// Best-effort canonical reason text for `status`. Used in the
+/// Replaying branch where we don't have a reqwest::Response to ask
+/// — borrows the same mapping reqwest's `Status::canonical_reason`
+/// uses but without pulling in a reqwest dep here.
+fn status_canonical_reason(status: u16) -> &'static str {
+    reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|s| s.canonical_reason())
+        .unwrap_or("")
 }
 
 /// Outcome of one HTTP call, ready to feed into JS.

@@ -921,8 +921,11 @@ enum BodyKind {
 pub(crate) fn live_fetch_handle(engine: &JsEngine) -> Option<(Arc<reqwest::Client>, tokio::runtime::Handle)> {
     let fs = engine.fetch_state_ref()?;
     match &fs.mode {
-        FetchMode::Live { client, rt_handle } => Some((client.clone(), rt_handle.clone())),
-        FetchMode::DeterministicNoCassette => None,
+        FetchMode::Live { client, rt_handle }
+        | FetchMode::Recording {
+            client, rt_handle, ..
+        } => Some((client.clone(), rt_handle.clone())),
+        FetchMode::Replaying { .. } | FetchMode::DeterministicNoCassette => None,
     }
 }
 
