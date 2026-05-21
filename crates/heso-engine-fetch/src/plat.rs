@@ -6,6 +6,48 @@
 //! plat content produce a byte-identical hash; anyone holding the plat
 //! JSON can recompute the hash and verify it hasn't been tampered with.
 //!
+//! ## What the hash *names*
+//!
+//! `plat_hash` is a fingerprint of the **agent-observable surface** of a
+//! page, not a byte-fingerprint of the response HTML. The canonicalizer
+//! intentionally strips two classes of noise BEFORE hashing:
+//!
+//! 1. **Per-request entropy in attribute values.** Many sites
+//!    (GitHub, Stripe, every modern SSR-with-hydration-IDs stack)
+//!    inject server-generated UUIDs into element attributes like
+//!    `id="icon-button-74b94e66-..."`, `aria-labelledby="tooltip-..."`,
+//!    `aria-describedby="validation-..."`. Two consecutive `heso open`
+//!    calls against such a page would otherwise produce different
+//!    hashes for the same content. We drop a documented allowlist of
+//!    *relational* attribute keys at every JSON-object level — see
+//!    [`EPHEMERAL_OBJECT_KEYS`] — so the hash reflects what the agent
+//!    *cares* about (tag, role, name, section, href, type, …) and not
+//!    the cross-element pointers a server happens to mint per
+//!    request.
+//! 2. **Per-request session/state envelopes.** Fields like
+//!    `inline_data`, `data_attrs` (hydration JSON blobs that often
+//!    embed request IDs / sessions / build hashes), `console`,
+//!    `cookies`, `scripts`, `lazy_hints`, `scroll`, `http_status`,
+//!    the failure envelope (`partial`, `partial_reason`,
+//!    `failed_scripts`, `console_errors_count`), and derived fields
+//!    like `content_hash` / `delta` / `framework` / `forms` are
+//!    pruned at every level so the hash is over the *agent-visible
+//!    content surface*, not the per-run telemetry that rides
+//!    alongside it.
+//!
+//! What stays in the hash: `url`, `title`, `description`, `tree`,
+//! `actions` (with `attrs` filtered per item 1), `metadata`, `text`,
+//! `linked_pages` (recursively hashed by the same rules).
+//!
+//! ## What the hash does NOT name
+//!
+//! - It is **not** a byte-fingerprint of the response HTML — see "What
+//!   the hash names" above.
+//! - It is **not** a network-replay anchor — that's [ADR 0008]'s
+//!   recording mode (designed, not yet implemented).
+//! - It is **not** a "who produced this plat" signature — that's
+//!   `Receipt`'s Ed25519 territory ([ADR 0005]).
+//!
 //! ## Canonical-JSON
 //!
 //! The hash must be over a *byte-stable* form of the plat — same plat
@@ -18,6 +60,9 @@
 //!   string-value subset).
 //! - Numbers are emitted in `serde_json`'s default form (which preserves
 //!   integer-vs-float distinction by serializing via the `Number` type).
+//! - **Ephemeral keys** ([`EPHEMERAL_OBJECT_KEYS`]) are stripped at every
+//!   level before sorting (this implements the "agent-observable
+//!   surface" definition above).
 //!
 //! This is a subset of [RFC 8785 (JCS — JSON Canonicalization Scheme)]
 //! sufficient for the value shapes the engine emits (no floats with
@@ -37,10 +82,11 @@
 //!
 //! ## Honest scope
 //!
-//! - Hashing identifies a *content snapshot*. If the upstream page
-//!   changes between fetches, the plat changes, and the hash changes —
-//!   that's correct, the hash names "this specific view" not "this URL
-//!   forever."
+//! - Hashing identifies an *agent-observable content snapshot*. If the
+//!   upstream page changes its visible content / heading structure /
+//!   action graph (semantically — not just a noisy `id` attribute
+//!   regenerating), the plat changes, and the hash changes — that's
+//!   correct.
 //! - Full network determinism (replaying the same recorded bytes from a
 //!   network capture) is [ADR 0008]'s recording story — designed, not
 //!   yet implemented. Not a blocker for hashing.
@@ -54,9 +100,89 @@
 
 use serde_json::Value;
 
+/// Keys stripped from every JSON object at every level before hashing.
+///
+/// Two categories live here:
+///
+/// 1. **The hash-of-the-hash sentinel** — `plat_hash`. Embedded in the
+///    plat JSON; would create a chicken-and-egg if hashed.
+/// 2. **Per-request entropy / per-session telemetry** that doesn't
+///    contribute to the agent-observable surface. Two subgroups:
+///
+///    - Element-attribute-level *relational* keys whose values are
+///      typically server-minted UUIDs cross-referencing other elements
+///      in the page (`id`, `aria-labelledby`, `aria-describedby`,
+///      `aria-controls`, `aria-owns`, `aria-activedescendant`,
+///      `for`, `nonce`). Functional aria-* attributes that reflect
+///      element STATE (`aria-checked`, `aria-disabled`, `aria-expanded`,
+///      `aria-hidden`, `aria-required`, `aria-pressed`, `aria-selected`)
+///      are intentionally NOT stripped — they describe content, not
+///      cross-element pointers.
+///    - Top-level / mid-tree blob fields that carry per-request
+///      payloads (`inline_data`, `data_attrs`), per-session state
+///      (`console`, `cookies`, `scripts`, `lazy_hints`, `scroll`,
+///      `http_status`, `framework`), failure envelope (`partial`,
+///      `partial_reason`, `failed_scripts`, `console_errors_count`),
+///      or fields derived FROM other fields (`content_hash`, `delta`,
+///      `forms`, `text` — derived from `tree` + post-hydration HTML).
+///
+/// Sorted alphabetically so a `binary_search` in [`is_ephemeral`] is
+/// O(log n).
+///
+/// Keep in sync with the doc-comment on [`hash`] — both are
+/// load-bearing on the "what plat_hash names" contract.
+pub const EPHEMERAL_OBJECT_KEYS: &[&str] = &[
+    // Relational element attributes (per-request UUIDs in dynamic SSR).
+    "aria-activedescendant",
+    "aria-controls",
+    "aria-describedby",
+    "aria-labelledby",
+    "aria-owns",
+    // Derived-from-other-fields metadata; would either create hash loops
+    // or duplicate already-hashed content.
+    "console",
+    "console_errors_count",
+    "content_hash",
+    "cookies",
+    // Server-rendered widget JSON; often embeds UUIDs / build hashes.
+    "data_attrs",
+    "delta",
+    "failed_scripts",
+    "for",
+    "forms",
+    "framework",
+    "http_status",
+    "id",
+    // Hydration JSON; often embeds requestId / sessionId / build IDs.
+    "inline_data",
+    "lazy_hints",
+    "nonce",
+    "partial",
+    "partial_reason",
+    // The "hash of the content" — embedded in the JSON, must not feed
+    // back into itself.
+    "plat_hash",
+    "scripts",
+    "scroll",
+    "text",
+];
+
+/// `true` iff `key` is a documented [`EPHEMERAL_OBJECT_KEYS`] entry —
+/// dropped from the canonical form at every level.
+fn is_ephemeral(key: &str) -> bool {
+    EPHEMERAL_OBJECT_KEYS.binary_search(&key).is_ok()
+}
+
 /// Hex-encoded BLAKE3 of the canonical-JSON serialization of `value`,
-/// with any top-level `plat_hash` field omitted from the input. 64 hex
-/// chars (256 bits).
+/// with [`EPHEMERAL_OBJECT_KEYS`] (including `plat_hash`) stripped at
+/// every level before hashing. 64 hex chars (256 bits).
+///
+/// The hash names the **agent-observable surface** of the plat — see
+/// the module-level doc-comment for the full definition. In particular,
+/// two `heso open` calls against the same page can produce the same
+/// hash even if the server minted different per-request UUIDs into
+/// `id` / `aria-labelledby` / `aria-describedby` attributes; that's
+/// the point.
 pub fn hash(value: &Value) -> String {
     // Stream the canonical bytes straight into the hasher — avoids
     // building the whole canonical String just to feed it to BLAKE3.
@@ -148,9 +274,14 @@ fn write_canonical<W: std::fmt::Write>(v: &Value, out: &mut W) {
             let _ = out.write_char(']');
         }
         Value::Object(map) => {
-            // Collect keys, drop `plat_hash` at every level (we hash the
-            // content the field names, not the field itself), then sort.
-            let mut keys: Vec<&String> = map.keys().filter(|k| k.as_str() != "plat_hash").collect();
+            // Collect keys, dropping every `EPHEMERAL_OBJECT_KEYS` entry
+            // at every level (per-request UUIDs in `id` /
+            // `aria-labelledby`-style relational attrs, plus
+            // session/state envelope fields like `inline_data` /
+            // `console` / `cookies` / `partial` that don't contribute
+            // to the agent-observable surface), then sort the
+            // survivors lexicographically.
+            let mut keys: Vec<&String> = map.keys().filter(|k| !is_ephemeral(k.as_str())).collect();
             keys.sort();
             let _ = out.write_char('{');
             for (i, key) in keys.iter().enumerate() {
@@ -351,5 +482,177 @@ mod tests {
             "linked_pages": [{"url": "a"}, {"url": "b"}]
         });
         assert_eq!(hash(&with_inner), hash(&without_inner));
+    }
+
+    // ========================================================================
+    // bug-report 05-C: agent-observable hash stability against per-request
+    // server-side UUIDs (GitHub-style CSP nonces, request IDs, build hashes
+    // embedded in `id` / `aria-labelledby` / `aria-describedby` attributes).
+    // ========================================================================
+
+    #[test]
+    fn hash_stable_when_only_ephemeral_relational_attrs_change() {
+        // Identical agent-observable surface; only `id`,
+        // `aria-labelledby`, `aria-describedby` carry per-request UUIDs.
+        // These are the exact attribute keys agent 5 observed leaking
+        // server-side entropy into `plat_hash` for github.com pages.
+        let v1 = json!({
+            "url": "https://example.com/",
+            "title": "Page",
+            "actions": [
+                {
+                    "ref": "@e0",
+                    "role": "button",
+                    "tag": "button",
+                    "name": "Submit",
+                    "attrs": {
+                        "id": "icon-button-74b94e66-8fab-40f4-90ea-fda2bb6133e7",
+                        "aria-labelledby": "tooltip-2446ac23-7ac6-481d-8430-6e4667e583d4",
+                        "aria-describedby": "validation-3769e0a2-c905-42db-ab8a-a8870f2e306b",
+                        "type": "submit",
+                    }
+                }
+            ]
+        });
+        let v2 = json!({
+            "url": "https://example.com/",
+            "title": "Page",
+            "actions": [
+                {
+                    "ref": "@e0",
+                    "role": "button",
+                    "tag": "button",
+                    "name": "Submit",
+                    "attrs": {
+                        "id": "icon-button-5b6f3f07-1bdc-4be4-8eeb-dff4c9ad3b84",
+                        "aria-labelledby": "tooltip-93e8dd11-c9ef-4819-83f8-66442b20394f",
+                        "aria-describedby": "validation-de974846-72d8-4b59-b189-035a6c82e608",
+                        "type": "submit",
+                    }
+                }
+            ]
+        });
+        assert_eq!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_still_changes_when_meaningful_attrs_change() {
+        // Non-ephemeral attrs (`href`, `type`, `name`, `value`) DO
+        // contribute to the hash — content changes must still flip it.
+        let base = json!({
+            "url": "https://example.com/",
+            "actions": [
+                {"ref": "@e0", "tag": "a", "attrs": {"href": "/page-1"}}
+            ]
+        });
+        let changed_href = json!({
+            "url": "https://example.com/",
+            "actions": [
+                {"ref": "@e0", "tag": "a", "attrs": {"href": "/page-2"}}
+            ]
+        });
+        assert_ne!(hash(&base), hash(&changed_href));
+    }
+
+    #[test]
+    fn hash_still_changes_when_visible_content_changes() {
+        // The `tree` field (heading-based content + intro text) is the
+        // agent-relevant content surface; changes there must flip the
+        // hash.
+        let v1 = json!({
+            "url": "x",
+            "tree": {"title": "T", "root": {"intro": "Hello world"}}
+        });
+        let v2 = json!({
+            "url": "x",
+            "tree": {"title": "T", "root": {"intro": "Goodbye world"}}
+        });
+        assert_ne!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_drops_inline_data_and_data_attrs_top_level_blobs() {
+        // SSR frameworks ship `__NEXT_DATA__` / `__NUXT_DATA__` /
+        // `data-*` JSON payloads that frequently embed requestId /
+        // sessionId / build hashes. Two plats with the same
+        // agent-visible surface but different hydration payloads must
+        // hash the same.
+        let v1 = json!({
+            "url": "x",
+            "title": "Same title",
+            "inline_data": {"__NEXT_DATA__": {"requestId": "req-aaa-111"}},
+            "data_attrs": {"data-foo": [{"requestId": "req-bbb-222"}]},
+        });
+        let v2 = json!({
+            "url": "x",
+            "title": "Same title",
+            "inline_data": {"__NEXT_DATA__": {"requestId": "req-ccc-333"}},
+            "data_attrs": {"data-foo": [{"requestId": "req-ddd-444"}]},
+        });
+        assert_eq!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_drops_per_session_envelope_fields() {
+        // `cookies`, `console`, `scripts`, `partial`, `partial_reason`,
+        // `failed_scripts`, `console_errors_count`, `lazy_hints`,
+        // `scroll`, `http_status`, `framework`, `forms`,
+        // `content_hash`, `delta`, `text` — all per-session telemetry
+        // / derived fields that don't contribute to the
+        // agent-observable surface.
+        let v1 = json!({
+            "url": "x",
+            "title": "T",
+            "cookies": [{"name": "s", "value": "session-1"}],
+            "console": ["log A"],
+            "http_status": 200,
+            "partial": false,
+            "scripts": {"executed": 5},
+        });
+        let v2 = json!({
+            "url": "x",
+            "title": "T",
+            "cookies": [{"name": "s", "value": "session-99999-DIFFERENT"}],
+            "console": ["log B", "log C", "log D"],
+            "http_status": 200,
+            "partial": false,
+            "scripts": {"executed": 12, "executed_with_error": 1},
+        });
+        assert_eq!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_preserves_functional_aria_state_attrs() {
+        // `aria-disabled`, `aria-checked`, etc. reflect element STATE
+        // (not relational pointers) — these are part of the
+        // agent-observable surface and must contribute to the hash.
+        let v1 = json!({
+            "url": "x",
+            "actions": [
+                {"ref": "@e0", "tag": "input", "attrs": {"aria-checked": "false"}}
+            ]
+        });
+        let v2 = json!({
+            "url": "x",
+            "actions": [
+                {"ref": "@e0", "tag": "input", "attrs": {"aria-checked": "true"}}
+            ]
+        });
+        assert_ne!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn ephemeral_object_keys_is_sorted_so_binary_search_works() {
+        // `is_ephemeral` uses `binary_search`; the list MUST be sorted.
+        // Guard against future maintenance accidentally inserting an
+        // out-of-order entry that would silently break the filter for
+        // entries after it.
+        let mut copy: Vec<&str> = EPHEMERAL_OBJECT_KEYS.to_vec();
+        copy.sort();
+        assert_eq!(
+            copy.as_slice(),
+            EPHEMERAL_OBJECT_KEYS,
+            "EPHEMERAL_OBJECT_KEYS must be sorted alphabetically"
+        );
     }
 }
