@@ -92,6 +92,7 @@
 //! [ADR 0016]: ../../decisions/0016-positioning-headless-browser-for-agents.md
 
 mod batch;
+mod receipts;
 mod search;
 mod serve;
 
@@ -137,8 +138,13 @@ fn print_banner() {
     println!("  heso open  <url>              Fetch once, return {{url,title,description,metadata,tree,actions,plat_hash}} (agent-facing)");
     println!("    [--explore-links N]            Pre-fetch up to --link-cap direct (depth=1) or nested (depth>=2) same-origin links");
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
+    println!("    [--receipt PATH]               Emit a signed Receipt (Ed25519, BLAKE3) to PATH alongside stdout JSON");
+    println!("    [--key PATH]                   Identity key for --receipt (default: heso-local-data/identity.key)");
+    println!("    [--mode M]                     Receipt mode: deterministic (default), recording, live");
+    println!("    [--seed N]                     Session seed stamped into the receipt (default 0)");
     println!("  heso read  <url>              Like `open` PLUS post-hydration text, grouped forms, cookies, console, framework sniff, scripts");
     println!("    [--include CSV]                Filter the optional surface: text,forms,cookies,console,framework,scripts (default: all)");
+    println!("    [--receipt PATH] [--key PATH] [--mode M] [--seed N]   Same signed-receipt suite as `heso open`");
     println!("  heso batch [open|read] <urls...>");
     println!("                                Parallel multi-URL scraping in ONE process. Shared cookie jar + reqwest");
     println!("                                connection pool. JSON-Lines on stdout, completion-ordered. Default subverb");
@@ -528,8 +534,23 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let mut link_cap: usize = DEFAULT_LINK_CAP;
     let mut best_effort = false;
     let mut inject_scripts: Vec<String> = Vec::new();
+    let mut sign_flags = receipts::SignFlags::default();
     let mut i = 0;
     while i < args.len() {
+        // `--receipt PATH` / `--key PATH` / `--mode M` / `--seed N` —
+        // the receipt-sign flag suite is shared across `open` and
+        // `read`, so the parsing lives in [`receipts`]. The helper
+        // returns how many arg slots it consumed (0 / 1 / 2); when it
+        // returns `None` the flag wasn't ours and we fall through to
+        // the open-specific match below.
+        match receipts::try_consume_sign_flag(args, i, &mut sign_flags) {
+            Ok(Some(n)) => {
+                i += n;
+                continue;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
         match args[i].as_str() {
             "--explore-links" => {
                 let Some(v) = args.get(i + 1) else {
@@ -583,7 +604,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... <url>");
+                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -601,7 +622,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     }
 
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
         return ExitCode::from(2);
     };
 
@@ -802,6 +823,17 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let hash = heso_engine_fetch::plat_hash(&body);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+    }
+    // `--receipt PATH` (P0 fix): emit a signed [`heso_trace::Receipt`]
+    // alongside the verb's normal stdout JSON. The trace is a single
+    // `cd <url>` primitive — the natural intent of `heso open <url>`.
+    // When the flag isn't supplied this is a no-op and the verb keeps
+    // its existing behavior byte-for-byte.
+    if sign_flags.is_active() {
+        let trace = receipts::url_trace(&url);
+        if let Err(code) = receipts::emit_signed_receipt(&engine, &trace, &sign_flags).await {
+            return code;
+        }
     }
     print_json(&body)
 }
@@ -1351,8 +1383,20 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let mut best_effort = false;
     let mut inject_scripts: Vec<String> = Vec::new();
     let mut complete = false;
+    let mut sign_flags = receipts::SignFlags::default();
     let mut i = 0;
     while i < args.len() {
+        // Receipt-sign flag suite — shared with `cmd_open`. The helper
+        // returns how many arg slots it consumed; on `None` we fall
+        // through to the read-specific match below.
+        match receipts::try_consume_sign_flag(args, i, &mut sign_flags) {
+            Ok(Some(n)) => {
+                i += n;
+                continue;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
         match args[i].as_str() {
             "--include" => {
                 let Some(v) = args.get(i + 1) else {
@@ -1672,6 +1716,17 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let hash = heso_engine_fetch::plat_hash(&body);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+    }
+    // `--receipt PATH` (P0 fix): emit a signed [`heso_trace::Receipt`]
+    // alongside the stdout JSON. Same shape as `cmd_open`; the trace
+    // is a single `cd <url>` primitive matching the user's intent.
+    if sign_flags.is_active() {
+        let trace = receipts::url_trace(&url);
+        if let Err(code) =
+            receipts::emit_signed_receipt(&fetch_engine, &trace, &sign_flags).await
+        {
+            return code;
+        }
     }
     print_json(&body)
 }
