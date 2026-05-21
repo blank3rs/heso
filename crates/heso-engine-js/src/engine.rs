@@ -563,8 +563,9 @@ impl JsEngine {
             }),
             Some(FetchMode::DeterministicNoCassette) | None => None,
         };
+        let base_url: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
         runtime.set_loader(
-            HttpResolver::new_with_import_map(import_map.clone()),
+            HttpResolver::with_state(import_map.clone(), base_url.clone()),
             HttpLoader::new(module_cache.clone(), http_fetcher.clone()),
         );
 
@@ -786,7 +787,11 @@ impl JsEngine {
         #[allow(clippy::arc_with_non_send_sync)]
         let module_resolver: Arc<Mutex<Option<ModuleResolveFn>>> =
             Arc::new(Mutex::new(None));
-        let base_url: Arc<Mutex<Option<Url>>> = Arc::new(Mutex::new(None));
+        // `base_url` was constructed earlier (when the static-import
+        // `HttpResolver` was wired). Sharing the same `Arc<Mutex>` here
+        // means `set_base_url` reaches both the dynamic-import and
+        // static-import resolvers in one mutate — they read the latest
+        // page URL on every resolve.
         install_dynamic_import(&context, module_resolver.clone(), base_url.clone())?;
 
         // Wire 1: install the default module resolver. This is the
@@ -3730,6 +3735,16 @@ fn install_browser_apis(
             // baseline Chrome/Firefox value on Linux desktops and is
             // the safest default for cross-platform sniffers.
             navigator.set("platform", "Linux x86_64")?;
+            // `navigator.appVersion` — HTML §9.5. Every modern browser
+            // returns a string that starts with "5.0 " regardless of
+            // version, and legacy MSIE-vintage sniffers feature-detect
+            // by string-matching against that prefix. pypi.org's
+            // `warehouse.js` does `navigator.appVersion.includes("MSIE 10")`
+            // unconditionally; with `appVersion` undefined the call
+            // throws `cannot read 'includes' of undefined`. Match the
+            // universal "5.0" prefix to keep those sniffers honest
+            // (they'll see "no, you're not MSIE 10" and move on).
+            navigator.set("appVersion", "5.0 (X11; Linux x86_64)")?;
             globals.set("navigator", navigator)?;
 
             // ---- performance.now() ----
@@ -3902,6 +3917,63 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         // Spec: any (object or null). null for a non-popup top-level
         // browsing context, which is our only mode today.
         globalThis.opener = null;
+    }
+
+    // window.postMessage(message, targetOrigin, transfer?) — HTML §9.4.3.
+    // docs.stripe.com's frontend.js wraps iframe communication around
+    // `(const {parent: t} = self; t.postMessage(...))`. With no nested
+    // browsing context in heso there's no real target — silently accept
+    // the call so iframe-shaped embed bundles (Stripe, Sentry session
+    // replay, Intercom, Algolia DocSearch) survive their bootstrap.
+    if (typeof globalThis.postMessage !== 'function') {
+        globalThis.postMessage = function () {};
+    }
+
+    // window.screen — CSSOM-View §6.1. Apple's head.built.js reads
+    // `window.screen.width`; without the global the access chain
+    // (`window.screen.width`) throws `cannot read property 'width' of
+    // undefined`. heso isn't a display surface — supply a sensible
+    // desktop default (1920x1080, 24-bit color) and the orientation
+    // shape any responsive-layout sniffer expects. The values are
+    // deterministic, so the same seed reads the same screen metrics.
+    if (typeof globalThis.screen === 'undefined') {
+        globalThis.screen = {
+            width: 1920, height: 1080,
+            availWidth: 1920, availHeight: 1040,
+            colorDepth: 24, pixelDepth: 24,
+            orientation: { type: 'landscape-primary', angle: 0 },
+        };
+    }
+
+    // document.styleSheets — CSSOM §6.5. emotion / styled-components /
+    // jss / MUI all iterate `document.styleSheets` during style-sheet
+    // resolution; without it the loop throws `cannot read 'length' of
+    // undefined`. heso doesn't render so a real StyleSheetList would
+    // be empty — return an array-shaped, length-0 stub. The loop
+    // body has a `try { sheet.insertRule(...) } catch {}` fallback,
+    // so any consumer that reaches a real `sheet` survives anyway.
+    if (typeof globalThis.document === 'object' && globalThis.document != null) {
+        var d = globalThis.document;
+        var dproto = Object.getPrototypeOf(d);
+        var hasStyleSheets = false;
+        try { hasStyleSheets = typeof d.styleSheets !== 'undefined'; } catch (_) {}
+        if (!hasStyleSheets) {
+            try {
+                Object.defineProperty(d, 'styleSheets', {
+                    configurable: true,
+                    get: function () {
+                        var arr = [];
+                        arr.length = 0;
+                        arr.item = function () { return null; };
+                        return arr;
+                    },
+                });
+            } catch (_) {
+                // Fallback: own-property assignment if defineProperty
+                // is rejected by a frozen document prototype.
+                d.styleSheets = [];
+            }
+        }
     }
 
     // queueMicrotask(fn) — schedule `fn` after the current synchronous
@@ -7111,6 +7183,27 @@ fn js_value_to_json<'js>(ctx: &Ctx<'js>, val: Value<'js>) -> Result<serde_json::
     // `JSON.stringify` semantics by producing null.
     if val.is_function() || val.is_symbol() {
         return Ok(serde_json::Value::Null);
+    }
+
+    // Error objects serialize to `{}` through plain `JSON.stringify`
+    // because `name`/`message`/`stack` are non-enumerable per
+    // ECMA-262. That made console.error(err) come out as `{}` and
+    // hid the actual diagnostic — which is the worst time to lose
+    // information. Detect anything with the Error-shaped property
+    // tuple and explicitly pull the three load-bearing fields.
+    if let Some(obj) = val.as_object() {
+        let message_res: rquickjs::Result<String> = obj.get("message");
+        let stack_res: rquickjs::Result<String> = obj.get("stack");
+        if let (Ok(message), Ok(stack)) = (message_res, stack_res) {
+            let name: String = obj
+                .get("name")
+                .unwrap_or_else(|_| "Error".to_owned());
+            return Ok(serde_json::json!({
+                "name": name,
+                "message": message,
+                "stack": stack,
+            }));
+        }
     }
 
     // Objects and arrays: hand to JS's own JSON.stringify, then parse.

@@ -57,7 +57,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rquickjs::loader::{Loader, Resolver};
 use rquickjs::module::Declared;
@@ -215,6 +215,16 @@ pub fn inline_module_specifier(base_url: Option<&Url>, index: usize) -> String {
 #[derive(Clone)]
 pub struct HttpResolver {
     import_map: SharedImportMap,
+    /// Shared page URL — same `Arc<Mutex>` the engine's `set_base_url`
+    /// mutates. Used as the referrer-fallback when QuickJS hands the
+    /// resolver a non-URL `base` (typically the synthetic
+    /// `"eval_script"` label QuickJS attaches to `ctx.eval(...)`
+    /// sources with no filename). Without this, Astro/island-shaped
+    /// classic inline scripts that do
+    /// `await import("/_astro/foo.js")` resolve against `about:blank`
+    /// and fail with `UnmappedBareSpecifier` — see ADR 0014 / HTML §8.1.5
+    /// "active script base URL".
+    page_url: Arc<Mutex<Option<Url>>>,
 }
 
 impl Default for HttpResolver {
@@ -228,9 +238,7 @@ impl HttpResolver {
     /// [`SharedImportMap`]. Convenience for callers (e.g. unit tests)
     /// that don't care about import-map plumbing.
     pub fn new() -> Self {
-        Self {
-            import_map: empty_shared_import_map(),
-        }
+        Self::with_state(empty_shared_import_map(), Arc::new(Mutex::new(None)))
     }
 
     /// Build a resolver bound to an existing [`SharedImportMap`].
@@ -239,22 +247,41 @@ impl HttpResolver {
     /// installs the parsed `<script type="importmap">` body into the
     /// map) all share one `Rc<RefCell<ImportMap>>`.
     pub fn new_with_import_map(import_map: SharedImportMap) -> Self {
-        Self { import_map }
+        Self::with_state(import_map, Arc::new(Mutex::new(None)))
+    }
+
+    /// Construct with both the shared import-map and the engine's
+    /// shared page-URL slot. The engine uses this so a single
+    /// `Arc<Mutex<Option<Url>>>` is observed by the static-import
+    /// resolver, the dynamic-`import()` default resolver, and every
+    /// caller of `set_base_url`.
+    pub fn with_state(
+        import_map: SharedImportMap,
+        page_url: Arc<Mutex<Option<Url>>>,
+    ) -> Self {
+        Self { import_map, page_url }
     }
 }
 
 impl Resolver for HttpResolver {
     fn resolve(&mut self, _ctx: &Ctx<'_>, base: &str, name: &str) -> Result<String, Error> {
-        // Parse `base` as the referrer URL for the import-map call.
-        // QuickJS hands us a string (because module names are strings
-        // in its internal map); `ImportMap::resolve` wants a `Url`.
-        // If the base doesn't parse (no page URL was set, or the host
-        // synthesized something exotic), fall back to `about:blank`
-        // — the map's bare-specifier branch then rejects, which is
-        // the correct behavior for an engine with no associated page.
-        let referrer = Url::parse(base).unwrap_or_else(|_| {
-            Url::parse("about:blank").expect("about:blank parses")
-        });
+        // Three-tier referrer resolution:
+        // 1. If `base` itself parses as a URL — that's the most
+        //    specific source (a real module URL or an inline-module
+        //    synthetic specifier) and wins.
+        // 2. Else fall back to the engine's current page URL. This is
+        //    what classic inline `<script>` blocks need when they call
+        //    `import("/foo.js")`: QuickJS labels the source
+        //    "eval_script", which isn't a URL — without this fallback
+        //    the import-map sees `about:blank` as the referrer and
+        //    rejects every absolute-path bare specifier.
+        // 3. Final fallback is `about:blank`; resolve will fail at
+        //    bare-specifier matching, which is the correct behavior
+        //    when no page is associated at all.
+        let referrer = Url::parse(base)
+            .ok()
+            .or_else(|| self.page_url.lock().ok().and_then(|g| g.clone()))
+            .unwrap_or_else(|| Url::parse("about:blank").expect("about:blank parses"));
         resolve_specifier_through_import_map(&self.import_map.borrow(), name, &referrer)
             .map(|u| u.to_string())
             .map_err(|msg| Error::new_resolving_message(base, name, msg))

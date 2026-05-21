@@ -830,6 +830,59 @@ impl Document {
             .map(|n| Element::from_id(self.doc.clone(), n.id))
     }
 
+    /// `document.scrollingElement` — DOM Std §4.7.1. In standards mode
+    /// returns `<html>`; in quirks mode returns `<body>`. heso parses
+    /// every page as standards-mode (no doctype-sniffed quirks branch),
+    /// so the simple form is correct. mdbook's `book.js` reads
+    /// `document.scrollingElement.scrollTop` on every render — without
+    /// this getter, `controllPosition` and `controllMenu` throw
+    /// `cannot read property 'scrollTop' of undefined`.
+    #[qjs(get, rename = "scrollingElement")]
+    fn scrolling_element(&self) -> Option<Element> {
+        let root = self.doc.tree.root();
+        for child in root.children_it(false) {
+            if !child.is_element() {
+                continue;
+            }
+            if let Some(name) = child.node_name() {
+                if name.as_ref().eq_ignore_ascii_case("html") {
+                    return Some(Element::from_id(self.doc.clone(), child.id));
+                }
+            }
+        }
+        None
+    }
+
+    /// `document.firstElementChild` — ParentNode mixin §4.2.6. First
+    /// element child of the document (skipping doctype / comments).
+    /// Equivalent to `documentElement` for well-formed HTML pages;
+    /// kept distinct because hydration code uses one or the other and
+    /// the alias path saves a `.documentElement` chain. docs.docker.com
+    /// inline script sets `document.firstElementChild.className`.
+    #[qjs(get, rename = "firstElementChild")]
+    fn first_element_child(&self) -> Option<Element> {
+        let root = self.doc.tree.root();
+        for child in root.children_it(false) {
+            if child.is_element() {
+                return Some(Element::from_id(self.doc.clone(), child.id));
+            }
+        }
+        None
+    }
+
+    /// `document.lastElementChild` — ParentNode mixin §4.2.6.
+    #[qjs(get, rename = "lastElementChild")]
+    fn last_element_child(&self) -> Option<Element> {
+        let root = self.doc.tree.root();
+        let mut last = None;
+        for child in root.children_it(false) {
+            if child.is_element() {
+                last = Some(child.id);
+            }
+        }
+        last.map(|id| Element::from_id(self.doc.clone(), id))
+    }
+
     /// `document.title` — text content of the `<title>` tag, or
     /// empty string.
     #[qjs(get)]
@@ -905,8 +958,16 @@ impl Document {
     /// This is enough for the Preact / React / Vue render path,
     /// which only ever calls `appendChild` and `textContent`-style
     /// updates on text nodes.
-    fn create_text_node(&self, data: String) -> Element {
-        let node_ref = self.doc.tree.new_text(data);
+    fn create_text_node(&self, data: rquickjs::Coerced<String>) -> Element {
+        // Preact's diffElementNodes calls createTextNode with whatever
+        // the vnode child is — for components rendering numeric children
+        // (badge counts, prices, years) that's a JS `int`. Strict
+        // `String` rejects via the rquickjs `FromJs` bridge with
+        // "Error converting from js 'int' into type 'string'", which
+        // halts hydration on Apple's globalheader and any Preact site.
+        // `Coerced<String>` runs `String(value)` semantics so numbers
+        // and bools become their string form, matching real browsers.
+        let node_ref = self.doc.tree.new_text(data.0);
         Element::from_id(self.doc.clone(), node_ref.id)
     }
 
@@ -1312,9 +1373,9 @@ impl Document {
     /// `getElementsByTagName("*")`; if comment children are mis-
     /// counted, jQuery switches to its manual implementation.
     /// Without `createComment`, the call throws and the detect dies.
-    fn create_comment(&self, data: String) -> Element {
+    fn create_comment(&self, data: rquickjs::Coerced<String>) -> Element {
         let node_id = self.doc.tree.create_node(dom_query::NodeData::Comment {
-            contents: data.into(),
+            contents: data.0.into(),
         });
         Element::from_id(self.doc.clone(), node_id)
     }
@@ -1678,9 +1739,9 @@ impl Element {
     /// this does **not** parse `value` as HTML — it is set verbatim
     /// as a text node.
     #[qjs(set, rename = "textContent")]
-    fn set_text_content(&self, value: String) {
+    fn set_text_content(&self, value: rquickjs::Coerced<String>) {
         if let Some(n) = self.node_ref() {
-            n.set_text(value);
+            n.set_text(value.0);
         }
     }
 
@@ -1699,9 +1760,9 @@ impl Element {
     /// `element.innerHTML = value` — parse `value` as an HTML fragment
     /// and replace this element's children with the parsed nodes.
     #[qjs(set, rename = "innerHTML")]
-    fn set_inner_html(&self, value: String) {
+    fn set_inner_html(&self, value: rquickjs::Coerced<String>) {
         if let Some(n) = self.node_ref() {
-            n.set_html(value);
+            n.set_html(value.0);
         }
     }
 
@@ -2021,6 +2082,101 @@ impl Element {
         _options: Opt<Value<'js>>,
     ) -> rquickjs::Result<Value<'js>> {
         ctx.globals().get("document")
+    }
+
+    /// `element.attributes` — DOM Element §7 `NamedNodeMap`. heso
+    /// returns a plain array of `{name, value}` POJOs rather than a
+    /// real `NamedNodeMap`; the shape is iterable, has `length`, and
+    /// supports index access — sufficient for every framework that
+    /// reaches for `el.attributes` (Alpine.js iterates it as
+    /// `Array.from(el.attributes)` to discover directive prefixes;
+    /// Vue and old jQuery do the same). Real `getNamedItem` /
+    /// `setNamedItem` are not exposed; no in-the-wild caller hits
+    /// them on docs.docker.com or other Alpine-using sites.
+    #[qjs(get, rename = "attributes")]
+    fn attributes<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let arr = rquickjs::Array::new(ctx.clone())?;
+        if let Some(n) = self.node_ref() {
+            for (i, a) in n.attrs().iter().enumerate() {
+                let obj = Object::new(ctx.clone())?;
+                obj.set("name", a.name.local.to_string())?;
+                obj.set("value", a.value.to_string())?;
+                arr.set(i, obj)?;
+            }
+        }
+        Ok(arr.into_value())
+    }
+
+    /// `meta.content` IDL — HTML §4.2.5.4. Reflects the `content`
+    /// attribute on `<meta>` elements. GitHub's hydro analytics client
+    /// destructures `const {name: s, content: i} = metaEl` and reads
+    /// the IDL property, not `getAttribute('content')` — without this
+    /// reflector, githubstatus.com's hydro init throws.
+    ///
+    /// Tag-gated to `<meta>` so future support for `<template>.content`
+    /// (which reflects a DocumentFragment, totally different shape)
+    /// isn't shadowed by this getter.
+    #[qjs(get, rename = "content")]
+    fn content(&self) -> String {
+        let Some(n) = self.node_ref() else {
+            return String::new();
+        };
+        let is_meta = n
+            .node_name()
+            .map(|name| name.as_ref().eq_ignore_ascii_case("meta"))
+            .unwrap_or(false);
+        if !is_meta {
+            return String::new();
+        }
+        n.attr("content").map(|s| s.to_string()).unwrap_or_default()
+    }
+
+    /// Setter pair for [`Self::content`] — `meta.content = "..."` writes
+    /// through to the `content` attribute. Same `<meta>` gate as the
+    /// getter so non-meta elements don't grow a phantom attribute.
+    #[qjs(set, rename = "content")]
+    fn set_content(&self, value: rquickjs::Coerced<String>) {
+        if let Some(n) = self.node_ref() {
+            let is_meta = n
+                .node_name()
+                .map(|name| name.as_ref().eq_ignore_ascii_case("meta"))
+                .unwrap_or(false);
+            if is_meta {
+                n.set_attr("content", &value.0);
+            }
+        }
+    }
+
+    /// `iframe.contentDocument` — HTML §11.6. Returns `null` for fresh
+    /// or detached iframes (no nested browsing context attached). heso
+    /// has no nested browsing-context support, so `null` is always
+    /// correct.
+    ///
+    /// Cloudflare's anti-bot bootstrap probes
+    /// `iframe.contentDocument || iframe.contentWindow.document` on
+    /// every iframe it injects. Returning `undefined` instead of `null`
+    /// makes the `||` fall through to `.document` on `contentWindow`,
+    /// which is also undefined — that's the `cannot read property
+    /// 'document' of undefined` chain that openai.com and solidjs.com
+    /// blew up on.
+    #[qjs(get, rename = "contentDocument")]
+    fn content_document<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        ctx.eval::<Value<'js>, _>("null")
+    }
+
+    /// `iframe.contentWindow` — HTML §11.6. Returns a Window-shaped
+    /// POJO with `{document: null}` rather than a real `WindowProxy`
+    /// because heso has no nested browsing context. The POJO shape
+    /// makes `if (iframe.contentWindow) { ... iframe.contentWindow.document
+    /// ... }` skip safely (the document is null) — closer to "fresh
+    /// iframe, not yet navigated" semantics than to "this iframe
+    /// doesn't exist."
+    #[qjs(get, rename = "contentWindow")]
+    fn content_window<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        let null_value: Value<'js> = ctx.eval("null")?;
+        obj.set("document", null_value)?;
+        Ok(obj.into_value())
     }
 
     /// `element.querySelector(selector)` — return the first descendant
@@ -4589,8 +4745,8 @@ impl ShadowRoot {
     /// nodes share the same `Arc<DqDocument>` we'll use to mint
     /// Element wrappers for queries.
     #[qjs(set, rename = "innerHTML")]
-    fn set_inner_html(&self, value: String) {
-        self.shadow_root_node().set_html(value);
+    fn set_inner_html(&self, value: rquickjs::Coerced<String>) {
+        self.shadow_root_node().set_html(value.0);
     }
 
     /// `shadowRoot.querySelector(selector)` — first descendant in
@@ -5398,7 +5554,7 @@ mod tests {
     fn inner_html_setter_parses_and_replaces_children() {
         let d = doc("<html><body><div><p>old</p></div></body></html>");
         let div = d.query_selector_inner("div").expect("div");
-        div.set_inner_html("<span>new1</span><span>new2</span>".to_owned());
+        div.set_inner_html(rquickjs::Coerced("<span>new1</span><span>new2</span>".to_owned()));
         // Old child is gone.
         assert!(!div.inner_html().contains("<p>old</p>"));
         // New children are parsed and present.
@@ -5415,7 +5571,7 @@ mod tests {
     fn text_content_setter_replaces_children_with_text_node() {
         let d = doc("<html><body><div><p>old</p><span>more</span></div></body></html>");
         let div = d.query_selector_inner("div").expect("div");
-        div.set_text_content("Just a string with <not a tag>".to_owned());
+        div.set_text_content(rquickjs::Coerced("Just a string with <not a tag>".to_owned()));
         // textContent reflects the new value.
         assert_eq!(div.text_content(), "Just a string with <not a tag>");
         // Children are gone (text setter does not parse HTML).

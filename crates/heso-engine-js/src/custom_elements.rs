@@ -1468,6 +1468,208 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
     wrapReturnsElement(elementProto, 'cloneNode');
 
     // ===============================================================
+    // ParentNode / ChildNode mixins — DOM Std §4.2.6 / §4.2.7.
+    //
+    // These are missing on heso's Rust-side Element/Document and the
+    // rspack popover-polyfill GitHub embeds (oddbird/popover-polyfill)
+    // calls them at the top level of every page that has Catalyst
+    // custom elements: `e.head.prepend(styleNode)` and `e.prepend(node)`
+    // for shadow roots, then `e.adoptedStyleSheets = [...]` in the
+    // CSSStyleSheet branch. Without these mixins, the polyfill throws
+    // `TypeError: not a function` and every Catalyst connectedCallback
+    // on the page cascades from the same broken entry-point.
+    //
+    // Variadic args accept `(Node | string)*`: strings become text
+    // nodes via `document.createTextNode`; Nodes are inserted with the
+    // existing `appendChild` / `insertBefore` plumbing so the slot-
+    // change dispatch and listener-registry invariants from the Rust
+    // side fire unchanged.
+    // ===============================================================
+    function toNodes(args) {
+        var out = [];
+        for (var i = 0; i < args.length; i++) {
+            var a = args[i];
+            if (a == null) continue;
+            if (typeof a === 'string') {
+                out.push(document.createTextNode(a));
+            } else {
+                out.push(a);
+            }
+        }
+        return out;
+    }
+    function installParentNodeMixin(proto, label) {
+        if (!proto) return;
+        if (typeof proto.append !== 'function') {
+            proto.append = function() {
+                var nodes = toNodes(arguments);
+                for (var i = 0; i < nodes.length; i++) this.appendChild(nodes[i]);
+            };
+        }
+        if (typeof proto.prepend !== 'function') {
+            proto.prepend = function() {
+                var nodes = toNodes(arguments);
+                var first = this.firstChild;
+                for (var i = 0; i < nodes.length; i++) {
+                    if (first) this.insertBefore(nodes[i], first);
+                    else this.appendChild(nodes[i]);
+                }
+            };
+        }
+        if (typeof proto.replaceChildren !== 'function') {
+            proto.replaceChildren = function() {
+                while (this.firstChild) this.removeChild(this.firstChild);
+                var nodes = toNodes(arguments);
+                for (var i = 0; i < nodes.length; i++) this.appendChild(nodes[i]);
+            };
+        }
+    }
+    installParentNodeMixin(elementProto, 'Element');
+    installParentNodeMixin(documentProto, 'Document');
+
+    if (typeof elementProto.before !== 'function') {
+        elementProto.before = function() {
+            var parent = this.parentNode;
+            if (!parent) return;
+            var nodes = toNodes(arguments);
+            for (var i = 0; i < nodes.length; i++) parent.insertBefore(nodes[i], this);
+        };
+    }
+    if (typeof elementProto.after !== 'function') {
+        elementProto.after = function() {
+            var parent = this.parentNode;
+            if (!parent) return;
+            var ref = this.nextSibling;
+            var nodes = toNodes(arguments);
+            for (var i = 0; i < nodes.length; i++) {
+                if (ref) parent.insertBefore(nodes[i], ref);
+                else parent.appendChild(nodes[i]);
+            }
+        };
+    }
+    if (typeof elementProto.remove !== 'function') {
+        elementProto.remove = function() {
+            var parent = this.parentNode;
+            if (parent) parent.removeChild(this);
+        };
+    }
+    if (typeof elementProto.replaceWith !== 'function') {
+        elementProto.replaceWith = function() {
+            var parent = this.parentNode;
+            if (!parent) return;
+            var nodes = toNodes(arguments);
+            var ref = this.nextSibling;
+            parent.removeChild(this);
+            for (var i = 0; i < nodes.length; i++) {
+                if (ref) parent.insertBefore(nodes[i], ref);
+                else parent.appendChild(nodes[i]);
+            }
+        };
+    }
+
+    // ===============================================================
+    // Tag-gated prototype methods that live on a specific HTML element
+    // subclass but ship on the shared Element prototype here (heso has
+    // one prototype object for all elements, so subclass-specific
+    // methods guard on `this.tagName`).
+    // ===============================================================
+
+    // HTMLSelectElement.prototype.add(element, before?) — HTML §4.10.7.
+    // docs.python.org switchers.js calls select.add(option) to wire its
+    // version picker.
+    if (typeof elementProto.add !== 'function') {
+        elementProto.add = function(element, before) {
+            var tag = (this.tagName || '').toLowerCase();
+            if (tag !== 'select' && tag !== 'optgroup' && tag !== 'datalist') {
+                throw new TypeError('Element.add: receiver is not <select>/<optgroup>/<datalist>');
+            }
+            if (before == null) return this.appendChild(element);
+            if (typeof before === 'number') {
+                var children = this.children;
+                var ref = (children && children[before]) || null;
+                return ref ? this.insertBefore(element, ref) : this.appendChild(element);
+            }
+            return this.insertBefore(element, before);
+        };
+    }
+
+    // HTMLCanvasElement.prototype.getContext(type, attrs?) — HTML §4.12.5.
+    // anthropic.com (Webflow Lottie) and apple.com (ac-target.js GPU
+    // fingerprint) both call canvas.getContext("2d"/"webgl"). heso
+    // does not render, so we return inert no-op contexts whose methods
+    // are present (so chained calls don't throw) but do nothing.
+    if (typeof elementProto.getContext !== 'function') {
+        var canvasContext2D = null;
+        var canvasContextGL = null;
+        function makeContext2D() {
+            if (canvasContext2D) return canvasContext2D;
+            var noop = function() {};
+            canvasContext2D = {
+                canvas: null,
+                fillStyle: '#000', strokeStyle: '#000',
+                font: '10px sans-serif',
+                globalAlpha: 1, globalCompositeOperation: 'source-over',
+                lineWidth: 1, lineCap: 'butt', lineJoin: 'miter',
+                miterLimit: 10, lineDashOffset: 0,
+                textAlign: 'start', textBaseline: 'alphabetic',
+                direction: 'inherit',
+                imageSmoothingEnabled: true, imageSmoothingQuality: 'low',
+                shadowBlur: 0, shadowColor: 'rgba(0,0,0,0)',
+                shadowOffsetX: 0, shadowOffsetY: 0,
+                fillRect: noop, strokeRect: noop, clearRect: noop,
+                fillText: noop, strokeText: noop,
+                measureText: function(t) { return { width: (t == null ? 0 : String(t).length * 6) }; },
+                beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop,
+                rect: noop, arc: noop, arcTo: noop, bezierCurveTo: noop,
+                quadraticCurveTo: noop, ellipse: noop,
+                stroke: noop, fill: noop, clip: noop,
+                save: noop, restore: noop,
+                scale: noop, rotate: noop, translate: noop,
+                transform: noop, setTransform: noop, resetTransform: noop,
+                createLinearGradient: function() { return { addColorStop: noop }; },
+                createRadialGradient: function() { return { addColorStop: noop }; },
+                createConicGradient: function() { return { addColorStop: noop }; },
+                createPattern: function() { return null; },
+                drawImage: noop, putImageData: noop, getImageData: function(_x, _y, w, h) {
+                    var len = Math.max(1, (w|0) * (h|0)) * 4;
+                    return { data: new Uint8ClampedArray(len), width: w|0, height: h|0 };
+                },
+                createImageData: function(w, h) {
+                    var len = Math.max(1, (w|0) * (h|0)) * 4;
+                    return { data: new Uint8ClampedArray(len), width: w|0, height: h|0 };
+                },
+                setLineDash: noop, getLineDash: function() { return []; },
+                isPointInPath: function() { return false; },
+                isPointInStroke: function() { return false; },
+            };
+            return canvasContext2D;
+        }
+        function makeContextGL() {
+            if (canvasContextGL) return canvasContextGL;
+            canvasContextGL = {
+                canvas: null,
+                drawingBufferWidth: 0, drawingBufferHeight: 0,
+                getExtension: function() { return null; },
+                getParameter: function() { return null; },
+                getSupportedExtensions: function() { return []; },
+                getContextAttributes: function() { return null; },
+                createShader: function() { return null; },
+                createProgram: function() { return null; },
+                createBuffer: function() { return null; },
+                createTexture: function() { return null; },
+            };
+            return canvasContextGL;
+        }
+        elementProto.getContext = function(type) {
+            var tag = (this.tagName || '').toLowerCase();
+            if (tag !== 'canvas') return null;
+            if (type === '2d') return makeContext2D();
+            if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') return makeContextGL();
+            return null;
+        };
+    }
+
+    // ===============================================================
     // Element.prototype.constructor as a tag-dispatched getter.
     //
     // Why: even when a fresh wrapper's [[Prototype]] hasn't been

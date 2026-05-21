@@ -746,6 +746,17 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     // from the missing CF JS. Same upstream signal for 5xx, etc.
     let (partial, partial_reason) =
         apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
+    // Then extraction-truthfulness: a usable page with title + actions
+    // + tree content overrides script-side `script_crash`/`fetch_failed`
+    // verdicts, since third-party tracker/ad failures don't stop the
+    // agent from reading the page.
+    let (partial, partial_reason) = apply_extraction_truthfulness(
+        partial,
+        partial_reason,
+        &page.tree.title,
+        page.actions.len(),
+        page.tree.root.children.len(),
+    );
     // Without `--best-effort`, today's contract is "open always
     // returns the page even if hydration errors happen" — we keep
     // that. The new partial fields are additive; the flag only
@@ -915,6 +926,47 @@ pub(crate) fn classify_failure_envelope(
 /// owned `String` (the HTTP path may produce `http_403` / `http_5xx`
 /// dynamically; the JS path returns static strings — both flow
 /// through this helper).
+/// Override a script-side `partial: true` verdict when the
+/// extracted page is functionally usable. The classifier flags any
+/// `failed_scripts[]` entry as degraded, but real-world pages embed
+/// third-party trackers, ad bundles, analytics SDKs, and
+/// authenticated subresource calls that fail under heso's identity
+/// without preventing content extraction — Slack's Clearbit 402,
+/// arstechnica's webpack-chunked theme app, BBC's Next.js client
+/// telemetry. When `<title>` is populated and at least one of
+/// actions / tree children is non-empty, the agent has a usable
+/// page; the structured `failed_scripts[]` and `console_errors_count`
+/// fields still ride the response for callers that care to inspect
+/// them.
+///
+/// HTTP-side classifications (`http_4xx`, `http_5xx`,
+/// `bot_challenge`) bypass this override — those signals mean the
+/// network response was bad and any extraction "success" off a
+/// challenge body is a false positive we should not silence.
+pub(crate) fn apply_extraction_truthfulness(
+    partial: bool,
+    reason: String,
+    title: &str,
+    action_count: usize,
+    tree_child_count: usize,
+) -> (bool, String) {
+    if !partial {
+        return (false, reason);
+    }
+    let http_owned = reason.starts_with("http_")
+        || matches!(reason.as_str(), "bot_challenge" | "cloudflare_challenge");
+    if http_owned {
+        return (true, reason);
+    }
+    let extraction_ok =
+        !title.trim().is_empty() && (action_count > 0 || tree_child_count > 0);
+    if extraction_ok {
+        (false, "ok".to_owned())
+    } else {
+        (true, reason)
+    }
+}
+
 pub(crate) fn apply_http_truthfulness(
     js_partial: bool,
     js_reason: &str,
@@ -1672,6 +1724,13 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         classify_failure_envelope(&failed_scripts, console_errors_count);
     let (partial, partial_reason) =
         apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
+    let (partial, partial_reason) = apply_extraction_truthfulness(
+        partial,
+        partial_reason,
+        &page.tree.title,
+        page.actions.len(),
+        page.tree.root.children.len(),
+    );
     attach_failure_envelope(
         &mut body,
         partial,
