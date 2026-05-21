@@ -68,18 +68,88 @@ pub fn canonical_json(value: &Value) -> String {
         .expect("serde_jcs emits valid UTF-8")
 }
 
-fn canonical_bytes(value: &Value) -> Vec<u8> {
+
+/// Per-request entropy and derived-metadata JSON keys stripped from
+/// the canonical bytes BEFORE serde_jcs canonicalization. Together with
+/// RFC 8785 byte-stability, this yields a hash over the agent-observable
+/// surface — not the per-request UUIDs / build hashes / session
+/// envelopes that ride alongside it.
+///
+/// MUST stay sorted alphabetically — `is_ephemeral` uses `binary_search`.
+pub const EPHEMERAL_OBJECT_KEYS: &[&str] = &[
+    "aria-activedescendant",
+    "aria-controls",
+    "aria-describedby",
+    "aria-labelledby",
+    "aria-owns",
+    "console",
+    "console_errors_count",
+    "content_hash",
+    "cookies",
+    "data_attrs",
+    "delta",
+    "failed_scripts",
+    "for",
+    "forms",
+    "framework",
+    "http_status",
+    "id",
+    "inline_data",
+    "lazy_hints",
+    "metadata",
+    "nonce",
+    "partial",
+    "partial_reason",
+    "scripts",
+    "scroll",
+    "text",
+];
+
+fn is_ephemeral(key: &str) -> bool {
+    EPHEMERAL_OBJECT_KEYS.binary_search(&key).is_ok()
+}
+
+/// Recursively strip ephemeral keys at every JSON-object level so the
+/// canonical bytes reflect only the agent-observable surface.
+fn strip_ephemeral(value: &Value) -> Value {
     match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if is_ephemeral(k) {
+                    continue;
+                }
+                out.insert(k.clone(), strip_ephemeral(v));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(strip_ephemeral).collect()),
+        other => other.clone(),
+    }
+}
+fn canonical_bytes(value: &Value) -> Vec<u8> {
+    // Strip ephemeral keys recursively before canonicalization — the
+    // hash names the agent-observable surface, not per-request UUIDs /
+    // session envelopes / derived telemetry. Combined with serde_jcs
+    // RFC 8785, this gives both byte-stability (any byte change in the
+    // observable surface flips the hash) and determinism on dynamic
+    // pages (per-request entropy elsewhere does not).
+    //
+    // Top-level `plat_hash` is also stripped — a hash field cannot
+    // contain its own digest. Nested `plat_hash` values (from
+    // `linked_pages[*]`) ARE preserved so a parent plat
+    // cryptographically commits to its children's hashes (Merkle-
+    // style).
+    let cleaned = match value {
         Value::Object(map) if map.contains_key("plat_hash") => {
             let mut stripped = map.clone();
             stripped.remove("plat_hash");
-            serde_jcs::to_vec(&Value::Object(stripped))
-                .expect("plat value canonicalizes")
+            strip_ephemeral(&Value::Object(stripped))
         }
-        other => serde_jcs::to_vec(other).expect("plat value canonicalizes"),
-    }
+        other => strip_ephemeral(other),
+    };
+    serde_jcs::to_vec(&cleaned).expect("plat value canonicalizes")
 }
-
 /// Verify a plat's embedded `plat_hash` against a recomputed hash over
 /// the rest of its canonical bytes.
 ///
@@ -664,5 +734,177 @@ mod tests {
             signature: bare,
         };
         assert!(matches!(open(&sealed), OpenOutcome::InvalidSignature(_)));
+    }
+
+    // ========================================================================
+    // bug-report 05-C: agent-observable hash stability against per-request
+    // server-side UUIDs (GitHub-style CSP nonces, request IDs, build hashes
+    // embedded in `id` / `aria-labelledby` / `aria-describedby` attributes).
+    // ========================================================================
+
+    #[test]
+    fn hash_stable_when_only_ephemeral_relational_attrs_change() {
+        // Identical agent-observable surface; only `id`,
+        // `aria-labelledby`, `aria-describedby` carry per-request UUIDs.
+        // These are the exact attribute keys agent 5 observed leaking
+        // server-side entropy into `plat_hash` for github.com pages.
+        let v1 = json!({
+            "url": "https://example.com/",
+            "title": "Page",
+            "actions": [
+                {
+                    "ref": "@e0",
+                    "role": "button",
+                    "tag": "button",
+                    "name": "Submit",
+                    "attrs": {
+                        "id": "icon-button-74b94e66-8fab-40f4-90ea-fda2bb6133e7",
+                        "aria-labelledby": "tooltip-2446ac23-7ac6-481d-8430-6e4667e583d4",
+                        "aria-describedby": "validation-3769e0a2-c905-42db-ab8a-a8870f2e306b",
+                        "type": "submit",
+                    }
+                }
+            ]
+        });
+        let v2 = json!({
+            "url": "https://example.com/",
+            "title": "Page",
+            "actions": [
+                {
+                    "ref": "@e0",
+                    "role": "button",
+                    "tag": "button",
+                    "name": "Submit",
+                    "attrs": {
+                        "id": "icon-button-5b6f3f07-1bdc-4be4-8eeb-dff4c9ad3b84",
+                        "aria-labelledby": "tooltip-93e8dd11-c9ef-4819-83f8-66442b20394f",
+                        "aria-describedby": "validation-de974846-72d8-4b59-b189-035a6c82e608",
+                        "type": "submit",
+                    }
+                }
+            ]
+        });
+        assert_eq!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_still_changes_when_meaningful_attrs_change() {
+        // Non-ephemeral attrs (`href`, `type`, `name`, `value`) DO
+        // contribute to the hash — content changes must still flip it.
+        let base = json!({
+            "url": "https://example.com/",
+            "actions": [
+                {"ref": "@e0", "tag": "a", "attrs": {"href": "/page-1"}}
+            ]
+        });
+        let changed_href = json!({
+            "url": "https://example.com/",
+            "actions": [
+                {"ref": "@e0", "tag": "a", "attrs": {"href": "/page-2"}}
+            ]
+        });
+        assert_ne!(hash(&base), hash(&changed_href));
+    }
+
+    #[test]
+    fn hash_still_changes_when_visible_content_changes() {
+        // The `tree` field (heading-based content + intro text) is the
+        // agent-relevant content surface; changes there must flip the
+        // hash.
+        let v1 = json!({
+            "url": "x",
+            "tree": {"title": "T", "root": {"intro": "Hello world"}}
+        });
+        let v2 = json!({
+            "url": "x",
+            "tree": {"title": "T", "root": {"intro": "Goodbye world"}}
+        });
+        assert_ne!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_drops_inline_data_and_data_attrs_top_level_blobs() {
+        // SSR frameworks ship `__NEXT_DATA__` / `__NUXT_DATA__` /
+        // `data-*` JSON payloads that frequently embed requestId /
+        // sessionId / build hashes. Two plats with the same
+        // agent-visible surface but different hydration payloads must
+        // hash the same.
+        let v1 = json!({
+            "url": "x",
+            "title": "Same title",
+            "inline_data": {"__NEXT_DATA__": {"requestId": "req-aaa-111"}},
+            "data_attrs": {"data-foo": [{"requestId": "req-bbb-222"}]},
+        });
+        let v2 = json!({
+            "url": "x",
+            "title": "Same title",
+            "inline_data": {"__NEXT_DATA__": {"requestId": "req-ccc-333"}},
+            "data_attrs": {"data-foo": [{"requestId": "req-ddd-444"}]},
+        });
+        assert_eq!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_drops_per_session_envelope_fields() {
+        // `cookies`, `console`, `scripts`, `partial`, `partial_reason`,
+        // `failed_scripts`, `console_errors_count`, `lazy_hints`,
+        // `scroll`, `http_status`, `framework`, `forms`,
+        // `content_hash`, `delta`, `text` — all per-session telemetry
+        // / derived fields that don't contribute to the
+        // agent-observable surface.
+        let v1 = json!({
+            "url": "x",
+            "title": "T",
+            "cookies": [{"name": "s", "value": "session-1"}],
+            "console": ["log A"],
+            "http_status": 200,
+            "partial": false,
+            "scripts": {"executed": 5},
+        });
+        let v2 = json!({
+            "url": "x",
+            "title": "T",
+            "cookies": [{"name": "s", "value": "session-99999-DIFFERENT"}],
+            "console": ["log B", "log C", "log D"],
+            "http_status": 200,
+            "partial": false,
+            "scripts": {"executed": 12, "executed_with_error": 1},
+        });
+        assert_eq!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn hash_preserves_functional_aria_state_attrs() {
+        // `aria-disabled`, `aria-checked`, etc. reflect element STATE
+        // (not relational pointers) — these are part of the
+        // agent-observable surface and must contribute to the hash.
+        let v1 = json!({
+            "url": "x",
+            "actions": [
+                {"ref": "@e0", "tag": "input", "attrs": {"aria-checked": "false"}}
+            ]
+        });
+        let v2 = json!({
+            "url": "x",
+            "actions": [
+                {"ref": "@e0", "tag": "input", "attrs": {"aria-checked": "true"}}
+            ]
+        });
+        assert_ne!(hash(&v1), hash(&v2));
+    }
+
+    #[test]
+    fn ephemeral_object_keys_is_sorted_so_binary_search_works() {
+        // `is_ephemeral` uses `binary_search`; the list MUST be sorted.
+        // Guard against future maintenance accidentally inserting an
+        // out-of-order entry that would silently break the filter for
+        // entries after it.
+        let mut copy: Vec<&str> = EPHEMERAL_OBJECT_KEYS.to_vec();
+        copy.sort();
+        assert_eq!(
+            copy.as_slice(),
+            EPHEMERAL_OBJECT_KEYS,
+            "EPHEMERAL_OBJECT_KEYS must be sorted alphabetically"
+        );
     }
 }

@@ -574,7 +574,7 @@ async fn run_read_for_url(
         body["forms"] = group_forms(&page.actions);
     }
     if include.cookies {
-        body["cookies"] = collect_cookies(engine, page.url());
+        body["cookies"] = collect_cookies(&page);
     }
     if include.console {
         body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);

@@ -436,3 +436,236 @@ async fn batch_open_invalid_url_emits_classified_error() {
         "expected `invalid_url:` tag, got: {tag}"
     );
 }
+
+// ============================================================================
+// Test 10 (bug-report 04, Bug B): `batch read --include cookies --parallel N`
+// emits a per-URL cookies snapshot that reflects *only this response's*
+// `Set-Cookie` headers — sibling tasks finishing first cannot leak their
+// cookies into our row.
+//
+// Fixture: two URLs, each setting a distinct cookie. With the old
+// `jar.matches(url)` scan at JSON-serialize time, a row's `cookies`
+// would contain both cookies whenever the sibling completed first.
+// With the eager `FetchPage::response_cookies` snapshot, each row sees
+// only the cookies its own response set, regardless of completion
+// ordering.
+// ============================================================================
+
+#[tokio::test]
+async fn batch_read_cookies_are_per_response_not_jar_snapshot() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/a"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Set-Cookie", "cook_a=A; Path=/")
+                .set_body_string("<title>A</title><body>page A</body>"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/b"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Set-Cookie", "cook_b=B; Path=/")
+                .set_body_string("<title>B</title><body>page B</body>"),
+        )
+        .mount(&server)
+        .await;
+
+    let url_a = format!("{}/a", server.uri());
+    let url_b = format!("{}/b", server.uri());
+    let out = run_batch(&[
+        "read",
+        "--parallel",
+        "4",
+        "--include",
+        "cookies",
+        &url_a,
+        &url_b,
+    ]);
+
+    assert!(
+        out.status.success(),
+        "expected success; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = parse_jsonl(&out);
+    assert_eq!(rows.len(), 2, "expected 2 rows: {rows:?}");
+
+    let row_a = rows
+        .iter()
+        .find(|r| r["url"].as_str().unwrap_or("").ends_with("/a"))
+        .expect("a row");
+    let row_b = rows
+        .iter()
+        .find(|r| r["url"].as_str().unwrap_or("").ends_with("/b"))
+        .expect("b row");
+
+    let a_cookies = row_a["cookies"].as_array().expect("a.cookies array");
+    let b_cookies = row_b["cookies"].as_array().expect("b.cookies array");
+    assert_eq!(
+        a_cookies.len(),
+        1,
+        "row A's cookies should contain only cook_a; got: {a_cookies:?}"
+    );
+    assert_eq!(
+        b_cookies.len(),
+        1,
+        "row B's cookies should contain only cook_b; got: {b_cookies:?}"
+    );
+    assert_eq!(a_cookies[0]["name"].as_str(), Some("cook_a"));
+    assert_eq!(b_cookies[0]["name"].as_str(), Some("cook_b"));
+}
+
+// ============================================================================
+// Test 11 (bug-report 04, Bug B determinism): the same fixture as Test 10,
+// run twice. Both runs must emit identical cookie counts per row even
+// though task completion order varies under `--parallel`. This is the
+// determinism property the race fix establishes.
+// ============================================================================
+
+#[tokio::test]
+async fn batch_read_cookies_are_deterministic_across_runs() {
+    let server = MockServer::start().await;
+    for (p, name) in [("/c1", "c1"), ("/c2", "c2"), ("/c3", "c3"), ("/c4", "c4")] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Set-Cookie",
+                        format!("{name}=v; Path=/").as_str(),
+                    )
+                    .set_body_string("<title>x</title>"),
+            )
+            .mount(&server)
+            .await;
+    }
+
+    let urls: Vec<String> = (1..=4).map(|i| format!("{}/c{i}", server.uri())).collect();
+    let mut args = vec!["read", "--parallel", "4", "--include", "cookies"];
+    for u in &urls {
+        args.push(u.as_str());
+    }
+
+    let r1 = run_batch(&args);
+    assert!(r1.status.success(), "run 1 failed: {}", String::from_utf8_lossy(&r1.stderr));
+    let rows_1 = parse_jsonl(&r1);
+
+    let r2 = run_batch(&args);
+    assert!(r2.status.success(), "run 2 failed: {}", String::from_utf8_lossy(&r2.stderr));
+    let rows_2 = parse_jsonl(&r2);
+
+    assert_eq!(rows_1.len(), 4);
+    assert_eq!(rows_2.len(), 4);
+    for rows in [&rows_1, &rows_2] {
+        for row in rows {
+            assert_eq!(row["ok"], serde_json::json!(true));
+            let cookies = row["cookies"].as_array().expect("cookies array");
+            assert_eq!(
+                cookies.len(),
+                1,
+                "expected exactly one per-response cookie; got: {row:?}"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// Test 12 (bug-report 04, Bug A): host-only cookies surface `host_only:
+// true` and fill `domain` with the request URL's effective host, NOT an
+// empty string.
+//
+// RFC 6265 §5.3 step 6 default: a `Set-Cookie` with no `Domain=`
+// attribute creates a "host-only" cookie scoped to the request URL's
+// host. The previous JSON emitted `"domain": ""` for these — the agent
+// could not tell a host-only cookie from a domain-wide cookie that
+// happened to have an empty `Domain=` (which is undefined behavior).
+// ============================================================================
+
+#[tokio::test]
+async fn batch_read_cookies_emit_host_only_flag_for_no_domain_attribute() {
+    let server = MockServer::start().await;
+    // Two cookies on one response:
+    //   `host_only_cook=H`         — no Domain attribute (host-only)
+    //   `wide_cook=W; Domain=...`  — explicit Domain (domain-wide)
+    //
+    // Use 127.0.0.1 so the test doesn't depend on a real public suffix.
+    // reqwest will accept `Domain=127.0.0.1` against a 127.0.0.1 request.
+    Mock::given(method("GET"))
+        .and(path("/h"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                // `append_header` (vs `insert_header`) preserves prior values
+                // for the same key — required since `Set-Cookie` is the
+                // canonical "one header line per cookie" case.
+                .append_header("Set-Cookie", "host_only_cook=H; Path=/")
+                .append_header("Set-Cookie", "wide_cook=W; Domain=127.0.0.1; Path=/")
+                .set_body_string("<title>h</title>"),
+        )
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/h", server.uri());
+    let out = run_batch(&[
+        "read",
+        "--parallel",
+        "1",
+        "--include",
+        "cookies",
+        &url,
+    ]);
+    assert!(
+        out.status.success(),
+        "expected success; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = parse_jsonl(&out);
+    assert_eq!(rows.len(), 1, "expected 1 row: {rows:?}");
+    let cookies = rows[0]["cookies"]
+        .as_array()
+        .expect("cookies array on row");
+    // Two cookies expected (HttpOnly was NOT set on either).
+    assert_eq!(cookies.len(), 2, "expected 2 cookies; got: {cookies:?}");
+
+    let host_only_entry = cookies
+        .iter()
+        .find(|c| c["name"].as_str() == Some("host_only_cook"))
+        .expect("host_only_cook in cookies array");
+    let wide_entry = cookies
+        .iter()
+        .find(|c| c["name"].as_str() == Some("wide_cook"))
+        .expect("wide_cook in cookies array");
+
+    // host-only cookie: `host_only: true` + domain == request host.
+    assert_eq!(
+        host_only_entry["host_only"].as_bool(),
+        Some(true),
+        "expected host_only=true for cookie with no Domain attr; got: {host_only_entry:?}"
+    );
+    let host_only_domain = host_only_entry["domain"].as_str().unwrap_or("");
+    assert!(
+        !host_only_domain.is_empty(),
+        "expected non-empty domain for host-only cookie (the effective host); got: {host_only_entry:?}"
+    );
+    assert_eq!(
+        host_only_domain, "127.0.0.1",
+        "expected domain == request host '127.0.0.1' for host-only cookie; got: {host_only_entry:?}"
+    );
+
+    // domain-wide cookie: `host_only: false` + domain == server's value.
+    // reqwest's Cookie::domain() reports the value with a leading `.` per
+    // RFC 6265 when sent without it (the spec auto-prepends), but the
+    // documented behavior varies — we accept either form.
+    assert_eq!(
+        wide_entry["host_only"].as_bool(),
+        Some(false),
+        "expected host_only=false for cookie with explicit Domain attr; got: {wide_entry:?}"
+    );
+    let wide_domain = wide_entry["domain"].as_str().unwrap_or("");
+    assert!(
+        wide_domain.contains("127.0.0.1"),
+        "expected domain containing '127.0.0.1' for explicit-domain cookie; got: {wide_entry:?}"
+    );
+}

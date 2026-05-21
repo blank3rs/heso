@@ -318,3 +318,91 @@ async fn read_against_running_session_uses_same_state() {
         "page A text leaked after navigate: {text_b}"
     );
 }
+
+// ============================================================================
+// bug-report 05-C: plat_hash is stable across runs even when the server
+// mints fresh per-request UUIDs into `id` / `aria-labelledby` /
+// `aria-describedby` attributes — the GitHub-style "every fetch produces a
+// different plat_hash" failure mode agent 5 documented.
+// ============================================================================
+
+#[tokio::test]
+async fn plat_hash_stable_against_per_request_server_uuids() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let server = MockServer::start().await;
+    // We can't use a simple `respond_with(ResponseTemplate::new(200)...)`
+    // here because we need a *different* body per request. wiremock-rs's
+    // `Respond` trait lets us hand back a freshly-templated response per
+    // call — the smallest knob that simulates GitHub's per-request
+    // UUID minting against a hermetic localhost server.
+    struct PerRequestUuids {
+        counter: AtomicU32,
+    }
+    impl wiremock::Respond for PerRequestUuids {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let n = self.counter.fetch_add(1, Ordering::SeqCst);
+            // Mint a fresh fake-UUID per request — same shape as
+            // GitHub's `icon-button-<uuid>` IDs, just deterministic so
+            // we can match on `n` in the assertion below.
+            let body = format!(
+                r#"<!doctype html><html><head><title>Hello</title></head><body>
+                    <h1 id="heading-{n}">Hello</h1>
+                    <button aria-labelledby="tooltip-{n}" aria-describedby="validation-{n}" id="btn-{n}">Submit</button>
+                    <p>Same content every time.</p>
+                </body></html>"#
+            );
+            ResponseTemplate::new(200).set_body_string(body)
+        }
+    }
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(PerRequestUuids {
+            counter: AtomicU32::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    // Fetch twice — different per-request UUIDs, identical content.
+    let out_1 = run_open(&server.uri());
+    let out_2 = run_open(&server.uri());
+    let body_1 = parse_stdout(&out_1);
+    let body_2 = parse_stdout(&out_2);
+
+    let hash_1 = body_1["plat_hash"].as_str().expect("plat_hash on body_1");
+    let hash_2 = body_2["plat_hash"].as_str().expect("plat_hash on body_2");
+
+    // The two runs MUST produce identical hashes despite the differing
+    // per-request UUIDs in `id` / `aria-labelledby` / `aria-describedby`.
+    assert_eq!(
+        hash_1, hash_2,
+        "plat_hash must be stable across runs when only per-request UUIDs differ; \
+         body_1.plat_hash={hash_1}, body_2.plat_hash={hash_2}"
+    );
+
+    // Sanity: the underlying actions DO carry the per-request `id` —
+    // confirming the test fixture is actually generating different
+    // attribute values and the hash stability is coming from the
+    // canonicalizer's ephemeral-key strip, not from the IDs happening
+    // to match.
+    let id_1 = body_1["actions"][0]["attrs"]["id"]
+        .as_str()
+        .expect("actions[0].attrs.id on body_1");
+    let id_2 = body_2["actions"][0]["attrs"]["id"]
+        .as_str()
+        .expect("actions[0].attrs.id on body_2");
+    assert_ne!(
+        id_1, id_2,
+        "fixture generated identical IDs across requests — test is not exercising the bug"
+    );
+}
+
+/// Spawn `heso open <url>` and return the captured `Output`. Mirrors
+/// the `run_read` helper above; kept inline here so the per-test
+/// dependencies stay obvious.
+fn run_open(url: &str) -> std::process::Output {
+    Command::new(heso_bin())
+        .args(["open", url])
+        .output()
+        .expect("spawn heso open")
+}

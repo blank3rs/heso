@@ -1255,7 +1255,16 @@ async fn dispatch_read(
             body["forms"] = forms_json.clone();
         }
         if include.cookies {
-            body["cookies"] = collect_cookies(&state.engine, &live_url);
+            // Snapshot from the initial `open` response — same semantics
+            // as the one-shot CLI's `heso read --include cookies` (the
+            // cookies *this response asked for*, not whatever the
+            // shared jar happens to contain at serialize time). Serve
+            // sessions are single-task per `page_id` so the
+            // batch-parallel race that motivated the eager snapshot
+            // (see `bug-reports/04-long-running.md`) doesn't apply
+            // here, but using the snapshot keeps the JSON shape
+            // identical across CLI and serve surfaces.
+            body["cookies"] = collect_cookies(static_page);
         }
         if include.console {
             body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);
