@@ -209,13 +209,16 @@ fn print_banner() {
     println!("                                Verify a saved fingerprint file (exit 0 valid, 1 invalid, 2 malformed)");
     println!("  heso stamp  [--seed N] <plan-or-plat.json>");
     println!("                                Execute a plan against the live web and mint a fresh plat that");
-    println!("                                embeds the plan. Accepts a bare Action[] array, a plat with a");
-    println!("                                `plan` field, or a fingerprint. Exit 0 ok / 1 if any step failed");
-    println!("                                (still emits the partial plat with `error` + `steps`).");
-    println!("  heso replay [--seed N] <plan-plat-or-fingerprint.json>");
-    println!("                                Re-execute the plan, print a per-step session log. No plat output —");
-    println!("                                use `stamp` for that. Refuses tampered fingerprints. Stateful:");
-    println!("                                one JsSession carries DOM mutations / RNG / cookies across steps.");
+    println!("                                embeds the plan, the recorded network cassette, and a step log.");
+    println!("                                Accepts a bare Action[] array, a plat with a `plan` field, or a");
+    println!("                                fingerprint. Exit 0 ok / 1 if any step failed.");
+    println!("  heso run    [--seed N] <plat.json>");
+    println!("                                Re-execute the plan against the plat's embedded cassette — no");
+    println!("                                network. Mints a fresh plat; for an unchanged cassette its");
+    println!("                                plat_hash equals the input's (byte-identical replay, ADR 0008).");
+    println!("                                Misses (page drifted since stamp) surface as graceful errors.");
+    println!("  heso replay <plat.json>       Emit the recorded step log from a plat. Pure observation — no");
+    println!("                                engine, no network, no JS. Use `run` to re-execute.");
     println!("  heso unpack <plat.json>       Extract the `plan` field from a plat (errors if none). Pipes into");
     println!("                                an editor or back into `stamp` for the edit/re-mint loop.");
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
@@ -4395,7 +4398,14 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let fetch = match FetchEngine::new() {
+    // Fresh shared cassette: the static `FetchEngine` and the JS-side
+    // `fetch` / XHR shims (via `open_js_session_with_cassette`) both
+    // append into this one log during the run. After the plan finishes
+    // we move the inner `Cassette` out and embed it in the plat body
+    // so `heso run <plat>` can play it back byte-identical.
+    let cassette: std::sync::Arc<std::sync::Mutex<heso_engine_fetch::Cassette>> =
+        std::sync::Arc::new(std::sync::Mutex::new(heso_engine_fetch::Cassette::new()));
+    let fetch = match FetchEngine::with_recording_cassette(cassette.clone()) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("engine init failed: {e}");
@@ -4437,10 +4447,27 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
                     outcome.steps.len().saturating_sub(1)
                 )),
             );
-            obj.insert(
-                "steps".to_owned(),
-                serde_json::Value::Array(outcome.steps.clone()),
-            );
+        }
+    }
+    // Always embed the step log — `heso replay <plat>` is the watch-
+    // only variant that reads this field without re-executing.
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "steps".to_owned(),
+            serde_json::Value::Array(outcome.steps.clone()),
+        );
+    }
+    // Snapshot the cassette out of the shared Arc and embed it under
+    // the canonical `cassette` field. It's NOT in EPHEMERAL_OBJECT_KEYS
+    // (verified by the plat_hash regression test) so tampering with
+    // the cassette flips the plat hash — replay can't quietly diverge.
+    let final_cassette = cassette
+        .lock()
+        .expect("cassette mutex poisoned")
+        .clone();
+    if let Some(obj) = body.as_object_mut() {
+        if let Ok(c) = serde_json::to_value(&final_cassette) {
+            obj.insert("cassette".to_owned(), c);
         }
     }
     let hash = heso_engine_fetch::plat_hash(&body);
@@ -4702,8 +4729,8 @@ async fn cmd_action_hash_verify(args: &[String]) -> ExitCode {
 /// - **Schema:** actions must use the canonical [`Action`] schema
 ///   (`verb: open|click|fill|submit`). Schema-free fingerprints hash
 ///   fine but can't be auto-replayed; exit `2` with a clear message.
-async fn cmd_replay(args: &[String]) -> ExitCode {
-    let (seed, path) = match parse_seed_and_path(args, "replay") {
+async fn cmd_run(args: &[String]) -> ExitCode {
+    let (seed, path) = match parse_seed_and_path(args, "run") {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -4724,12 +4751,23 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
     let plan = match extract_plan(&value) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("replay: {e}");
+            eprintln!("run: {e}");
             return ExitCode::from(2);
         }
     };
 
-    let fetch = match FetchEngine::new() {
+    // If the input plat carries a `cassette` field, re-execute under
+    // Replaying mode against it — no network access, every fetch
+    // looks up the cassette, misses surface as graceful errors. If
+    // the plat has no cassette (old format or a hand-written plan),
+    // fall back to live HTTP so `run` stays useful for legacy plats.
+    let fetch = match extract_cassette(&value) {
+        Some(cassette) => {
+            FetchEngine::with_replaying_cassette(std::sync::Arc::new(cassette))
+        }
+        None => FetchEngine::new(),
+    };
+    let fetch = match fetch {
         Ok(e) => e,
         Err(e) => {
             eprintln!("engine init failed: {e}");
@@ -4739,21 +4777,127 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
 
     let outcome = run_plan(&fetch, &plan.actions, seed, plan.start_url.clone()).await;
 
-    let session = serde_json::json!({
-        "source": plan.source,
-        "start_url": plan.start_url.to_string(),
-        "final_url": outcome.final_url.to_string(),
-        "steps_run": outcome.steps.len(),
-        "steps_total": plan.actions.len(),
-        "ok": outcome.ok,
-        "note": "stateful replay — one JsSession carries DOM mutations, RNG, virtual clock, and cookies (via shared reqwest::Client) across all steps. Navigation (Open, or an <a href> click) replaces the document but keeps the engine. Refs (`@e7`) are resolved against the action graph captured at the most-recent navigation — between navigations the live DOM has been mutated, so a ref may point to an element whose attributes have shifted. Submit still has the no-real-POST limitation: JsSession::submit dispatches a click on the form's submit button rather than issuing an HTTP POST. For byte-identical replay against recorded network responses, see ADR 0008 (not yet implemented).",
-        "steps": outcome.steps,
-    });
-    if !outcome.ok {
-        let _ = print_json(&session);
-        return ExitCode::FAILURE;
+    // Mint a fresh plat over the post-run state — same shape as
+    // `cmd_stamp`'s output, including a freshly-computed plat_hash.
+    // For a Replaying run against an unmodified cassette this hash
+    // is identical to the input plat's; that's the integration-test
+    // surface (see `crates/heso-cli/tests/cassette_replay.rs`).
+    let html = outcome
+        .session
+        .as_ref()
+        .map(|s| s.document_html())
+        .unwrap_or_default();
+    let mut page = FetchPage::from_html(
+        plan.start_url.as_str().to_owned(),
+        outcome.final_url.clone(),
+        200,
+        Vec::new(),
+        html,
+    );
+    if !outcome.final_actions.is_empty() {
+        page.actions = outcome.final_actions;
     }
-    print_json(&session)
+    page.plan = Some(plan.actions_json);
+    let mut body = page.plat_body_base();
+    if !outcome.ok {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "error".to_owned(),
+                serde_json::Value::String(format!(
+                    "run aborted at step {}: see `steps`",
+                    outcome.steps.len().saturating_sub(1)
+                )),
+            );
+        }
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "steps".to_owned(),
+            serde_json::Value::Array(outcome.steps.clone()),
+        );
+        // Re-embed the cassette so `run`'s output plat is itself
+        // replayable. For Replaying mode this is the same cassette
+        // we read from the input; for the (rare) Live fallback path
+        // there's no cassette to carry forward.
+        if let Some(c) = value.get("cassette").cloned() {
+            obj.insert("cassette".to_owned(), c);
+        }
+    }
+    let hash = heso_engine_fetch::plat_hash(&body);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+    }
+    let _ = print_json(&body);
+    if outcome.ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// `heso replay <plat.json>` — emit the `steps` field of a plat
+/// without re-executing anything. Pure observation: no engine init,
+/// no network, no JS, no cassette lookup. Useful for inspecting the
+/// step log a previous `heso stamp` or `heso run` recorded into a
+/// plat (e.g. CI artifact, signed receipt).
+///
+/// Exit codes:
+/// - `0` — plat had a `steps` field and it was emitted.
+/// - `2` — file unreadable, not JSON, or missing `steps` field.
+async fn cmd_replay(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: heso replay <plat.json>");
+        eprintln!();
+        eprintln!("Emits the recorded step log from a plat without re-executing.");
+        eprintln!("To re-execute the plan against the plat's cassette, use `heso run`.");
+        return ExitCode::from(2);
+    }
+    let path = &args[0];
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot read `{path}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{path}` is not valid JSON: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let Some(steps) = value.get("steps") else {
+        eprintln!(
+            "`{path}` has no `steps` field — it was not produced by `heso stamp` or `heso run`."
+        );
+        return ExitCode::from(2);
+    };
+    let summary = serde_json::json!({
+        "source": path,
+        "start_url": value.get("url").or_else(|| value.get("input_url")).cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "steps_count": steps.as_array().map(|a| a.len()).unwrap_or(0),
+        "plat_hash": value.get("plat_hash").cloned().unwrap_or(serde_json::Value::Null),
+        "cassette_records": value
+            .get("cassette")
+            .and_then(|c| c.get("records"))
+            .and_then(|r| r.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        "steps": steps,
+    });
+    print_json(&summary)
+}
+
+/// Extract the `cassette` field from a plat JSON and deserialize it
+/// into a usable [`heso_engine_fetch::Cassette`]. Returns `None` if
+/// the field is absent or malformed; `cmd_run`'s caller falls back
+/// to Live mode in that case, which matches the legacy behavior of
+/// the pre-cassette CLI.
+fn extract_cassette(plat: &serde_json::Value) -> Option<heso_engine_fetch::Cassette> {
+    let raw = plat.get("cassette")?;
+    serde_json::from_value(raw.clone()).ok()
 }
 
 /// Result of running a plan against the live web.
@@ -4854,17 +4998,50 @@ async fn ensure_session(
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;
     *current_actions = page.actions;
-    let (sess, _outcome) = match seed {
-        Some(n) => heso_engine_js::JsSession::open_with_seed(
-            &page.body_html,
-            current_url.clone(),
-            n,
-        ),
-        None => heso_engine_js::JsSession::open(&page.body_html, current_url.clone()),
-    }
+    let (sess, _outcome) = open_js_session_with_cassette(
+        fetch,
+        &page.body_html,
+        current_url.clone(),
+        seed,
+    )
     .map_err(|e| format!("js session open failed: {e}"))?;
     *session = Some(sess);
     Ok(())
+}
+
+/// Open a [`heso_engine_js::JsSession`] whose JS-side fetch / XHR
+/// shims inherit the parent [`FetchEngine`]'s cassette mode. Without
+/// this, the static-fetch layer would record / replay correctly but
+/// any `fetch()` call from an inline `<script>` would hit the live
+/// wire (Recording) or reject with the legacy "no cassette" error
+/// (Replaying) — half-cassette is a leaky abstraction we don't want.
+fn open_js_session_with_cassette(
+    fetch: &FetchEngine,
+    body_html: &str,
+    url: Url,
+    seed: Option<u64>,
+) -> Result<
+    (heso_engine_js::JsSession, heso_engine_js::ScriptOutcome),
+    heso_engine_js::EvalError,
+> {
+    let cassette_mode = fetch.cassette_mode().clone();
+    let resolved_seed = seed.unwrap_or(0);
+    // For Live + Recording paths the JS engine needs a `reqwest::Client`
+    // + tokio handle to make calls; Replaying serves from the cassette
+    // and ignores both. We pull the client and the current tokio
+    // runtime handle whenever they're available — every caller of
+    // run_plan runs inside `#[tokio::main]` so `Handle::try_current`
+    // succeeds.
+    let client = Some(fetch.client());
+    let rt_handle = tokio::runtime::Handle::try_current().ok();
+    heso_engine_js::JsSession::open_with_seed_and_cassette(
+        body_html,
+        url,
+        resolved_seed,
+        cassette_mode,
+        client,
+        rt_handle,
+    )
 }
 
 /// One step of stateful replay. Lazily initializes `session` on first
@@ -4894,17 +5071,12 @@ async fn execute_step_session(
             *current_actions = page.actions.clone();
             let script_outcome = match session.as_mut() {
                 None => {
-                    let (sess, outcome) = match seed {
-                        Some(n) => heso_engine_js::JsSession::open_with_seed(
-                            &page.body_html,
-                            current_url.clone(),
-                            n,
-                        ),
-                        None => heso_engine_js::JsSession::open(
-                            &page.body_html,
-                            current_url.clone(),
-                        ),
-                    }
+                    let (sess, outcome) = open_js_session_with_cassette(
+                        fetch,
+                        &page.body_html,
+                        current_url.clone(),
+                        seed,
+                    )
                     .map_err(|e| format!("js session open failed: {e}"))?;
                     *session = Some(sess);
                     outcome
@@ -5451,6 +5623,7 @@ async fn main() -> ExitCode {
         Some("action-hash") => cmd_action_hash(&args[1..]).await,
         Some("action-hash-verify") => cmd_action_hash_verify(&args[1..]).await,
         Some("replay") => cmd_replay(&args[1..]).await,
+        Some("run") => cmd_run(&args[1..]).await,
         Some("stamp") => cmd_stamp(&args[1..]).await,
         Some("unpack") => cmd_unpack(&args[1..]).await,
         Some("identity") => cmd_identity(&args[1..]),

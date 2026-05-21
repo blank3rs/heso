@@ -116,6 +116,47 @@ impl JsSession {
         Self::open_on_engine(engine, html, url, ScriptFetchPolicy::default())
     }
 
+    /// Like [`Self::open_with_seed`] but threads a cassette mode
+    /// through to the engine's `fetch` / XHR shims. Used by `heso
+    /// stamp` (Recording) and `heso run` (Replaying) so JS-side
+    /// network traffic during inline-script execution and event
+    /// dispatch is captured into / served from the same cassette as
+    /// the static fetch layer.
+    ///
+    /// `client` + `rt_handle` are needed for Live and Recording
+    /// modes (which still hit the wire). They are unused for
+    /// Replaying — callers may pass placeholder values or skip
+    /// `Replaying` entirely if they don't have a client handy.
+    pub fn open_with_seed_and_cassette(
+        html: &str,
+        url: Url,
+        seed: u64,
+        cassette_mode: heso_engine_fetch::CassetteMode,
+        client: Option<std::sync::Arc<reqwest::Client>>,
+        rt_handle: Option<tokio::runtime::Handle>,
+    ) -> Result<(Self, ScriptOutcome), EvalError> {
+        let engine = match cassette_mode {
+            heso_engine_fetch::CassetteMode::Live => match (client, rt_handle) {
+                (Some(c), Some(rt)) => JsEngine::new_with_seed_and_live_fetch(seed, c, rt)?,
+                _ => JsEngine::new_with_seed(seed)?,
+            },
+            heso_engine_fetch::CassetteMode::Recording(cassette) => match (client, rt_handle) {
+                (Some(c), Some(rt)) => {
+                    JsEngine::new_with_recording_cassette(seed, c, rt, cassette, None)?
+                }
+                _ => {
+                    return Err(EvalError::Engine(
+                        "Recording mode requires a reqwest client + tokio handle".into(),
+                    ))
+                }
+            },
+            heso_engine_fetch::CassetteMode::Replaying(cassette) => {
+                JsEngine::new_with_replaying_cassette(seed, cassette, None)?
+            }
+        };
+        Self::open_on_engine(engine, html, url, ScriptFetchPolicy::default())
+    }
+
     /// Lowest-level constructor: caller supplies a fully-built
     /// [`JsEngine`] (so they can pre-attach a fetch shim, custom RNG,
     /// or a non-default memory cap) plus the
