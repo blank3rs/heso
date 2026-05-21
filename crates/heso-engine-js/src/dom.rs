@@ -1204,6 +1204,142 @@ impl Document {
             .map(|n| Element::from_id(self.doc.clone(), n.id))
     }
 
+    /// `document.nodeType` — always `9` (the `DOCUMENT_NODE` constant
+    /// from WHATWG DOM §4.4 "Interface Node").
+    ///
+    /// Without this getter, the `document` instance had no `nodeType`
+    /// property at all — JS reads returned `undefined`. jQuery 3.6's
+    /// Sizzle selector engine gates its `setDocument(e)` setup on
+    /// `9 === r.nodeType`; with `undefined` on the left, the guard
+    /// fails silently, the cached `C` (= document) reference never
+    /// gets assigned, and every subsequent `ce(fn)` feature-detect
+    /// (`var t = C.createElement("fieldset")`) throws
+    /// "cannot read property 'createElement' of undefined". Net
+    /// effect: jQuery doesn't load, every page that bundles it
+    /// (kernel.org Sphinx docs, every Bootstrap site, every legacy
+    /// docs build) sees the entire feature-detect cascade die before
+    /// `$` is even defined.
+    ///
+    /// The [`Element::node_type`] getter mirrors the same constant on
+    /// node-typed wrappers (1 for element, 3 for text, 8 for comment,
+    /// 9 for document via `is_document()`, etc.). The `Document` JS
+    /// instance is a distinct rquickjs class so it doesn't pick up
+    /// `Element::node_type` via prototype chaining — hence the
+    /// explicit duplicate here.
+    #[qjs(get)]
+    fn node_type(&self) -> u32 {
+        9
+    }
+
+    /// `document.nodeName` — always `"#document"` per WHATWG DOM §4.4.
+    ///
+    /// Mirror of [`Self::node_type`] for the textual side: jQuery's
+    /// Sizzle setup also reads `C.nodeName` in a couple of feature
+    /// detects (`r=C.nodeName.toLowerCase()` for the doc-vs-fragment
+    /// distinction). Returning the spec constant keeps both branches
+    /// honest.
+    #[qjs(get)]
+    fn node_name(&self) -> String {
+        "#document".to_owned()
+    }
+
+    /// `document.ownerDocument` — always `null` per WHATWG DOM §4.4
+    /// "Interface Document": a document is itself the document, so it
+    /// has no owner. Frameworks read `node.ownerDocument` during
+    /// hydration; an explicit `null` is spec-correct and stops
+    /// Sizzle's `r=e?e.ownerDocument||e:p` from falling into the
+    /// `||e` branch with a document on the left.
+    #[qjs(get)]
+    fn owner_document<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
+        Value::new_null(ctx)
+    }
+
+    /// `document.defaultView` — the `Window` object whose document is
+    /// `self`. In a real browser this is the global `window`. heso
+    /// aliases `window === globalThis === self === top === parent` (see
+    /// `BROWSER_APIS_BOOTSTRAP`), so we return `ctx.globals()`.
+    ///
+    /// jQuery 3.6's Sizzle setup reads `n=C.defaultView` and registers
+    /// an `unload` listener on it (`n.addEventListener("unload", oe,
+    /// !1)`); when `defaultView` is `undefined`, the
+    /// `(n=C.defaultView)` short-circuits the comma expression but
+    /// the next `&&`-chained feature-detect still expects `C` to be
+    /// set — which only happens if the *prior* `nodeType === 9` check
+    /// succeeds (see [`Self::node_type`]). Returning the real global
+    /// completes the chain rather than tripping a later detect.
+    ///
+    /// Real-world reaches that depend on a non-null `defaultView`:
+    /// jQuery's iframe-detection (`n.top !== n`), React's
+    /// `ownerDocument.defaultView` lookup for synthetic-event
+    /// dispatch, every "is this code running in a window context"
+    /// branch in framework boot.
+    #[qjs(get, rename = "defaultView")]
+    fn default_view<'js>(&self, ctx: Ctx<'js>) -> Value<'js> {
+        ctx.globals().into_value()
+    }
+
+    /// `document.createComment(data)` — create an orphan comment node
+    /// wrapping `data`. WHATWG DOM §4.5 "Interface Document".
+    ///
+    /// Backed by `dom_query::Tree::create_node(NodeData::Comment{
+    /// contents })` so the returned wrapper's underlying node reports
+    /// `nodeType === 8` (via the existing [`Element::node_type`]
+    /// is_comment branch). Same wrapper type as elements / text nodes
+    /// — Phase 1B does not split Comment into a separate Rust class,
+    /// but the load-bearing path (`document.createComment("")`
+    /// followed by `appendChild`) works identically.
+    ///
+    /// Used in jQuery's Sizzle feature detect:
+    /// `d.getElementsByTagName = ce(function(e) {
+    ///     return e.appendChild(C.createComment("")),
+    ///         !e.getElementsByTagName("*").length;
+    /// })` — appends a comment to a fieldset, then queries
+    /// `getElementsByTagName("*")`; if comment children are mis-
+    /// counted, jQuery switches to its manual implementation.
+    /// Without `createComment`, the call throws and the detect dies.
+    fn create_comment(&self, data: String) -> Element {
+        let node_id = self.doc.tree.create_node(dom_query::NodeData::Comment {
+            contents: data.into(),
+        });
+        Element::from_id(self.doc.clone(), node_id)
+    }
+
+    /// `document.implementation` — a `DOMImplementation`-shaped POJO
+    /// per WHATWG DOM §4.5.1.
+    ///
+    /// heso doesn't expose a separate `DOMImplementation` class; the
+    /// load-bearing reach (jQuery 3.6's `E.implementation
+    /// .createHTMLDocument("")` at module init) only needs a callable
+    /// `createHTMLDocument` that returns something with a `.body` /
+    /// `.createElement`. We delegate to the JS-side shim installed in
+    /// `BROWSER_APIS_BOOTSTRAP` (`__hesoDocumentImplementation`)
+    /// which constructs a fresh detached `<html>` subtree backed by
+    /// a `<template>` orphan. `createDocument` / `createDocumentType`
+    /// / `hasFeature` are stubbed to match the spec's "always returns
+    /// true" + sensible defaults.
+    ///
+    /// Returning a fresh POJO each access is fine: the spec doesn't
+    /// promise identity (it returns a host object, but feature-detect
+    /// code just calls methods, never `===`-compares). If a frame-
+    /// work caches it (jQuery does, via `y.createHTMLDocument =
+    /// (_t = E.implementation.createHTMLDocument("").body)...`), the
+    /// cached reference is one of these POJOs and stays alive via
+    /// the JS heap.
+    #[qjs(get)]
+    fn implementation<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
+        let globals = ctx.globals();
+        // The bootstrap installs a builder function so every reach
+        // returns a fresh POJO whose methods close over the current
+        // `document`. Falling back to an empty object keeps the
+        // surface non-null on the off chance the bootstrap hasn't run.
+        let builder: Option<Function<'js>> =
+            globals.get::<_, Option<Function<'js>>>("__hesoDocumentImplementation")?;
+        match builder {
+            Some(f) => f.call::<(), Value<'js>>(()),
+            None => Ok(Object::new(ctx)?.into_value()),
+        }
+    }
+
     /// `document.cookie` getter (WHATWG HTML §6.1).
     ///
     /// Returns the `;`-joined `name=value` cookie string for the

@@ -705,6 +705,27 @@ impl JsEngine {
             #[allow(clippy::arc_with_non_send_sync)]
             let queue = Arc::new(crate::xhr::XhrQueue::new());
             crate::xhr::install_xhr(&context, fs.mode.clone(), queue.clone())?;
+            // After the rquickjs `XmlHttpRequest` class is installed,
+            // its prototype is a real object reachable as
+            // `globalThis.XMLHttpRequest.prototype`. Bundles like
+            // Transcend's airgap.js capture method/getter references
+            // off it at module-init time via the
+            // `Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype,
+            // "X").get` pattern. The class macro doesn't emit
+            // ACCESSOR descriptors for instance-side data properties
+            // (response / responseText / etc.) — they live on each
+            // instance as own data props. Install thin accessor
+            // shims that delegate to the instance fields so the
+            // descriptor read returns a real getter function. The
+            // earlier BROWSER_APIS_BOOTSTRAP pass tried to do the
+            // same thing but ran BEFORE install_xhr, so it
+            // no-op'd silently. We retry here.
+            context
+                .with(|ctx| -> rquickjs::Result<()> {
+                    ctx.eval::<(), _>(XHR_PROTO_ACCESSOR_BOOTSTRAP)?;
+                    Ok(())
+                })
+                .map_err(|e| EvalError::Engine(format!("install xhr proto accessors: {e}")))?;
             Some(XhrState {
                 queue,
                 mode: fs.mode.clone(),
@@ -3897,6 +3918,41 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         };
     }
 
+    // -------------------------------------------------------------
+    // performance.* method completion.
+    //
+    // The Rust-side `install_browser_apis` installs `performance.now()`
+    // and `.timeOrigin`. Bundles like airgap.js read additional
+    // methods (`setResourceTimingBufferSize`, `getEntries`,
+    // `getEntriesByType`, `clearResourceTimings`, etc.) that the
+    // user-timing add-on later patches with real implementations.
+    // Install no-op stubs so the early reach (`performance.X` call)
+    // doesn't throw "not a function".
+    // -------------------------------------------------------------
+    if (typeof globalThis.performance === 'object' && globalThis.performance != null) {
+        var perf = globalThis.performance;
+        if (typeof perf.setResourceTimingBufferSize !== 'function') {
+            perf.setResourceTimingBufferSize = function () {};
+        }
+        if (typeof perf.clearResourceTimings !== 'function') {
+            perf.clearResourceTimings = function () {};
+        }
+        if (typeof perf.getEntries !== 'function') {
+            perf.getEntries = function () { return []; };
+        }
+        if (typeof perf.getEntriesByType !== 'function') {
+            perf.getEntriesByType = function () { return []; };
+        }
+        if (typeof perf.getEntriesByName !== 'function') {
+            perf.getEntriesByName = function () { return []; };
+        }
+        if (typeof perf.toJSON !== 'function') {
+            perf.toJSON = function () {
+                return { timeOrigin: this.timeOrigin || 0 };
+            };
+        }
+    }
+
     // requestAnimationFrame(cb) / cancelAnimationFrame(id) — route to
     // setTimeout(cb, 16). 16ms ~= 60fps. The id returned IS the
     // setTimeout id, so cancelAnimationFrame just calls clearTimeout.
@@ -4497,6 +4553,1957 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         // it.
         globalThis.$RT = 0;
     }
+
+    // -------------------------------------------------------------
+    // Spec-IDL constructor stubs that bundled web code destructures
+    // method handles off at module-init time.
+    //
+    // The Transcend `airgap.js` consent script (vendored on every
+    // MDN page) opens with a giant `{X:y,...} = globalThis`
+    // destructure that includes MessagePort, MessageChannel,
+    // History, SubmitEvent, CookieChangeEvent, CookieStore,
+    // SecurityPolicyViolationEvent, ReadableStream, Intl,
+    // DOMParser, XMLSerializer, NamedNodeMap, DocumentType,
+    // CharacterData, etc. The destructure itself just yields
+    // `undefined` for missing names — harmless. The crash comes a
+    // few statements later when the script does
+    // `{postMessage:pE,start:lE,close:uE} = MessagePort.prototype`
+    // (`TC[P]` in the minified code) — `undefined.prototype`
+    // throws "cannot read property 'prototype' of undefined".
+    //
+    // Each of the missing types gets a stub constructor: a function
+    // that throws `Illegal constructor` on direct `new`, with a
+    // `.prototype` object exposing the spec methods airgap (and
+    // similar bundles) destructure. The methods are no-ops that
+    // return safe defaults — frameworks at module-init time only
+    // CAPTURE the references; they call them at runtime, by which
+    // point we hope a real implementation has been wired (e.g. the
+    // History stub points at the existing `globalThis.history`
+    // object). For shapes we don't intend to implement
+    // (MessagePort, ReadableStream) the no-ops are deliberately
+    // inert — calling them is rare in agent-relevant paths.
+    //
+    // Idempotent: each `if (typeof ... === 'undefined')` guards
+    // against re-registration on a second engine init pass and
+    // against collision with a real implementation if one lands.
+    // -------------------------------------------------------------
+    function makeStubCtor(name, protoMethods) {
+        var ctor = function () { throw new TypeError(name + ': Illegal constructor'); };
+        try {
+            Object.defineProperty(ctor, 'name', { value: name, configurable: true });
+        } catch (e) {}
+        var proto = {};
+        for (var i = 0; i < protoMethods.length; i++) {
+            proto[protoMethods[i]] = function () {};
+        }
+        Object.defineProperty(proto, 'constructor', {
+            value: ctor, writable: true, enumerable: false, configurable: true,
+        });
+        ctor.prototype = proto;
+        return ctor;
+    }
+
+    if (typeof globalThis.MessagePort === 'undefined') {
+        // WHATWG HTML §9.2.7. Spec methods: postMessage(message,
+        // transferable?), start(), close(), addEventListener
+        // (inherits EventTarget). No backing impl in heso.
+        globalThis.MessagePort = makeStubCtor(
+            'MessagePort',
+            ['postMessage', 'start', 'close', 'addEventListener', 'removeEventListener', 'dispatchEvent']
+        );
+    }
+    if (typeof globalThis.MessageChannel === 'undefined') {
+        // WHATWG HTML §9.2.6. `new MessageChannel()` yields a pair
+        // of MessagePorts; we expose a real constructor that returns
+        // two stub MessagePort instances so site code that does
+        // `var ch = new MessageChannel(); ch.port1.postMessage(...)`
+        // doesn't throw on construction.
+        globalThis.MessageChannel = function MessageChannel() {
+            this.port1 = Object.create(globalThis.MessagePort.prototype);
+            this.port2 = Object.create(globalThis.MessagePort.prototype);
+        };
+        globalThis.MessageChannel.prototype = {
+            constructor: globalThis.MessageChannel,
+        };
+    }
+    if (typeof globalThis.History === 'undefined') {
+        // WHATWG HTML §7.7.1. Method shapes: go(delta?), back(),
+        // forward(), pushState(state, title, url?),
+        // replaceState(state, title, url?). The existing
+        // `globalThis.history` object (installed by
+        // [`crate::history::install_history`]) already has these
+        // methods; we expose the spec-named constructor so
+        // `history instanceof History` works AND so the prototype
+        // destructure pattern (`{go,replaceState}=History.prototype`
+        // in airgap.js) yields real function references.
+        globalThis.History = function History() {
+            throw new TypeError('History: Illegal constructor');
+        };
+        var hist = globalThis.history;
+        var historyProto = {
+            constructor: globalThis.History,
+            go: hist && typeof hist.go === 'function' ? hist.go : function () {},
+            back: hist && typeof hist.back === 'function' ? hist.back : function () {},
+            forward: hist && typeof hist.forward === 'function' ? hist.forward : function () {},
+            pushState: hist && typeof hist.pushState === 'function' ? hist.pushState : function () {},
+            replaceState: hist && typeof hist.replaceState === 'function' ? hist.replaceState : function () {},
+        };
+        globalThis.History.prototype = historyProto;
+    }
+    // Spec-event constructor factory. Real bundles build instances
+    // (`new SubmitEvent('submit')`, `new SecurityPolicyViolationEvent
+    // ('securitypolicyviolation')`, etc.) so the constructor must be
+    // callable. We extend Event (a real built-in) to preserve
+    // `isTrusted` / `type` / `bubbles` / `cancelable` plumbing, and
+    // we surface a `.constructor.name` of the spec event name so
+    // `event.constructor.name === "SubmitEvent"` works.
+    //
+    // `defaultMembers` becomes both (a) per-instance default values
+    // applied in the constructor (so `e.submitter` is `null` on a
+    // fresh `new SubmitEvent()`), AND (b) PROTOTYPE-level accessor
+    // descriptors so the `Object.getOwnPropertyDescriptor(Event,
+    // "X").get` pattern returns a real getter. The accessor reads
+    // back through the instance-side storage; the constructor
+    // assigns there.
+    function makeEventSubclass(name, defaultMembers) {
+        var ctor;
+        // Use a plain function so we work even when the host
+        // Event base class lacks subclass-via-class syntax.
+        if (typeof globalThis.Event === 'function') {
+            ctor = function (type, init) {
+                globalThis.Event.call(this, type, init || {});
+                if (init) {
+                    for (var k in init) {
+                        if (Object.prototype.hasOwnProperty.call(init, k)) {
+                            try {
+                                // Stash under a parallel hidden slot
+                                // so the prototype accessor can read
+                                // it back without recursing.
+                                Object.defineProperty(this, '__' + k, {
+                                    value: init[k],
+                                    writable: true, enumerable: false, configurable: true,
+                                });
+                            } catch (e) {}
+                        }
+                    }
+                }
+                if (defaultMembers) {
+                    for (var dk in defaultMembers) {
+                        if (typeof this['__' + dk] === 'undefined') {
+                            try {
+                                Object.defineProperty(this, '__' + dk, {
+                                    value: defaultMembers[dk],
+                                    writable: true, enumerable: false, configurable: true,
+                                });
+                            } catch (e) {}
+                        }
+                    }
+                }
+            };
+            try {
+                ctor.prototype = Object.create(globalThis.Event.prototype);
+                ctor.prototype.constructor = ctor;
+            } catch (e) {
+                ctor.prototype = { constructor: ctor };
+            }
+        } else {
+            ctor = function (type, init) {
+                this.type = type || '';
+                this.bubbles = !!(init && init.bubbles);
+                this.cancelable = !!(init && init.cancelable);
+                this.composed = !!(init && init.composed);
+                this.isTrusted = false;
+                if (init) {
+                    for (var k in init) {
+                        if (Object.prototype.hasOwnProperty.call(init, k)) {
+                            try {
+                                Object.defineProperty(this, '__' + k, {
+                                    value: init[k],
+                                    writable: true, enumerable: false, configurable: true,
+                                });
+                            } catch (e) {}
+                        }
+                    }
+                }
+                if (defaultMembers) {
+                    for (var dk in defaultMembers) {
+                        if (typeof this['__' + dk] === 'undefined') {
+                            try {
+                                Object.defineProperty(this, '__' + dk, {
+                                    value: defaultMembers[dk],
+                                    writable: true, enumerable: false, configurable: true,
+                                });
+                            } catch (e) {}
+                        }
+                    }
+                }
+            };
+            ctor.prototype = { constructor: ctor };
+        }
+        try {
+            Object.defineProperty(ctor, 'name', { value: name, configurable: true });
+        } catch (e) {}
+        // Install ACCESSOR descriptors for each spec-specific member
+        // on the prototype. The descriptor's get returns
+        // `this.__name`; the set updates the same slot.
+        if (defaultMembers) {
+            for (var name_ in defaultMembers) {
+                (function (memberName, defaultValue) {
+                    try {
+                        Object.defineProperty(ctor.prototype, memberName, {
+                            get: function () {
+                                var v = this['__' + memberName];
+                                return v === undefined ? defaultValue : v;
+                            },
+                            set: function (v) {
+                                try {
+                                    Object.defineProperty(this, '__' + memberName, {
+                                        value: v,
+                                        writable: true, enumerable: false, configurable: true,
+                                    });
+                                } catch (e) {}
+                            },
+                            enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
+                })(name_, defaultMembers[name_]);
+            }
+        }
+        return ctor;
+    }
+
+    if (typeof globalThis.SubmitEvent === 'undefined') {
+        // WHATWG HTML §4.10.21. Extends Event with `submitter`
+        // (HTMLElement?).
+        globalThis.SubmitEvent = makeEventSubclass('SubmitEvent', { submitter: null });
+    }
+    if (typeof globalThis.CookieChangeEvent === 'undefined') {
+        globalThis.CookieChangeEvent = makeEventSubclass(
+            'CookieChangeEvent', { changed: [], deleted: [] }
+        );
+    }
+    if (typeof globalThis.CookieStore === 'undefined') {
+        // WHATWG Cookie Store API. Methods: get, getAll, set, delete.
+        globalThis.CookieStore = makeStubCtor(
+            'CookieStore',
+            ['get', 'getAll', 'set', 'delete', 'addEventListener', 'removeEventListener', 'dispatchEvent']
+        );
+    }
+    // -------------------------------------------------------------
+    // EventTarget.prototype permissive override.
+    //
+    // The rquickjs `EventTarget` class accepts only `Class<EventTarget>`
+    // instances as the receiver. Bundles like Transcend's airgap.js
+    // capture `EventTarget.prototype.addEventListener` at module-init
+    // time via `Object.getOwnPropertyDescriptor(EventTarget.prototype,
+    // "addEventListener").value` (or a similar variant), then call
+    // the captured reference with arbitrary singletons as `this`
+    // (cookieStore, performance, document, etc.). Some of those
+    // singletons are real EventTarget classes (Element, Document via
+    // class definitions); others are plain POJOs we install in this
+    // bootstrap. The strict rquickjs `this` guard rejects the POJO
+    // path with "Error converting from js 'object' into type
+    // 'EventTarget'", crashing the bundle.
+    //
+    // We replace the prototype methods with JS shims that store
+    // listeners as own-property maps on the receiver. This is
+    // duck-typing-friendly: real EventTarget instances still work
+    // (the shim is just JS, no type guard), and POJOs work too.
+    // For DOM nodes that go through the Rust dispatch path, the
+    // existing `Element.prototype.addEventListener` (defined on
+    // Element.prototype via the rquickjs Element class) shadows the
+    // EventTarget prototype, so real-element dispatch is unchanged.
+    // -------------------------------------------------------------
+    if (typeof globalThis.EventTarget === 'function' && globalThis.EventTarget.prototype) {
+        var etProto = globalThis.EventTarget.prototype;
+        var ET_LISTENERS_KEY = '__hesoEtListeners';
+        try {
+            Object.defineProperty(etProto, 'addEventListener', {
+                value: function (type, listener, options) {
+                    if (this == null || typeof type !== 'string'
+                        || typeof listener !== 'function') return;
+                    var store = this[ET_LISTENERS_KEY];
+                    if (!store) {
+                        try {
+                            Object.defineProperty(this, ET_LISTENERS_KEY, {
+                                value: {}, writable: true,
+                                enumerable: false, configurable: true,
+                            });
+                            store = this[ET_LISTENERS_KEY];
+                        } catch (e) { return; }
+                    }
+                    if (!store[type]) store[type] = [];
+                    var capture = false, once = false, passive = false;
+                    if (typeof options === 'boolean') capture = options;
+                    else if (options && typeof options === 'object') {
+                        capture = !!options.capture;
+                        once = !!options.once;
+                        passive = !!options.passive;
+                    }
+                    store[type].push({ listener: listener, capture: capture, once: once, passive: passive });
+                },
+                writable: true, enumerable: false, configurable: true,
+            });
+            Object.defineProperty(etProto, 'removeEventListener', {
+                value: function (type, listener, options) {
+                    if (this == null || typeof type !== 'string'
+                        || typeof listener !== 'function') return;
+                    var store = this[ET_LISTENERS_KEY];
+                    if (!store || !store[type]) return;
+                    var capture = typeof options === 'boolean'
+                        ? options
+                        : (options && options.capture);
+                    store[type] = store[type].filter(function (e) {
+                        return e.listener !== listener || e.capture !== !!capture;
+                    });
+                },
+                writable: true, enumerable: false, configurable: true,
+            });
+            Object.defineProperty(etProto, 'dispatchEvent', {
+                value: function (event) {
+                    if (this == null || event == null) return true;
+                    var type = event && event.type;
+                    if (typeof type !== 'string') return true;
+                    var store = this[ET_LISTENERS_KEY];
+                    if (!store || !store[type]) return true;
+                    var arr = store[type].slice();
+                    for (var i = 0; i < arr.length; i++) {
+                        try {
+                            arr[i].listener.call(this, event);
+                        } catch (e) {
+                            if (typeof console !== 'undefined' && console.error) {
+                                console.error('EventTarget dispatch listener threw:',
+                                    e && e.message ? e.message : e);
+                            }
+                        }
+                        if (arr[i].once) {
+                            this.removeEventListener(type, arr[i].listener, arr[i].capture);
+                        }
+                    }
+                    return !event.defaultPrevented;
+                },
+                writable: true, enumerable: false, configurable: true,
+            });
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.warn) {
+                console.warn('heso: EventTarget permissive override failed:',
+                    e && e.message ? e.message : e);
+            }
+        }
+    }
+    if (typeof globalThis.cookieStore === 'undefined') {
+        // Lowercase: the live singleton (per spec, `window.cookieStore`
+        // is the instance — like `navigator` or `location`). Returns
+        // empty results so probes don't throw, but agent code wanting
+        // cookies should still use `document.cookie`.
+        //
+        // Real bundles (airgap.js) call
+        // `EventTarget.prototype.addEventListener.call(cookieStore,
+        // "change", ...)` — capturing the prototype method via
+        // `H($e, ...)` and invoking with our singleton as `this`.
+        // The rquickjs EventTarget class rejects non-instance
+        // receivers, so we need cookieStore to either BE an
+        // EventTarget instance (constructable) OR to shadow the
+        // prototype methods with own-property no-ops that the
+        // capture-and-call path never reaches.
+        //
+        // We pick (b): assign the own properties so they're seen
+        // before the prototype walk during normal `.addEventListener
+        // (...)` calls. But the airgap pattern is a captured
+        // reference, so own-property shadowing doesn't help there.
+        // We construct an actual EventTarget if the runtime exposes
+        // it as a usable constructor — that gives `addEventListener`
+        // bound to a real receiver. Otherwise fall back to a plain
+        // POJO with no-op shadows; the captured-call pattern is
+        // niche enough that a warning suffices.
+        var cookieStoreObj;
+        try {
+            cookieStoreObj = new globalThis.EventTarget();
+        } catch (e) {
+            cookieStoreObj = {};
+        }
+        cookieStoreObj.get = function () { return Promise.resolve(null); };
+        cookieStoreObj.getAll = function () { return Promise.resolve([]); };
+        cookieStoreObj.set = function () { return Promise.resolve(); };
+        cookieStoreObj.delete = function () { return Promise.resolve(); };
+        // Shadow addEventListener / removeEventListener / dispatchEvent
+        // as own properties so the normal `cookieStore.add(...)`
+        // path doesn't reach EventTarget.prototype (where the
+        // rquickjs type guard rejects non-EventTarget receivers).
+        // The captured `H($e, ...)` pattern is still served by the
+        // real EventTarget instance underneath.
+        cookieStoreObj.onchange = null;
+        globalThis.cookieStore = cookieStoreObj;
+    }
+    if (typeof globalThis.SecurityPolicyViolationEvent === 'undefined') {
+        globalThis.SecurityPolicyViolationEvent = makeEventSubclass(
+            'SecurityPolicyViolationEvent',
+            {
+                documentURI: '', referrer: '', blockedURI: '',
+                violatedDirective: '', effectiveDirective: '',
+                originalPolicy: '', disposition: 'enforce',
+                sourceFile: '', lineNumber: 0, columnNumber: 0,
+                statusCode: 0, sample: ''
+            }
+        );
+    }
+    if (typeof globalThis.ReadableStream === 'undefined') {
+        // WHATWG Streams §3.2. Methods: cancel, getReader,
+        // pipeThrough, pipeTo, tee.
+        globalThis.ReadableStream = makeStubCtor(
+            'ReadableStream',
+            ['cancel', 'getReader', 'pipeThrough', 'pipeTo', 'tee']
+        );
+    }
+    if (typeof globalThis.WritableStream === 'undefined') {
+        globalThis.WritableStream = makeStubCtor(
+            'WritableStream',
+            ['abort', 'close', 'getWriter']
+        );
+    }
+    if (typeof globalThis.TransformStream === 'undefined') {
+        globalThis.TransformStream = makeStubCtor('TransformStream', []);
+    }
+    if (typeof globalThis.NamedNodeMap === 'undefined') {
+        globalThis.NamedNodeMap = makeStubCtor(
+            'NamedNodeMap',
+            ['getNamedItem', 'setNamedItem', 'removeNamedItem', 'item', 'getNamedItemNS', 'setNamedItemNS', 'removeNamedItemNS']
+        );
+    }
+    if (typeof globalThis.Attr === 'undefined') {
+        globalThis.Attr = makeStubCtor('Attr', []);
+    }
+    if (typeof globalThis.DocumentType === 'undefined') {
+        globalThis.DocumentType = makeStubCtor('DocumentType', ['remove']);
+    }
+    if (typeof globalThis.CharacterData === 'undefined') {
+        // WHATWG DOM §4.10. Spec methods: substringData, appendData,
+        // insertData, deleteData, replaceData; plus before/after/
+        // replaceWith/remove from ChildNode mixin.
+        globalThis.CharacterData = makeStubCtor(
+            'CharacterData',
+            ['substringData', 'appendData', 'insertData', 'deleteData', 'replaceData', 'before', 'after', 'replaceWith', 'remove']
+        );
+    }
+    if (typeof globalThis.Text === 'undefined') {
+        globalThis.Text = makeStubCtor('Text', ['splitText']);
+    }
+    if (typeof globalThis.Comment === 'undefined') {
+        globalThis.Comment = makeStubCtor('Comment', []);
+    }
+    if (typeof globalThis.DOMParser === 'undefined') {
+        // WHATWG DOM Parsing & Serialization §2.1. Method:
+        // parseFromString(string, type) — returns Document.
+        var DOMParser = function DOMParser() {};
+        DOMParser.prototype = {
+            constructor: DOMParser,
+            parseFromString: function (str, type) {
+                // Approximate via the createHTMLDocument shim,
+                // then drop the source into <body>.innerHTML.
+                if (typeof document === 'undefined' || !document.implementation) {
+                    throw new TypeError('DOMParser: no document.implementation available');
+                }
+                var d = document.implementation.createHTMLDocument('');
+                if (typeof str === 'string' && d.body) {
+                    try { d.body.innerHTML = str; } catch (e) {}
+                }
+                return d;
+            }
+        };
+        globalThis.DOMParser = DOMParser;
+    }
+    if (typeof globalThis.XMLSerializer === 'undefined') {
+        var XMLSerializer = function XMLSerializer() {};
+        XMLSerializer.prototype = {
+            constructor: XMLSerializer,
+            serializeToString: function (node) {
+                if (node == null) return '';
+                if (typeof node.outerHTML === 'string') return node.outerHTML;
+                if (typeof node.toString === 'function') return node.toString();
+                return '';
+            }
+        };
+        globalThis.XMLSerializer = XMLSerializer;
+    }
+    if (typeof globalThis.DOMImplementation === 'undefined') {
+        // The constructor isn't user-callable per spec, but airgap
+        // and other bundles do `instanceof DOMImplementation` checks
+        // — give them something to chain into.
+        globalThis.DOMImplementation = makeStubCtor(
+            'DOMImplementation',
+            ['createHTMLDocument', 'createDocument', 'createDocumentType', 'hasFeature']
+        );
+    }
+    if (typeof globalThis.HTMLDocument === 'undefined') {
+        // Spec: HTMLDocument inherits Document. heso doesn't split
+        // these — we expose the bare constructor so `instanceof` /
+        // prototype destructure pattern doesn't crash.
+        globalThis.HTMLDocument = makeStubCtor('HTMLDocument', []);
+    }
+    if (typeof globalThis.Navigator === 'undefined') {
+        // Spec methods + accessors that real-world bundles destructure
+        // off Navigator.prototype: sendBeacon (method), vibrate
+        // (method), share (method), languages (accessor),
+        // userAgent (accessor), language (accessor),
+        // serviceWorker (accessor), userAgentData (accessor),
+        // hardwareConcurrency (accessor), deviceMemory (accessor),
+        // onLine (accessor), cookieEnabled (accessor),
+        // doNotTrack (accessor). The singleton
+        // `globalThis.navigator` already exposes most of these as
+        // data properties; the prototype-side ACCESSOR descriptors
+        // exist only here so the
+        // `Object.getOwnPropertyDescriptor(Navigator.prototype, X).get`
+        // pattern returns a real function.
+        var Navigator = function Navigator() {
+            throw new TypeError('Navigator: Illegal constructor');
+        };
+        Navigator.prototype = {
+            constructor: Navigator,
+            sendBeacon: function () { return true; },
+            vibrate: function () { return false; },
+            share: function () { return Promise.reject(new Error('share not supported')); },
+        };
+        // Each property is installed as an accessor descriptor so
+        // `H(Navigator,"X").get` resolves to a real function. The
+        // getter reads the corresponding singleton field so the
+        // value stays in sync with whatever the engine has set on
+        // `globalThis.navigator`.
+        function navAccessor(name, dflt) {
+            try {
+                Object.defineProperty(Navigator.prototype, name, {
+                    get: function () {
+                        try {
+                            var v = globalThis.navigator && globalThis.navigator[name];
+                            return v == null ? dflt : v;
+                        } catch (e) { return dflt; }
+                    },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        navAccessor('languages', ['en-US']);
+        navAccessor('language', 'en-US');
+        navAccessor('userAgent', 'Mozilla/5.0 (compatible; heso/0.0.1)');
+        navAccessor('platform', 'Linux x86_64');
+        navAccessor('onLine', true);
+        navAccessor('cookieEnabled', true);
+        navAccessor('webdriver', false);
+        navAccessor('hardwareConcurrency', 1);
+        navAccessor('deviceMemory', 4);
+        navAccessor('doNotTrack', null);
+        navAccessor('userAgentData', null);
+        navAccessor('serviceWorker', null);
+        navAccessor('clipboard', null);
+        navAccessor('mediaDevices', null);
+        navAccessor('storage', null);
+        navAccessor('credentials', null);
+        navAccessor('permissions', null);
+        navAccessor('connection', null);
+        navAccessor('plugins', { length: 0 });
+        navAccessor('mimeTypes', { length: 0 });
+        navAccessor('vendor', '');
+        navAccessor('vendorSub', '');
+        navAccessor('productSub', '20030107');
+        navAccessor('product', 'Gecko');
+        navAccessor('appCodeName', 'Mozilla');
+        navAccessor('appName', 'Netscape');
+        navAccessor('appVersion', '5.0');
+        globalThis.Navigator = Navigator;
+    }
+    if (typeof globalThis.TreeWalker === 'undefined') {
+        globalThis.TreeWalker = makeStubCtor(
+            'TreeWalker',
+            ['firstChild', 'lastChild', 'nextNode', 'previousNode', 'parentNode', 'nextSibling', 'previousSibling']
+        );
+    }
+    if (typeof globalThis.Range === 'undefined') {
+        globalThis.Range = makeStubCtor(
+            'Range',
+            ['setStart', 'setEnd', 'cloneRange', 'detach', 'collapse', 'selectNode', 'selectNodeContents',
+             'deleteContents', 'extractContents', 'cloneContents', 'insertNode', 'surroundContents',
+             'compareBoundaryPoints', 'isPointInRange', 'comparePoint', 'intersectsNode']
+        );
+        // commonAncestorContainer / startContainer / endContainer /
+        // startOffset / endOffset / collapsed are accessor
+        // descriptors per WHATWG DOM §5.5 "Interface Range". Bundles
+        // like Transcend's airgap read `H(Range,"commonAncestorContainer").get`
+        // at module-init time; without an accessor descriptor the
+        // .get access throws.
+        try {
+            Object.defineProperty(globalThis.Range.prototype, 'commonAncestorContainer', {
+                get: function () { return globalThis.document || null; },
+                set: function () {},
+                enumerable: false, configurable: true,
+            });
+            Object.defineProperty(globalThis.Range.prototype, 'startContainer', {
+                get: function () { return globalThis.document || null; },
+                set: function () {},
+                enumerable: false, configurable: true,
+            });
+            Object.defineProperty(globalThis.Range.prototype, 'endContainer', {
+                get: function () { return globalThis.document || null; },
+                set: function () {},
+                enumerable: false, configurable: true,
+            });
+            Object.defineProperty(globalThis.Range.prototype, 'startOffset', {
+                get: function () { return 0; },
+                set: function () {},
+                enumerable: false, configurable: true,
+            });
+            Object.defineProperty(globalThis.Range.prototype, 'endOffset', {
+                get: function () { return 0; },
+                set: function () {},
+                enumerable: false, configurable: true,
+            });
+            Object.defineProperty(globalThis.Range.prototype, 'collapsed', {
+                get: function () { return true; },
+                set: function () {},
+                enumerable: false, configurable: true,
+            });
+        } catch (e) {}
+    }
+    if (typeof globalThis.NodeFilter === 'undefined') {
+        // Spec constants for filter return values.
+        globalThis.NodeFilter = {
+            FILTER_ACCEPT: 1,
+            FILTER_REJECT: 2,
+            FILTER_SKIP: 3,
+            SHOW_ALL: 0xFFFFFFFF,
+            SHOW_ELEMENT: 1,
+            SHOW_ATTRIBUTE: 2,
+            SHOW_TEXT: 4,
+            SHOW_CDATA_SECTION: 8,
+            SHOW_ENTITY_REFERENCE: 16,
+            SHOW_ENTITY: 32,
+            SHOW_PROCESSING_INSTRUCTION: 64,
+            SHOW_COMMENT: 128,
+            SHOW_DOCUMENT: 256,
+            SHOW_DOCUMENT_TYPE: 512,
+            SHOW_DOCUMENT_FRAGMENT: 1024,
+            SHOW_NOTATION: 2048,
+        };
+    }
+    if (typeof globalThis.Performance === 'undefined') {
+        // `globalThis.performance` exists with .now, .timeOrigin,
+        // user-timing methods. Expose the spec name so `instanceof`
+        // works, plus stub methods bundles destructure off the
+        // prototype (`getEntries`, `getEntriesByName`,
+        // `getEntriesByType`, `clearResourceTimings`, `mark`,
+        // `measure`, `clearMarks`, `clearMeasures`, `now`,
+        // `toJSON`).
+        globalThis.Performance = makeStubCtor(
+            'Performance',
+            ['getEntries', 'getEntriesByName', 'getEntriesByType',
+             'clearResourceTimings', 'mark', 'measure', 'clearMarks',
+             'clearMeasures', 'now', 'toJSON', 'setResourceTimingBufferSize']
+        );
+        // `getEntries` etc. on the stub prototype return [] so the
+        // common `performance.getEntries().filter(...)` pattern
+        // doesn't throw at iteration. Replace the `function(){}`
+        // bodies installed by makeStubCtor.
+        ['getEntries', 'getEntriesByName', 'getEntriesByType'].forEach(function (m) {
+            try {
+                Object.defineProperty(globalThis.Performance.prototype, m, {
+                    value: function () { return []; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        });
+        try {
+            Object.defineProperty(globalThis.Performance.prototype, 'now', {
+                value: function () { return 0; },
+                writable: true, enumerable: false, configurable: true,
+            });
+        } catch (e) {}
+    }
+    if (typeof globalThis.Storage === 'undefined') {
+        globalThis.Storage = makeStubCtor(
+            'Storage',
+            ['getItem', 'setItem', 'removeItem', 'clear', 'key']
+        );
+    }
+    if (typeof globalThis.Window === 'undefined') {
+        // Many feature-detects do `globalThis instanceof Window`.
+        // Expose a constructor whose prototype is `Object.prototype`
+        // so the chain doesn't need to be re-pointed at globalThis.
+        globalThis.Window = makeStubCtor('Window', []);
+    }
+    if (typeof globalThis.Document === 'undefined') {
+        // Note: a real `Document` class IS installed by
+        // [`crate::custom_elements::install_custom_elements`] after
+        // the bootstrap runs the first time the engine sees a real
+        // document. This branch only fires on a bare-engine path
+        // (no document loaded yet) so the constructor exists for
+        // feature-detection.
+        globalThis.Document = makeStubCtor('Document', []);
+    }
+    if (typeof globalThis.HTMLFormControlsCollection === 'undefined') {
+        globalThis.HTMLFormControlsCollection = makeStubCtor('HTMLFormControlsCollection', ['namedItem']);
+    }
+    if (typeof globalThis.RadioNodeList === 'undefined') {
+        globalThis.RadioNodeList = makeStubCtor('RadioNodeList', []);
+    }
+    if (typeof globalThis.PageTransitionEvent === 'undefined') {
+        globalThis.PageTransitionEvent = makeEventSubclass('PageTransitionEvent', { persisted: false });
+    }
+    if (typeof globalThis.HashChangeEvent === 'undefined') {
+        globalThis.HashChangeEvent = makeEventSubclass('HashChangeEvent', { oldURL: '', newURL: '' });
+    }
+    if (typeof globalThis.BeforeUnloadEvent === 'undefined') {
+        globalThis.BeforeUnloadEvent = makeEventSubclass('BeforeUnloadEvent', { returnValue: '' });
+    }
+    if (typeof globalThis.ClipboardEvent === 'undefined') {
+        globalThis.ClipboardEvent = makeEventSubclass('ClipboardEvent', { clipboardData: null });
+    }
+    if (typeof globalThis.DragEvent === 'undefined') {
+        globalThis.DragEvent = makeEventSubclass('DragEvent', { dataTransfer: null });
+    }
+    if (typeof globalThis.ErrorEvent === 'undefined') {
+        globalThis.ErrorEvent = makeEventSubclass(
+            'ErrorEvent', { message: '', filename: '', lineno: 0, colno: 0, error: null }
+        );
+    }
+    if (typeof globalThis.PromiseRejectionEvent === 'undefined') {
+        globalThis.PromiseRejectionEvent = makeEventSubclass(
+            'PromiseRejectionEvent', { promise: null, reason: null }
+        );
+    }
+    if (typeof globalThis.MessageEvent === 'undefined') {
+        globalThis.MessageEvent = makeEventSubclass(
+            'MessageEvent',
+            { data: null, origin: '', lastEventId: '', source: null, ports: [] }
+        );
+    }
+    if (typeof globalThis.Response === 'undefined') {
+        // WHATWG Fetch §5. Methods bundles reach for off
+        // Response.prototype: `.json()`, `.text()`, `.arrayBuffer()`,
+        // `.blob()`, `.formData()`, `.clone()`. heso's fetch()
+        // returns a real Response-shaped object today (see
+        // src/fetch.rs), so the stub here is a feature-detect
+        // fallback for code that captures references on
+        // Response.prototype directly at module-init time.
+        globalThis.Response = makeStubCtor(
+            'Response',
+            ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'clone']
+        );
+    }
+    if (typeof globalThis.Request === 'undefined') {
+        globalThis.Request = makeStubCtor(
+            'Request',
+            ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'clone']
+        );
+    }
+    if (typeof globalThis.TextEncoder === 'undefined') {
+        // WHATWG Encoding §6. The constructor returns an instance
+        // with `encoding === 'utf-8'` and `.encode(str) -> Uint8Array`.
+        // Real implementation: convert each code point to UTF-8
+        // bytes; QuickJS's `JS_NewStringUTF8` already does this in
+        // C, so we can punt to an inefficient JS impl that's enough
+        // for the feature-detect path.
+        var TextEncoder = function TextEncoder() {
+            this.encoding = 'utf-8';
+        };
+        TextEncoder.prototype = {
+            constructor: TextEncoder,
+            encoding: 'utf-8',
+            encode: function (input) {
+                input = String(input == null ? '' : input);
+                // Manual UTF-8 encode. Slow but correct for the
+                // ASCII + BMP path airgap tests against.
+                var bytes = [];
+                for (var i = 0; i < input.length; i++) {
+                    var cp = input.charCodeAt(i);
+                    // Handle surrogate pairs to get full code points.
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < input.length) {
+                        var low = input.charCodeAt(i + 1);
+                        if (low >= 0xDC00 && low <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                            i++;
+                        }
+                    }
+                    if (cp < 0x80) {
+                        bytes.push(cp);
+                    } else if (cp < 0x800) {
+                        bytes.push(0xC0 | (cp >> 6));
+                        bytes.push(0x80 | (cp & 0x3F));
+                    } else if (cp < 0x10000) {
+                        bytes.push(0xE0 | (cp >> 12));
+                        bytes.push(0x80 | ((cp >> 6) & 0x3F));
+                        bytes.push(0x80 | (cp & 0x3F));
+                    } else {
+                        bytes.push(0xF0 | (cp >> 18));
+                        bytes.push(0x80 | ((cp >> 12) & 0x3F));
+                        bytes.push(0x80 | ((cp >> 6) & 0x3F));
+                        bytes.push(0x80 | (cp & 0x3F));
+                    }
+                }
+                return new Uint8Array(bytes);
+            },
+            encodeInto: function (input, dest) {
+                var arr = this.encode(input);
+                var n = Math.min(arr.length, dest.length);
+                for (var i = 0; i < n; i++) dest[i] = arr[i];
+                return { read: input.length, written: n };
+            }
+        };
+        globalThis.TextEncoder = TextEncoder;
+    }
+    if (typeof globalThis.TextDecoder === 'undefined') {
+        var TextDecoder = function TextDecoder(label, options) {
+            this.encoding = (label || 'utf-8').toLowerCase();
+            this.fatal = !!(options && options.fatal);
+            this.ignoreBOM = !!(options && options.ignoreBOM);
+        };
+        TextDecoder.prototype = {
+            constructor: TextDecoder,
+            decode: function (input) {
+                if (input == null) return '';
+                var bytes = input instanceof Uint8Array
+                    ? input
+                    : (input.buffer ? new Uint8Array(input.buffer) : new Uint8Array(input));
+                // UTF-8 decode.
+                var out = '';
+                var i = 0;
+                while (i < bytes.length) {
+                    var b1 = bytes[i++];
+                    var cp;
+                    if (b1 < 0x80) {
+                        cp = b1;
+                    } else if ((b1 & 0xE0) === 0xC0) {
+                        cp = ((b1 & 0x1F) << 6) | (bytes[i++] & 0x3F);
+                    } else if ((b1 & 0xF0) === 0xE0) {
+                        cp = ((b1 & 0x0F) << 12) | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
+                    } else {
+                        cp = ((b1 & 0x07) << 18) | ((bytes[i++] & 0x3F) << 12)
+                           | ((bytes[i++] & 0x3F) << 6) | (bytes[i++] & 0x3F);
+                    }
+                    if (cp < 0x10000) {
+                        out += String.fromCharCode(cp);
+                    } else {
+                        cp -= 0x10000;
+                        out += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+                    }
+                }
+                return out;
+            }
+        };
+        globalThis.TextDecoder = TextDecoder;
+    }
+    if (typeof globalThis.PerformanceObserverEntryList === 'undefined') {
+        globalThis.PerformanceObserverEntryList = makeStubCtor(
+            'PerformanceObserverEntryList',
+            ['getEntries', 'getEntriesByName', 'getEntriesByType']
+        );
+    }
+    if (typeof globalThis.PerformanceEntry === 'undefined') {
+        globalThis.PerformanceEntry = makeStubCtor('PerformanceEntry', ['toJSON']);
+    }
+    if (typeof globalThis.PerformanceResourceTiming === 'undefined') {
+        globalThis.PerformanceResourceTiming = makeStubCtor('PerformanceResourceTiming', ['toJSON']);
+    }
+    if (typeof globalThis.PerformanceMark === 'undefined') {
+        globalThis.PerformanceMark = makeStubCtor('PerformanceMark', ['toJSON']);
+    }
+    if (typeof globalThis.PerformanceMeasure === 'undefined') {
+        globalThis.PerformanceMeasure = makeStubCtor('PerformanceMeasure', ['toJSON']);
+    }
+    if (typeof globalThis.PerformanceNavigationTiming === 'undefined') {
+        globalThis.PerformanceNavigationTiming = makeStubCtor('PerformanceNavigationTiming', ['toJSON']);
+    }
+    if (typeof globalThis.PerformancePaintTiming === 'undefined') {
+        globalThis.PerformancePaintTiming = makeStubCtor('PerformancePaintTiming', ['toJSON']);
+    }
+    if (typeof globalThis.ValidityState === 'undefined') {
+        var ValidityState = function ValidityState() {
+            throw new TypeError('ValidityState: Illegal constructor');
+        };
+        var validityProto = { constructor: ValidityState };
+        // All read-only accessors that always evaluate to false on
+        // the stub (no validation in heso). Spec at WHATWG HTML
+        // §4.10.18.4.
+        ['valid', 'valueMissing', 'typeMismatch', 'patternMismatch',
+         'tooLong', 'tooShort', 'rangeUnderflow', 'rangeOverflow',
+         'stepMismatch', 'badInput', 'customError'].forEach(function (n) {
+            try {
+                Object.defineProperty(validityProto, n, {
+                    get: function () { return n === 'valid'; },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        });
+        ValidityState.prototype = validityProto;
+        globalThis.ValidityState = ValidityState;
+    }
+    // HTMLInputElement.prototype.value setter — many bundles
+    // capture `H(HTMLInputElement, "value").set` at module init.
+    // The rquickjs Element class doesn't expose `value` as an
+    // accessor on the Element prototype (it's per-class in heso's
+    // input handling). Install a shim that round-trips through
+    // setAttribute as a fallback.
+    if (typeof globalThis.HTMLInputElement === 'function'
+        && globalThis.HTMLInputElement.prototype) {
+        var iproto = globalThis.HTMLInputElement.prototype;
+        if (!Object.getOwnPropertyDescriptor(iproto, 'value')) {
+            try {
+                Object.defineProperty(iproto, 'value', {
+                    get: function () {
+                        try { return this.getAttribute('value') || ''; } catch (e) { return ''; }
+                    },
+                    set: function (v) {
+                        try {
+                            if (this.setAttribute) this.setAttribute('value', v == null ? '' : String(v));
+                        } catch (e) {}
+                    },
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+    }
+
+    // -------------------------------------------------------------
+    // `Intl` shim — at minimum a `DateTimeFormat` constructor so
+    // `airgap.js`'s `{DateTimeFormat:tm}=Cu` destructure (where
+    // `Cu = globalThis.Intl`) doesn't throw "Cannot destructure
+    // property 'DateTimeFormat' of undefined".
+    //
+    // We don't implement real locale-aware formatting — heso is
+    // headless and locale-neutral. The stub returns
+    // English-formatted timestamps via toLocaleString / toString
+    // fallbacks so the surface is non-throwing.
+    // -------------------------------------------------------------
+    if (typeof globalThis.Intl === 'undefined') {
+        var IntlStub = {};
+        IntlStub.DateTimeFormat = function DateTimeFormat() {};
+        IntlStub.DateTimeFormat.prototype = {
+            constructor: IntlStub.DateTimeFormat,
+            format: function (d) {
+                if (d == null) d = new Date();
+                if (typeof d === 'number') d = new Date(d);
+                return d && typeof d.toISOString === 'function' ? d.toISOString() : String(d);
+            },
+            formatToParts: function () { return []; },
+            formatRange: function () { return ''; },
+            formatRangeToParts: function () { return []; },
+            resolvedOptions: function () {
+                return {
+                    locale: 'en-US',
+                    calendar: 'gregory',
+                    numberingSystem: 'latn',
+                    timeZone: 'UTC',
+                    year: 'numeric', month: 'numeric', day: 'numeric',
+                };
+            }
+        };
+        IntlStub.DateTimeFormat.supportedLocalesOf = function () { return ['en-US']; };
+        IntlStub.NumberFormat = function NumberFormat() {};
+        IntlStub.NumberFormat.prototype = {
+            constructor: IntlStub.NumberFormat,
+            format: function (n) { return String(n); },
+            formatToParts: function () { return []; },
+            resolvedOptions: function () {
+                return {
+                    locale: 'en-US',
+                    numberingSystem: 'latn',
+                    style: 'decimal',
+                };
+            }
+        };
+        IntlStub.NumberFormat.supportedLocalesOf = function () { return ['en-US']; };
+        IntlStub.Collator = function Collator() {};
+        IntlStub.Collator.prototype = {
+            constructor: IntlStub.Collator,
+            compare: function (a, b) { return a < b ? -1 : a > b ? 1 : 0; },
+            resolvedOptions: function () { return { locale: 'en-US' }; }
+        };
+        IntlStub.Collator.supportedLocalesOf = function () { return ['en-US']; };
+        IntlStub.PluralRules = function PluralRules() {};
+        IntlStub.PluralRules.prototype = {
+            constructor: IntlStub.PluralRules,
+            select: function () { return 'other'; },
+            resolvedOptions: function () { return { locale: 'en-US' }; }
+        };
+        IntlStub.PluralRules.supportedLocalesOf = function () { return ['en-US']; };
+        IntlStub.RelativeTimeFormat = function RelativeTimeFormat() {};
+        IntlStub.RelativeTimeFormat.prototype = {
+            constructor: IntlStub.RelativeTimeFormat,
+            format: function (n, unit) { return n + ' ' + unit; },
+            formatToParts: function () { return []; },
+            resolvedOptions: function () { return { locale: 'en-US' }; }
+        };
+        IntlStub.RelativeTimeFormat.supportedLocalesOf = function () { return ['en-US']; };
+        IntlStub.ListFormat = function ListFormat() {};
+        IntlStub.ListFormat.prototype = {
+            constructor: IntlStub.ListFormat,
+            format: function (arr) { return Array.isArray(arr) ? arr.join(', ') : String(arr); },
+            formatToParts: function () { return []; },
+            resolvedOptions: function () { return { locale: 'en-US' }; }
+        };
+        IntlStub.ListFormat.supportedLocalesOf = function () { return ['en-US']; };
+        IntlStub.Locale = function Locale(tag) {
+            this.baseName = tag || 'en-US';
+            this.language = 'en';
+            this.region = 'US';
+        };
+        IntlStub.Locale.prototype = {
+            constructor: IntlStub.Locale,
+            toString: function () { return this.baseName; },
+            maximize: function () { return this; },
+            minimize: function () { return this; }
+        };
+        IntlStub.Segmenter = function Segmenter() {};
+        IntlStub.Segmenter.prototype = {
+            constructor: IntlStub.Segmenter,
+            segment: function (s) {
+                var arr = String(s == null ? '' : s).split('').map(function (ch, i) {
+                    return { segment: ch, index: i, input: s, isWordLike: /\w/.test(ch) };
+                });
+                arr[Symbol.iterator] = function* () { for (var i = 0; i < arr.length; i++) yield arr[i]; };
+                return arr;
+            },
+            resolvedOptions: function () { return { locale: 'en-US', granularity: 'grapheme' }; }
+        };
+        IntlStub.Segmenter.supportedLocalesOf = function () { return ['en-US']; };
+        IntlStub.getCanonicalLocales = function (l) {
+            if (l == null) return [];
+            return Array.isArray(l) ? l.slice() : [String(l)];
+        };
+        globalThis.Intl = IntlStub;
+    }
+
+    // -------------------------------------------------------------
+    // `document.implementation` builder — WHATWG DOM §4.5.1.
+    //
+    // The Rust-side [`crate::dom::Document::implementation`] getter
+    // calls this thunk to construct a fresh DOMImplementation-shaped
+    // POJO on each access. We install one global builder rather than
+    // returning a stashed singleton so each call closes over the
+    // current `document` global (a single engine can re-`install_
+    // document` across navigations).
+    //
+    // Load-bearing reach: jQuery 3.6's module init reads
+    // `y.createHTMLDocument = ((_t = E.implementation
+    // .createHTMLDocument("").body).innerHTML = "<form></form>",
+    // _t.childNodes.length === 2)` — needs both
+    // `createHTMLDocument(title)` returning something with `.body`
+    // and `.body.innerHTML = "..."` setter / `.body.childNodes`.
+    //
+    // `createHTMLDocument(title)` returns a fresh Document-shaped
+    // view backed by a detached `<html><head><title>...</title>
+    // </head><body></body></html>` parse. We approximate by spinning
+    // up an off-document `<template>` populated with the skeleton —
+    // gives a node tree whose `.body` / `.head` / `.documentElement`
+    // selectors return live wrappers and whose
+    // `.body.innerHTML = "..."` setter parses fresh HTML into a
+    // mutable subtree. Identity is not promised (`!==`-comparison
+    // is a Phase 1C+ concern) but the feature-detect path passes.
+    //
+    // `createDocument` / `createDocumentType` / `hasFeature` are
+    // stubbed against the spec's "always returns true" + sensible
+    // defaults so the rare feature-detect doesn't throw.
+    // -------------------------------------------------------------
+    if (typeof globalThis.__hesoDocumentImplementation !== 'function') {
+        globalThis.__hesoDocumentImplementation = function() {
+            // We re-build the POJO on each access so it carries
+            // closure references to the current `document`. A cached
+            // singleton would point at a stale document after a
+            // navigation.
+            var impl = {};
+
+            // hasFeature(feature, version) — spec says always return
+            // true since DOM3. Some old plugins still call it.
+            impl.hasFeature = function() { return true; };
+
+            // createHTMLDocument(title?) — returns a fresh Document.
+            // We approximate by constructing detached orphan
+            // <html>/<head>/<title>/<body> elements directly via
+            // `document.createElement` (each is allocated in the
+            // same `dom_query::Tree` but with no parent attachment,
+            // so the host document's `body` and `head` are
+            // unaffected). The wrapper is a plain JS object whose
+            // `.body` / `.head` / `.documentElement` reads return
+            // those orphan element handles; `.body.innerHTML = "..."`
+            // setter parses fresh HTML into that subtree.
+            //
+            // We deliberately *do not* use `<template>` here: the
+            // html5ever parser strips `<html>` / `<head>` / `<body>`
+            // tags from template fragment content (they're not
+            // allowed as template children per HTML §13.2.6.4).
+            // Orphan elements built individually skip the parser
+            // entirely, so the wrappers are returned intact.
+            impl.createHTMLDocument = function(title) {
+                title = (title == null) ? '' : String(title);
+                var htmlNode = document.createElement('html');
+                var headNode = document.createElement('head');
+                var bodyNode = document.createElement('body');
+                var titleNode = document.createElement('title');
+                if (title) {
+                    titleNode.textContent = title;
+                }
+                headNode.appendChild(titleNode);
+                htmlNode.appendChild(headNode);
+                htmlNode.appendChild(bodyNode);
+                var subDoc = {
+                    nodeType: 9,
+                    nodeName: '#document',
+                    documentElement: htmlNode,
+                    head: headNode,
+                    body: bodyNode,
+                    title: title,
+                    defaultView: null,
+                    ownerDocument: null,
+                    // Element-construction surface — delegate to the
+                    // host document so every fresh element ends up
+                    // in a coherent tree (Phase 1B has a single
+                    // dom_query::Document per engine; cross-document
+                    // adoption is a Phase 1C+ concern).
+                    createElement: function(tag) {
+                        return document.createElement(tag);
+                    },
+                    createElementNS: function(ns, tag) {
+                        return document.createElementNS(ns, tag);
+                    },
+                    createTextNode: function(data) {
+                        return document.createTextNode(data);
+                    },
+                    createComment: function(data) {
+                        return document.createComment(data);
+                    },
+                    createDocumentFragment: function() {
+                        return document.createDocumentFragment();
+                    },
+                    // Query surface — scope to the orphan tree so
+                    // selectors only see the off-document subtree.
+                    querySelector: function(sel) {
+                        return htmlNode.querySelector(sel);
+                    },
+                    querySelectorAll: function(sel) {
+                        return htmlNode.querySelectorAll(sel);
+                    },
+                    getElementById: function(id) {
+                        var found = htmlNode.querySelector('#' + id);
+                        return found || null;
+                    },
+                    getElementsByTagName: function(tag) {
+                        return htmlNode.querySelectorAll(tag);
+                    },
+                    adoptNode: function(node) { return node; },
+                    importNode: function(node, deep) {
+                        // Spec says adopt + clone; we approximate
+                        // with cloneNode since heso has one shared
+                        // tree.
+                        return node && node.cloneNode ? node.cloneNode(!!deep) : node;
+                    }
+                };
+                return subDoc;
+            };
+
+            // createDocument(namespace, qualifiedName, doctype) —
+            // mostly used by XML/SVG code. We return the same skeleton
+            // shape with the doctype stashed if provided.
+            impl.createDocument = function(ns, qname, doctype) {
+                var sub = impl.createHTMLDocument('');
+                sub.doctype = doctype || null;
+                return sub;
+            };
+
+            // createDocumentType(name, publicId, systemId) — returns
+            // a DocumentType-shaped POJO. Frameworks only read the
+            // `.name` / `.publicId` / `.systemId` fields.
+            impl.createDocumentType = function(name, publicId, systemId) {
+                return {
+                    nodeType: 10,
+                    nodeName: name || 'html',
+                    name: name || 'html',
+                    publicId: publicId || '',
+                    systemId: systemId || '',
+                    ownerDocument: null
+                };
+            };
+
+            return impl;
+        };
+    }
+
+    // -------------------------------------------------------------
+    // Missing-getter shim on Element.prototype / Document.prototype.
+    //
+    // Bundles like Transcend's `airgap.js` capture method references
+    // by reading `Object.getOwnPropertyDescriptor(Type.prototype, X).get`
+    // at module-init time. If `X` is not an accessor descriptor on
+    // the prototype, the result is `undefined` and the `.get` access
+    // throws "cannot read property 'get' of undefined".
+    //
+    // heso's rquickjs DOM exposes the most-used accessors via
+    // `#[qjs(get)]` getters, but the long tail
+    // (`baseURI`, `ownerDocument`, `namespaceURI`, `isConnected`,
+    // `compareDocumentPosition`, `doctype`, `xmlVersion`,
+    // `currentScript` when no script is loading, etc.) is missing.
+    //
+    // We patch these onto the prototypes lazily here. Each property
+    // is installed via `Object.defineProperty` with `get` and `set`
+    // accessors that return spec-shaped defaults; site code that
+    // grabs `descriptor.get` gets a real function, and the function
+    // returns a non-throwing value when invoked. Idempotent per
+    // property via `getOwnPropertyDescriptor` check.
+    //
+    // Note: these are installed onto `Element.prototype` and
+    // `Document.prototype` only — both must be reachable as
+    // `globalThis.Element.prototype` / `globalThis.Document.prototype`
+    // (installed by [`crate::custom_elements::install_custom_elements`]
+    // earlier in engine init).
+    // -------------------------------------------------------------
+    function ensureAccessor(proto, name, getter, setter) {
+        if (!proto) return;
+        var d = Object.getOwnPropertyDescriptor(proto, name);
+        if (d && (typeof d.get === 'function' || typeof d.value !== 'undefined')) {
+            return; // Already implemented (either accessor or data property).
+        }
+        try {
+            Object.defineProperty(proto, name, {
+                get: getter,
+                set: setter || function () {},
+                enumerable: false,
+                configurable: true
+            });
+        } catch (e) {
+            // Some rquickjs-managed prototypes are sealed; fall back
+            // to a no-op so initialization continues. Site code will
+            // see undefined; that's no worse than today.
+        }
+    }
+    // -------------------------------------------------------------
+    // Per-HTML-Element-class accessor descriptors. Many bundles
+    // (airgap.js, Modernizr, jQuery's feature detect) capture
+    // method handles by reading
+    // `Object.getOwnPropertyDescriptor(HTMLXElement.prototype, "Y").get`
+    // at module-init time. heso's HTML*Element constructors all share
+    // the rquickjs Element prototype, so we install all the needed
+    // accessors on the shared prototype below. Each accessor reads
+    // back through `getAttribute` / `setAttribute` for the
+    // reflected-attribute case (per WHATWG HTML §2.3.2) so the round
+    // trip is consistent with what `el.outerHTML` reports.
+    //
+    // We only stub the ACCESSOR shape; the methods themselves do
+    // light work (re-read the underlying attribute). Properties not
+    // listed here continue to live on the shared Element prototype
+    // unmodified.
+    // -------------------------------------------------------------
+    function reflectedAttrAccessor(proto, propName, attrName, dflt) {
+        if (!proto) return;
+        var existing = Object.getOwnPropertyDescriptor(proto, propName);
+        if (existing && (typeof existing.get === 'function' || typeof existing.value !== 'undefined')) {
+            return;
+        }
+        try {
+            Object.defineProperty(proto, propName, {
+                get: function () {
+                    try {
+                        var v = this.getAttribute ? this.getAttribute(attrName) : null;
+                        return v == null ? dflt : v;
+                    } catch (e) { return dflt; }
+                },
+                set: function (v) {
+                    try {
+                        if (this.setAttribute) {
+                            this.setAttribute(attrName, v == null ? '' : String(v));
+                        }
+                    } catch (e) {}
+                },
+                enumerable: false, configurable: true,
+            });
+        } catch (e) {}
+    }
+    // SVGElement is rarely needed in agent-relevant paths but
+    // airgap.js reads `H(SVGElement, "dataset").get`. Define a stub
+    // sharing Element.prototype's accessors so the descriptor read
+    // returns a real accessor.
+    if (typeof globalThis.SVGElement === 'undefined'
+        && typeof globalThis.Element === 'function'
+        && globalThis.Element.prototype) {
+        var SVGElement = function SVGElement() {
+            throw new TypeError('SVGElement: Illegal constructor');
+        };
+        // Borrow Element.prototype so the dataset / other accessors
+        // we install below are reachable via inheritance. Then
+        // shadow `dataset` onto SVGElement.prototype below as an OWN
+        // property so `getOwnPropertyDescriptor` finds it.
+        var svgProto = Object.create(globalThis.Element.prototype);
+        Object.defineProperty(svgProto, 'constructor', {
+            value: SVGElement, writable: true, enumerable: false, configurable: true,
+        });
+        Object.defineProperty(SVGElement, 'prototype', {
+            value: svgProto, writable: false, configurable: false, enumerable: false,
+        });
+        Object.defineProperty(SVGElement, 'name', { value: 'SVGElement', configurable: true });
+        globalThis.SVGElement = SVGElement;
+    }
+    if (typeof globalThis.Element === 'function' && globalThis.Element.prototype) {
+        var elProto = globalThis.Element.prototype;
+        // HTML anchor/area: download / ping (extra to existing href).
+        reflectedAttrAccessor(elProto, 'download', 'download', '');
+        reflectedAttrAccessor(elProto, 'ping', 'ping', '');
+        reflectedAttrAccessor(elProto, 'rel', 'rel', '');
+        reflectedAttrAccessor(elProto, 'target', 'target', '');
+        reflectedAttrAccessor(elProto, 'type', 'type', '');
+        // <base href> — without an accessor here, the
+        // `H(HTMLBaseElement,"href").set` capture returns undefined
+        // and a later setter call crashes. Element.prototype already
+        // exposes `.href` for anchor/link elements via the
+        // dom_query-backed wrapper, but the descriptor on the
+        // shared prototype is non-accessor. Re-install as an
+        // accessor that round-trips through the attribute.
+        reflectedAttrAccessor(elProto, 'href', 'href', '');
+        // Image / video / audio: src, srcset, currentSrc.
+        reflectedAttrAccessor(elProto, 'src', 'src', '');
+        reflectedAttrAccessor(elProto, 'srcset', 'srcset', '');
+        // currentSrc is read-only in spec; the reflected accessor
+        // returns src for simplicity.
+        if (!Object.getOwnPropertyDescriptor(elProto, 'currentSrc')) {
+            try {
+                Object.defineProperty(elProto, 'currentSrc', {
+                    get: function () {
+                        try { return this.getAttribute('src') || ''; } catch (e) { return ''; }
+                    },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        // iframe: srcdoc, credentialless.
+        reflectedAttrAccessor(elProto, 'srcdoc', 'srcdoc', '');
+        if (!Object.getOwnPropertyDescriptor(elProto, 'credentialless')) {
+            try {
+                Object.defineProperty(elProto, 'credentialless', {
+                    get: function () { return false; },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        // dataset — the rquickjs class exposes this via a Proxy
+        // installed by `install_custom_elements`. We also need it
+        // as an OWN accessor on HTMLElement.prototype and
+        // SVGElement.prototype because some bundles (airgap.js)
+        // read `Object.getOwnPropertyDescriptor(HTMLElement.prototype,
+        // "dataset")` rather than walking the proto chain. Install
+        // the same accessor body on all three prototypes when
+        // missing.
+        function installDatasetAccessor(proto) {
+            if (!proto || Object.getOwnPropertyDescriptor(proto, 'dataset')) return;
+            try {
+                Object.defineProperty(proto, 'dataset', {
+                    get: function () {
+                        var el = this;
+                        return new Proxy({}, {
+                            get: function (_t, key) {
+                                if (typeof key !== 'string') return undefined;
+                                var kebab = 'data-' + key.replace(/[A-Z]/g, function (m) {
+                                    return '-' + m.toLowerCase();
+                                });
+                                try { return el.getAttribute(kebab); } catch (e) { return undefined; }
+                            },
+                            set: function (_t, key, value) {
+                                if (typeof key !== 'string') return false;
+                                var kebab = 'data-' + key.replace(/[A-Z]/g, function (m) {
+                                    return '-' + m.toLowerCase();
+                                });
+                                try { el.setAttribute(kebab, String(value)); } catch (e) {}
+                                return true;
+                            }
+                        });
+                    },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        installDatasetAccessor(elProto);
+        if (typeof globalThis.HTMLElement === 'function' && globalThis.HTMLElement.prototype) {
+            installDatasetAccessor(globalThis.HTMLElement.prototype);
+        }
+        if (typeof globalThis.SVGElement === 'function' && globalThis.SVGElement.prototype) {
+            installDatasetAccessor(globalThis.SVGElement.prototype);
+        }
+        // Disable the prior single-prototype branch — the function
+        // form above handles all three. Keep a no-op guard so the
+        // OLD `if (!Object.getOwnPropertyDescriptor(elProto, 'dataset'))` block
+        // below short-circuits.
+        if (false && !Object.getOwnPropertyDescriptor(elProto, 'dataset')) {
+            // The proxy is created on-demand from the rquickjs side
+            // in custom_elements.rs. Add a getter that reaches into
+            // that pathway — but only if the class-installed
+            // property is genuinely absent (the typical case where
+            // the runtime hasn't materialized the lazy property
+            // yet). Otherwise the existing accessor wins via the
+            // `Object.getOwnPropertyDescriptor` short-circuit above.
+            try {
+                Object.defineProperty(elProto, 'dataset', {
+                    get: function () {
+                        // Build a fresh Proxy each call. Lazy
+                        // pattern matches the rquickjs class.
+                        var el = this;
+                        return new Proxy({}, {
+                            get: function (_t, key) {
+                                if (typeof key !== 'string') return undefined;
+                                // Translate camelCase to data-kebab.
+                                var kebab = 'data-' + key.replace(/[A-Z]/g, function (m) {
+                                    return '-' + m.toLowerCase();
+                                });
+                                try { return el.getAttribute(kebab); } catch (e) { return undefined; }
+                            },
+                            set: function (_t, key, value) {
+                                if (typeof key !== 'string') return false;
+                                var kebab = 'data-' + key.replace(/[A-Z]/g, function (m) {
+                                    return '-' + m.toLowerCase();
+                                });
+                                try { el.setAttribute(kebab, String(value)); } catch (e) {}
+                                return true;
+                            }
+                        });
+                    },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        // ValidityState exposed via `el.validity` on form controls.
+        // The accessor returns a {valid, valueMissing, ...} object.
+        if (!Object.getOwnPropertyDescriptor(elProto, 'validity')) {
+            try {
+                Object.defineProperty(elProto, 'validity', {
+                    get: function () {
+                        return {
+                            valid: true,
+                            valueMissing: false,
+                            typeMismatch: false,
+                            patternMismatch: false,
+                            tooLong: false,
+                            tooShort: false,
+                            rangeUnderflow: false,
+                            rangeOverflow: false,
+                            stepMismatch: false,
+                            badInput: false,
+                            customError: false,
+                        };
+                    },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+    }
+    if (typeof globalThis.HTMLCollection === 'function' && globalThis.HTMLCollection.prototype) {
+        // length — accessor returning this.length (the underlying
+        // data property). The HTMLCollection prototype is
+        // Object.prototype-shaped per custom_elements.rs, so we
+        // need to install a getter that delegates to the instance.
+        if (!Object.getOwnPropertyDescriptor(globalThis.HTMLCollection.prototype, 'length')) {
+            try {
+                Object.defineProperty(globalThis.HTMLCollection.prototype, 'length', {
+                    get: function () {
+                        if (this == null) return 0;
+                        return typeof this.length === 'number' ? this.length : 0;
+                    },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        if (typeof globalThis.HTMLCollection.prototype.item !== 'function') {
+            try {
+                Object.defineProperty(globalThis.HTMLCollection.prototype, 'item', {
+                    value: function (i) {
+                        if (this == null) return null;
+                        var n = typeof this.length === 'number' ? this.length : 0;
+                        return i >= 0 && i < n ? this[i] : null;
+                    },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        if (typeof globalThis.HTMLCollection.prototype.namedItem !== 'function') {
+            try {
+                Object.defineProperty(globalThis.HTMLCollection.prototype, 'namedItem', {
+                    value: function (name) {
+                        if (this == null) return null;
+                        var n = typeof this.length === 'number' ? this.length : 0;
+                        for (var i = 0; i < n; i++) {
+                            if (this[i] && (this[i].id === name || this[i].name === name)) {
+                                return this[i];
+                            }
+                        }
+                        return null;
+                    },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+    }
+    if (typeof globalThis.NodeList === 'function' && globalThis.NodeList.prototype) {
+        if (!Object.getOwnPropertyDescriptor(globalThis.NodeList.prototype, 'length')) {
+            try {
+                Object.defineProperty(globalThis.NodeList.prototype, 'length', {
+                    get: function () {
+                        if (this == null) return 0;
+                        return typeof this.length === 'number' ? this.length : 0;
+                    },
+                    set: function () {},
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+    }
+    if (typeof globalThis.XMLHttpRequest === 'function' && globalThis.XMLHttpRequest.prototype) {
+        // XHR exposes readyState / response / responseText / responseType / withCredentials
+        // as data properties on the instance (per src/xhr.rs); the
+        // ACCESSOR descriptor is missing from the prototype.
+        // Frameworks (airgap, jQuery legacy) read it off the
+        // prototype at module-init time. Bridge via property
+        // lookups.
+        var xhrProto = globalThis.XMLHttpRequest.prototype;
+        ['readyState', 'response', 'responseText', 'responseURL', 'responseXML',
+         'responseType', 'status', 'statusText', 'withCredentials', 'timeout', 'upload']
+            .forEach(function (name) {
+                if (!Object.getOwnPropertyDescriptor(xhrProto, name)) {
+                    try {
+                        Object.defineProperty(xhrProto, name, {
+                            get: function () {
+                                if (this == null) return undefined;
+                                return this[name];
+                            },
+                            set: function (v) {
+                                if (this == null) return;
+                                this[name] = v;
+                            },
+                            enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
+                }
+            });
+    }
+    if (typeof globalThis.Request === 'function' && globalThis.Request.prototype) {
+        // url / method / headers / body — accessors that delegate
+        // to instance fields.
+        ['url', 'method', 'headers', 'body', 'bodyUsed', 'cache', 'credentials',
+         'destination', 'integrity', 'mode', 'redirect', 'referrer', 'referrerPolicy', 'signal']
+            .forEach(function (name) {
+                if (!Object.getOwnPropertyDescriptor(globalThis.Request.prototype, name)) {
+                    try {
+                        Object.defineProperty(globalThis.Request.prototype, name, {
+                            get: function () {
+                                if (this == null) return undefined;
+                                return this['_' + name] !== undefined ? this['_' + name] : this[name];
+                            },
+                            set: function () {},
+                            enumerable: false, configurable: true,
+                        });
+                    } catch (e) {}
+                }
+            });
+    }
+    // ShadowRoot — innerHTML accessor. heso's `<shadowroot>` impl
+    // exposes innerHTML via the rquickjs ShadowRoot class, so this
+    // is a backstop for the prototype-descriptor read pattern.
+    if (typeof globalThis.ShadowRoot === 'function' && globalThis.ShadowRoot.prototype) {
+        if (!Object.getOwnPropertyDescriptor(globalThis.ShadowRoot.prototype, 'innerHTML')) {
+            try {
+                Object.defineProperty(globalThis.ShadowRoot.prototype, 'innerHTML', {
+                    get: function () { return this.innerHTML || ''; },
+                    set: function (v) { this.innerHTML = v; },
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+    }
+    if (typeof globalThis.Element === 'function' && globalThis.Element.prototype) {
+        var elProto = globalThis.Element.prototype;
+        // Node IDL surface (WHATWG DOM §4.4). Many of these are
+        // technically on `Node.prototype` in the spec, but heso shares
+        // one prototype across Element/Document/etc., so installing
+        // them on the shared Element prototype reaches everywhere.
+        ensureAccessor(elProto, 'baseURI', function () {
+            // baseURI per spec: the document's base URL. heso
+            // exposes the page URL via globalThis.location.href when
+            // available; fall back to about:blank to stay
+            // non-throwing on a bare engine.
+            try {
+                if (typeof location !== 'undefined' && location.href) return location.href;
+            } catch (e) {}
+            return 'about:blank';
+        });
+        ensureAccessor(elProto, 'ownerDocument', function () {
+            // For any element wrapper attached to the live tree,
+            // ownerDocument is the host document. Detached elements
+            // (createElement orphans) also share the host document
+            // in heso's single-tree model.
+            return globalThis.document || null;
+        });
+        ensureAccessor(elProto, 'namespaceURI', function () {
+            // We don't track namespaces; return the HTML namespace as
+            // a safe constant. Bundles that compare against
+            // 'http://www.w3.org/1999/xhtml' get the truthful answer.
+            return 'http://www.w3.org/1999/xhtml';
+        });
+        ensureAccessor(elProto, 'prefix', function () { return null; });
+        ensureAccessor(elProto, 'isConnected', function () {
+            // True iff the element is in the document tree. heso's
+            // current `document.contains(node)` works for that
+            // check; punt to it.
+            try {
+                return globalThis.document && globalThis.document.contains
+                    ? globalThis.document.contains(this)
+                    : false;
+            } catch (e) { return false; }
+        });
+        ensureAccessor(elProto, 'nodeValue', function () {
+            // Spec: text/comment nodes return their data; element
+            // nodes return null. Without per-type wrappers we can
+            // approximate via textContent for text-like nodes and
+            // null for elements. The latter is the load-bearing
+            // branch (framework `if (n.nodeValue == null)` filters).
+            try {
+                var t = this && this.nodeType;
+                if (t === 3 || t === 8) return this.textContent || '';
+                return null;
+            } catch (e) { return null; }
+        });
+        // compareDocumentPosition — per WHATWG DOM §4.4. Returns a
+        // bitmask of relative positions. heso doesn't track relative
+        // order across detached subtrees; return 0 ("no special
+        // relationship") for safety. Bundles that use this to dedupe
+        // (jQuery's sortDetached detect) fall through to the
+        // pre-existing-document branch and behave as if the nodes
+        // are in document order.
+        if (typeof elProto.compareDocumentPosition !== 'function') {
+            try {
+                Object.defineProperty(elProto, 'compareDocumentPosition', {
+                    value: function () { return 0; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        // lookupNamespaceURI / lookupPrefix / isDefaultNamespace —
+        // rarely needed but cheap to stub.
+        if (typeof elProto.lookupNamespaceURI !== 'function') {
+            try {
+                Object.defineProperty(elProto, 'lookupNamespaceURI', {
+                    value: function () { return null; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                Object.defineProperty(elProto, 'lookupPrefix', {
+                    value: function () { return null; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                Object.defineProperty(elProto, 'isDefaultNamespace', {
+                    value: function (uri) { return uri === 'http://www.w3.org/1999/xhtml'; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        // normalize() — joins adjacent text nodes. No-op for heso
+        // (the parser already does this on load); the surface needs
+        // to exist for `el.normalize()` calls not to throw.
+        if (typeof elProto.normalize !== 'function') {
+            try {
+                Object.defineProperty(elProto, 'normalize', {
+                    value: function () {},
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        // isSameNode / isEqualNode — identity / structural compare.
+        // Stub at minimum so `node.isSameNode(other)` doesn't throw.
+        if (typeof elProto.isSameNode !== 'function') {
+            try {
+                Object.defineProperty(elProto, 'isSameNode', {
+                    value: function (other) { return this === other; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                Object.defineProperty(elProto, 'isEqualNode', {
+                    value: function (other) {
+                        if (other == null) return false;
+                        try {
+                            return this.outerHTML === other.outerHTML;
+                        } catch (e) { return this === other; }
+                    },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+    }
+    if (typeof globalThis.Document === 'function' && globalThis.Document.prototype) {
+        var docProto = globalThis.Document.prototype;
+        ensureAccessor(docProto, 'doctype', function () { return null; });
+        ensureAccessor(docProto, 'xmlVersion', function () { return null; });
+        ensureAccessor(docProto, 'xmlEncoding', function () { return null; });
+        ensureAccessor(docProto, 'xmlStandalone', function () { return false; });
+        ensureAccessor(docProto, 'URL', function () {
+            try { return location.href; } catch (e) { return 'about:blank'; }
+        });
+        ensureAccessor(docProto, 'documentURI', function () {
+            try { return location.href; } catch (e) { return 'about:blank'; }
+        });
+        ensureAccessor(docProto, 'compatMode', function () { return 'CSS1Compat'; });
+        ensureAccessor(docProto, 'characterSet', function () { return 'UTF-8'; });
+        ensureAccessor(docProto, 'charset', function () { return 'UTF-8'; });
+        ensureAccessor(docProto, 'inputEncoding', function () { return 'UTF-8'; });
+        ensureAccessor(docProto, 'contentType', function () { return 'text/html'; });
+        ensureAccessor(docProto, 'lastModified', function () {
+            try { return new Date().toUTCString(); } catch (e) { return ''; }
+        });
+        ensureAccessor(docProto, 'referrer', function () { return ''; });
+        ensureAccessor(docProto, 'domain', function () {
+            try { return location.hostname || ''; } catch (e) { return ''; }
+        });
+        ensureAccessor(docProto, 'visibilityState', function () { return 'visible'; });
+        ensureAccessor(docProto, 'hidden', function () { return false; });
+        ensureAccessor(docProto, 'fullscreenElement', function () { return null; });
+        ensureAccessor(docProto, 'fullscreenEnabled', function () { return false; });
+        ensureAccessor(docProto, 'pointerLockElement', function () { return null; });
+        // currentScript: scripts.rs writes `document.currentScript`
+        // as an instance data property right before each script
+        // runs. A pure accessor on the prototype would block that
+        // assignment, so we provide BOTH a get and set that bounce
+        // through a hidden instance field
+        // (`__hesoCurrentScriptValue`). Falls back to
+        // `globalThis.__hesoCurrentScript()` for the
+        // bare-engine path that some tests use.
+        if (!Object.getOwnPropertyDescriptor(docProto, 'currentScript')) {
+            try {
+                Object.defineProperty(docProto, 'currentScript', {
+                    get: function () {
+                        try {
+                            // Instance-side stash (preferred — set
+                            // by scripts.rs per-script).
+                            if (this.__hesoCurrentScriptValue !== undefined) {
+                                return this.__hesoCurrentScriptValue;
+                            }
+                            if (typeof globalThis.__hesoCurrentScript === 'function') {
+                                return globalThis.__hesoCurrentScript();
+                            }
+                            return null;
+                        } catch (e) { return null; }
+                    },
+                    set: function (v) {
+                        try {
+                            // Use defineProperty so the slot is
+                            // writable even when the host runtime
+                            // is in strict mode.
+                            Object.defineProperty(this, '__hesoCurrentScriptValue', {
+                                value: v,
+                                writable: true, enumerable: false, configurable: true,
+                            });
+                        } catch (e) {}
+                    },
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        // Spec methods bundles often pull off Document.prototype:
+        // adoptNode / importNode / hasFocus / open / close / write
+        // / writeln / execCommand. Each is a no-op stub.
+        if (typeof docProto.adoptNode !== 'function') {
+            try {
+                Object.defineProperty(docProto, 'adoptNode', {
+                    value: function (n) { return n; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        if (typeof docProto.importNode !== 'function') {
+            try {
+                Object.defineProperty(docProto, 'importNode', {
+                    value: function (n, deep) {
+                        return n && n.cloneNode ? n.cloneNode(!!deep) : n;
+                    },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        if (typeof docProto.hasFocus !== 'function') {
+            try {
+                Object.defineProperty(docProto, 'hasFocus', {
+                    value: function () { return false; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+        ['open', 'close', 'write', 'writeln'].forEach(function (m) {
+            if (typeof docProto[m] !== 'function') {
+                try {
+                    Object.defineProperty(docProto, m, {
+                        value: function () {},
+                        writable: true, enumerable: false, configurable: true,
+                    });
+                } catch (e) {}
+            }
+        });
+        if (typeof docProto.execCommand !== 'function') {
+            try {
+                Object.defineProperty(docProto, 'execCommand', {
+                    value: function () { return false; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                Object.defineProperty(docProto, 'queryCommandSupported', {
+                    value: function () { return false; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                Object.defineProperty(docProto, 'queryCommandEnabled', {
+                    value: function () { return false; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                Object.defineProperty(docProto, 'queryCommandState', {
+                    value: function () { return false; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+                Object.defineProperty(docProto, 'queryCommandValue', {
+                    value: function () { return ''; },
+                    writable: true, enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        }
+    }
+
+    // -------------------------------------------------------------
+    // `DOMTokenList.prototype[Symbol.iterator]` — WHATWG DOM §7.1
+    // "Interface DOMTokenList" declares this an iterable; each
+    // iteration yields one class token in order.
+    //
+    // Load-bearing reach: Transcend's `airgap.js` consent script
+    // (on every MDN page) builds an iterable-type registry by
+    // destructuring `Symbol.iterator` from a list of sample
+    // instances:
+    //
+    //   var ia = [[], new Ne, new ao, ""];
+    //   h && s(Fc, ia, UC, Q.createElement("_").classList, GC);
+    //   var [HC, FC, VC, qC, WC, KC, BC] = ia.map(({[$s]:e}) => e);
+    //   //                                                  ^ Symbol.iterator
+    //   ...
+    //   var [YC, Gu, $C, zC, jC, XC, QC] = ia.map(e => e && e[$s]().next);
+    //   //                                                ^ "not a function"
+    //
+    // Without `Symbol.iterator` on DOMTokenList.prototype, the
+    // second map call invokes `undefined()` on the classList row
+    // and the whole bundle dies at evaluation time.
+    //
+    // We patch the prototype rather than implementing iteration on
+    // the Rust class because the rquickjs 0.11 `#[methods]` macro
+    // has no `#[qjs(symbol = ...)]` hook for binding to a
+    // well-known symbol. JS-side patching is the same path
+    // Headers / FormData / URLSearchParams use (see
+    // [`crate::web_apis`] / [`crate::url_search_params`]).
+    //
+    // Implementation: best-effort token enumeration via the
+    // wrapper's `value` property (DOMTokenList.value is the joined
+    // class string per spec). Most call sites only feature-detect
+    // (truthy prototype method → "this is iterable") and never
+    // pull actual tokens via the iterator; the destructure pattern
+    // in airgap.js calls `.next` once and bails the moment
+    // `{done: true}` comes back. Returning an iterator-shaped
+    // object whose `.next` is callable is enough.
+    // -------------------------------------------------------------
+    if (typeof globalThis.DOMTokenList === 'function' &&
+        globalThis.DOMTokenList.prototype &&
+        !globalThis.DOMTokenList.prototype[Symbol.iterator]) {
+        try {
+            Object.defineProperty(
+                globalThis.DOMTokenList.prototype,
+                Symbol.iterator,
+                {
+                    value: function () {
+                        // Best-effort iteration: enumerate via
+                        // `this.value` (the joined class string)
+                        // when exposed; otherwise yield nothing.
+                        // A real browser yields one token per
+                        // iteration; feature-detect-only callers
+                        // (the destructure pattern, the airgap
+                        // `e[Symbol.iterator]` dance) just want a
+                        // callable that returns an iterator-shaped
+                        // object.
+                        var raw = '';
+                        try {
+                            raw = this.value || '';
+                        } catch (e) { raw = ''; }
+                        var tokens = raw.split(/\s+/).filter(function(t) {
+                            return t.length > 0;
+                        });
+                        var i = 0;
+                        return {
+                            next: function () {
+                                if (i < tokens.length) {
+                                    return { value: tokens[i++], done: false };
+                                }
+                                return { value: undefined, done: true };
+                            },
+                            // Iterator protocol §7.4.1: `return` /
+                            // `throw` are optional but some
+                            // consumers expect them on early
+                            // termination.
+                            'return': function () {
+                                i = tokens.length;
+                                return { value: undefined, done: true };
+                            }
+                        };
+                    },
+                    writable: true,
+                    configurable: true,
+                    enumerable: false
+                }
+            );
+        } catch (e) {
+            if (typeof console !== 'undefined' && console.warn) {
+                console.warn(
+                    'heso: DOMTokenList Symbol.iterator install failed:',
+                    e && e.message ? e.message : e
+                );
+            }
+        }
+    }
+})();
+"#;
+
+/// Adds spec-shaped accessor descriptors to
+/// `XMLHttpRequest.prototype` after [`crate::xhr::install_xhr`]
+/// registers the rquickjs class. Real bundles
+/// (Transcend airgap.js, jQuery legacy, axios) capture method/
+/// getter references by reading
+/// `Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, X).get`
+/// at module-init time. The rquickjs class macro doesn't emit
+/// ACCESSOR descriptors for instance-side data properties
+/// (readyState / response / responseText / etc.) — they're own
+/// data props on each instance. The patches below install thin
+/// accessor shims on the prototype that delegate to the instance
+/// field so the descriptor read returns a real getter function.
+///
+/// Must run AFTER [`crate::xhr::install_xhr`]; the earlier
+/// `BROWSER_APIS_BOOTSTRAP` pass tried to install these in
+/// `install_browser_apis` but ran BEFORE XHR existed and
+/// no-op'd silently.
+const XHR_PROTO_ACCESSOR_BOOTSTRAP: &str = r#"
+(function () {
+    if (typeof globalThis.XMLHttpRequest !== 'function') return;
+    var proto = globalThis.XMLHttpRequest.prototype;
+    if (!proto) return;
+    ['readyState', 'response', 'responseText', 'responseURL', 'responseXML',
+     'responseType', 'status', 'statusText', 'withCredentials', 'timeout', 'upload']
+        .forEach(function (name) {
+            if (Object.getOwnPropertyDescriptor(proto, name)) return;
+            try {
+                Object.defineProperty(proto, name, {
+                    get: function () {
+                        if (this == null) return undefined;
+                        return this[name];
+                    },
+                    set: function (v) {
+                        if (this == null) return;
+                        this[name] = v;
+                    },
+                    enumerable: false, configurable: true,
+                });
+            } catch (e) {}
+        });
 })();
 "#;
 
