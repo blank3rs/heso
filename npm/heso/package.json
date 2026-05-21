@@ -1,6 +1,6 @@
-{
+﻿{
   "name": "@ixla/heso",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "description": "The agent-native web engine. No Chromium. No Node. One Rust binary.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
@@ -30,11 +30,11 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@ixla/heso-win32-x64": "0.0.7",
-    "@ixla/heso-linux-x64": "0.0.7",
-    "@ixla/heso-linux-arm64": "0.0.7",
-    "@ixla/heso-darwin-x64": "0.0.7",
-    "@ixla/heso-darwin-arm64": "0.0.7"
+    "@ixla/heso-win32-x64": "0.0.8",
+    "@ixla/heso-linux-x64": "0.0.8",
+    "@ixla/heso-linux-arm64": "0.0.8",
+    "@ixla/heso-darwin-x64": "0.0.8",
+    "@ixla/heso-darwin-arm64": "0.0.8"
   },
   "engines": {
     "node": ">=14"

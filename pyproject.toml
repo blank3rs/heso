@@ -1,4 +1,4 @@
-# Setuptools config for the `heso` PyPI distribution.
+﻿# Setuptools config for the `heso` PyPI distribution.
 #
 # What changed in v0.0.2:
 #   v0.0.1 shipped a binary-only wheel via maturin (`bindings = bin`).
@@ -33,7 +33,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heso"
-version = "0.0.7"
+version = "0.0.8"
 description = "The agent-native web engine. No Chromium. No Node. One Rust binary."
 readme = "README.md"
 requires-python = ">=3.8"

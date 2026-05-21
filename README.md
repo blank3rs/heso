@@ -29,7 +29,7 @@ npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example
 powershell -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso.zip -OutFile heso.zip; Expand-Archive heso.zip -DestinationPath ."
 ```
 
-> Shipping `v0.0.7` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.0.8` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 
 After install, `heso` is on `$PATH`:
 
@@ -64,13 +64,14 @@ Most of this codebase was written with help from Claude under one person's direc
 - `heso navigate` — change URL within a session.
 - `heso eval-dom <url> "<js>"` — fetch, run scripts, then run your JS against the resulting DOM.
 
-**Bundle, edit, and replay action sequences.**
+**Bundle, edit, replay, and re-execute action sequences.**
 
-A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`). A *plat* is an observation. The three verbs below close the loop:
+A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`). A *plat* is an observation, plus an embedded network *cassette* — every (method, URL, request-body) → (status, headers, response-body) tuple the engine touched during the run. Four verbs close the loop:
 
-- `heso stamp <plan.json>` — executes the plan against the live web and mints a fresh plat that embeds the plan. Accepts a bare `Action[]` array, a plat with a `"plan"` field, or a `TraceFingerprint`. Exit 0 on a clean run; 1 if any step failed (still prints the partial plat with `error` + `steps`).
-- `heso replay <plat.json>` — re-executes the embedded plan and prints a per-step session log. No plat output — use `stamp` for that. Stateful: one `JsSession` carries DOM mutations / RNG / cookies across steps.
-- `heso unpack <plat.json>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint.
+- `heso stamp <plan.json>` — executes the plan against the live web and mints a fresh plat that embeds the plan, the recorded cassette, and a per-step log. Accepts a bare `Action[]` array, a plat with a `"plan"` field, or a `TraceFingerprint`. Exit 0 on a clean run; 1 if any step failed (still prints the partial plat with `error` + `steps`).
+- `heso run <plat.json>` — re-executes the plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay (ADR 0008). If the cassette has drifted (page changed since stamping), the failing step carries a structured `cassette miss: METHOD URL not recorded` error and `run` exits 1 — graceful, never silent.
+- `heso replay <plat.json>` — pure observation. Reads the recorded step log from the plat and prints it. No engine, no JS, no cassette lookup, no network. Use `run` if you want to re-execute.
+- `heso unpack <plat.json>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint a fresh plat (with a fresh cassette since the requests changed).
 
 ```sh
 cat > plan.json <<EOF
@@ -81,12 +82,13 @@ cat > plan.json <<EOF
   {"verb": "submit", "ref": "@form1"}
 ]
 EOF
-heso stamp plan.json > plat.json          # plan → plat
-heso replay plat.json                     # plat → step log (no artifact)
+heso stamp plan.json > plat.json          # plan → plat (records cassette)
+heso run plat.json > plat-replay.json     # plat → plat (off-network, byte-identical)
+heso replay plat.json                     # plat → step log (pure read, no execution)
 heso unpack plat.json > plan-again.json   # plat → plan (edit, restamp)
 ```
 
-The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to both the plan AND the observed content. Edit either and the hash no longer matches. `heso plat-verify` will say so.
+The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso plat-verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
 
 **Recover from broken sites.**
 
