@@ -1,8 +1,10 @@
-# heso — The agent-native web engine. No Chromium. No Node. One Rust binary.
+# heso — Playwright for agents, built around reproducibility. One Rust binary.
 
 **Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
 
-It fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
+A headless web engine for agents: fetches a URL, runs the JavaScript, clicks, fills forms, scrapes — and returns JSON. The load-bearing part: every run can be **stamped** into a signed *plat* with an embedded network cassette, then **byte-identically re-executed** off-network with `heso run`. Anyone, any machine, same output. No Chromium. No Node.
+
+Optimized for structured outputs and reproducibility, not for pixel-perfect rendering or anti-bot warfare. If your task lives in pixels or animations, use Chromium. If it lives in JSON, you're in the right place.
 
 ```
 binary       9.6 MB
@@ -89,6 +91,22 @@ heso unpack plat.json > plan-again.json   # plat → plan (edit, restamp)
 ```
 
 The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso plat-verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
+
+**Replay a published plat in one command.** Install `heso` (`uv tool install heso` / `pipx install heso` / `npm install -g @ixla/heso`), then:
+
+```sh
+curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-1-goldfinger.plat.json \
+  | heso run - \
+  | jq -r .plat_hash
+# → d93c08ba32b762dd6e47091a1d4bd4aa4d8308dbdbf44869f81146a3f5b8033a
+```
+
+That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia article. No network is involved in `heso run` itself.
+
+Three sample plats live as release assets on v0.0.9:
+- [`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-1-goldfinger.plat.json) — Wikipedia `Goldfinger_(film)` (1 MB plat, hash `d93c08ba…`)
+- [`replay-demo-2-torvalds-bio.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-2-torvalds-bio.plat.json) — Wikipedia `Linus_Torvalds` (1 MB plat, hash `27e66b0d…`)
+- [`replay-demo-3-rust-lang-rust.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-3-rust-lang-rust.plat.json) — `github.com/rust-lang/rust` (640 KB plat, hash `201e9410…`)
 
 **Recover from broken sites.**
 

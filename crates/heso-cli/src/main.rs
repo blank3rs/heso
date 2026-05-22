@@ -4377,12 +4377,9 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let contents = match std::fs::read_to_string(&path) {
+    let contents = match read_plat_input(&path) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot read `{path}`: {e}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
@@ -4494,12 +4491,9 @@ async fn cmd_unpack(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let path = &args[0];
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match read_plat_input(path) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot read `{path}`: {e}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
@@ -4514,6 +4508,31 @@ async fn cmd_unpack(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     print_json(plan)
+}
+
+/// Read the input JSON for `stamp` / `run` / `replay` / `unpack` —
+/// either from `path` (file on disk) or from stdin when `path` is
+/// `-`. The stdin branch unlocks the headline one-liner
+/// `curl <plat-url> | heso run -` so a published plat anywhere on
+/// the internet replays byte-identically without a download step.
+fn read_plat_input(path: &str) -> Result<String, ExitCode> {
+    if path == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("cannot read stdin: {e}");
+            return Err(ExitCode::from(2));
+        }
+        Ok(buf)
+    } else {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                eprintln!("cannot read `{path}`: {e}");
+                Err(ExitCode::from(2))
+            }
+        }
+    }
 }
 
 /// Shared `--seed N <path>` flag walker used by `stamp` and the
@@ -4734,12 +4753,9 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let contents = match std::fs::read_to_string(&path) {
+    let contents = match read_plat_input(&path) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot read `{path}`: {e}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
@@ -4853,12 +4869,9 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let path = &args[0];
-    let contents = match std::fs::read_to_string(path) {
+    let contents = match read_plat_input(path) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot read `{path}`: {e}");
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
