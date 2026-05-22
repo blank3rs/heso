@@ -31,7 +31,7 @@ npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example
 powershell -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso.zip -OutFile heso.zip; Expand-Archive heso.zip -DestinationPath ."
 ```
 
-> Shipping `v0.0.9` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.0.10` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 
 After install, `heso` is on `$PATH`:
 
@@ -95,7 +95,7 @@ The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the 
 **Replay a published plat in one command.** Install `heso` (`uv tool install heso` / `pipx install heso` / `npm install -g @ixla/heso`), then:
 
 ```sh
-curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-1-goldfinger.plat.json \
+curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json \
   | heso run - \
   | jq -r .plat_hash
 # → d93c08ba32b762dd6e47091a1d4bd4aa4d8308dbdbf44869f81146a3f5b8033a
@@ -103,10 +103,10 @@ curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-1
 
 That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia article. No network is involved in `heso run` itself.
 
-Three sample plats live as release assets on v0.0.9:
-- [`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-1-goldfinger.plat.json) — Wikipedia `Goldfinger_(film)` (1 MB plat, hash `d93c08ba…`)
-- [`replay-demo-2-torvalds-bio.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-2-torvalds-bio.plat.json) — Wikipedia `Linus_Torvalds` (1 MB plat, hash `27e66b0d…`)
-- [`replay-demo-3-rust-lang-rust.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.9/replay-demo-3-rust-lang-rust.plat.json) — `github.com/rust-lang/rust` (640 KB plat, hash `201e9410…`)
+Three sample plats live as release assets on v0.0.10:
+- [`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json) — Wikipedia `Goldfinger_(film)` (1 MB plat, hash `d93c08ba…`)
+- [`replay-demo-2-torvalds-bio.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-2-torvalds-bio.plat.json) — Wikipedia `Linus_Torvalds` (1 MB plat, hash `27e66b0d…`)
+- [`replay-demo-3-rust-lang-rust.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-3-rust-lang-rust.plat.json) — `github.com/rust-lang/rust` (640 KB plat, hash `201e9410…`)
 
 **Recover from broken sites.**
 
