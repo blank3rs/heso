@@ -31,7 +31,7 @@ npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example
 powershell -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso.zip -OutFile heso.zip; Expand-Archive heso.zip -DestinationPath ."
 ```
 
-> Shipping `v0.0.12` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.0.13` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 
 After install, `heso` is on `$PATH`:
 
@@ -410,7 +410,7 @@ Requires Rust 1.80+ (`rustup` from https://rustup.rs).
 
 ## Status
 
-Pre-alpha. `v0.0.12` is on every registry. Worth trying if the use case fits; not worth depending on in production yet — APIs may still shift.
+Pre-alpha. `v0.0.13` is on every registry. Worth trying if the use case fits; not worth depending on in production yet — APIs may still shift.
 
 ## License
 
