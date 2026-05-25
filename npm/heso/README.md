@@ -21,7 +21,7 @@ npm install @ixla/heso            # library (also gives you the CLI shim)
 npx @ixla/heso open https://example.com   # one-shot
 ```
 
-> `v0.0.1` ships Windows-x64 only. Linux + macOS binaries land with `v0.0.2`.
+> Ships prebuilt binaries for Windows x64, Linux x64 + arm64, and macOS x64 + arm64. `npm` picks the right `@ixla/heso-<platform>-<arch>` via `optionalDependencies` — no native build step.
 
 ## Use as a CLI
 
@@ -56,6 +56,7 @@ Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.
 import {
   open, search, read, evalDom, session, wait,
   stamp, replay, unpack,
+  platHash, platVerify, platInfo, platDiff, platRedact, platSeal, platUnseal,
   HesoError,
 } from "@ixla/heso";
 
@@ -78,6 +79,16 @@ await session(async (s) => {
   const page = await s.read({ include: "text,actions" });
   const title = await s.eval({ js: "document.title" });
 });
+
+// Plat dev tools + envelope
+const hash    = await platHash("out.plat");                    // 64-char hex
+const ok      = await platVerify("out.plat");                  // boolean
+const summary = await platInfo("out.plat");                    // multi-line text
+const { identical, output } = await platDiff("a.plat", "b.plat");
+const clean   = await platRedact("cookies", "out.plat");       // plat with field stripped
+const sealed  = await platSeal("out.plat");                    // SealedPlat envelope
+const status  = await platUnseal("sealed.plat");               // { status: "valid", ... }
+const body    = await platUnseal("sealed.plat", { extract: true }); // inner plat
 ```
 
 All functions return `Promise<object>`. TypeScript declarations ship in `index.d.ts`.

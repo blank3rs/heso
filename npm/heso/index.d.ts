@@ -227,6 +227,87 @@ export function replay(
  */
 export function unpack(file: string): Promise<unknown[]>;
 
+// Plat dev tools + envelope ---------------------------------------------
+
+export interface PlatSealOptions {
+  /** Identity-key path. Default: `heso-local-data/identity.key`. */
+  key?: string;
+}
+
+export interface PlatUnsealOptions {
+  /**
+   * When true, stdout is the inner `content` plat body (parsed) instead
+   * of the small `{status, alg, public_key, plat_hash}` envelope.
+   */
+  extract?: boolean;
+}
+
+/**
+ * `heso plat-hash <file>` — BLAKE3 over the plat's canonical-JSON bytes.
+ * Returns the 64-char lowercase hex string.
+ */
+export function platHash(file: string): Promise<string>;
+
+/**
+ * `heso plat-verify <file>` — embedded `plat_hash` matches recomputed?
+ * Resolves to `true` (CLI exit 0) or `false` (exit 1 = mismatch).
+ * Rejects with `HesoError` on usage/file errors (exit 2).
+ */
+export function platVerify(file: string): Promise<boolean>;
+
+/**
+ * `heso plat-info <file>` — human-readable plat summary (multi-line
+ * text: `plat_hash`, `verified`, `size`, `url`, `title`, plan/cassette
+ * counts, sealed status, partial flag, present ephemerals).
+ */
+export function platInfo(file: string): Promise<string>;
+
+/**
+ * `heso plat-diff <a> <b>` — structured diff of two plats.
+ * Resolves with `{identical, output}`; `identical` is `true` iff CLI
+ * exited 0; `output` is the full stdout.
+ */
+export function platDiff(
+  a: string,
+  b: string,
+): Promise<{ identical: boolean; output: string }>;
+
+/**
+ * `heso plat-redact <field> <file>` — strip a top-level field and emit
+ * a new plat with a recomputed `plat_hash`. Ephemeral fields leave
+ * `plat_hash` unchanged; non-ephemeral fields change it and invalidate
+ * any prior signature. Refuses sealed envelopes (rejects with
+ * `HesoError`).
+ */
+export function platRedact(
+  field: string,
+  file: string,
+): Promise<Record<string, unknown>>;
+
+/**
+ * `heso plat-seal <file> [--key PATH]` — Ed25519 envelope wrapper.
+ * Default key is `heso-local-data/identity.key`; mint one with
+ * `heso identity init`. Returns the parsed `SealedPlat` JSON object
+ * (`{alg, content, signature}`).
+ */
+export function platSeal(
+  file: string,
+  options?: PlatSealOptions,
+): Promise<Record<string, unknown>>;
+
+/**
+ * `heso plat-unseal <file> [--extract]` — verify a sealed envelope
+ * offline. Resolves with the parsed status JSON
+ * (`{status, alg, public_key, plat_hash}`), or with the extracted
+ * inner plat body when `extract: true`. Rejects with `HesoError` on
+ * exit 1 (`HashMismatch` / `InvalidSignature`) or exit 2
+ * (`WrongAlgorithm` / malformed envelope); branch on `err.code`.
+ */
+export function platUnseal(
+  file: string,
+  options?: PlatUnsealOptions,
+): Promise<Record<string, unknown>>;
+
 /** Low-level: spawn `heso <args>` and parse stdout. */
 export function run(
   args: string[],

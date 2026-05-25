@@ -76,6 +76,13 @@ __all__ = [
     "stamp",
     "replay",
     "unpack",
+    "plat_hash",
+    "plat_verify",
+    "plat_info",
+    "plat_diff",
+    "plat_redact",
+    "plat_seal",
+    "plat_unseal",
     "run",
 ]
 
@@ -582,6 +589,101 @@ def unpack(path: Union[str, Path]) -> list:
     :func:`stamp`).
     """
     return run("unpack", str(path))
+
+
+# ---------------------------------------------------------------------------
+# Plat dev tools + envelope
+# ---------------------------------------------------------------------------
+
+
+def plat_hash(path: Union[str, Path]) -> str:
+    """``heso plat-hash <file>`` — BLAKE3 over the plat's canonical
+    JSON bytes. Returns the 64-char lowercase hex string.
+    """
+    return run("plat-hash", str(path), parse_json=False).strip()
+
+
+def plat_verify(path: Union[str, Path]) -> bool:
+    """``heso plat-verify <file>`` — embedded ``plat_hash`` matches the
+    recomputed BLAKE3?
+
+    Returns ``True`` (CLI exit 0) or ``False`` (exit 1 = mismatch).
+    Raises :class:`HesoError` on usage / unreadable / not-JSON (exit 2).
+    """
+    try:
+        run("plat-verify", str(path), parse_json=False)
+        return True
+    except HesoError as e:
+        if e.returncode == 1:
+            return False
+        raise
+
+
+def plat_info(path: Union[str, Path]) -> str:
+    """``heso plat-info <file>`` — human-readable plat summary
+    (multi-line text: ``plat_hash``, ``verified``, ``size``, ``url``,
+    ``title``, plan/cassette counts, sealed status, partial flag, and
+    which ephemeral fields are present).
+    """
+    return run("plat-info", str(path), parse_json=False)
+
+
+def plat_diff(a: Union[str, Path], b: Union[str, Path]) -> dict:
+    """``heso plat-diff <a> <b>`` — structured diff of two plats.
+
+    Returns ``{"identical": bool, "output": str}``. ``identical`` is
+    ``True`` iff the CLI exited 0; ``output`` is the full stdout (the
+    human-readable diff text). Raises :class:`HesoError` on usage /
+    unreadable input (exit 2).
+    """
+    try:
+        out = run("plat-diff", str(a), str(b), parse_json=False)
+        return {"identical": True, "output": out}
+    except HesoError as e:
+        if e.returncode == 1:
+            return {"identical": False, "output": e.stdout}
+        raise
+
+
+def plat_redact(field: str, path: Union[str, Path]) -> dict:
+    """``heso plat-redact <field> <file>`` — strip a top-level field
+    and emit a fresh plat with a recomputed ``plat_hash``.
+
+    Stripping an ephemeral field (``cookies``, ``console``, per-request
+    UUIDs) leaves ``plat_hash`` unchanged. Stripping a non-ephemeral
+    field changes the hash and invalidates any prior signature. Refuses
+    sealed envelopes (raises :class:`HesoError` with ``returncode=1``).
+    """
+    return run("plat-redact", str(field), str(path))
+
+
+def plat_seal(path: Union[str, Path], *, key: Optional[Union[str, Path]] = None) -> dict:
+    """``heso plat-seal <file> [--key PATH]`` — wrap a plat in an
+    Ed25519 envelope.
+
+    Default key path is ``heso-local-data/identity.key``; mint one with
+    ``heso identity init``. Returns the parsed ``SealedPlat`` JSON
+    object ``{alg, content, signature}``.
+    """
+    extra: list[str] = []
+    if key is not None:
+        extra.extend(["--key", str(key)])
+    return run("plat-seal", str(path), *extra)
+
+
+def plat_unseal(path: Union[str, Path], *, extract: bool = False) -> dict:
+    """``heso plat-unseal <file> [--extract]`` — verify a sealed
+    envelope offline (no network, no clock, no key material).
+
+    Returns parsed JSON: a small status object
+    ``{status, alg, public_key, plat_hash}`` by default, or the
+    extracted inner plat body when ``extract=True``. Raises
+    :class:`HesoError` on exit 1 (``HashMismatch`` /
+    ``InvalidSignature``) or exit 2 (``WrongAlgorithm`` / malformed
+    envelope); branch on ``err.returncode``.
+    """
+    extra: list[str] = ["--extract"] if extract else []
+    return run("plat-unseal", str(path), *extra)
 
 
 # ---------------------------------------------------------------------------

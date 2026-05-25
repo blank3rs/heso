@@ -129,14 +129,20 @@ function _findBinary() {
 function _whichPath(name) {
   const PATH = process.env.PATH || "";
   const sep = process.platform === "win32" ? ";" : ":";
+  // On Windows we also want to accept the bare name when it already
+  // carries an extension (`heso.exe`) — PATHEXT lookups are
+  // case-insensitive in the shell, so include `""` as a candidate
+  // suffix and lowercase the comparison.
   const exts =
     process.platform === "win32"
-      ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";")
+      ? ["", ...(process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";")]
       : [""];
+  const nameLower = name.toLowerCase();
   for (const dir of PATH.split(sep)) {
     if (!dir) continue;
     for (const ext of exts) {
-      const candidate = path.join(dir, name.endsWith(ext) ? name : name + ext);
+      const alreadyHasExt = ext === "" || nameLower.endsWith(ext.toLowerCase());
+      const candidate = path.join(dir, alreadyHasExt ? name : name + ext);
       try {
         const stat = fs.statSync(candidate);
         if (stat.isFile()) return candidate;
@@ -446,6 +452,78 @@ function unpack(filePath) {
   return _spawnJson(["unpack", String(filePath)]);
 }
 
+// Plat dev tools + envelope. All take a file path (or `-` for stdin).
+// `platHash` returns just the hex string; `platVerify` and `platDiff`
+// boil their exit codes into booleans; the rest return parsed JSON.
+
+/** `heso plat-hash <file>` — BLAKE3 over the plat's canonical JSON. */
+async function platHash(filePath) {
+  const raw = await run(["plat-hash", String(filePath)], { parseJson: false });
+  return raw.trim();
+}
+
+/** `heso plat-verify <file>` — embedded plat_hash matches recomputed? */
+async function platVerify(filePath) {
+  try {
+    await _spawn(["plat-verify", String(filePath)]);
+    return true;
+  } catch (e) {
+    if (e instanceof HesoError && e.code === 1) return false;
+    throw e;
+  }
+}
+
+/** `heso plat-info <file>` — human-readable plat summary (multi-line text). */
+async function platInfo(filePath) {
+  return run(["plat-info", String(filePath)], { parseJson: false });
+}
+
+/**
+ * `heso plat-diff <a> <b>` — structured diff of two plats.
+ * Returns `{ identical, output }` where `identical` is true iff the CLI
+ * exited 0 and `output` is the full stdout (human-readable diff text).
+ */
+async function platDiff(aPath, bPath) {
+  try {
+    const { stdout } = await _spawn(["plat-diff", String(aPath), String(bPath)]);
+    return { identical: true, output: stdout };
+  } catch (e) {
+    if (e instanceof HesoError && e.code === 1) {
+      return { identical: false, output: e.stdout };
+    }
+    throw e;
+  }
+}
+
+/**
+ * `heso plat-redact <field> <file>` — strip a top-level field and emit a
+ * fresh plat with recomputed plat_hash. Returns the parsed redacted plat.
+ */
+function platRedact(field, filePath) {
+  return _spawnJson(["plat-redact", String(field), String(filePath)]);
+}
+
+/**
+ * `heso plat-seal <file> [--key PATH]` — Ed25519 envelope.
+ * Default key is `heso-local-data/identity.key` (`heso identity init`
+ * to mint). Returns the parsed `SealedPlat` JSON envelope.
+ */
+function platSeal(filePath, options) {
+  return _spawnJson(["plat-seal", String(filePath), ..._optsToArgv(options)]);
+}
+
+/**
+ * `heso plat-unseal <file> [--extract]` — verify a sealed envelope.
+ * Resolves with parsed JSON on exit 0 (a status object, or the inner
+ * `content` plat body when `extract: true`). On exit 1 (`HashMismatch`
+ * / `InvalidSignature`) or 2 (`WrongAlgorithm` / malformed) throws a
+ * `HesoError` carrying `code` and `stderr` so callers can branch on
+ * the failure mode.
+ */
+function platUnseal(filePath, options) {
+  return _spawnJson(["plat-unseal", String(filePath), ..._optsToArgv(options)]);
+}
+
 // ---------------------------------------------------------------------------
 // Stateful session (wraps `heso serve`)
 // ---------------------------------------------------------------------------
@@ -676,6 +754,14 @@ module.exports = {
   stamp,
   replay,
   unpack,
+  // plat dev tools + envelope
+  platHash,
+  platVerify,
+  platInfo,
+  platDiff,
+  platRedact,
+  platSeal,
+  platUnseal,
   // session
   Session,
   session,
