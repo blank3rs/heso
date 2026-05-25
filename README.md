@@ -92,15 +92,20 @@ heso unpack out.plat > plan-again.json    # plat → plan (edit, restamp)
 
 The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso plat-verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
 
-**Inspect a plat.** Three text dev tools, all baked into the main binary:
+**Inspect a plat.** Text dev tools, all baked into the main binary:
 
 ```sh
 heso plat-info   out.plat                       # human summary: hash, plan / cassette / steps counts, sealed status, ephemerals present
 heso plat-diff   before.plat after.plat         # what changed (plan, cassette URLs, ephemerals, url / title / description)
 heso plat-redact cookies   my.plat > clean.plat # strip a top-level field; recomputes plat_hash
+heso plat-seal   my.plat > sealed.plat          # wrap in Ed25519 envelope (default key: heso-local-data/identity.key)
+heso plat-unseal sealed.plat                    # verify; exit 0 valid / 1 invalid / 2 wrong-alg or malformed
+heso plat-unseal sealed.plat --extract          # verify, then print the inner plat body for piping
 ```
 
 `plat-redact` refuses sealed envelopes (would break the signature). Stripping an ephemeral field (`cookies`, `console`, per-request UUIDs and similar per-session telemetry that don't contribute to the hash) leaves `plat_hash` unchanged. Stripping anything else warns to stderr and invalidates any prior signature over the plat.
+
+`plat-seal` produces a `SealedPlat` JSON envelope (`{alg, content, signature}`) that any holder of the envelope + the `heso` binary can verify offline — no key material, no network, no clock. Mint a key once with `heso identity init`; from then on the same key signs every plat. `plat-unseal` checks the algorithm tag, the embedded `plat_hash`, and the Ed25519 signature in order, and refuses to silently treat an unknown `alg` as Ed25519.
 
 **Replay a published plat in one command.** Install `heso` (`uv tool install heso` / `pipx install heso` / `npm install -g @ixla/heso`), then:
 

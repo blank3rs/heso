@@ -186,6 +186,10 @@ fn print_banner() {
     println!("  heso plat-diff   <a> <b>      Show what changed between two plats (plan, cassette URLs, ephemerals)");
     println!("  heso plat-redact <field> <file>");
     println!("                                Strip a top-level field and emit a new plat with a recomputed plat_hash");
+    println!("  heso plat-seal   <file> [--key PATH]");
+    println!("                                Wrap a plat in an Ed25519 envelope (default key: heso-local-data/identity.key)");
+    println!("  heso plat-unseal <file> [--extract]");
+    println!("                                Verify a sealed envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
     println!("  heso eval-js [--seed N] <js>  [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window yet — Phase 1B.");
     println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
@@ -4705,6 +4709,219 @@ async fn cmd_plat_redact(args: &[String]) -> ExitCode {
 }
 
 // ============================================================================
+// Sealed envelope: seal / unseal
+// ============================================================================
+//
+// `plat-seal` wraps a plat body in an Ed25519 envelope; `plat-unseal`
+// checks one. The envelope is the unit of trust — holding it plus the
+// `heso` binary is sufficient to decide whether the content was produced
+// by the holder of the public key and is byte-for-byte what was signed.
+// No network, no clock, no key material needed at verify time.
+
+/// `heso plat-seal <file> [--key PATH]` — wrap a plat body in an
+/// Ed25519 envelope. The envelope is self-describing JSON
+/// (`{alg, content, signature}`) — verifying it offline requires only
+/// the envelope and the `heso` binary.
+///
+/// Refuses an input that already looks sealed (has `alg` + `signature`):
+/// double-sealing is almost always a mistake. Extract `.content` first.
+///
+/// Exit codes: `0` sealed, `1` input unreadable / not JSON / key load
+/// failed / pre-sealed input, `2` usage.
+async fn cmd_plat_seal(args: &[String]) -> ExitCode {
+    let mut file: Option<&str> = None;
+    let mut key_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--key" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--key needs a value");
+                    return ExitCode::from(2);
+                };
+                key_path = Some(PathBuf::from(v));
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if file.is_some() {
+                    eprintln!("unexpected positional `{other}` (expected a single file argument)");
+                    return ExitCode::from(2);
+                }
+                file = Some(other);
+                i += 1;
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("usage: heso plat-seal <file> [--key PATH]");
+        eprintln!();
+        eprintln!("Wrap a plat body in an Ed25519 envelope, printed as JSON on stdout.");
+        eprintln!("Pass `-` to read the plat from stdin. --key defaults to");
+        eprintln!("`{DEFAULT_IDENTITY_PATH}` (init with `heso identity init`).");
+        return ExitCode::from(2);
+    };
+
+    let contents = match read_plat_input(file) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let body: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{file}` is not valid JSON: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if body.get("alg").is_some() && body.get("signature").is_some() {
+        eprintln!(
+            "refused: input looks like a sealed envelope already (has `alg` + `signature`)."
+        );
+        eprintln!("double-sealing is almost always a mistake. Extract `content` first:");
+        eprintln!("  jq .content {file} | heso plat-seal -");
+        return ExitCode::FAILURE;
+    }
+
+    let path = key_path.unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH));
+    let key = match IdentityKey::load(&path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("failed to load identity at `{}`: {e}", path.display());
+            eprintln!("run `heso identity init` first, or pass --key <PATH>.");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let sealed = heso_engine_fetch::plat_seal(&key, body);
+    match serde_json::to_string(&sealed) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize sealed envelope: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `heso plat-unseal <file> [--extract]` — verify a sealed envelope.
+/// Without `--extract`, prints a small JSON status object to stdout.
+/// With `--extract`, prints the inner `content` (the plat body) to
+/// stdout instead — pipe it into anything that takes a plat.
+///
+/// Exit codes:
+/// * `0` envelope is valid (signature + embedded hash both match);
+/// * `1` envelope is invalid — content was mutated (`HashMismatch`) or
+///   the signature does not verify (`InvalidSignature`);
+/// * `2` envelope is malformed (not a SealedPlat shape) OR carries an
+///   algorithm tag this binary does not know (`WrongAlgorithm`), OR a
+///   usage error.
+async fn cmd_plat_unseal(args: &[String]) -> ExitCode {
+    let mut file: Option<&str> = None;
+    let mut extract = false;
+    for a in args {
+        match a.as_str() {
+            "--extract" => extract = true,
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if file.is_some() {
+                    eprintln!("unexpected positional `{other}` (expected a single file argument)");
+                    return ExitCode::from(2);
+                }
+                file = Some(other);
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("usage: heso plat-unseal <file> [--extract]");
+        eprintln!();
+        eprintln!("Verify a sealed plat envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
+        eprintln!("Pass `-` to read the envelope from stdin. With --extract, also print the inner");
+        eprintln!("plat body (the `content` field) to stdout for piping into another verb.");
+        return ExitCode::from(2);
+    };
+
+    let contents = match read_plat_input(file) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let sealed: heso_engine_fetch::SealedPlat = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{file}` is not a sealed envelope: {e}");
+            eprintln!("expected JSON with `alg`, `content`, and `signature` fields.");
+            return ExitCode::from(2);
+        }
+    };
+
+    match heso_engine_fetch::plat_open(&sealed) {
+        heso_engine_fetch::PlatOpenOutcome::Valid => {
+            if extract {
+                match serde_json::to_string(&sealed.content) {
+                    Ok(s) => {
+                        println!("{s}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("failed to serialize content: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            } else {
+                let body = serde_json::json!({
+                    "status": "valid",
+                    "alg": sealed.alg,
+                    "public_key": sealed.signature.public_key,
+                    "plat_hash": sealed.content
+                        .get("plat_hash")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                });
+                match serde_json::to_string(&body) {
+                    Ok(s) => {
+                        println!("{s}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("failed to serialize status: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        }
+        heso_engine_fetch::PlatOpenOutcome::HashMismatch => {
+            let embedded = sealed
+                .content
+                .get("plat_hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown)");
+            let recomputed = heso_engine_fetch::plat_hash(&sealed.content);
+            eprintln!("INVALID: content `plat_hash` does not match recomputed BLAKE3");
+            eprintln!("  embedded:   {embedded}");
+            eprintln!("  recomputed: {recomputed}");
+            eprintln!("the content has been mutated since sealing.");
+            ExitCode::from(1)
+        }
+        heso_engine_fetch::PlatOpenOutcome::InvalidSignature(e) => {
+            eprintln!("INVALID: signature does not verify: {e}");
+            ExitCode::from(1)
+        }
+        heso_engine_fetch::PlatOpenOutcome::WrongAlgorithm(tag) => {
+            eprintln!("WRONG ALGORITHM: envelope carries `{tag}`, this binary only knows `heso-plat/v1+ed25519`.");
+            ExitCode::from(2)
+        }
+    }
+}
+
+// ============================================================================
 // Plan lifecycle: stamp / replay / unpack
 // ============================================================================
 //
@@ -6078,6 +6295,8 @@ async fn main() -> ExitCode {
         Some("plat-info") => cmd_plat_info(&args[1..]).await,
         Some("plat-diff") => cmd_plat_diff(&args[1..]).await,
         Some("plat-redact") => cmd_plat_redact(&args[1..]).await,
+        Some("plat-seal") => cmd_plat_seal(&args[1..]).await,
+        Some("plat-unseal") => cmd_plat_unseal(&args[1..]).await,
         Some("eval-js") => cmd_eval_js(&args[1..]).await,
         Some("eval-dom") => cmd_eval_dom(&args[1..]).await,
         Some("click") => cmd_click(&args[1..]).await,
