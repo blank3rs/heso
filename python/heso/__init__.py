@@ -192,6 +192,8 @@ def _kwargs_to_argv(kwargs: Mapping[str, Any]) -> list[str]:
 
     ``--field`` is special: it accepts repeated ``NAME=VALUE`` pairs
     and may be passed as a ``dict`` or ``list[tuple[str, str]]``.
+    ``--inject-script`` is repeatable and may be passed as one string
+    or a list of strings.
     Everything else: one kwarg -> one flag (with or without a value).
     """
     argv: list[str] = []
@@ -221,6 +223,16 @@ def _kwargs_to_argv(kwargs: Mapping[str, Any]) -> list[str]:
                 raise HesoError(
                     f"`field=` must be a dict or list of pairs; got {type(value).__name__}"
                 )
+            continue
+
+        if key == "inject_script" and isinstance(value, (list, tuple)):
+            for item in value:
+                normalized = _normalize_value(item)
+                if normalized is None:
+                    continue
+                if normalized == "":
+                    raise HesoError("inject_script entries must be strings, not bools")
+                argv.extend([flag, normalized])
             continue
 
         normalized = _normalize_value(value)
@@ -568,14 +580,13 @@ def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
 
 
 def replay(path: Union[str, Path], **kwargs: Any) -> dict:
-    """``heso replay <plan-plat-or-fingerprint.json>`` — re-execute a
-    plan and return a per-step session log. **Does not** produce a plat
-    — use :func:`stamp` for that.
+    """``heso replay <plat.plat>`` — read the recorded step log from a
+    plat. **Does not** execute the engine, touch the network, or produce
+    a fresh plat — use :func:`run` for low-level calls or the CLI
+    ``heso run`` verb when you want cassette-backed re-execution.
 
-    Accepts the same three input shapes as :func:`stamp`. Returns a
-    dict shaped ``{source, start_url, final_url, steps_run,
-    steps_total, ok, steps}``. Raises :class:`HesoError` on any failed
-    step (the log is still on ``stdout``).
+    Returns a dict shaped ``{steps_count, plat_hash, cassette_records,
+    steps}``.
     """
     return run("replay", str(path), *_kwargs_to_argv(kwargs))
 
@@ -921,4 +932,4 @@ def session(binary: Optional[str] = None) -> Session:
 # version into setup.cfg / pyproject for the wheel build). The value
 # here is the same default the workspace ships with; it gets bumped
 # at release time.
-__version__ = "0.0.3"
+__version__ = "0.0.14"

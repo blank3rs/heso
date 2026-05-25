@@ -52,8 +52,8 @@ class HesoError extends Error {
 // ---------------------------------------------------------------------------
 
 // process.platform x process.arch -> per-platform npm package +
-// binary basename. The full matrix as of v0.0.2: Windows x86_64,
-// Linux x86_64 + ARM64, macOS Intel + Apple Silicon. Adding a new
+// binary basename. The current matrix: Windows x86_64, Linux x86_64 +
+// ARM64, macOS Intel + Apple Silicon. Adding a new
 // target is a one-line entry here, a sibling `npm/platforms/<plat>-<arch>/`
 // directory, and one matrix row in `.github/workflows/pypi.yml`.
 const PLATFORMS = {

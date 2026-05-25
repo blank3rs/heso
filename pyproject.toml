@@ -1,10 +1,9 @@
 # Setuptools config for the `heso` PyPI distribution.
 #
-# What changed in v0.0.2:
-#   v0.0.1 shipped a binary-only wheel via maturin (`bindings = bin`).
-#   That gave us `heso open URL` on PATH after `pip install heso` but
-#   left zero room for a Python library API. Users asked for both —
-#   subprocess wrapper + import surface.
+# Packaging shape:
+#   Earlier releases used a binary-only wheel. The current distribution
+#   is a normal Python package with both a subprocess wrapper and an
+#   import surface.
 #
 # Now: setuptools assembles a *normal* Python package at `python/heso/`
 # that bundles the prebuilt `heso(.exe)` binary as package data under
@@ -44,7 +43,9 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Rust",
@@ -62,7 +63,7 @@ Issues = "https://github.com/blank3rs/heso/issues"
 # `pip install heso` generates a launcher (`heso.exe` on Windows, a
 # shebanged shim on POSIX) that imports this module and calls main().
 # main() exec's into the bundled binary. Net: `heso open URL` works
-# on PATH after install, identical UX to the v0.0.1 maturin wheel.
+# on PATH after install, matching the direct binary UX.
 heso = "heso.__main__:main"
 
 # ----------------------------------------------------------------------
@@ -98,11 +99,9 @@ heso = ["bin/heso", "bin/heso.exe", "bin/.gitkeep"]
 # bdist_wheel platform tag
 # ----------------------------------------------------------------------
 #
-# v0.0.1 hardcoded `plat-name = "win_amd64"` here because the only
-# published wheel was Windows. v0.0.2 onwards we publish five wheels
-# in parallel from `.github/workflows/pypi.yml`, each passing its
-# own `--plat-name=<tag>` to bdist_wheel and post-fixing the file
-# name via `wheel tags` if setuptools dropped the build option.
+# Platform wheels are built in parallel from `.github/workflows/pypi.yml`,
+# each passing its own `--plat-name=<tag>` to bdist_wheel and post-fixing
+# the file name via `wheel tags` if setuptools dropped the build option.
 #
 # As a result there is no longer a single "right" plat_name to
 # hardcode. Local `python -m build` runs without a flag will produce

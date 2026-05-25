@@ -5,9 +5,9 @@
 Fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
 
 ```
-binary       9.2 MB
-cold start   ~80 ms   (open https://example.com, network included)
-engine only  ~35 ms   (no network)
+binary       9.73 MB
+cold start   ~77 ms   (open https://example.com, network included)
+engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
 ```
 
@@ -68,7 +68,7 @@ const value   = await evalDom("https://example.com", "document.title");
 
 // Wait for a condition
 const ready = await wait("https://app.example.com/", {
-  selector_exists: ".dashboard",
+  selectorExists: ".dashboard",
   timeout: "5s",
 });
 
@@ -112,7 +112,7 @@ try {
 For sites that crash some scripts, opt into the partial-success envelope instead:
 
 ```js
-const page = await read("https://shoelace.style", { best_effort: true });
+const page = await read("https://shoelace.style", { bestEffort: true });
 if (page.partial) {
   console.log("got partial:", page.partial_reason, page.failed_scripts);
 }
@@ -121,7 +121,7 @@ if (page.partial) {
 ## What it can do
 
 - **Find and read**: `search`, `open`, `read --complete`, `batch`, `wait`
-- **Interact**: `click` by ref/text/selector/aria, `fill`, `submit`, `navigate`
+- **Interact**: `click` by ref/text/selector/aria, `fill`, `submit`; sessions also expose `navigate`
 - **Recover from broken sites**: `--best-effort` returns `partial: true` + structured failure envelope; `--inject-script` shims missing globals
 - **Detect state changes**: `read` returns `content_hash`; pass `--since <hash>` for a `delta` describing what changed
 - **Stateful sessions**: `session()` wraps a long-lived `heso serve` for login → navigate → scrape flows

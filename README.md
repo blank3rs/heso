@@ -13,7 +13,7 @@ batch        ~1.1 s   for 8 URLs in parallel
 
 [![heso agent demo — 50 second screen recording](demo/poster.jpg)](https://www.heso.ca/#demo)
 
-A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no Node, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo) · [download MP4](https://github.com/blank3rs/heso/releases/download/v0.0.13/demo.mp4) (9.73 MB)
+A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no Node, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
 
 ## Install
 
@@ -24,9 +24,12 @@ uv tool install heso          # or: pipx install heso  /  pip install heso
 # Node
 npm install -g @ixla/heso     # or one-shot: npx @ixla/heso open https://example.com
 
-# Direct binary
+# Direct binary installers
+# macOS / Linux:
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.sh | sh
+
 # Windows:
-powershell -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso.zip -OutFile heso.zip; Expand-Archive heso.zip -DestinationPath ."
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.ps1 | iex"
 ```
 
 > Shipping `v0.0.14` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
@@ -57,7 +60,7 @@ You get JSON: title, description, a heading tree, and a list of clickable elemen
 - `heso click <url> --text "Sign in"` — or by visible text, CSS selector, or aria-label.
 - `heso fill <url> @e3 "hello"` — type into an input.
 - `heso submit <url> @e9` — submit a form.
-- `heso navigate` — change URL within a session.
+- `heso serve` exposes a JSON-RPC `navigate` method for changing URL inside a stateful session.
 - `heso eval-dom <url> "<js>"` — fetch, run scripts, then run your JS against the resulting DOM.
 
 **Bundle, edit, replay, and re-execute action sequences.**
@@ -398,7 +401,7 @@ cargo build --release -p heso-cli
 ./target/release/heso search "rust web scraping" --limit 5
 ```
 
-Requires Rust 1.80+ (`rustup` from https://rustup.rs).
+Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 

@@ -190,11 +190,11 @@ fn print_banner() {
     println!("                                Wrap a plat in an Ed25519 envelope (default key: heso-local-data/identity.key)");
     println!("  heso plat-unseal <file> [--extract]");
     println!("                                Verify a sealed envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
-    println!("  heso eval-js [--seed N] <js>  [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
-    println!("                                Pass `-` to read JS source from stdin. No DOM/window yet — Phase 1B.");
+    println!("  heso eval-js [--seed N] <js>  Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
+    println!("                                Pass `-` to read JS source from stdin. No DOM/window; use eval-dom for pages.");
     println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
     println!("  heso eval-dom [--seed N] [--js-fetch] <url> <js>");
-    println!("                                [Phase 1C — ADR 0014] Fetch <url>, run every <script> in document order, then eval <js>");
+    println!("                                Fetch <url>, run every <script> in document order, then eval <js>");
     println!("                                against the post-hydration DOM. Pass `-` for <js> to read from stdin.");
     println!("                                --seed N seeds the determinism shims (default 0). Default skips <script src=...>;");
     println!("                                pass --js-fetch to install the JS `fetch()` global and honor <script src=...>");
@@ -244,6 +244,10 @@ fn print_banner() {
     println!(
         "decisions/0014-bundled-quickjs-agent-dom.md (JS engine, in progress) for the design."
     );
+}
+
+fn print_version() {
+    println!("heso {}", env!("CARGO_PKG_VERSION"));
 }
 
 /// Open a URL with the default `FetchEngine`. Returns the loaded page or an
@@ -6271,6 +6275,14 @@ async fn cmd_receipt_verify(args: &[String]) -> ExitCode {
 async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("-h" | "--help" | "help") => {
+            print_banner();
+            ExitCode::SUCCESS
+        }
+        Some("-V" | "--version" | "version") => {
+            print_version();
+            ExitCode::SUCCESS
+        }
         Some("fetch") => cmd_fetch(&args[1..]).await,
         Some("tree") => cmd_tree(&args[1..]).await,
         Some("ls") => cmd_ls(&args[1..]).await,

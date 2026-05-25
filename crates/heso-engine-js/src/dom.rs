@@ -2117,18 +2117,28 @@ impl Element {
     /// (which reflects a DocumentFragment, totally different shape)
     /// isn't shadowed by this getter.
     #[qjs(get, rename = "content")]
-    fn content(&self) -> String {
+    fn content<'js>(&self, ctx: Ctx<'js>) -> rquickjs::Result<Value<'js>> {
         let Some(n) = self.node_ref() else {
-            return String::new();
+            return ctx.eval::<Value<'js>, _>("undefined");
         };
-        let is_meta = n
+        let node_name = n
             .node_name()
-            .map(|name| name.as_ref().eq_ignore_ascii_case("meta"))
-            .unwrap_or(false);
-        if !is_meta {
-            return String::new();
+            .map(|name| name.as_ref().to_owned())
+            .unwrap_or_default();
+        if node_name.eq_ignore_ascii_case("meta") {
+            let content = n.attr("content").map(|s| s.to_string()).unwrap_or_default();
+            let js_s = rquickjs::String::from_str(ctx, &content)?;
+            return Ok(js_s.into_value());
         }
-        n.attr("content").map(|s| s.to_string()).unwrap_or_default()
+        if node_name.eq_ignore_ascii_case("template") {
+            let holder_node = self.doc.tree.new_element("template-content-holder");
+            let holder_id = holder_node.id;
+            holder_node.set_html(template_inner_html_from_outer(&n.html()));
+            let holder = Element::from_id(self.doc.clone(), holder_id);
+            let instance = Class::instance(ctx.clone(), holder)?;
+            return Ok(instance.into_value());
+        }
+        ctx.eval::<Value<'js>, _>("undefined")
     }
 
     /// Setter pair for [`Self::content`] — `meta.content = "..."` writes
@@ -4297,6 +4307,17 @@ impl Element {
     fn scroll_into_view(&self, _arg: Opt<Value<'_>>) {
         // intentional no-op — no layout.
     }
+}
+
+fn template_inner_html_from_outer(outer: &str) -> String {
+    let mut inner = outer;
+    if let Some(open_end) = inner.find('>') {
+        inner = &inner[open_end + 1..];
+    }
+    if let Some(close_start) = inner.rfind("</template>") {
+        inner = &inner[..close_start];
+    }
+    inner.to_owned()
 }
 
 /// Recursively clone the subtree rooted at `source_id` into the

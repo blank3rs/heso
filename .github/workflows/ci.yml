@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+      - name: Product surface guard
+        run: cargo test -p heso-cli --test product_surface
+      - name: Plat contract guard
+        run: cargo test -p heso-engine-fetch plat::tests
+      - name: Stateful RPC guard
+        run: cargo test -p heso-cli --test serve_stateful_rpc

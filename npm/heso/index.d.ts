@@ -211,9 +211,10 @@ export function stamp(
 ): Promise<Record<string, unknown>>;
 
 /**
- * `heso replay <plan-plat-or-fingerprint.json>` — re-execute a plan
- * and return a per-step session log. Does **not** produce a plat — use
- * `stamp` for that. Rejects with `HesoError` on any failed step.
+ * `heso replay <plat.plat>` — read the recorded step log from a plat.
+ * Pure observation: no engine, no network, no JS, no cassette lookup.
+ * Use the CLI `heso run` verb when you want cassette-backed
+ * re-execution.
  */
 export function replay(
   file: string,

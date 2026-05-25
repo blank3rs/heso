@@ -26,8 +26,8 @@ const fs = require("fs");
 // package's `bin/` dir. Keep entries narrow; expanding the matrix is a
 // one-line edit per target triple.
 //
-// Five-platform matrix as of v0.0.2: Windows x86_64, Linux x86_64 +
-// ARM64, macOS Intel + Apple Silicon. Mirror any change here in
+// Current five-platform matrix: Windows x86_64, Linux x86_64 + ARM64,
+// macOS Intel + Apple Silicon. Mirror any change here in
 // `index.js`'s PLATFORMS map and the matrix in
 // `.github/workflows/pypi.yml`.
 const PLATFORMS = {
