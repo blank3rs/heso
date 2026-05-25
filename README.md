@@ -135,8 +135,7 @@ Three sample plats live as release assets on v0.0.10:
 
 - **No rendering.** No canvas, WebGL, CSS layout, or video. If the meaning is in pixels, use a real browser.
 - **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `heso/<version>` so anything fingerprinting will see us coming. We detect Cloudflare interstitials and surface them as `partial_reason: "bot_challenge"` rather than pretending the page loaded.
-- **Pages built on tech we don't simulate.** Service Workers, WebRTC, WebUSB, WebBluetooth — not supported.
-- **Sites whose JS we can't run.** QuickJS isn't V8. Most works; some doesn't.
+- **Service Workers, WebRTC, WebUSB, WebBluetooth.** Not implemented. The JS engine itself runs modern Next.js / React / Vue / Svelte / SSR sites cleanly; the gaps are in browser features above ECMAScript.
 - **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
 
 ## Use as a library
@@ -373,9 +372,9 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 
 | Thing | Number |
 |---|---|
-| Binary size | 9.2 MB |
-| Cold start (`open https://example.com`, network included) | ~80 ms |
-| Engine-only (no network, local fixture) | ~35 ms |
+| Binary size | 9.6 MB |
+| Cold start (`open https://example.com`, network included) | ~77 ms |
+| Engine-only (no network, local fixture) | ~28 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
 | Search (DDG, 5 results) | ~1 s |
 
@@ -383,7 +382,7 @@ No comparisons to other tools — different tools have different tradeoffs and "
 
 ## Building from source
 
-If you're on Linux/macOS today (v0.0.2 will ship prebuilt binaries) or want to hack on heso itself:
+If you want to hack on heso itself (prebuilt binaries for Windows x64, Linux x64+arm64, macOS x64+arm64 ship from each release tag — see Install above):
 
 ```sh
 git clone https://github.com/blank3rs/heso
@@ -396,7 +395,7 @@ Requires Rust 1.80+ (`rustup` from https://rustup.rs).
 
 ## Status
 
-Pre-alpha. `v0.0.1` is on every registry. Worth trying if the use case fits; not worth depending on in production yet. Next ([`v0.0.2`](https://github.com/blank3rs/heso/milestone/2)) ships Linux + macOS binaries and the library APIs above.
+Pre-alpha. `v0.0.10` is on every registry. Worth trying if the use case fits; not worth depending on in production yet — APIs may still shift.
 
 ## License
 

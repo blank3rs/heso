@@ -25,8 +25,10 @@ heso-local-data/
 *.local
 
 # AI coding agents — local state directories (auth tokens, worktrees,
-# conversation history, scratch). Project-level instructions like
-# CLAUDE.md and AGENTS.md are shared docs and DO ship.
+# conversation history, scratch). All internal agent meta — AGENTS.md,
+# CLAUDE.md, /.agent/, /decisions/, /proposals/, /research/, /skills/,
+# /bug-reports/, state.json — stays local (see entries below). The only
+# .md that ships at the repo root is README.md.
 .claude/
 .cursor/
 .cursorignore
