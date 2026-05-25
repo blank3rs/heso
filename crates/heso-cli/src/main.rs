@@ -767,6 +767,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         &page.tree.title,
         page.actions.len(),
         page.tree.root.children.len(),
+        &failed_scripts,
     );
     // Without `--best-effort`, today's contract is "open always
     // returns the page even if hydration errors happen" — we keep
@@ -950,16 +951,24 @@ pub(crate) fn classify_failure_envelope(
 /// fields still ride the response for callers that care to inspect
 /// them.
 ///
-/// HTTP-side classifications (`http_4xx`, `http_5xx`,
-/// `bot_challenge`) bypass this override — those signals mean the
-/// network response was bad and any extraction "success" off a
-/// challenge body is a false positive we should not silence.
+/// Two classes of failures bypass this override and keep
+/// `partial: true`:
+///
+/// 1. HTTP-side classifications (`http_4xx`, `http_5xx`,
+///    `bot_challenge`) — the network response was bad and any
+///    extraction "success" off a challenge body is a false positive.
+/// 2. Inline `<script>` crashes (a `ScriptFailure` with `url: None`)
+///    — these are the page's OWN code failing, not a third-party
+///    tracker. The page may still render, but the agent needs to
+///    know the site's own logic broke; that's actionable signal it
+///    couldn't get from a `failed_scripts[]` length alone.
 pub(crate) fn apply_extraction_truthfulness(
     partial: bool,
     reason: String,
     title: &str,
     action_count: usize,
     tree_child_count: usize,
+    failed_scripts: &[heso_engine_js::ScriptFailure],
 ) -> (bool, String) {
     if !partial {
         return (false, reason);
@@ -967,6 +976,12 @@ pub(crate) fn apply_extraction_truthfulness(
     let http_owned = reason.starts_with("http_")
         || matches!(reason.as_str(), "bot_challenge" | "cloudflare_challenge");
     if http_owned {
+        return (true, reason);
+    }
+    let inline_crashed = failed_scripts
+        .iter()
+        .any(|f| f.url.is_none() && f.reason == "script_crash");
+    if inline_crashed {
         return (true, reason);
     }
     let extraction_ok =
@@ -1741,6 +1756,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         &page.tree.title,
         page.actions.len(),
         page.tree.root.children.len(),
+        &failed_scripts,
     );
     attach_failure_envelope(
         &mut body,
