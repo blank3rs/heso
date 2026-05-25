@@ -1,6 +1,6 @@
 {
   "name": "@ixla/heso-linux-arm64",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "description": "Linux ARM64 binary for @ixla/heso. Do not install directly.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
