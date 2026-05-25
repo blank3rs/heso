@@ -40,6 +40,10 @@ heso serve     # JSON-RPC over stdio for multi-step sessions
 heso stamp  plan.json > out.plat    # plan → plat (executes + mints)
 heso replay out.plat                # plat → per-step log (no artifact)
 heso unpack out.plat > plan.json    # plat → plan (edit, restamp)
+
+heso plat-info   out.plat           # human summary of a plat (hash, plan/cassette/steps counts, sealed status)
+heso plat-diff   a.plat b.plat      # what changed (plan, cassette URLs, ephemerals)
+heso plat-redact cookies my.plat    # strip a top-level field, recompute plat_hash
 ```
 
 Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.

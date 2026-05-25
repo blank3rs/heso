@@ -182,6 +182,10 @@ fn print_banner() {
     println!("                                   Most public instances disable JSON output by default.");
     println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
     println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
+    println!("  heso plat-info   <file>       Human summary of a plat: hash, plan/cassette/steps counts, sealed status, partial flag");
+    println!("  heso plat-diff   <a> <b>      Show what changed between two plats (plan, cassette URLs, ephemerals)");
+    println!("  heso plat-redact <field> <file>");
+    println!("                                Strip a top-level field and emit a new plat with a recomputed plat_hash");
     println!("  heso eval-js [--seed N] <js>  [Phase 1A — ADR 0014] Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window yet — Phase 1B.");
     println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
@@ -4256,6 +4260,451 @@ async fn cmd_plat_verify(args: &[String]) -> ExitCode {
 }
 
 // ============================================================================
+// Plat dev tools: info / diff / redact
+// ============================================================================
+//
+// Text-only inspection tools for `.plat` files. Live in the main binary
+// (not a separate package) because they are tiny and the alternative —
+// "install another binary just to grep a plat" — is worse UX than baked-in.
+
+/// Format a byte count as `B` / `KB` / `MB` for human-readable output.
+fn plat_format_bytes(n: usize) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// `heso plat-info <file>` — print a human summary of a plat: hash,
+/// size, url/title, plan/cassette/steps counts, sealed status, partial
+/// flag, and which top-level ephemeral fields are present (stripped
+/// from the hash but worth knowing about).
+///
+/// Exit codes: `0` ok, `1` file unreadable or not JSON, `2` usage.
+async fn cmd_plat_info(args: &[String]) -> ExitCode {
+    if args.is_empty() {
+        eprintln!("usage: heso plat-info <file>");
+        eprintln!();
+        eprintln!("Print a human summary of a plat: plat_hash, plan length,");
+        eprintln!("cassette record count, step count, sealed status, partial");
+        eprintln!("flag, and which ephemeral fields are present.");
+        return ExitCode::from(2);
+    }
+    let file = &args[0];
+    let contents = match tokio::fs::read_to_string(file).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to read `{file}`: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let size_bytes = contents.len();
+    let value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{file}` is not valid JSON: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let embedded_hash = value
+        .get("plat_hash")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(not present)");
+    let url = value
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no url)");
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(no title)");
+
+    let plan_summary = match value.get("plan").and_then(|v| v.as_array()) {
+        Some(arr) if arr.is_empty() => "0 actions".to_owned(),
+        Some(arr) => {
+            let verbs: Vec<&str> = arr
+                .iter()
+                .filter_map(|a| a.get("verb").and_then(|v| v.as_str()))
+                .collect();
+            if verbs.is_empty() {
+                format!("{} actions (unknown shape)", arr.len())
+            } else {
+                format!("{} actions ({})", arr.len(), verbs.join(" → "))
+            }
+        }
+        None => "(no plan)".to_owned(),
+    };
+
+    let cassette_summary = match value
+        .get("cassette")
+        .and_then(|c| c.get("records"))
+        .and_then(|r| r.as_array())
+    {
+        Some(records) if records.is_empty() => "0 records".to_owned(),
+        Some(records) => {
+            let mut methods: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut body_bytes: usize = 0;
+            for r in records {
+                let method = r
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_owned();
+                *methods.entry(method).or_insert(0) += 1;
+                if let Some(body_b64) = r.get("response_body_b64").and_then(|v| v.as_str()) {
+                    body_bytes += body_b64.len() * 3 / 4;
+                }
+            }
+            let method_parts: Vec<String> =
+                methods.iter().map(|(m, c)| format!("{c} {m}")).collect();
+            format!(
+                "{} records ({}; ~{} body data)",
+                records.len(),
+                method_parts.join(", "),
+                plat_format_bytes(body_bytes)
+            )
+        }
+        None => "(no cassette)".to_owned(),
+    };
+
+    let steps_summary = match value.get("steps").and_then(|s| s.as_array()) {
+        Some(steps) => {
+            let total = steps.len();
+            let errors = steps.iter().filter(|s| s.get("error").is_some()).count();
+            let ok = total - errors;
+            format!("{total} steps ({ok} ok, {errors} errors)")
+        }
+        None => "(no steps)".to_owned(),
+    };
+
+    let sealed = value.get("alg").is_some() && value.get("signature").is_some();
+    let partial = value
+        .get("partial")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let partial_reason = value
+        .get("partial_reason")
+        .and_then(|v| v.as_str())
+        .filter(|s| *s != "ok" && !s.is_empty());
+
+    let verified = match heso_engine_fetch::plat_verify(&value) {
+        Ok(true) => "yes (hash matches content)",
+        Ok(false) => "NO (embedded hash does not match recomputed)",
+        Err(_) => "n/a (missing or malformed plat_hash)",
+    };
+
+    let ephemerals_present: Vec<&str> = if let Some(obj) = value.as_object() {
+        heso_engine_fetch::EPHEMERAL_OBJECT_KEYS
+            .iter()
+            .filter(|k| obj.contains_key(**k))
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    println!("plat_hash:    {embedded_hash}");
+    println!("verified:     {verified}");
+    println!("size:         {}", plat_format_bytes(size_bytes));
+    println!("url:          {url}");
+    println!("title:        {title}");
+    println!("plan:         {plan_summary}");
+    println!("cassette:     {cassette_summary}");
+    println!("steps:        {steps_summary}");
+    println!(
+        "sealed:       {}",
+        if sealed { "yes (Ed25519 envelope)" } else { "no" }
+    );
+    let partial_line = match (partial, partial_reason) {
+        (false, _) => "false".to_owned(),
+        (true, Some(reason)) => format!("true ({reason})"),
+        (true, None) => "true".to_owned(),
+    };
+    println!("partial:      {partial_line}");
+    if ephemerals_present.is_empty() {
+        println!("ephemerals:   none");
+    } else {
+        println!(
+            "ephemerals:   {} (stripped from hash)",
+            ephemerals_present.join(", ")
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+/// `heso plat-diff <a> <b>` — show what changed between two plats:
+/// `plat_hash`, plan, cassette URL set + per-URL response bodies,
+/// ephemeral fields that flipped, and key top-level fields.
+///
+/// Output is a small, human-readable report — not a unified diff. For a
+/// full structural diff, pipe each plat through `jq` and use `diff`.
+///
+/// Exit codes: `0` plats are byte-identical-equivalent (same plat_hash),
+/// `1` plats differ in any agent-observable way, `2` usage / unreadable.
+async fn cmd_plat_diff(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: heso plat-diff <a> <b>");
+        eprintln!();
+        eprintln!("Show what changed between two plats. Exit 0 if their");
+        eprintln!("plat_hash matches (no agent-observable difference), 1 if");
+        eprintln!("they differ, 2 on usage error or unreadable file.");
+        return ExitCode::from(2);
+    }
+    let (file_a, file_b) = (&args[0], &args[1]);
+
+    async fn load(path: &str) -> Result<serde_json::Value, String> {
+        let s = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| format!("failed to read `{path}`: {e}"))?;
+        serde_json::from_str(&s).map_err(|e| format!("`{path}` is not valid JSON: {e}"))
+    }
+
+    let a = match load(file_a).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let b = match load(file_b).await {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let hash_a = a
+        .get("plat_hash")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| heso_engine_fetch::plat_hash(&a));
+    let hash_b = b
+        .get("plat_hash")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| heso_engine_fetch::plat_hash(&b));
+
+    if hash_a == hash_b {
+        println!("plat_hash:    IDENTICAL ({hash_a})");
+        println!();
+        println!("The plats are byte-equivalent under HESO/1.0 §1.5 canonicalization.");
+        println!("Any difference between the files lives in ephemeral fields only");
+        println!("(per-session telemetry stripped from the hash).");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("plat_hash:    DIFFERENT");
+    println!("              a: {hash_a}");
+    println!("              b: {hash_b}");
+    println!();
+
+    // Plan diff: lengths + verb sequence.
+    let plan_a = a.get("plan").and_then(|v| v.as_array());
+    let plan_b = b.get("plan").and_then(|v| v.as_array());
+    match (plan_a, plan_b) {
+        (Some(pa), Some(pb)) if pa == pb => {
+            println!("plan:         IDENTICAL ({} actions)", pa.len());
+        }
+        (Some(pa), Some(pb)) => {
+            println!(
+                "plan:         DIFFERENT (a: {} actions, b: {} actions)",
+                pa.len(),
+                pb.len()
+            );
+        }
+        (Some(_), None) => println!("plan:         only in a"),
+        (None, Some(_)) => println!("plan:         only in b"),
+        (None, None) => {}
+    }
+
+    // Cassette diff: URL set difference + per-URL response body diff.
+    fn cassette_records(v: &serde_json::Value) -> Vec<(&str, &str, &str)> {
+        v.get("cassette")
+            .and_then(|c| c.get("records"))
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| {
+                        let method = r.get("method").and_then(|v| v.as_str()).unwrap_or("?");
+                        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+                        let body = r
+                            .get("response_body_b64")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        (method, url, body)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let recs_a = cassette_records(&a);
+    let recs_b = cassette_records(&b);
+    if !recs_a.is_empty() || !recs_b.is_empty() {
+        let keys_a: std::collections::BTreeMap<(&str, &str), &str> =
+            recs_a.iter().map(|(m, u, b)| ((*m, *u), *b)).collect();
+        let keys_b: std::collections::BTreeMap<(&str, &str), &str> =
+            recs_b.iter().map(|(m, u, b)| ((*m, *u), *b)).collect();
+        let only_a: Vec<&(&str, &str)> =
+            keys_a.keys().filter(|k| !keys_b.contains_key(*k)).collect();
+        let only_b: Vec<&(&str, &str)> =
+            keys_b.keys().filter(|k| !keys_a.contains_key(*k)).collect();
+        let changed: Vec<&(&str, &str)> = keys_a
+            .iter()
+            .filter_map(|(k, va)| {
+                let vb = keys_b.get(k)?;
+                if vb != va {
+                    Some(k)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if only_a.is_empty() && only_b.is_empty() && changed.is_empty() {
+            println!("cassette:     IDENTICAL ({} records)", keys_a.len());
+        } else {
+            println!(
+                "cassette:     DIFFERENT (a: {} records, b: {} records)",
+                keys_a.len(),
+                keys_b.len()
+            );
+            for k in &only_a {
+                println!("              - {} {}  (in a only)", k.0, k.1);
+            }
+            for k in &only_b {
+                println!("              + {} {}  (in b only)", k.0, k.1);
+            }
+            for k in &changed {
+                println!("              ~ {} {}  (response body differs)", k.0, k.1);
+            }
+        }
+    }
+
+    // Ephemeral fields that differ (won't affect plat_hash, but worth
+    // knowing — e.g. cookies / http_status changed between two runs).
+    let ephs_diff: Vec<&str> = heso_engine_fetch::EPHEMERAL_OBJECT_KEYS
+        .iter()
+        .filter(|k| a.get(**k) != b.get(**k))
+        .copied()
+        .collect();
+    if !ephs_diff.is_empty() {
+        println!(
+            "ephemerals:   {} differ (stripped from hash)",
+            ephs_diff.join(", ")
+        );
+    }
+
+    // Key top-level scalars that often differ in obvious ways.
+    for field in &["url", "title", "description"] {
+        let av = a.get(*field).and_then(|v| v.as_str()).unwrap_or("");
+        let bv = b.get(*field).and_then(|v| v.as_str()).unwrap_or("");
+        if av != bv {
+            println!("{field}: DIFFERENT");
+            println!("              a: {av}");
+            println!("              b: {bv}");
+        }
+    }
+
+    ExitCode::from(1)
+}
+
+/// `heso plat-redact <field> <file>` — strip a top-level field from a
+/// plat and emit the result on stdout with a freshly-recomputed
+/// `plat_hash`. Refuses to operate on a sealed envelope (would break
+/// the signature). Warns to stderr if the field is non-ephemeral (the
+/// hash will change; any previous attestation is invalidated).
+///
+/// Exit codes: `0` redaction applied (field removed or already absent),
+/// `1` refused (sealed envelope), `2` usage / unreadable / not a plat.
+async fn cmd_plat_redact(args: &[String]) -> ExitCode {
+    if args.len() < 2 {
+        eprintln!("usage: heso plat-redact <field> <file>");
+        eprintln!();
+        eprintln!("Strip a top-level field from a plat and emit the result on");
+        eprintln!("stdout with a recomputed plat_hash. Useful for sharing a plat");
+        eprintln!("without per-session bytes (cookies, console output, etc.).");
+        eprintln!();
+        eprintln!("Refuses sealed envelopes — extract `content` first if needed.");
+        return ExitCode::from(2);
+    }
+    let field = &args[0];
+    let file = &args[1];
+    let contents = match tokio::fs::read_to_string(file).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to read `{file}`: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("`{file}` is not valid JSON: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if value.get("alg").is_some() && value.get("signature").is_some() {
+        eprintln!(
+            "refused: `{file}` looks like a sealed envelope (has `alg` + `signature`)."
+        );
+        eprintln!("redacting it would break the signature. Extract `content` first:");
+        eprintln!("  jq .content {file} | heso plat-redact {field} -");
+        return ExitCode::from(1);
+    }
+
+    let obj = match value.as_object_mut() {
+        Some(o) => o,
+        None => {
+            eprintln!("`{file}` is not a JSON object (plats are objects).");
+            return ExitCode::from(2);
+        }
+    };
+
+    let was_present = obj.remove(field.as_str()).is_some();
+    let is_ephemeral = heso_engine_fetch::EPHEMERAL_OBJECT_KEYS
+        .iter()
+        .any(|k| *k == field.as_str());
+
+    if !was_present {
+        eprintln!("note: field `{field}` was not present; plat_hash unchanged.");
+    } else if !is_ephemeral {
+        eprintln!(
+            "warning: `{field}` is NOT in the ephemeral keys list (it contributes to plat_hash)."
+        );
+        eprintln!("the output plat has a NEW plat_hash; any prior signature is invalidated.");
+    }
+
+    // Strip the existing plat_hash, recompute against the modified body,
+    // re-embed. This is a no-op on the hash for ephemeral-key redactions.
+    obj.remove("plat_hash");
+    let new_hash = heso_engine_fetch::plat_hash(&value);
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(
+            "plat_hash".to_owned(),
+            serde_json::Value::String(new_hash),
+        );
+    }
+
+    match serde_json::to_string(&value) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to serialize redacted plat: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+// ============================================================================
 // Plan lifecycle: stamp / replay / unpack
 // ============================================================================
 //
@@ -5626,6 +6075,9 @@ async fn main() -> ExitCode {
         Some("wait") => cmd_wait(&args[1..]).await,
         Some("plat-hash") => cmd_plat_hash(&args[1..]).await,
         Some("plat-verify") => cmd_plat_verify(&args[1..]).await,
+        Some("plat-info") => cmd_plat_info(&args[1..]).await,
+        Some("plat-diff") => cmd_plat_diff(&args[1..]).await,
+        Some("plat-redact") => cmd_plat_redact(&args[1..]).await,
         Some("eval-js") => cmd_eval_js(&args[1..]).await,
         Some("eval-dom") => cmd_eval_dom(&args[1..]).await,
         Some("click") => cmd_click(&args[1..]).await,

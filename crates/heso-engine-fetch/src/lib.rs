@@ -84,7 +84,7 @@ pub use metadata::{extract as extract_metadata, PageMetadata};
 pub use plat::{
     canonical_json as plat_canonical_json, hash as plat_hash, open as plat_open,
     seal as plat_seal, verify as plat_verify, OpenOutcome as PlatOpenOutcome,
-    SealedPlat, VerifyError as PlatVerifyError,
+    SealedPlat, VerifyError as PlatVerifyError, EPHEMERAL_OBJECT_KEYS,
 };
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
 // `ResponseCookie` is defined inline below alongside `FetchPage` and is
