@@ -4,9 +4,10 @@
 //! This module gives a plat two layers of cryptographic identity:
 //!
 //! 1. A **content hash** — BLAKE3 over the [RFC 8785] canonical-JSON
-//!    bytes of the plat (with its own `plat_hash` field excluded). Two
-//!    runs that produced the same plat content produce the same hash;
-//!    any byte changed inside the plat changes the hash.
+//!    bytes of the plat (with its own top-level `plat_hash` field
+//!    excluded). Two runs that produced the same plat content produce
+//!    the same hash; any content change inside the plat changes the
+//!    hash.
 //! 2. A **sealed envelope** — [`SealedPlat`] — that pairs the plat
 //!    body with an Ed25519 [`Signature`] over the same canonical bytes,
 //!    domain-separated by [`SIGNING_DOMAIN`]. Verifying needs only the
@@ -14,9 +15,10 @@
 //!
 //! The unbreakability property reduces to a single invariant:
 //!
-//! > *Mutating any byte inside the plat changes the canonical bytes,
-//! > which changes the signed message, which fails Ed25519
-//! > `verify_strict`.*
+//! > *Mutating any content byte inside the plat changes the canonical
+//! > bytes, which changes the signed message, which fails Ed25519
+//! > `verify_strict`. Mutating the top-level `plat_hash` itself is caught
+//! > by hash verification before signature verification.*
 //!
 //! Everything else (Merkle aggregation, transparency-log anchoring,
 //! post-quantum hybrids) is a layer above this and a non-breaking
@@ -68,85 +70,19 @@ pub fn canonical_json(value: &Value) -> String {
         .expect("serde_jcs emits valid UTF-8")
 }
 
-
-/// Per-request entropy and derived-metadata JSON keys stripped from
-/// the canonical bytes BEFORE serde_jcs canonicalization. Together with
-/// RFC 8785 byte-stability, this yields a hash over the agent-observable
-/// surface — not the per-request UUIDs / build hashes / session
-/// envelopes that ride alongside it.
-///
-/// MUST stay sorted alphabetically — `is_ephemeral` uses `binary_search`.
-pub const EPHEMERAL_OBJECT_KEYS: &[&str] = &[
-    "aria-activedescendant",
-    "aria-controls",
-    "aria-describedby",
-    "aria-labelledby",
-    "aria-owns",
-    "console",
-    "console_errors_count",
-    "content_hash",
-    "cookies",
-    "data_attrs",
-    "delta",
-    "failed_scripts",
-    "for",
-    "forms",
-    "framework",
-    "http_status",
-    "id",
-    "inline_data",
-    "lazy_hints",
-    "metadata",
-    "nonce",
-    "partial",
-    "partial_reason",
-    "scripts",
-    "scroll",
-    "text",
-];
-
-fn is_ephemeral(key: &str) -> bool {
-    EPHEMERAL_OBJECT_KEYS.binary_search(&key).is_ok()
-}
-
-/// Recursively strip ephemeral keys at every JSON-object level so the
-/// canonical bytes reflect only the agent-observable surface.
-fn strip_ephemeral(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (k, v) in map {
-                if is_ephemeral(k) {
-                    continue;
-                }
-                out.insert(k.clone(), strip_ephemeral(v));
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(strip_ephemeral).collect()),
-        other => other.clone(),
-    }
-}
 fn canonical_bytes(value: &Value) -> Vec<u8> {
-    // Strip ephemeral keys recursively before canonicalization — the
-    // hash names the agent-observable surface, not per-request UUIDs /
-    // session envelopes / derived telemetry. Combined with serde_jcs
-    // RFC 8785, this gives both byte-stability (any byte change in the
-    // observable surface flips the hash) and determinism on dynamic
-    // pages (per-request entropy elsewhere does not).
-    //
-    // Top-level `plat_hash` is also stripped — a hash field cannot
-    // contain its own digest. Nested `plat_hash` values (from
-    // `linked_pages[*]`) ARE preserved so a parent plat
-    // cryptographically commits to its children's hashes (Merkle-
-    // style).
+    // Strip only the top-level `plat_hash` before canonicalization: a
+    // hash field cannot contain its own digest. Every other field is
+    // content. Nested `plat_hash` values (from `linked_pages[*]`) ARE
+    // preserved so a parent plat cryptographically commits to its
+    // children's hashes (Merkle-style).
     let cleaned = match value {
         Value::Object(map) if map.contains_key("plat_hash") => {
             let mut stripped = map.clone();
             stripped.remove("plat_hash");
-            strip_ephemeral(&Value::Object(stripped))
+            Value::Object(stripped)
         }
-        other => strip_ephemeral(other),
+        other => other.clone(),
     };
     serde_jcs::to_vec(&cleaned).expect("plat value canonicalizes")
 }
@@ -353,9 +289,8 @@ mod tests {
     // URL-in-hash invariant tests. These exist because the public
     // contract "different URLs produce different plat hashes" is the
     // load-bearing claim behind plat-hash content addressing. If any
-    // future refactor adds `url` / `input_url` to EPHEMERAL_OBJECT_KEYS,
-    // changes the canonical-form pass to normalize URLs aggressively,
-    // or drops either field from the hash input, these tests trip.
+    // future refactor normalizes URLs aggressively or drops either
+    // field from the hash input, these tests trip.
     // ------------------------------------------------------------------
 
     #[test]
@@ -395,16 +330,6 @@ mod tests {
             hash(&a), hash(&b),
             "different `input_url` MUST yield different plat_hash"
         );
-    }
-
-    #[test]
-    fn url_and_input_url_keys_are_not_ephemeral() {
-        // Source-of-truth pin: the two tests above could pass by
-        // accident if any other field varied. This checks the
-        // ephemeral-keys list directly so a careless "add url to the
-        // stripped set" PR fails the suite at the moment of edit.
-        assert!(!is_ephemeral("url"),       "`url` MUST NOT be ephemeral");
-        assert!(!is_ephemeral("input_url"), "`input_url` MUST NOT be ephemeral");
     }
 
     #[test]
@@ -795,17 +720,14 @@ mod tests {
     }
 
     // ========================================================================
-    // bug-report 05-C: agent-observable hash stability against per-request
-    // server-side UUIDs (GitHub-style CSP nonces, request IDs, build hashes
-    // embedded in `id` / `aria-labelledby` / `aria-describedby` attributes).
+    // Tamper-evidence: any content field that ships in the plat is hashed.
     // ========================================================================
 
     #[test]
-    fn hash_stable_when_only_ephemeral_relational_attrs_change() {
-        // Identical agent-observable surface; only `id`,
-        // `aria-labelledby`, `aria-describedby` carry per-request UUIDs.
-        // These are the exact attribute keys agent 5 observed leaking
-        // server-side entropy into `plat_hash` for github.com pages.
+    fn hash_changes_when_relational_attrs_change() {
+        // These fields can contain per-request UUIDs on some sites, but
+        // once heso emits them they are part of the artifact. Mutating
+        // them after stamping must be detectable by plat_hash.
         let v1 = json!({
             "url": "https://example.com/",
             "title": "Page",
@@ -842,13 +764,13 @@ mod tests {
                 }
             ]
         });
-        assert_eq!(hash(&v1), hash(&v2));
+        assert_ne!(hash(&v1), hash(&v2));
     }
 
     #[test]
     fn hash_still_changes_when_meaningful_attrs_change() {
-        // Non-ephemeral attrs (`href`, `type`, `name`, `value`) DO
-        // contribute to the hash — content changes must still flip it.
+        // Attribute changes contribute to the hash — content changes
+        // must still flip it.
         let base = json!({
             "url": "https://example.com/",
             "actions": [
@@ -881,12 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn hash_drops_inline_data_and_data_attrs_top_level_blobs() {
+    fn hash_includes_inline_data_and_data_attrs_top_level_blobs() {
         // SSR frameworks ship `__NEXT_DATA__` / `__NUXT_DATA__` /
-        // `data-*` JSON payloads that frequently embed requestId /
-        // sessionId / build hashes. Two plats with the same
-        // agent-visible surface but different hydration payloads must
-        // hash the same.
+        // `data-*` JSON payloads. They may contain request IDs or build
+        // hashes, but they are still bytes heso observed and emitted.
+        // If they change, the plat hash must change too.
         let v1 = json!({
             "url": "x",
             "title": "Same title",
@@ -899,17 +820,17 @@ mod tests {
             "inline_data": {"__NEXT_DATA__": {"requestId": "req-ccc-333"}},
             "data_attrs": {"data-foo": [{"requestId": "req-ddd-444"}]},
         });
-        assert_eq!(hash(&v1), hash(&v2));
+        assert_ne!(hash(&v1), hash(&v2));
     }
 
     #[test]
-    fn hash_drops_per_session_envelope_fields() {
+    fn hash_includes_per_session_envelope_fields() {
         // `cookies`, `console`, `scripts`, `partial`, `partial_reason`,
         // `failed_scripts`, `console_errors_count`, `lazy_hints`,
         // `scroll`, `http_status`, `framework`, `forms`,
-        // `content_hash`, `delta`, `text` — all per-session telemetry
-        // / derived fields that don't contribute to the
-        // agent-observable surface.
+        // `content_hash`, `delta`, `text` — all are part of the plat
+        // once emitted. Redacting any present field must produce a new
+        // hash.
         let v1 = json!({
             "url": "x",
             "title": "T",
@@ -928,14 +849,13 @@ mod tests {
             "partial": false,
             "scripts": {"executed": 12, "executed_with_error": 1},
         });
-        assert_eq!(hash(&v1), hash(&v2));
+        assert_ne!(hash(&v1), hash(&v2));
     }
 
     #[test]
     fn hash_preserves_functional_aria_state_attrs() {
-        // `aria-disabled`, `aria-checked`, etc. reflect element STATE
-        // (not relational pointers) — these are part of the
-        // agent-observable surface and must contribute to the hash.
+        // `aria-disabled`, `aria-checked`, etc. reflect element state,
+        // and emitted attrs must contribute to the hash.
         let v1 = json!({
             "url": "x",
             "actions": [
@@ -949,21 +869,6 @@ mod tests {
             ]
         });
         assert_ne!(hash(&v1), hash(&v2));
-    }
-
-    #[test]
-    fn ephemeral_object_keys_is_sorted_so_binary_search_works() {
-        // `is_ephemeral` uses `binary_search`; the list MUST be sorted.
-        // Guard against future maintenance accidentally inserting an
-        // out-of-order entry that would silently break the filter for
-        // entries after it.
-        let mut copy: Vec<&str> = EPHEMERAL_OBJECT_KEYS.to_vec();
-        copy.sort();
-        assert_eq!(
-            copy.as_slice(),
-            EPHEMERAL_OBJECT_KEYS,
-            "EPHEMERAL_OBJECT_KEYS must be sorted alphabetically"
-        );
     }
 
     // ========================================================================
@@ -1019,7 +924,7 @@ mod tests {
                 "f098b1ac08693b85c05fc9465a9f7763d22fb8563e292b025f7dbab9cc67ac62",
             ),
             (
-                "V3 V1 plus populated ephemerals (must hash same as V1)",
+                "V3 V1 plus populated telemetry (must hash differently)",
                 json!({
                     "input_url": "https://example.com/",
                     "url": "https://example.com/",
@@ -1034,7 +939,7 @@ mod tests {
                     "partial": false,
                     "partial_reason": "ok"
                 }),
-                "bc272895d75d0d780e6304e2cbd15a7a67819a3909c1aa5c51f7b5bbb28abccf",
+                "a6c4dcef1d2c5e96a6abb47878df0a905336f5a557f7a8b1d99f76da49c351b9",
             ),
             (
                 "V4 Unicode NFC (é = U+00E9)",

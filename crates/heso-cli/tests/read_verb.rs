@@ -320,14 +320,13 @@ async fn read_against_running_session_uses_same_state() {
 }
 
 // ============================================================================
-// bug-report 05-C: plat_hash is stable across runs even when the server
-// mints fresh per-request UUIDs into `id` / `aria-labelledby` /
-// `aria-describedby` attributes — the GitHub-style "every fetch produces a
-// different plat_hash" failure mode agent 5 documented.
+// bug-report 05-C regression: per-request UUIDs in emitted action attrs
+// are content. If the server mints fresh `id` / `aria-labelledby` /
+// `aria-describedby` bytes, the plat_hash must change with those bytes.
 // ============================================================================
 
 #[tokio::test]
-async fn plat_hash_stable_against_per_request_server_uuids() {
+async fn plat_hash_changes_with_per_request_server_uuids() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     let server = MockServer::start().await;
@@ -363,7 +362,8 @@ async fn plat_hash_stable_against_per_request_server_uuids() {
         .mount(&server)
         .await;
 
-    // Fetch twice — different per-request UUIDs, identical content.
+    // Fetch twice: different per-request UUIDs in emitted action attrs,
+    // otherwise identical visible content.
     let out_1 = run_open(&server.uri());
     let out_2 = run_open(&server.uri());
     let body_1 = parse_stdout(&out_1);
@@ -372,19 +372,17 @@ async fn plat_hash_stable_against_per_request_server_uuids() {
     let hash_1 = body_1["plat_hash"].as_str().expect("plat_hash on body_1");
     let hash_2 = body_2["plat_hash"].as_str().expect("plat_hash on body_2");
 
-    // The two runs MUST produce identical hashes despite the differing
-    // per-request UUIDs in `id` / `aria-labelledby` / `aria-describedby`.
-    assert_eq!(
+    // Action attrs are emitted content. If those bytes differ, the plat
+    // identity must differ too.
+    assert_ne!(
         hash_1, hash_2,
-        "plat_hash must be stable across runs when only per-request UUIDs differ; \
+        "plat_hash must change when emitted action attrs differ; \
          body_1.plat_hash={hash_1}, body_2.plat_hash={hash_2}"
     );
 
     // Sanity: the underlying actions DO carry the per-request `id` —
-    // confirming the test fixture is actually generating different
-    // attribute values and the hash stability is coming from the
-    // canonicalizer's ephemeral-key strip, not from the IDs happening
-    // to match.
+    // confirming the test fixture is actually generating a content
+    // difference.
     let id_1 = body_1["actions"][0]["attrs"]["id"]
         .as_str()
         .expect("actions[0].attrs.id on body_1");

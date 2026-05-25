@@ -42,7 +42,7 @@ heso replay out.plat                # plat → per-step log (no artifact)
 heso unpack out.plat > plan.json    # plat → plan (edit, restamp)
 
 heso plat-info   out.plat           # human summary of a plat (hash, plan/cassette/steps counts, sealed status)
-heso plat-diff   a.plat b.plat      # what changed (plan, cassette URLs, ephemerals)
+heso plat-diff   a.plat b.plat      # what changed (plan, cassette URLs, fields)
 heso plat-redact cookies my.plat    # strip a top-level field, recompute plat_hash
 heso plat-seal   my.plat            # wrap in Ed25519 envelope (default key: heso-local-data/identity.key)
 heso plat-unseal sealed.plat        # verify; exit 0 valid / 1 invalid / 2 wrong-alg

@@ -258,7 +258,7 @@ export function platVerify(file: string): Promise<boolean>;
 /**
  * `heso plat-info <file>` — human-readable plat summary (multi-line
  * text: `plat_hash`, `verified`, `size`, `url`, `title`, plan/cassette
- * counts, sealed status, partial flag, present ephemerals).
+ * counts, sealed status, partial flag).
  */
 export function platInfo(file: string): Promise<string>;
 
@@ -274,10 +274,9 @@ export function platDiff(
 
 /**
  * `heso plat-redact <field> <file>` — strip a top-level field and emit
- * a new plat with a recomputed `plat_hash`. Ephemeral fields leave
- * `plat_hash` unchanged; non-ephemeral fields change it and invalidate
- * any prior signature. Refuses sealed envelopes (rejects with
- * `HesoError`).
+ * a new plat with a recomputed `plat_hash`. Removing any present content
+ * field changes the hash and invalidates any prior signature. Refuses
+ * sealed envelopes (rejects with `HesoError`).
  */
 export function platRedact(
   field: string,

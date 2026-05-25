@@ -183,7 +183,7 @@ fn print_banner() {
     println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
     println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
     println!("  heso plat-info   <file>       Human summary of a plat: hash, plan/cassette/steps counts, sealed status, partial flag");
-    println!("  heso plat-diff   <a> <b>      Show what changed between two plats (plan, cassette URLs, ephemerals)");
+    println!("  heso plat-diff   <a> <b>      Show what changed between two plats (plan, cassette URLs, fields)");
     println!("  heso plat-redact <field> <file>");
     println!("                                Strip a top-level field and emit a new plat with a recomputed plat_hash");
     println!("  heso plat-seal   <file> [--key PATH]");
@@ -821,8 +821,8 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         }
     }
     // Compute plat_hash over the canonical form of `body`. The plat
-    // module recursively strips any `plat_hash` field at every level
-    // before hashing, so embedding it here doesn't poison the hash.
+    // module strips only the top-level `plat_hash` field before
+    // hashing, so embedding it here doesn't poison the hash.
     let hash = heso_engine_fetch::plat_hash(&body);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
@@ -4298,10 +4298,22 @@ fn plat_format_bytes(n: usize) -> String {
     }
 }
 
+fn changed_top_level_fields(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    if let Some(obj) = a.as_object() {
+        keys.extend(obj.keys().filter(|k| k.as_str() != "plat_hash").cloned());
+    }
+    if let Some(obj) = b.as_object() {
+        keys.extend(obj.keys().filter(|k| k.as_str() != "plat_hash").cloned());
+    }
+    keys.into_iter()
+        .filter(|k| a.get(k) != b.get(k))
+        .collect()
+}
+
 /// `heso plat-info <file>` — print a human summary of a plat: hash,
 /// size, url/title, plan/cassette/steps counts, sealed status, partial
-/// flag, and which top-level ephemeral fields are present (stripped
-/// from the hash but worth knowing about).
+/// flag.
 ///
 /// Exit codes: `0` ok, `1` file unreadable or not JSON, `2` usage.
 async fn cmd_plat_info(args: &[String]) -> ExitCode {
@@ -4309,8 +4321,7 @@ async fn cmd_plat_info(args: &[String]) -> ExitCode {
         eprintln!("usage: heso plat-info <file>");
         eprintln!();
         eprintln!("Print a human summary of a plat: plat_hash, plan length,");
-        eprintln!("cassette record count, step count, sealed status, partial");
-        eprintln!("flag, and which ephemeral fields are present.");
+        eprintln!("cassette record count, step count, sealed status, and partial flag.");
         return ExitCode::from(2);
     }
     let file = &args[0];
@@ -4418,16 +4429,6 @@ async fn cmd_plat_info(args: &[String]) -> ExitCode {
         Err(_) => "n/a (missing or malformed plat_hash)",
     };
 
-    let ephemerals_present: Vec<&str> = if let Some(obj) = value.as_object() {
-        heso_engine_fetch::EPHEMERAL_OBJECT_KEYS
-            .iter()
-            .filter(|k| obj.contains_key(**k))
-            .copied()
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     println!("plat_hash:    {embedded_hash}");
     println!("verified:     {verified}");
     println!("size:         {}", plat_format_bytes(size_bytes));
@@ -4446,34 +4447,26 @@ async fn cmd_plat_info(args: &[String]) -> ExitCode {
         (true, None) => "true".to_owned(),
     };
     println!("partial:      {partial_line}");
-    if ephemerals_present.is_empty() {
-        println!("ephemerals:   none");
-    } else {
-        println!(
-            "ephemerals:   {} (stripped from hash)",
-            ephemerals_present.join(", ")
-        );
-    }
 
     ExitCode::SUCCESS
 }
 
 /// `heso plat-diff <a> <b>` — show what changed between two plats:
 /// `plat_hash`, plan, cassette URL set + per-URL response bodies,
-/// ephemeral fields that flipped, and key top-level fields.
+/// changed top-level fields, and key scalar fields.
 ///
 /// Output is a small, human-readable report — not a unified diff. For a
 /// full structural diff, pipe each plat through `jq` and use `diff`.
 ///
-/// Exit codes: `0` plats are byte-identical-equivalent (same plat_hash),
-/// `1` plats differ in any agent-observable way, `2` usage / unreadable.
+/// Exit codes: `0` plats have the same canonical content hash, `1`
+/// plats differ, `2` usage / unreadable.
 async fn cmd_plat_diff(args: &[String]) -> ExitCode {
     if args.len() < 2 {
         eprintln!("usage: heso plat-diff <a> <b>");
         eprintln!();
         eprintln!("Show what changed between two plats. Exit 0 if their");
-        eprintln!("plat_hash matches (no agent-observable difference), 1 if");
-        eprintln!("they differ, 2 on usage error or unreadable file.");
+        eprintln!("plat_hash matches, 1 if they differ, 2 on usage error");
+        eprintln!("or unreadable file.");
         return ExitCode::from(2);
     }
     let (file_a, file_b) = (&args[0], &args[1]);
@@ -4500,23 +4493,13 @@ async fn cmd_plat_diff(args: &[String]) -> ExitCode {
         }
     };
 
-    let hash_a = a
-        .get("plat_hash")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| heso_engine_fetch::plat_hash(&a));
-    let hash_b = b
-        .get("plat_hash")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| heso_engine_fetch::plat_hash(&b));
+    let hash_a = heso_engine_fetch::plat_hash(&a);
+    let hash_b = heso_engine_fetch::plat_hash(&b);
 
     if hash_a == hash_b {
         println!("plat_hash:    IDENTICAL ({hash_a})");
         println!();
         println!("The plats are byte-equivalent under HESO/1.0 §1.5 canonicalization.");
-        println!("Any difference between the files lives in ephemeral fields only");
-        println!("(per-session telemetry stripped from the hash).");
         return ExitCode::SUCCESS;
     }
 
@@ -4606,18 +4589,9 @@ async fn cmd_plat_diff(args: &[String]) -> ExitCode {
         }
     }
 
-    // Ephemeral fields that differ (won't affect plat_hash, but worth
-    // knowing — e.g. cookies / http_status changed between two runs).
-    let ephs_diff: Vec<&str> = heso_engine_fetch::EPHEMERAL_OBJECT_KEYS
-        .iter()
-        .filter(|k| a.get(**k) != b.get(**k))
-        .copied()
-        .collect();
-    if !ephs_diff.is_empty() {
-        println!(
-            "ephemerals:   {} differ (stripped from hash)",
-            ephs_diff.join(", ")
-        );
+    let top_changed = changed_top_level_fields(&a, &b);
+    if !top_changed.is_empty() {
+        println!("fields:       {} differ", top_changed.join(", "));
     }
 
     // Key top-level scalars that often differ in obvious ways.
@@ -4637,8 +4611,8 @@ async fn cmd_plat_diff(args: &[String]) -> ExitCode {
 /// `heso plat-redact <field> <file>` — strip a top-level field from a
 /// plat and emit the result on stdout with a freshly-recomputed
 /// `plat_hash`. Refuses to operate on a sealed envelope (would break
-/// the signature). Warns to stderr if the field is non-ephemeral (the
-/// hash will change; any previous attestation is invalidated).
+/// the signature). Removing any present field changes the hash and
+/// invalidates any previous attestation.
 ///
 /// Exit codes: `0` redaction applied (field removed or already absent),
 /// `1` refused (sealed envelope), `2` usage / unreadable / not a plat.
@@ -4648,7 +4622,7 @@ async fn cmd_plat_redact(args: &[String]) -> ExitCode {
         eprintln!();
         eprintln!("Strip a top-level field from a plat and emit the result on");
         eprintln!("stdout with a recomputed plat_hash. Useful for sharing a plat");
-        eprintln!("without per-session bytes (cookies, console output, etc.).");
+        eprintln!("without sensitive bytes (cookies, console output, etc.).");
         eprintln!();
         eprintln!("Refuses sealed envelopes — extract `content` first if needed.");
         return ExitCode::from(2);
@@ -4679,32 +4653,34 @@ async fn cmd_plat_redact(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
 
-    let obj = match value.as_object_mut() {
-        Some(o) => o,
-        None => {
-            eprintln!("`{file}` is not a JSON object (plats are objects).");
-            return ExitCode::from(2);
-        }
-    };
-
-    let was_present = obj.remove(field.as_str()).is_some();
-    let is_ephemeral = heso_engine_fetch::EPHEMERAL_OBJECT_KEYS
-        .iter()
-        .any(|k| *k == field.as_str());
-
-    if !was_present {
-        eprintln!("note: field `{field}` was not present; plat_hash unchanged.");
-    } else if !is_ephemeral {
-        eprintln!(
-            "warning: `{field}` is NOT in the ephemeral keys list (it contributes to plat_hash)."
-        );
-        eprintln!("the output plat has a NEW plat_hash; any prior signature is invalidated.");
+    if !value.is_object() {
+        eprintln!("`{file}` is not a JSON object (plats are objects).");
+        return ExitCode::from(2);
     }
 
+    let old_hash = heso_engine_fetch::plat_hash(&value);
+    let was_present = value
+        .as_object_mut()
+        .expect("checked object above")
+        .remove(field.as_str())
+        .is_some();
+
     // Strip the existing plat_hash, recompute against the modified body,
-    // re-embed. This is a no-op on the hash for ephemeral-key redactions.
-    obj.remove("plat_hash");
+    // re-embed.
+    value
+        .as_object_mut()
+        .expect("checked object above")
+        .remove("plat_hash");
     let new_hash = heso_engine_fetch::plat_hash(&value);
+    if !was_present {
+        eprintln!("note: field `{field}` was not present; plat_hash unchanged.");
+    } else if old_hash == new_hash {
+        eprintln!("note: removed `{field}`; canonical content hash is unchanged.");
+    } else {
+        eprintln!(
+            "warning: removed `{field}`; the output plat has a NEW plat_hash and any prior signature is invalidated."
+        );
+    }
     if let Some(obj) = value.as_object_mut() {
         obj.insert(
             "plat_hash".to_owned(),
@@ -5137,9 +5113,8 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
         );
     }
     // Snapshot the cassette out of the shared Arc and embed it under
-    // the canonical `cassette` field. It's NOT in EPHEMERAL_OBJECT_KEYS
-    // (verified by the plat_hash regression test) so tampering with
-    // the cassette flips the plat hash — replay can't quietly diverge.
+    // the canonical `cassette` field. Any cassette mutation flips the
+    // plat hash, so replay can't quietly diverge.
     let final_cassette = cassette
         .lock()
         .expect("cassette mutex poisoned")

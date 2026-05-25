@@ -24,6 +24,24 @@ fn write_temp(suffix: &str, body: &[u8]) -> PathBuf {
     p
 }
 
+fn compute_plat_hash(value: &serde_json::Value) -> String {
+    let path = write_temp("hash-input.plat", value.to_string().as_bytes());
+    let out = Command::new(heso_bin())
+        .args(["plat-hash", path.to_str().unwrap()])
+        .output()
+        .expect("spawn heso plat-hash");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        out.status.success(),
+        "plat-hash failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("plat-hash stdout is UTF-8")
+        .trim()
+        .to_owned()
+}
+
 /// Build a minimal plat (matching HESO/1.0 §1.9 V1 fixture) with the
 /// embedded plat_hash recomputed by `heso plat-hash`.
 fn minimal_plat() -> serde_json::Value {
@@ -110,13 +128,8 @@ fn plat_diff_different_plats_emits_differences_and_exits_one() {
     let plat_a = minimal_plat();
     let mut plat_b = minimal_plat();
     plat_b["title"] = serde_json::json!("Different Title");
-    // After mutation, the embedded plat_hash is stale; plat-diff
-    // recomputes when needed, so leaving it stale is fine for this test
-    // (but recompute to be honest about what a real diff target looks
-    // like in the wild).
-    if let Some(obj) = plat_b.as_object_mut() {
-        obj.remove("plat_hash");
-    }
+    // Leave the embedded plat_hash stale on purpose: plat-diff must
+    // compare recomputed content hashes, not trust the stored field.
 
     let a = write_temp("diff-diff-a.plat", plat_a.to_string().as_bytes());
     let b = write_temp("diff-diff-b.plat", plat_b.to_string().as_bytes());
@@ -135,22 +148,25 @@ fn plat_diff_different_plats_emits_differences_and_exits_one() {
 }
 
 #[test]
-fn plat_redact_ephemeral_field_preserves_hash() {
-    // Add an ephemeral field (`cookies`) to the minimal plat. The
-    // ephemeral keys list strips it before hashing, so redacting it
-    // MUST leave plat_hash unchanged.
+fn plat_redact_present_field_changes_hash() {
+    // Add a share-sensitive top-level field. It is emitted content, so it
+    // contributes to the hash until redacted.
     let mut plat = minimal_plat();
     plat["cookies"] = serde_json::json!([{"name": "s", "value": "session-123"}]);
-    // plat_hash field still holds the V1 hash, which is correct because
-    // `cookies` was stripped during canonicalization regardless of
-    // whether the field was present.
-    let path = write_temp("redact-eph.plat", plat.to_string().as_bytes());
+    let original_hash = compute_plat_hash(&plat);
+    plat["plat_hash"] = serde_json::Value::String(original_hash.clone());
+    let path = write_temp("redact-present.plat", plat.to_string().as_bytes());
 
     let out = Command::new(heso_bin())
         .args(["plat-redact", "cookies", path.to_str().unwrap()])
         .output()
         .expect("spawn heso");
     assert!(out.status.success(), "plat-redact failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("NEW plat_hash") && stderr.contains("signature is invalidated"),
+        "expected hash-change warning, got:\n{stderr}"
+    );
 
     let redacted: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("redacted output is JSON");
@@ -158,17 +174,22 @@ fn plat_redact_ephemeral_field_preserves_hash() {
         redacted.get("cookies").is_none(),
         "`cookies` field should be removed from output"
     );
+    assert_ne!(
+        original_hash,
+        redacted["plat_hash"].as_str().unwrap(),
+        "redacting a present field must change plat_hash"
+    );
     assert_eq!(
         redacted["plat_hash"].as_str().unwrap(),
         "bc272895d75d0d780e6304e2cbd15a7a67819a3909c1aa5c51f7b5bbb28abccf",
-        "ephemeral redact must preserve plat_hash"
+        "redacted minimal plat should return to the V1 hash"
     );
 
     let _ = std::fs::remove_file(&path);
 }
 
 #[test]
-fn plat_redact_non_ephemeral_field_warns_and_changes_hash() {
+fn plat_redact_present_scalar_warns_and_changes_hash() {
     let plat = minimal_plat();
     let path = write_temp("redact-noneph.plat", plat.to_string().as_bytes());
 
@@ -180,11 +201,7 @@ fn plat_redact_non_ephemeral_field_warns_and_changes_hash() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("NOT in the ephemeral keys list"),
-        "expected non-ephemeral warning, got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("plat_hash") && stderr.contains("signature is invalidated"),
+        stderr.contains("NEW plat_hash") && stderr.contains("signature is invalidated"),
         "expected hash-changes-signature-invalidated note, got:\n{stderr}"
     );
 
@@ -194,7 +211,7 @@ fn plat_redact_non_ephemeral_field_warns_and_changes_hash() {
     assert_ne!(
         redacted["plat_hash"].as_str().unwrap(),
         "bc272895d75d0d780e6304e2cbd15a7a67819a3909c1aa5c51f7b5bbb28abccf",
-        "non-ephemeral redact must change plat_hash"
+        "redacting a present scalar must change plat_hash"
     );
 
     let _ = std::fs::remove_file(&path);

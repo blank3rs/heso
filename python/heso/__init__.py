@@ -622,8 +622,7 @@ def plat_verify(path: Union[str, Path]) -> bool:
 def plat_info(path: Union[str, Path]) -> str:
     """``heso plat-info <file>`` — human-readable plat summary
     (multi-line text: ``plat_hash``, ``verified``, ``size``, ``url``,
-    ``title``, plan/cassette counts, sealed status, partial flag, and
-    which ephemeral fields are present).
+    ``title``, plan/cassette counts, sealed status, and partial flag).
     """
     return run("plat-info", str(path), parse_json=False)
 
@@ -649,10 +648,9 @@ def plat_redact(field: str, path: Union[str, Path]) -> dict:
     """``heso plat-redact <field> <file>`` — strip a top-level field
     and emit a fresh plat with a recomputed ``plat_hash``.
 
-    Stripping an ephemeral field (``cookies``, ``console``, per-request
-    UUIDs) leaves ``plat_hash`` unchanged. Stripping a non-ephemeral
-    field changes the hash and invalidates any prior signature. Refuses
-    sealed envelopes (raises :class:`HesoError` with ``returncode=1``).
+    Removing any present content field changes the hash and invalidates
+    any prior signature. Refuses sealed envelopes (raises
+    :class:`HesoError` with ``returncode=1``).
     """
     return run("plat-redact", str(field), str(path))
 
