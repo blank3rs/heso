@@ -97,6 +97,8 @@ heso-local-data/
 /demo/demo.mp4
 /demo/.palette.png
 /demo/README.md
+# Auto-generated demo MP4s from make-demo.py — local only, never tracked.
+/demo/renders/
 
 # Benchmarks are local-only. They were useful for design decisions but
 # don't belong in the public repo until they're presented cleanly.

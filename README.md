@@ -1,10 +1,8 @@
-# heso — Playwright for agents, built around reproducibility. One Rust binary.
+# heso — Playwright for agents. Reproducible by hash. One Rust binary.
 
 **Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
 
 A headless web engine for agents: fetches a URL, runs the JavaScript, clicks, fills forms, scrapes — and returns JSON. The load-bearing part: every run can be **stamped** into a signed *plat* with an embedded network cassette, then **byte-identically re-executed** off-network with `heso run`. Anyone, any machine, same output. No Chromium. No Node.
-
-Optimized for structured outputs and reproducibility, not for pixel-perfect rendering or anti-bot warfare. If your task lives in pixels or animations, use Chromium. If it lives in JSON, you're in the right place.
 
 ```
 binary       9.73 MB
@@ -13,9 +11,9 @@ engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
 ```
 
-![heso agent demo](demo/demo.gif)
+[![heso agent demo — 50 second screen recording](demo/poster.jpg)](https://www.heso.ca/#demo)
 
-That's a real recording — Claude Code (`claude -p` from the repo root, with the heso skill loaded) discovering the verbs, navigating the page tree, and pulling the live top story off Hacker News. No edits, no replays.
+A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no Node, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo) · [download MP4](https://github.com/blank3rs/heso/releases/download/v0.0.13/demo.mp4) (4.3 MB)
 
 ## Install
 
@@ -41,10 +39,6 @@ heso open https://example.com
 ```
 
 You get JSON: title, description, a heading tree, and a list of clickable elements numbered `@e0`, `@e1`, and so on.
-
-## A note before you read further
-
-Most of this codebase was written with help from Claude under one person's direction. The co-author tag is on basically every commit. It moved fast, which means the feature surface ran ahead of real usage. Treat this as working code that needs more eyes on real workloads, not a finished product.
 
 ## What it can do
 
@@ -392,8 +386,6 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 | Engine-only (no network, local fixture) | ~28 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
 | Search (DDG, 5 results) | ~1 s |
-
-No comparisons to other tools — different tools have different tradeoffs and "X is faster than Y" framing rarely survives contact with a real workload.
 
 ## Building from source
 
