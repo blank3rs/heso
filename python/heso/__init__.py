@@ -545,7 +545,7 @@ def tree(url: str, **kwargs: Any) -> dict:
 
 
 def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
-    """``heso stamp <plan-or-plat.json>`` — execute a plan against the
+    """``heso stamp <plan-or-plat>`` — execute a plan against the
     live web and mint a fresh plat that embeds the plan.
 
     Accepts a bare ``Action[]`` JSON array, a plat with a ``"plan"``
@@ -574,7 +574,7 @@ def replay(path: Union[str, Path], **kwargs: Any) -> dict:
 
 
 def unpack(path: Union[str, Path]) -> list:
-    """``heso unpack <plat.json>`` — extract the ``plan`` field of a
+    """``heso unpack <plat.plat>`` — extract the ``plan`` field of a
     plat for editing. Returns the action list directly.
 
     Raises :class:`HesoError` when the file has no ``plan`` field

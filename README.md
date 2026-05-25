@@ -71,9 +71,9 @@ Most of this codebase was written with help from Claude under one person's direc
 A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`). A *plat* is an observation, plus an embedded network *cassette* — every (method, URL, request-body) → (status, headers, response-body) tuple the engine touched during the run. Four verbs close the loop:
 
 - `heso stamp <plan.json>` — executes the plan against the live web and mints a fresh plat that embeds the plan, the recorded cassette, and a per-step log. Accepts a bare `Action[]` array, a plat with a `"plan"` field, or a `TraceFingerprint`. Exit 0 on a clean run; 1 if any step failed (still prints the partial plat with `error` + `steps`).
-- `heso run <plat.json>` — re-executes the plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay (ADR 0008). If the cassette has drifted (page changed since stamping), the failing step carries a structured `cassette miss: METHOD URL not recorded` error and `run` exits 1 — graceful, never silent.
-- `heso replay <plat.json>` — pure observation. Reads the recorded step log from the plat and prints it. No engine, no JS, no cassette lookup, no network. Use `run` if you want to re-execute.
-- `heso unpack <plat.json>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint a fresh plat (with a fresh cassette since the requests changed).
+- `heso run <plat.plat>` — re-executes the plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay (ADR 0008). If the cassette has drifted (page changed since stamping), the failing step carries a structured `cassette miss: METHOD URL not recorded` error and `run` exits 1 — graceful, never silent.
+- `heso replay <plat.plat>` — pure observation. Reads the recorded step log from the plat and prints it. No engine, no JS, no cassette lookup, no network. Use `run` if you want to re-execute.
+- `heso unpack <plat.plat>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint a fresh plat (with a fresh cassette since the requests changed).
 
 ```sh
 cat > plan.json <<EOF
@@ -84,10 +84,10 @@ cat > plan.json <<EOF
   {"verb": "submit", "ref": "@form1"}
 ]
 EOF
-heso stamp plan.json > plat.json          # plan → plat (records cassette)
-heso run plat.json > plat-replay.json     # plat → plat (off-network, byte-identical)
-heso replay plat.json                     # plat → step log (pure read, no execution)
-heso unpack plat.json > plan-again.json   # plat → plan (edit, restamp)
+heso stamp plan.json > out.plat           # plan → plat (records cassette)
+heso run out.plat > replay.plat           # plat → plat (off-network, byte-identical)
+heso replay out.plat                      # plat → step log (pure read, no execution)
+heso unpack out.plat > plan-again.json    # plat → plan (edit, restamp)
 ```
 
 The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso plat-verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.

@@ -207,19 +207,19 @@ fn print_banner() {
     println!("                                JSON with site_id / action_ids[] / trace_id (the headline hash).");
     println!("  heso action-hash-verify <file>");
     println!("                                Verify a saved fingerprint file (exit 0 valid, 1 invalid, 2 malformed)");
-    println!("  heso stamp  [--seed N] <plan-or-plat.json>");
+    println!("  heso stamp  [--seed N] <plan-or-plat>");
     println!("                                Execute a plan against the live web and mint a fresh plat that");
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
     println!("                                Accepts a bare Action[] array, a plat with a `plan` field, or a");
     println!("                                fingerprint. Exit 0 ok / 1 if any step failed.");
-    println!("  heso run    [--seed N] <plat.json>");
+    println!("  heso run    [--seed N] <plat.plat>");
     println!("                                Re-execute the plan against the plat's embedded cassette — no");
     println!("                                network. Mints a fresh plat; for an unchanged cassette its");
     println!("                                plat_hash equals the input's (byte-identical replay, ADR 0008).");
     println!("                                Misses (page drifted since stamp) surface as graceful errors.");
-    println!("  heso replay <plat.json>       Emit the recorded step log from a plat. Pure observation — no");
+    println!("  heso replay <plat.plat>       Emit the recorded step log from a plat. Pure observation — no");
     println!("                                engine, no network, no JS. Use `run` to re-execute.");
-    println!("  heso unpack <plat.json>       Extract the `plan` field from a plat (errors if none). Pipes into");
+    println!("  heso unpack <plat.plat>       Extract the `plan` field from a plat (errors if none). Pipes into");
     println!("                                an editor or back into `stamp` for the edit/re-mint loop.");
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
     println!(
@@ -4364,7 +4364,7 @@ fn first_open_url(actions: &[Action]) -> Option<Url> {
     None
 }
 
-/// `heso stamp [--seed N] <plan-or-plat.json>` — execute a plan
+/// `heso stamp [--seed N] <plan-or-plat>` — execute a plan
 /// against the live web and emit a fresh plat that embeds the plan.
 ///
 /// Accepts the same three input shapes as [`cmd_replay`]: a bare
@@ -4479,12 +4479,12 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
     }
 }
 
-/// `heso unpack <plat.json>` — extract the `plan` array from a plat
+/// `heso unpack <plat.plat>` — extract the `plan` array from a plat
 /// and print it. Exits 2 if the file has no `plan` field (a plat that
 /// was produced by single-URL `heso open` instead of `heso stamp`).
 async fn cmd_unpack(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso unpack <plat.json>");
+        eprintln!("usage: heso unpack <plat.plat>");
         eprintln!();
         eprintln!("Extracts the `plan` array from a plat so it can be edited");
         eprintln!("standalone and stamped back into a fresh plat with `heso stamp`.");
@@ -4851,7 +4851,7 @@ async fn cmd_run(args: &[String]) -> ExitCode {
     }
 }
 
-/// `heso replay <plat.json>` — emit the `steps` field of a plat
+/// `heso replay <plat.plat>` — emit the `steps` field of a plat
 /// without re-executing anything. Pure observation: no engine init,
 /// no network, no JS, no cassette lookup. Useful for inspecting the
 /// step log a previous `heso stamp` or `heso run` recorded into a
@@ -4862,7 +4862,7 @@ async fn cmd_run(args: &[String]) -> ExitCode {
 /// - `2` — file unreadable, not JSON, or missing `steps` field.
 async fn cmd_replay(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso replay <plat.json>");
+        eprintln!("usage: heso replay <plat.plat>");
         eprintln!();
         eprintln!("Emits the recorded step log from a plat without re-executing.");
         eprintln!("To re-execute the plan against the plat's cassette, use `heso run`.");

@@ -199,7 +199,7 @@ export interface PlanOptions extends CommonOptions {
 }
 
 /**
- * `heso stamp <plan-or-plat.json>` — execute a plan against the live
+ * `heso stamp <plan-or-plat>` — execute a plan against the live
  * web and mint a fresh plat that embeds the plan. Accepts a bare
  * `Action[]` JSON array, a plat with a `"plan"` field, or a
  * `TraceFingerprint`. Rejects with `HesoError` if any step failed
@@ -221,7 +221,7 @@ export function replay(
 ): Promise<Record<string, unknown>>;
 
 /**
- * `heso unpack <plat.json>` — extract the `plan` field of a plat for
+ * `heso unpack <plat.plat>` — extract the `plan` field of a plat for
  * editing. Returns the action array directly. Rejects with
  * `HesoError` when the file has no `plan` field.
  */

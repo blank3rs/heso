@@ -37,9 +37,9 @@ heso wait https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
 heso open https://x.com --best-effort --inject-script "window.lunr = (() => ({}))()"
 heso serve     # JSON-RPC over stdio for multi-step sessions
 
-heso stamp  plan.json > plat.json   # plan → plat (executes + mints)
-heso replay plat.json               # plat → per-step log (no artifact)
-heso unpack plat.json > plan.json   # plat → plan (edit, restamp)
+heso stamp  plan.json > out.plat    # plan → plat (executes + mints)
+heso replay out.plat                # plat → per-step log (no artifact)
+heso unpack out.plat > plan.json    # plat → plan (edit, restamp)
 ```
 
 Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.

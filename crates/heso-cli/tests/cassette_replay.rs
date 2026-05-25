@@ -106,7 +106,7 @@ async fn stamp_then_run_is_byte_identical() {
     let stamp_hash = plat["plat_hash"].as_str().expect("plat_hash string").to_owned();
 
     // Persist the stamped plat to disk so `run` can read it.
-    let plat_path = write_temp("plat.json", &stamp_out.stdout);
+    let plat_path = write_temp("plat.plat", &stamp_out.stdout);
 
     // The wiremock server can shut down now — `run` should not touch
     // the network. (We don't actually shut it down here because
@@ -192,7 +192,7 @@ async fn replay_emits_step_log_without_executing() {
 
     let stamp_out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
     assert!(stamp_out.status.success());
-    let plat_path = write_temp("plat.json", &stamp_out.stdout);
+    let plat_path = write_temp("plat.plat", &stamp_out.stdout);
 
     drop(server);
 

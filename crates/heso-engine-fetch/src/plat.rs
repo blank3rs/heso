@@ -965,4 +965,154 @@ mod tests {
             "EPHEMERAL_OBJECT_KEYS must be sorted alphabetically"
         );
     }
+
+    // ========================================================================
+    // HESO/1.0 §1.9 — canonical test vectors. The assertions pin each
+    // (canonical bytes, plat_hash) pair as a regression test; if any
+    // change to canonicalization or the hash construction drifts these,
+    // the test fails before the spec falls out of sync.
+    //
+    // Run with `--nocapture` to dump human-readable canonical bytes
+    // alongside the hashes for cross-implementation conformance:
+    //   cargo test --release -p heso-engine-fetch \
+    //     plat::tests::heso_1_0_section_1_9_vectors -- --nocapture
+    // ========================================================================
+
+    #[test]
+    fn heso_1_0_section_1_9_vectors() {
+        fn hex(bytes: &[u8]) -> String {
+            use std::fmt::Write;
+            let mut s = String::with_capacity(bytes.len() * 2);
+            for b in bytes {
+                write!(s, "{:02x}", b).unwrap();
+            }
+            s
+        }
+
+        let vectors: Vec<(&str, Value, &str)> = vec![
+            (
+                "V1 minimal plat",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Example",
+                    "description": "",
+                    "tree": [],
+                    "actions": []
+                }),
+                "bc272895d75d0d780e6304e2cbd15a7a67819a3909c1aa5c51f7b5bbb28abccf",
+            ),
+            (
+                "V2 Merkle parent over two child plat_hashes",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Parent",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "linked_pages": [
+                        {"url": "https://example.com/a", "plat_hash": "aaaa"},
+                        {"url": "https://example.com/b", "plat_hash": "bbbb"}
+                    ]
+                }),
+                "f098b1ac08693b85c05fc9465a9f7763d22fb8563e292b025f7dbab9cc67ac62",
+            ),
+            (
+                "V3 V1 plus populated ephemerals (must hash same as V1)",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Example",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "cookies": [{"name": "s", "value": "session-123"}],
+                    "http_status": 200,
+                    "console": ["log"],
+                    "id": "page-uuid-7f3a2",
+                    "partial": false,
+                    "partial_reason": "ok"
+                }),
+                "bc272895d75d0d780e6304e2cbd15a7a67819a3909c1aa5c51f7b5bbb28abccf",
+            ),
+            (
+                "V4 Unicode NFC (é = U+00E9)",
+                json!({
+                    "input_url": "https://example.com/caf\u{00e9}",
+                    "url": "https://example.com/caf\u{00e9}",
+                    "title": "caf\u{00e9}",
+                    "description": "",
+                    "tree": [],
+                    "actions": []
+                }),
+                "a64f1bf864d5eba5972a4a41fed19144077fedf23c9626c9b7adf57343b6c650",
+            ),
+            (
+                "V5 Unicode NFD (é = U+0065 U+0301)",
+                json!({
+                    "input_url": "https://example.com/cafe\u{0301}",
+                    "url": "https://example.com/cafe\u{0301}",
+                    "title": "cafe\u{0301}",
+                    "description": "",
+                    "tree": [],
+                    "actions": []
+                }),
+                "0a514b8a155da02f7db89ae79fb9fa885cc7ba88bf6837f1139b4026abbe2f7d",
+            ),
+            (
+                "V6a title is empty string",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "",
+                    "description": "",
+                    "tree": [],
+                    "actions": []
+                }),
+                "121f46f2d02fafadb811cd0ff2a1b7e5d6f64a381af29b36295384ba96f91c4b",
+            ),
+            (
+                "V6b title is null",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": null,
+                    "description": "",
+                    "tree": [],
+                    "actions": []
+                }),
+                "801a174528591c1ef1cd3e3d249f76f277be8e84675b4758791b1e1355d2aa41",
+            ),
+            (
+                "V6c title is absent",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "description": "",
+                    "tree": [],
+                    "actions": []
+                }),
+                "e53bdc36b6aa0dbc27679d4c1a0dae825e9f500c48915357f9e34dfd49cb8c45",
+            ),
+        ];
+
+        for (name, body, expected_hash) in &vectors {
+            let bytes = canonical_bytes(body);
+            let bytes_hex = hex(&bytes);
+            let plat_hash = hash(body);
+            eprintln!("=== {name} ===");
+            eprintln!("input_json:           {}", serde_json::to_string(body).unwrap());
+            eprintln!("canonical_bytes_utf8: {}", String::from_utf8_lossy(&bytes));
+            eprintln!("canonical_bytes_hex:  {}", bytes_hex);
+            eprintln!("plat_hash:            {}", plat_hash);
+            eprintln!();
+            if *expected_hash != "TBD" {
+                assert_eq!(
+                    &plat_hash, expected_hash,
+                    "{name}: plat_hash drifted from §1.9 pinned vector"
+                );
+            }
+        }
+    }
 }
