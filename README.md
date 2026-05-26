@@ -15,6 +15,24 @@ batch        ~1.1 s   for 8 URLs in parallel
 
 A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no rendering pipeline, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
 
+## Contents
+
+- [Install](#install)
+- [What it can do](#what-it-can-do)
+- [What it can't do](#what-it-cant-do)
+- [Why not just use X?](#why-not-just-use-x)
+- [Use as a library](#use-as-a-library)
+- [Examples](#examples)
+- [Signed receipts](#signed-receipts)
+- [Error handling](#error-handling)
+- [Plug into agent harnesses](#plug-into-agent-harnesses)
+- [Verbs are open](#verbs-are-open)
+- [Use as an agent skill](#use-as-an-agent-skill)
+- [Stats](#stats)
+- [Building from source](#building-from-source)
+- [Status](#status)
+- [License](#license)
+
 ## Install
 
 ```sh
@@ -364,6 +382,19 @@ heso is harness-agnostic. The same package serves five integration patterns:
 | **Long-running JSON-RPC harnesses** | `heso serve` is a JSON-RPC 2.0 server over stdin/stdout. Cookies + DOM state persist across calls. |
 
 The verbs are the contract (see [ADR 0017](https://github.com/blank3rs/heso/blob/main/decisions/0017-verbs-as-agent-surface.md)) — no heso-specific framework dependency, no adapter layer.
+
+## Verbs are open
+
+**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The spec defines a closed core set of bare verb names (`open`, `read`, `click`, `fill`, `submit`, `wait`, `stamp`, `run`, `replay`, `unpack`, `identity-init`, `receipt-verify`, `plat-hash`, `plat-verify`, `plat-seal`, `plat-unseal`) — every conformant implementation must dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
+
+```json
+{"verb": "com.example.scrape-pricing", "url": "https://example.com/products"}
+{"verb": "org.archive.warc-import",    "path": "./snapshot.warc"}
+```
+
+No registration server, no central authority. DNS ownership is the squat-defence — the same model as Java packages, Android application IDs, Maven groups, and OCI image labels. Publish a doc under your domain describing the input/output shape; any HESO/1.0 implementation that knows that verb can dispatch it.
+
+Today, the reference implementation (this binary, `v0.0.15`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Third-party verb dispatch is in the spec, not yet in the reference impl. To use an extension verb today you implement HESO/1.0 yourself, in any language; the protocol does not lock vocabulary to one binary.
 
 ## Use as an agent skill
 
