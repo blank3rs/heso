@@ -385,16 +385,18 @@ The verbs are the contract (see [ADR 0017](https://github.com/blank3rs/heso/blob
 
 ## Verbs are open
 
-**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The spec defines a closed core set of bare verb names (`open`, `read`, `click`, `fill`, `submit`, `wait`, `stamp`, `run`, `replay`, `unpack`, `identity-init`, `receipt-verify`, `plat-hash`, `plat-verify`, `plat-seal`, `plat-unseal`) — every conformant implementation must dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
+**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The full spec lives at [`spec/HESO-1.0.md`](spec/HESO-1.0.md). It defines a closed core set of 16 bare verb names (`open`, `read`, `click`, `fill`, `submit`, `wait`, `stamp`, `run`, `replay`, `unpack`, `identity-init`, `receipt-verify`, `plat-hash`, `plat-verify`, `plat-seal`, `plat-unseal`) — every conformant implementation MUST dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
 
 ```json
 {"verb": "com.example.scrape-pricing", "url": "https://example.com/products"}
 {"verb": "org.archive.warc-import",    "path": "./snapshot.warc"}
 ```
 
-No registration server, no central authority. DNS ownership is the squat-defence — the same model as Java packages, Android application IDs, Maven groups, and OCI image labels. Publish a doc under your domain describing the input/output shape; any HESO/1.0 implementation that knows that verb can dispatch it.
+No registration server, no central authority. **Dispatch is local-only** (spec §4.4) — receiving a plat with an unknown extension verb is a structured error, never a network fetch or a code download. The doc-under-your-domain is human documentation, not a code-delivery channel; discovering a verb (reading the doc) and dispatching it (running the code) are separate operations the spec keeps cleanly apart.
 
-Today, the reference implementation (this binary, `v0.1.0`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Third-party verb dispatch is in the spec, not yet in the reference impl. To use an extension verb today you implement HESO/1.0 yourself, in any language; the protocol does not lock vocabulary to one binary.
+DNS ownership prevents anyone but you from claiming names *under your domain* — same anti-impersonation model as Java packages, Android application IDs, Maven groups, and OCI image labels. It does NOT solve typosquatting (`com.exarnple.foo` and `com.example.foo` are distinct names that look identical to a human reader). HESO/1.0 anchors trust on signing keys, not verb names: pin receivers to trusted signers via the existing `receipt-verify --trusted-keys` allowlist (spec §3.9, §4.6).
+
+Today, the reference implementation (this binary, `v0.1.0`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary; to dispatch one today you implement HESO/1.0 yourself, in any language. The spec is what makes that implementation possible.
 
 ## Use as an agent skill
 
