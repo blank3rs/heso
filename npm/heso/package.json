@@ -1,6 +1,6 @@
 {
   "name": "@ixla/heso",
-  "version": "0.0.15",
+  "version": "0.1.0",
   "description": "Minimal web runtime for agents: fetch, JS, DOM, forms, clicks → JSON. No rendering pipeline, no Chromium, no Node.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
@@ -31,11 +31,11 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@ixla/heso-win32-x64": "0.0.15",
-    "@ixla/heso-linux-x64": "0.0.15",
-    "@ixla/heso-linux-arm64": "0.0.15",
-    "@ixla/heso-darwin-x64": "0.0.15",
-    "@ixla/heso-darwin-arm64": "0.0.15"
+    "@ixla/heso-win32-x64": "0.1.0",
+    "@ixla/heso-linux-x64": "0.1.0",
+    "@ixla/heso-linux-arm64": "0.1.0",
+    "@ixla/heso-darwin-x64": "0.1.0",
+    "@ixla/heso-darwin-arm64": "0.1.0"
   },
   "engines": {
     "node": ">=14"
