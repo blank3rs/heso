@@ -51,23 +51,39 @@ async fn fixture_server(html: &str) -> MockServer {
 }
 
 fn run_verb(verb: &str, extra_args: &[&str]) -> std::process::Output {
+    run_verb_with_env(verb, extra_args, &[])
+}
+
+fn run_verb_with_env(
+    verb: &str,
+    extra_args: &[&str],
+    envs: &[(&str, String)],
+) -> std::process::Output {
     let mut args = vec![verb];
     args.extend_from_slice(extra_args);
-    Command::new(heso_bin())
-        .args(&args)
-        .output()
-        .expect("spawn heso")
+    let mut cmd = Command::new(heso_bin());
+    cmd.args(&args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("spawn heso")
 }
 
 #[tokio::test]
 async fn stamp_records_cassette() {
-    let server = fixture_server("<html><head><title>fixture</title></head><body><h1>hi</h1></body></html>").await;
+    let server =
+        fixture_server("<html><head><title>fixture</title></head><body><h1>hi</h1></body></html>")
+            .await;
     let url = format!("{}/page", server.uri());
     let plan = serde_json::json!([{ "verb": "open", "url": url }]);
     let plan_path = write_temp("plan.json", plan.to_string().as_bytes());
 
     let out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
-    assert!(out.status.success(), "stamp failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stamp failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let plat: serde_json::Value = serde_json::from_slice(&out.stdout).expect("plat is json");
     let records = plat
@@ -83,8 +99,13 @@ async fn stamp_records_cassette() {
     assert_eq!(first["url"], url);
     assert_eq!(first["status"], 200);
     // Response body is base64 — non-empty and decodes to the HTML.
-    let body_b64 = first["response_body_b64"].as_str().expect("body_b64 string");
-    assert!(!body_b64.is_empty(), "recorded response body must not be empty");
+    let body_b64 = first["response_body_b64"]
+        .as_str()
+        .expect("body_b64 string");
+    assert!(
+        !body_b64.is_empty(),
+        "recorded response body must not be empty"
+    );
 
     let _ = std::fs::remove_file(&plan_path);
 }
@@ -101,9 +122,16 @@ async fn stamp_then_run_is_byte_identical() {
 
     // stamp once against the live wiremock — captures a cassette.
     let stamp_out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
-    assert!(stamp_out.status.success(), "stamp failed: {}", String::from_utf8_lossy(&stamp_out.stderr));
+    assert!(
+        stamp_out.status.success(),
+        "stamp failed: {}",
+        String::from_utf8_lossy(&stamp_out.stderr)
+    );
     let plat: serde_json::Value = serde_json::from_slice(&stamp_out.stdout).expect("plat is json");
-    let stamp_hash = plat["plat_hash"].as_str().expect("plat_hash string").to_owned();
+    let stamp_hash = plat["plat_hash"]
+        .as_str()
+        .expect("plat_hash string")
+        .to_owned();
 
     // Persist the stamped plat to disk so `run` can read it.
     let plat_path = write_temp("plat.plat", &stamp_out.stdout);
@@ -120,7 +148,8 @@ async fn stamp_then_run_is_byte_identical() {
         "run failed: {}",
         String::from_utf8_lossy(&run_out.stderr)
     );
-    let run_plat: serde_json::Value = serde_json::from_slice(&run_out.stdout).expect("run plat is json");
+    let run_plat: serde_json::Value =
+        serde_json::from_slice(&run_out.stdout).expect("run plat is json");
     let run_hash = run_plat["plat_hash"].as_str().expect("plat_hash string");
 
     assert_eq!(
@@ -133,6 +162,118 @@ async fn stamp_then_run_is_byte_identical() {
 }
 
 #[tokio::test]
+async fn registry_hash_run_replay_and_verify_work() {
+    let server = fixture_server(
+        "<html><head><title>registry fixture</title></head><body><p>hash replay</p></body></html>",
+    )
+    .await;
+    let url = format!("{}/page", server.uri());
+    let plan = serde_json::json!([{ "verb": "open", "url": url }]);
+    let plan_path = write_temp("plan.json", plan.to_string().as_bytes());
+
+    let stamp_out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
+    assert!(
+        stamp_out.status.success(),
+        "stamp failed: {}",
+        String::from_utf8_lossy(&stamp_out.stderr)
+    );
+    let plat: serde_json::Value = serde_json::from_slice(&stamp_out.stdout).expect("plat is json");
+    let hash = plat["plat_hash"]
+        .as_str()
+        .expect("plat_hash string")
+        .to_owned();
+
+    let registry = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/plat/{hash}/file")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_bytes(stamp_out.stdout.clone()),
+        )
+        .mount(&registry)
+        .await;
+
+    drop(server);
+    let envs = [("HESO_ECOSYSTEM_URL", registry.uri())];
+
+    let run_out = run_verb_with_env("run", &["--seed", "0", &hash], &envs);
+    assert!(
+        run_out.status.success(),
+        "run <hash> failed: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let run_plat: serde_json::Value =
+        serde_json::from_slice(&run_out.stdout).expect("run output is json");
+    assert_eq!(
+        run_plat["plat_hash"].as_str(),
+        Some(hash.as_str()),
+        "registry-backed run must preserve the stamped plat hash"
+    );
+
+    let replay_out = run_verb_with_env("replay", &[&hash], &envs);
+    assert!(
+        replay_out.status.success(),
+        "replay <hash> failed: {}",
+        String::from_utf8_lossy(&replay_out.stderr)
+    );
+    let replay: serde_json::Value =
+        serde_json::from_slice(&replay_out.stdout).expect("replay output is json");
+    assert_eq!(replay["plat_hash"].as_str(), Some(hash.as_str()));
+    let expected_source = format!("registry:{hash}");
+    assert_eq!(replay["source"].as_str(), Some(expected_source.as_str()));
+
+    let verify_out = run_verb_with_env("plat-verify", &[&hash], &envs);
+    assert!(
+        verify_out.status.success(),
+        "plat-verify <hash> failed: {}",
+        String::from_utf8_lossy(&verify_out.stderr)
+    );
+    let verify_stdout = String::from_utf8_lossy(&verify_out.stdout);
+    assert!(verify_stdout.contains(&format!("OK {hash}")));
+
+    let _ = std::fs::remove_file(&plan_path);
+}
+
+#[tokio::test]
+async fn registry_hash_refuses_mismatched_body() {
+    let server = fixture_server("<html><body>registry mismatch fixture</body></html>").await;
+    let url = format!("{}/page", server.uri());
+    let plan = serde_json::json!([{ "verb": "open", "url": url }]);
+    let plan_path = write_temp("plan.json", plan.to_string().as_bytes());
+
+    let stamp_out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
+    assert!(stamp_out.status.success());
+
+    let requested_hash = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let registry = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(wm_path(format!("/plat/{requested_hash}/file")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_bytes(stamp_out.stdout.clone()),
+        )
+        .mount(&registry)
+        .await;
+
+    drop(server);
+    let envs = [("HESO_ECOSYSTEM_URL", registry.uri())];
+    let run_out = run_verb_with_env("run", &["--seed", "0", requested_hash], &envs);
+    assert!(
+        !run_out.status.success(),
+        "run <hash> must refuse a registry body whose plat_hash does not match the requested hash"
+    );
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(
+        stderr.contains("does not match requested hash"),
+        "unexpected stderr: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(&plan_path);
+}
+
+#[tokio::test]
 async fn run_against_tampered_cassette_errors_gracefully() {
     let server = fixture_server("<html><body>fixture</body></html>").await;
     let url = format!("{}/page", server.uri());
@@ -142,11 +283,11 @@ async fn run_against_tampered_cassette_errors_gracefully() {
     let stamp_out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
     assert!(stamp_out.status.success());
 
-    let mut plat: serde_json::Value = serde_json::from_slice(&stamp_out.stdout).expect("plat is json");
+    let mut plat: serde_json::Value =
+        serde_json::from_slice(&stamp_out.stdout).expect("plat is json");
     // Tamper the recorded URL so lookup fails — simulates a page that
     // changed paths since stamping.
-    plat
-        .pointer_mut("/cassette/records/0/url")
+    plat.pointer_mut("/cassette/records/0/url")
         .map(|v| *v = serde_json::Value::String("https://drifted.example/".into()))
         .expect("path exists");
     // Remove plat_hash since we've mutated the body.
@@ -163,7 +304,8 @@ async fn run_against_tampered_cassette_errors_gracefully() {
         "run against a tampered cassette must exit non-zero"
     );
 
-    let run_plat: serde_json::Value = serde_json::from_slice(&run_out.stdout).expect("partial plat is json");
+    let run_plat: serde_json::Value =
+        serde_json::from_slice(&run_out.stdout).expect("partial plat is json");
     let steps = run_plat["steps"].as_array().expect("steps array");
     assert!(
         !steps.is_empty(),
@@ -273,7 +415,10 @@ async fn replay_refuses_plat_without_steps_field() {
     let plat_path = write_temp("plat-bare.json", plat.to_string().as_bytes());
 
     let out = run_verb("replay", &[plat_path.to_str().unwrap()]);
-    assert!(!out.status.success(), "replay should refuse a stepless plat");
+    assert!(
+        !out.status.success(),
+        "replay should refuse a stepless plat"
+    );
     assert_eq!(
         out.status.code(),
         Some(2),

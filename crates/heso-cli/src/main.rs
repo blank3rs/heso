@@ -72,6 +72,13 @@
 //!   against the recomputed hash of its content. Exit 0 = match, 1 =
 //!   mismatch (tampered/corrupted), 2 = malformed (missing or
 //!   non-string `plat_hash`).
+//! - `heso publish <plat-file> -d "description"` — Upload an existing
+//!   stamped plat to the public registry at heso.ca/ecosystem.
+//! - `heso pull <plat-hash> [-o output-path]` — Download a published plat
+//!   from the registry by its 64-character BLAKE3 content hash.
+//! - `heso list` — Browse the public plat registry.
+//! - `heso update` — Detect global heso installs owned by npm, PyPI
+//!   tooling, Cargo, or Homebrew and delegate updates to those managers.
 //! - `heso serve` — long-running JSON-RPC 2.0 server over stdin/stdout.
 //!   Framework authors (Browser Use, Stagehand, custom agents) launch
 //!   ONE child process and pipe newline-delimited requests in, responses
@@ -92,6 +99,7 @@
 //! [ADR 0016]: ../../decisions/0016-positioning-headless-browser-for-agents.md
 
 mod batch;
+mod ecosystem;
 mod receipts;
 mod search;
 mod serve;
@@ -105,8 +113,8 @@ mod serve;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::env;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
 
 use heso_core::{IdentityKey, Url};
 use heso_engine_api::{EngineApi, Page};
@@ -126,7 +134,9 @@ const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
 
 fn print_banner() {
     let version = env!("CARGO_PKG_VERSION");
-    println!("heso {version} — the agent-native web engine. No Chromium. No Node. One Rust binary.");
+    println!(
+        "heso {version} — the agent-native web engine. No Chromium. No Node. One Rust binary."
+    );
     println!();
     println!("Subcommands:");
     println!("  heso fetch <url>              GET a URL via the native fetch engine, print {{url, text}} JSON");
@@ -140,8 +150,12 @@ fn print_banner() {
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
     println!("    [--receipt PATH]               Emit a signed Receipt (Ed25519, BLAKE3) to PATH alongside stdout JSON");
     println!("    [--key PATH]                   Identity key for --receipt (default: heso-local-data/identity.key)");
-    println!("    [--mode M]                     Receipt mode: deterministic (default), recording, live");
-    println!("    [--seed N]                     Session seed stamped into the receipt (default 0)");
+    println!(
+        "    [--mode M]                     Receipt mode: deterministic (default), recording, live"
+    );
+    println!(
+        "    [--seed N]                     Session seed stamped into the receipt (default 0)"
+    );
     println!("  heso read  <url>              Like `open` PLUS post-hydration text, grouped forms, cookies, console, framework sniff, scripts");
     println!("    [--include CSV]                Filter the optional surface: text,forms,cookies,console,framework,scripts (default: all)");
     println!("    [--receipt PATH] [--key PATH] [--mode M] [--seed N]   Same signed-receipt suite as `heso open`");
@@ -175,11 +189,15 @@ fn print_banner() {
     println!("  heso search <query>           Multi-backend web search: DDG HTML + Wikipedia summary (default).");
     println!("                                Pure HTTP + HTML — no JS engine spin-up. No API key required.");
     println!("    [--limit N]                    Max merged results (default 30, max 100). Wikipedia goes in");
-    println!("                                   the top-level `knowledge` block, not in `results`.");
+    println!(
+        "                                   the top-level `knowledge` block, not in `results`."
+    );
     println!("    [--engines ddg,wiki,searxng]   Pick subset (default ddg,wiki). Round-robin ranked merge,");
     println!("                                   dedupe by canonical URL.");
     println!("    [--searx-url URL]              Optional SearXNG base URL. Also reads HESO_SEARX_URL env.");
-    println!("                                   Most public instances disable JSON output by default.");
+    println!(
+        "                                   Most public instances disable JSON output by default."
+    );
     println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
     println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
     println!("  heso plat-info   <file>       Human summary of a plat: hash, plan/cassette/steps counts, sealed status, partial flag");
@@ -190,6 +208,15 @@ fn print_banner() {
     println!("                                Wrap a plat in an Ed25519 envelope (default key: heso-local-data/identity.key)");
     println!("  heso plat-unseal <file> [--extract]");
     println!("                                Verify a sealed envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
+    println!("  heso publish <plat-file> -d \"description\" [-t \"tag1,tag2\"]");
+    println!("                                Upload a stamped plat to the public registry at heso.ca/ecosystem.");
+    println!("  heso pull    <plat-hash> [-o output-path]");
+    println!(
+        "                                Download a published plat by its 64-char BLAKE3 hash."
+    );
+    println!("  heso list    [-q query] [-t tag] [--sort trending|downloads|newest] [--limit N]");
+    println!("                                Browse the public plat registry.");
+    println!("  heso update [--dry-run]      Update every detected global heso install channel.");
     println!("  heso eval-js [--seed N] <js>  Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window; use eval-dom for pages.");
     println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
@@ -220,15 +247,19 @@ fn print_banner() {
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
     println!("                                Accepts a bare Action[] array, a plat with a `plan` field, or a");
     println!("                                fingerprint. Exit 0 ok / 1 if any step failed.");
-    println!("  heso run    [--seed N] <plat.plat>");
+    println!("  heso run    [--seed N] <plat.plat|plat-hash|->");
     println!("                                Re-execute the plan against the plat's embedded cassette — no");
     println!("                                network. Mints a fresh plat; for an unchanged cassette its");
     println!("                                plat_hash equals the input's (byte-identical replay, ADR 0008).");
     println!("                                Misses (page drifted since stamp) surface as graceful errors.");
-    println!("  heso replay <plat.plat>       Emit the recorded step log from a plat. Pure observation — no");
+    println!("  heso replay <plat.plat|plat-hash|->");
+    println!("                                Emit the recorded step log from a plat. Pure observation — no");
     println!("                                engine, no network, no JS. Use `run` to re-execute.");
-    println!("  heso unpack <plat.plat>       Extract the `plan` field from a plat (errors if none). Pipes into");
-    println!("                                an editor or back into `stamp` for the edit/re-mint loop.");
+    println!("  heso unpack <plat.plat|plat-hash|->");
+    println!("                                Extract the `plan` field from a plat (errors if none). Pipes into");
+    println!(
+        "                                an editor or back into `stamp` for the edit/re-mint loop."
+    );
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
     println!(
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
@@ -248,6 +279,196 @@ fn print_banner() {
 
 fn print_version() {
     println!("heso {}", env!("CARGO_PKG_VERSION"));
+}
+
+struct UpdateStep {
+    channel: &'static str,
+    command: &'static str,
+}
+
+fn print_update_help() {
+    eprintln!("usage: heso update [--dry-run]");
+    eprintln!();
+    eprintln!(
+        "Detect globally installed heso packages and delegate updates to their package managers."
+    );
+    eprintln!("Detected channels: npm, uv tool, pipx, pip, cargo install, Homebrew.");
+    eprintln!();
+    eprintln!("  --dry-run    print the commands without running them");
+}
+
+fn shell_output(command: &str) -> Option<(bool, String)> {
+    let output = if cfg!(windows) {
+        Command::new("cmd").args(["/C", command]).output()
+    } else {
+        Command::new("sh").args(["-c", command]).output()
+    }
+    .ok()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Some((output.status.success(), text))
+}
+
+fn shell_status(command: &str) -> bool {
+    if cfg!(windows) {
+        Command::new("cmd").args(["/C", command]).status()
+    } else {
+        Command::new("sh").args(["-c", command]).status()
+    }
+    .map(|s| s.success())
+    .unwrap_or(false)
+}
+
+fn command_exists(name: &str) -> bool {
+    let probe = if cfg!(windows) {
+        format!("where.exe {name}")
+    } else {
+        format!("command -v {name}")
+    };
+    shell_output(&probe)
+        .map(|(ok, out)| ok && !out.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn output_contains_success(command: &str, needle: &str) -> bool {
+    shell_output(command)
+        .map(|(ok, out)| ok && out.contains(needle))
+        .unwrap_or(false)
+}
+
+fn detect_update_steps() -> Vec<UpdateStep> {
+    let mut steps = Vec::new();
+
+    if command_exists("npm")
+        && output_contains_success("npm list -g @ixla/heso --depth=0 --json", "@ixla/heso")
+    {
+        steps.push(UpdateStep {
+            channel: "npm",
+            command: "npm cache verify",
+        });
+        steps.push(UpdateStep {
+            channel: "npm",
+            command: "npm install -g @ixla/heso@latest",
+        });
+    }
+
+    if command_exists("uv") && output_contains_success("uv tool list", "heso") {
+        steps.push(UpdateStep {
+            channel: "uv",
+            command: "uv tool upgrade heso",
+        });
+    }
+
+    if command_exists("pipx") && output_contains_success("pipx list", "heso") {
+        steps.push(UpdateStep {
+            channel: "pipx",
+            command: "pipx upgrade heso",
+        });
+    }
+
+    if cfg!(windows) && command_exists("py") && shell_status("py -m pip show heso >NUL 2>NUL") {
+        steps.push(UpdateStep {
+            channel: "pip",
+            command: "py -m pip install --upgrade heso",
+        });
+    } else if !cfg!(windows)
+        && command_exists("python3")
+        && shell_status("python3 -m pip show heso >/dev/null 2>/dev/null")
+    {
+        steps.push(UpdateStep {
+            channel: "pip",
+            command: "python3 -m pip install --upgrade heso",
+        });
+    } else if !cfg!(windows)
+        && command_exists("python")
+        && shell_status("python -m pip show heso >/dev/null 2>/dev/null")
+    {
+        steps.push(UpdateStep {
+            channel: "pip",
+            command: "python -m pip install --upgrade heso",
+        });
+    }
+
+    if command_exists("cargo") && output_contains_success("cargo install --list", "heso-cli") {
+        steps.push(UpdateStep {
+            channel: "cargo",
+            command:
+                "cargo install --git https://github.com/blank3rs/heso heso-cli --locked --force",
+        });
+    }
+
+    if command_exists("brew") && output_contains_success("brew list --versions heso", "heso") {
+        steps.push(UpdateStep {
+            channel: "homebrew",
+            command: "brew update",
+        });
+        steps.push(UpdateStep {
+            channel: "homebrew",
+            command: "brew upgrade heso",
+        });
+    }
+
+    steps
+}
+
+async fn cmd_update(args: &[String]) -> ExitCode {
+    let mut dry_run = false;
+    for arg in args {
+        match arg.as_str() {
+            "--dry-run" | "--check" => dry_run = true,
+            "-h" | "--help" => {
+                print_update_help();
+                return ExitCode::SUCCESS;
+            }
+            other => {
+                eprintln!("update: unknown flag `{other}`");
+                print_update_help();
+                return ExitCode::from(2);
+            }
+        }
+    }
+
+    let steps = detect_update_steps();
+    if steps.is_empty() {
+        println!("No package-manager-owned heso installs detected.");
+        println!(
+            "If this binary came from the GitHub installer, reinstall from the latest release:"
+        );
+        if cfg!(windows) {
+            println!(
+                "  powershell -ExecutionPolicy Bypass -c \"irm https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.ps1 | iex\""
+            );
+        } else {
+            println!(
+                "  curl --proto '=https' --tlsv1.2 -LsSf https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.sh | sh"
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if dry_run {
+        println!("Detected update commands:");
+        for step in &steps {
+            println!("  [{}] {}", step.channel, step.command);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let mut failed = false;
+    for step in &steps {
+        println!("==> [{}] {}", step.channel, step.command);
+        if !shell_status(step.command) {
+            eprintln!("update: command failed for channel `{}`", step.channel);
+            failed = true;
+        }
+    }
+
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        println!("heso update complete.");
+        ExitCode::SUCCESS
+    }
 }
 
 /// Open a URL with the default `FetchEngine`. Returns the loaded page or an
@@ -294,7 +515,14 @@ async fn cmd_fetch(args: &[String]) -> ExitCode {
     let url = match Url::parse(&args[0]) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{}`: {e}", args[0]);
+            if ecosystem::is_plat_hash(&args[0]) {
+                eprintln!(
+                    "`{}` looks like a plat hash, not a URL. Use `heso run {}` to replay the published plat, or `heso pull {}` to download it.",
+                    args[0], args[0], args[0]
+                );
+            } else {
+                eprintln!("invalid URL `{}`: {e}", args[0]);
+            }
             return ExitCode::from(2);
         }
     };
@@ -754,8 +982,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             hydrate_for_failure_envelope(&engine, &page.body_html, page.url().clone());
         (failed, console_errors, None)
     };
-    let (js_partial, js_reason) =
-        classify_failure_envelope(&failed_scripts, console_errors_count);
+    let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts, console_errors_count);
     // HTTP truthfulness wins over JS classification — a 403 with a
     // Cloudflare challenge body shouldn't pretend to be a `script_crash`
     // from the missing CF JS. Same upstream signal for 5xx, etc.
@@ -809,15 +1036,9 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             // the static `tree.title`). Only swap when the JS eval
             // returned a non-empty string.
             if let Some(t) = post_title.as_ref() {
-                obj.insert(
-                    "title".to_owned(),
-                    serde_json::Value::String(t.clone()),
-                );
+                obj.insert("title".to_owned(), serde_json::Value::String(t.clone()));
             }
-            obj.insert(
-                "text".to_owned(),
-                serde_json::Value::String(post_text),
-            );
+            obj.insert("text".to_owned(), serde_json::Value::String(post_text));
             obj.insert(
                 "console".to_owned(),
                 serde_json::to_value(console).unwrap_or(serde_json::Value::Null),
@@ -988,8 +1209,7 @@ pub(crate) fn apply_extraction_truthfulness(
     if inline_crashed {
         return (true, reason);
     }
-    let extraction_ok =
-        !title.trim().is_empty() && (action_count > 0 || tree_child_count > 0);
+    let extraction_ok = !title.trim().is_empty() && (action_count > 0 || tree_child_count > 0);
     if extraction_ok {
         (false, "ok".to_owned())
     } else {
@@ -1003,8 +1223,7 @@ pub(crate) fn apply_http_truthfulness(
     http_status: u16,
     body_html: &str,
 ) -> (bool, String) {
-    if let Some(http_reason) =
-        heso_engine_fetch::partial_reason_for_status(http_status, body_html)
+    if let Some(http_reason) = heso_engine_fetch::partial_reason_for_status(http_status, body_html)
     {
         return (true, http_reason);
     }
@@ -1601,43 +1820,44 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // structured message names the offending pre-script index.
     // `mut` so `run_auto_scroll_loop` (--complete) can pass it as
     // `&mut JsSession`.
-    let (mut session, script_outcome) = match heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
-        js_engine,
-        &page.body_html,
-        page.url().clone(),
-        heso_engine_js::ScriptFetchPolicy::Fetch,
-        &inject_scripts,
-    ) {
-        Ok(pair) => pair,
-        Err(e) => {
-            if best_effort {
-                // Surface a synthetic failure envelope and exit 0 with
-                // the static fields the static fetch already produced.
-                // No DOM session means no post-hydration text/forms/
-                // cookies — we still ship the static tree + plat_hash
-                // so the agent has something to inspect.
-                let mut body = page.plat_body_base();
-                let synthetic_failure = heso_engine_js::ScriptFailure {
-                    url: None,
-                    reason: "script_crash".to_owned(),
-                    message: format!("hydrate failed: {e}"),
-                    line: None,
-                };
-                let failed = vec![synthetic_failure];
-                attach_failure_envelope(&mut body, true, "script_crash", &failed, 0);
-                let hash = heso_engine_fetch::plat_hash(&body);
-                if let Some(obj) = body.as_object_mut() {
-                    obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+    let (mut session, script_outcome) =
+        match heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
+            js_engine,
+            &page.body_html,
+            page.url().clone(),
+            heso_engine_js::ScriptFetchPolicy::Fetch,
+            &inject_scripts,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                if best_effort {
+                    // Surface a synthetic failure envelope and exit 0 with
+                    // the static fields the static fetch already produced.
+                    // No DOM session means no post-hydration text/forms/
+                    // cookies — we still ship the static tree + plat_hash
+                    // so the agent has something to inspect.
+                    let mut body = page.plat_body_base();
+                    let synthetic_failure = heso_engine_js::ScriptFailure {
+                        url: None,
+                        reason: "script_crash".to_owned(),
+                        message: format!("hydrate failed: {e}"),
+                        line: None,
+                    };
+                    let failed = vec![synthetic_failure];
+                    attach_failure_envelope(&mut body, true, "script_crash", &failed, 0);
+                    let hash = heso_engine_fetch::plat_hash(&body);
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
+                    }
+                    return print_json(&body);
                 }
-                return print_json(&body);
+                // The error's Display names the offending --inject-script
+                // index when the engine flagged a pre-script throw, so a
+                // bare `{e}` is informative enough here.
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
             }
-            // The error's Display names the offending --inject-script
-            // index when the engine flagged a pre-script throw, so a
-            // bare `{e}` is informative enough here.
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
+        };
     let mut console = session.engine().drain_console();
     let failed_scripts = session.engine().drain_script_failures();
     let mut post_html = session.document_html();
@@ -1683,8 +1903,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // post-load action graph (which may differ from `page.actions`
     // under `--complete`).
     let mut body = page.plat_body_base();
-    body["actions"] = serde_json::to_value(&current_actions)
-        .unwrap_or(serde_json::Value::Null);
+    body["actions"] = serde_json::to_value(&current_actions).unwrap_or(serde_json::Value::Null);
     // Always compute visible_text + forms — they feed `content_hash`
     // and the `--since` snapshot store even when the include filter
     // would have dropped them from the user-visible body. The body
@@ -1750,8 +1969,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // the schema bump. Under `--best-effort` we additionally guarantee
     // exit 0 — the existing happy path already returns success here
     // since `JsSession::open_on_engine` succeeded.
-    let (js_partial, js_reason) =
-        classify_failure_envelope(&failed_scripts, console_errors_count);
+    let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts, console_errors_count);
     let (partial, partial_reason) =
         apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
     let (partial, partial_reason) = apply_extraction_truthfulness(
@@ -1780,7 +1998,6 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         body["scroll"] = serde_json::to_value(&s).unwrap_or(serde_json::Value::Null);
     }
 
-
     // plat_hash last — same canonical form as `heso open` so an
     // agent that already trusts an `open` plat can verify a `read`
     // payload identically.
@@ -1794,9 +2011,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     if sign_flags.is_active() {
         let parsed_url = Url::parse(&url_str).expect("URL already validated above");
         let trace = receipts::url_trace(&parsed_url);
-        if let Err(code) =
-            receipts::emit_signed_receipt(&fetch_engine, &trace, &sign_flags).await
-        {
+        if let Err(code) = receipts::emit_signed_receipt(&fetch_engine, &trace, &sign_flags).await {
             return code;
         }
     }
@@ -1937,8 +2152,11 @@ pub(crate) fn compute_content_hash(
     //    actionable on this page" regardless of which order we walked.
     let mut sorted_actions: Vec<&(String, Option<String>)> = actions.iter().collect();
     sorted_actions.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| a.1.as_deref().unwrap_or("").cmp(b.1.as_deref().unwrap_or("")))
+        a.0.cmp(&b.0).then_with(|| {
+            a.1.as_deref()
+                .unwrap_or("")
+                .cmp(b.1.as_deref().unwrap_or(""))
+        })
     });
     hasher.update(b"actions\x00");
     for (ref_id, name) in &sorted_actions {
@@ -1960,9 +2178,21 @@ pub(crate) fn compute_content_hash(
         let mut form_keys: Vec<FormKey> = arr
             .iter()
             .map(|f| {
-                let ref_id = f.get("ref").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-                let action = f.get("action").and_then(|v| v.as_str()).unwrap_or("").to_owned();
-                let method = f.get("method").and_then(|v| v.as_str()).unwrap_or("").to_owned();
+                let ref_id = f
+                    .get("ref")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let action = f
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let method = f
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
                 let inputs: Vec<(String, String)> = f
                     .get("inputs")
                     .and_then(|v| v.as_array())
@@ -1971,8 +2201,14 @@ pub(crate) fn compute_content_hash(
                             .iter()
                             .map(|i| {
                                 (
-                                    i.get("name").and_then(|x| x.as_str()).unwrap_or("").to_owned(),
-                                    i.get("ref").and_then(|x| x.as_str()).unwrap_or("").to_owned(),
+                                    i.get("name")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    i.get("ref")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_owned(),
                                 )
                             })
                             .collect();
@@ -2009,10 +2245,7 @@ pub(crate) fn compute_content_hash(
 ///   - `forms_changed`, `text_changed`, `title_changed`: deep-eq booleans.
 ///   - `since_matched`: always `true` here (caller chose this path
 ///     because they found a prior snapshot).
-pub(crate) fn compute_delta(
-    current: &ReadSnapshot,
-    prior: &ReadSnapshot,
-) -> serde_json::Value {
+pub(crate) fn compute_delta(current: &ReadSnapshot, prior: &ReadSnapshot) -> serde_json::Value {
     use std::collections::HashSet;
     let prior_set: HashSet<(&str, &str)> = prior
         .actions
@@ -2166,7 +2399,9 @@ static NEXT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| 
 fn find_load_more_actions(actions: &[ElementRef]) -> Vec<LazyAction> {
     let mut out = Vec::new();
     for a in actions {
-        let Some(name) = a.name.as_deref() else { continue };
+        let Some(name) = a.name.as_deref() else {
+            continue;
+        };
         let trimmed = name.trim();
         // Common exact-match conveniences: "More", "Show more" (also
         // caught by the regex but inexpensive to short-circuit).
@@ -2205,7 +2440,9 @@ fn find_pagination_next(actions: &[ElementRef]) -> Option<LazyAction> {
         }
     }
     for a in actions {
-        let Some(name) = a.name.as_deref() else { continue };
+        let Some(name) = a.name.as_deref() else {
+            continue;
+        };
         let trimmed = name.trim();
         if NEXT_RE.is_match(trimmed) {
             return Some(LazyAction {
@@ -2843,7 +3080,8 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
         }
     } else if network_idle {
         heso_engine_js::WaitCondition::NetworkIdle {
-            idle_window_ms: idle_window.unwrap_or(heso_engine_js::wait_for::DEFAULT_NETWORK_IDLE_WINDOW_MS),
+            idle_window_ms: idle_window
+                .unwrap_or(heso_engine_js::wait_for::DEFAULT_NETWORK_IDLE_WINDOW_MS),
         }
     } else {
         // --time
@@ -3018,7 +3256,9 @@ fn parse_duration_ms(s: &str) -> Result<u64, String> {
         .parse()
         .map_err(|e| format!("invalid number `{num_part}`: {e}"))?;
     if !value.is_finite() || value < 0.0 {
-        return Err(format!("duration must be a non-negative finite number, got `{s}`"));
+        return Err(format!(
+            "duration must be a non-negative finite number, got `{s}`"
+        ));
     }
     let ms = match unit.as_str() {
         "" | "ms" => value,
@@ -3322,7 +3562,11 @@ fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
         } => {
             eprintln!(
                 "no element matched locator {}",
-                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
+                format_locator(
+                    text.as_deref(),
+                    css_selector.as_deref(),
+                    aria_label.as_deref()
+                )
             );
             ExitCode::from(2)
         }
@@ -3335,7 +3579,11 @@ fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
             let n = candidates.len();
             eprintln!(
                 "ambiguous: {n} elements matched locator {}",
-                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
+                format_locator(
+                    text.as_deref(),
+                    css_selector.as_deref(),
+                    aria_label.as_deref()
+                )
             );
             eprintln!("candidates (use one of these refs):");
             for c in &candidates {
@@ -3350,10 +3598,7 @@ fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
                 } else {
                     name.to_owned()
                 };
-                eprintln!(
-                    "  {} ({} {}) \"{}\"",
-                    c.ref_id, c.role, c.tag, snippet
-                );
+                eprintln!("  {} ({} {}) \"{}\"", c.ref_id, c.role, c.tag, snippet);
             }
             ExitCode::from(2)
         }
@@ -3626,10 +3871,7 @@ where
 /// empty, a bare fragment (`#`), a `javascript:` pseudo-URL, or
 /// otherwise unfollowable. Relative URLs are resolved against
 /// `page_url` per WHATWG URL spec.
-fn follow_anchor_href(
-    action: &heso_engine_fetch::ElementRef,
-    page_url: &Url,
-) -> Option<Url> {
+fn follow_anchor_href(action: &heso_engine_fetch::ElementRef, page_url: &Url) -> Option<Url> {
     let href = action.attrs.get("href")?;
     let trimmed = href.trim();
     if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -3671,10 +3913,7 @@ async fn augment_click_with_destination(
     match engine.open(dest_url).await {
         Ok(dest_page) => {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert(
-                    "navigated".to_owned(),
-                    serde_json::Value::Bool(true),
-                );
+                obj.insert("navigated".to_owned(), serde_json::Value::Bool(true));
                 obj.insert(
                     "navigated_to".to_owned(),
                     serde_json::Value::String(dest_page.url().as_str().to_owned()),
@@ -3711,10 +3950,7 @@ async fn augment_click_with_destination(
                     dest_page.http_status,
                     &dest_page.body_html,
                 ) {
-                    obj.insert(
-                        "partial".to_owned(),
-                        serde_json::Value::Bool(true),
-                    );
+                    obj.insert("partial".to_owned(), serde_json::Value::Bool(true));
                     obj.insert(
                         "partial_reason".to_owned(),
                         serde_json::Value::String(reason),
@@ -3724,10 +3960,7 @@ async fn augment_click_with_destination(
         }
         Err(e) => {
             if let Some(obj) = body.as_object_mut() {
-                obj.insert(
-                    "navigated".to_owned(),
-                    serde_json::Value::Bool(false),
-                );
+                obj.insert("navigated".to_owned(), serde_json::Value::Bool(false));
                 obj.insert(
                     "navigated_to".to_owned(),
                     serde_json::Value::String(dest_url.as_str().to_owned()),
@@ -3776,9 +4009,7 @@ async fn cmd_click(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
     if extra.is_empty() {
-        eprintln!(
-            "usage: heso click <url> (<@ref> | --text S | --selector CSS | --aria-label S)"
-        );
+        eprintln!("usage: heso click <url> (<@ref> | --text S | --selector CSS | --aria-label S)");
         return ExitCode::from(2);
     }
     let url_arg = &extra[0];
@@ -4044,7 +4275,8 @@ pub(crate) fn merge_submit_fields(
     data_fields: &[(String, String)],
     fields_cli: &[(String, String)],
 ) -> Vec<(String, String)> {
-    let mut merged: Vec<(String, String)> = Vec::with_capacity(data_fields.len() + fields_cli.len());
+    let mut merged: Vec<(String, String)> =
+        Vec::with_capacity(data_fields.len() + fields_cli.len());
     let cli_names: std::collections::HashSet<&str> =
         fields_cli.iter().map(|(n, _)| n.as_str()).collect();
     for (n, v) in data_fields {
@@ -4209,21 +4441,18 @@ async fn cmd_submit_inner(
 
 async fn cmd_plat_hash(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso plat-hash <file>");
+        eprintln!("usage: heso plat-hash <file|plat-hash>");
         return ExitCode::from(2);
     }
-    let file = &args[0];
-    let contents = match tokio::fs::read_to_string(file).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to read `{file}`: {e}");
-            return ExitCode::FAILURE;
-        }
+    let input = &args[0];
+    let (contents, source) = match read_plat_input_or_hash(input, "plat-hash").await {
+        Ok(v) => v,
+        Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{file}` is not valid JSON: {e}");
+            eprintln!("`{source}` is not valid JSON: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4238,21 +4467,18 @@ async fn cmd_plat_hash(args: &[String]) -> ExitCode {
 /// non-string `plat_hash`).
 async fn cmd_plat_verify(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso plat-verify <file>");
+        eprintln!("usage: heso plat-verify <file|plat-hash>");
         return ExitCode::from(2);
     }
-    let file = &args[0];
-    let contents = match tokio::fs::read_to_string(file).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to read `{file}`: {e}");
-            return ExitCode::FAILURE;
-        }
+    let input = &args[0];
+    let (contents, source) = match read_plat_input_or_hash(input, "plat-verify").await {
+        Ok(v) => v,
+        Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{file}` is not valid JSON: {e}");
+            eprintln!("`{source}` is not valid JSON: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4310,9 +4536,7 @@ fn changed_top_level_fields(a: &serde_json::Value, b: &serde_json::Value) -> Vec
     if let Some(obj) = b.as_object() {
         keys.extend(obj.keys().filter(|k| k.as_str() != "plat_hash").cloned());
     }
-    keys.into_iter()
-        .filter(|k| a.get(k) != b.get(k))
-        .collect()
+    keys.into_iter().filter(|k| a.get(k) != b.get(k)).collect()
 }
 
 /// `heso plat-info <file>` — print a human summary of a plat: hash,
@@ -4322,25 +4546,22 @@ fn changed_top_level_fields(a: &serde_json::Value, b: &serde_json::Value) -> Vec
 /// Exit codes: `0` ok, `1` file unreadable or not JSON, `2` usage.
 async fn cmd_plat_info(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso plat-info <file>");
+        eprintln!("usage: heso plat-info <file|plat-hash>");
         eprintln!();
         eprintln!("Print a human summary of a plat: plat_hash, plan length,");
         eprintln!("cassette record count, step count, sealed status, and partial flag.");
         return ExitCode::from(2);
     }
-    let file = &args[0];
-    let contents = match tokio::fs::read_to_string(file).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to read `{file}`: {e}");
-            return ExitCode::FAILURE;
-        }
+    let input = &args[0];
+    let (contents, source) = match read_plat_input_or_hash(input, "plat-info").await {
+        Ok(v) => v,
+        Err(code) => return code,
     };
     let size_bytes = contents.len();
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{file}` is not valid JSON: {e}");
+            eprintln!("`{source}` is not valid JSON: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -4443,7 +4664,11 @@ async fn cmd_plat_info(args: &[String]) -> ExitCode {
     println!("steps:        {steps_summary}");
     println!(
         "sealed:       {}",
-        if sealed { "yes (Ed25519 envelope)" } else { "no" }
+        if sealed {
+            "yes (Ed25519 envelope)"
+        } else {
+            "no"
+        }
     );
     let partial_line = match (partial, partial_reason) {
         (false, _) => "false".to_owned(),
@@ -4649,9 +4874,7 @@ async fn cmd_plat_redact(args: &[String]) -> ExitCode {
     };
 
     if value.get("alg").is_some() && value.get("signature").is_some() {
-        eprintln!(
-            "refused: `{file}` looks like a sealed envelope (has `alg` + `signature`)."
-        );
+        eprintln!("refused: `{file}` looks like a sealed envelope (has `alg` + `signature`).");
         eprintln!("redacting it would break the signature. Extract `content` first:");
         eprintln!("  jq .content {file} | heso plat-redact {field} -");
         return ExitCode::from(1);
@@ -4686,10 +4909,7 @@ async fn cmd_plat_redact(args: &[String]) -> ExitCode {
         );
     }
     if let Some(obj) = value.as_object_mut() {
-        obj.insert(
-            "plat_hash".to_owned(),
-            serde_json::Value::String(new_hash),
-        );
+        obj.insert("plat_hash".to_owned(), serde_json::Value::String(new_hash));
     }
 
     match serde_json::to_string(&value) {
@@ -4774,9 +4994,7 @@ async fn cmd_plat_seal(args: &[String]) -> ExitCode {
     };
 
     if body.get("alg").is_some() && body.get("signature").is_some() {
-        eprintln!(
-            "refused: input looks like a sealed envelope already (has `alg` + `signature`)."
-        );
+        eprintln!("refused: input looks like a sealed envelope already (has `alg` + `signature`).");
         eprintln!("double-sealing is almost always a mistake. Extract `content` first:");
         eprintln!("  jq .content {file} | heso plat-seal -");
         return ExitCode::FAILURE;
@@ -4839,7 +5057,9 @@ async fn cmd_plat_unseal(args: &[String]) -> ExitCode {
     let Some(file) = file else {
         eprintln!("usage: heso plat-unseal <file> [--extract]");
         eprintln!();
-        eprintln!("Verify a sealed plat envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
+        eprintln!(
+            "Verify a sealed plat envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed."
+        );
         eprintln!("Pass `-` to read the envelope from stdin. With --extract, also print the inner");
         eprintln!("plat body (the `content` field) to stdout for piping into another verb.");
         return ExitCode::from(2);
@@ -4946,8 +5166,6 @@ struct PlanInput {
     /// plat's `"plan"` field verbatim. Preserved separately so a
     /// round-trip stamp → unpack → stamp yields identical bytes.
     actions_json: serde_json::Value,
-    /// Origin of this plan — for logging / error context.
-    source: &'static str,
 }
 
 /// Detect a plan inside any of the three accepted JSON shapes:
@@ -4959,14 +5177,12 @@ fn extract_plan(value: &serde_json::Value) -> Result<PlanInput, String> {
         let actions = parse_actions(value)
             .map_err(|e| format!("plan array is not a canonical Action[]: {e}"))?;
         let start = first_open_url(&actions).ok_or_else(|| {
-            "a bare plan must start with an `open` action so we know the entry URL"
-                .to_owned()
+            "a bare plan must start with an `open` action so we know the entry URL".to_owned()
         })?;
         return Ok(PlanInput {
             actions,
             start_url: start,
             actions_json: value.clone(),
-            source: "plan-array",
         });
     }
     // Object: either a TraceFingerprint or a plat.
@@ -4979,7 +5195,10 @@ fn extract_plan(value: &serde_json::Value) -> Result<PlanInput, String> {
         match verify_fingerprint(&fp) {
             FingerprintOutcome::Valid => {}
             FingerprintOutcome::Mismatch => {
-                return Err("fingerprint integrity check failed (file was modified after creation)".to_owned());
+                return Err(
+                    "fingerprint integrity check failed (file was modified after creation)"
+                        .to_owned(),
+                );
             }
             FingerprintOutcome::WrongAlgorithm(tag) => {
                 return Err(format!("unknown fingerprint algorithm `{tag}`"));
@@ -4990,30 +5209,29 @@ fn extract_plan(value: &serde_json::Value) -> Result<PlanInput, String> {
         }
         let actions = parse_actions(&fp.actions)
             .map_err(|e| format!("fingerprint actions are not canonical: {e}"))?;
-        let start = Url::parse(&fp.url)
-            .map_err(|e| format!("fingerprint url unparseable: {e}"))?;
+        let start = Url::parse(&fp.url).map_err(|e| format!("fingerprint url unparseable: {e}"))?;
         return Ok(PlanInput {
             actions,
             start_url: start,
             actions_json: fp.actions,
-            source: "fingerprint",
         });
     }
     if let Some(plan_value) = obj.get("plan") {
         let actions = parse_actions(plan_value)
             .map_err(|e| format!("plat's `plan` field is not a canonical Action[]: {e}"))?;
         let start = first_open_url(&actions).ok_or_else(|| {
-            "plat's `plan` must start with an `open` action so we know the entry URL"
-                .to_owned()
+            "plat's `plan` must start with an `open` action so we know the entry URL".to_owned()
         })?;
         return Ok(PlanInput {
             actions,
             start_url: start,
             actions_json: plan_value.clone(),
-            source: "plat",
         });
     }
-    Err("input is neither a fingerprint, a plat with a `plan` field, nor a bare Action[] array".to_owned())
+    Err(
+        "input is neither a fingerprint, a plat with a `plan` field, nor a bare Action[] array"
+            .to_owned(),
+    )
 }
 
 /// First `Action::Open` URL in the plan, parsed.
@@ -5039,14 +5257,14 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let contents = match read_plat_input(&path) {
-        Ok(s) => s,
+    let (contents, source) = match read_plat_input_or_hash(&path, "stamp").await {
+        Ok(v) => v,
         Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{path}` is not valid JSON: {e}");
+            eprintln!("`{source}` is not valid JSON: {e}");
             return ExitCode::from(2);
         }
     };
@@ -5119,10 +5337,7 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
     // Snapshot the cassette out of the shared Arc and embed it under
     // the canonical `cassette` field. Any cassette mutation flips the
     // plat hash, so replay can't quietly diverge.
-    let final_cassette = cassette
-        .lock()
-        .expect("cassette mutex poisoned")
-        .clone();
+    let final_cassette = cassette.lock().expect("cassette mutex poisoned").clone();
     if let Some(obj) = body.as_object_mut() {
         if let Ok(c) = serde_json::to_value(&final_cassette) {
             obj.insert("cassette".to_owned(), c);
@@ -5145,26 +5360,26 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
 /// was produced by single-URL `heso open` instead of `heso stamp`).
 async fn cmd_unpack(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso unpack <plat.plat>");
+        eprintln!("usage: heso unpack <plat.plat|plat-hash|->");
         eprintln!();
         eprintln!("Extracts the `plan` array from a plat so it can be edited");
         eprintln!("standalone and stamped back into a fresh plat with `heso stamp`.");
         return ExitCode::from(2);
     }
-    let path = &args[0];
-    let contents = match read_plat_input(path) {
-        Ok(s) => s,
+    let input = &args[0];
+    let (contents, source) = match read_plat_input_or_hash(input, "unpack").await {
+        Ok(v) => v,
         Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{path}` is not valid JSON: {e}");
+            eprintln!("`{source}` is not valid JSON: {e}");
             return ExitCode::from(2);
         }
     };
     let Some(plan) = value.get("plan") else {
-        eprintln!("`{path}` has no `plan` field — it was not produced by `heso stamp`");
+        eprintln!("`{source}` has no `plan` field — it was not produced by `heso stamp`");
         eprintln!("(plats minted by single-URL `heso open` carry no plan).");
         return ExitCode::from(2);
     };
@@ -5194,6 +5409,39 @@ fn read_plat_input(path: &str) -> Result<String, ExitCode> {
             }
         }
     }
+}
+
+/// Read a plat from stdin, a local file, or the public registry when
+/// the argument is a bare 64-char plat hash.
+async fn read_plat_input_or_hash(input: &str, verb: &str) -> Result<(String, String), ExitCode> {
+    if input != "-" && !Path::new(input).exists() && ecosystem::is_plat_hash(input) {
+        match ecosystem::download_plat_text(input).await {
+            Ok(s) => {
+                let value: serde_json::Value = match serde_json::from_str(&s) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{verb}: downloaded plat `{input}` is not valid JSON: {e}");
+                        return Err(ExitCode::FAILURE);
+                    }
+                };
+                let embedded = value.get("plat_hash").and_then(|v| v.as_str());
+                let recomputed = heso_engine_fetch::plat_hash(&value);
+                if embedded != Some(input) || recomputed != input {
+                    eprintln!("{verb}: registry returned a plat that does not match requested hash `{input}`");
+                    eprintln!("  embedded:   {}", embedded.unwrap_or("(missing)"));
+                    eprintln!("  recomputed: {recomputed}");
+                    return Err(ExitCode::FAILURE);
+                }
+                return Ok((s, format!("registry:{input}")));
+            }
+            Err(e) => {
+                eprintln!("{verb}: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        }
+    }
+
+    read_plat_input(input).map(|s| (s, input.to_owned()))
 }
 
 /// Shared `--seed N <path>` flag walker used by `stamp` and the
@@ -5229,7 +5477,7 @@ fn parse_seed_and_path(args: &[String], verb: &str) -> Result<(Option<u64>, Stri
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: heso {verb} [--seed N] <file.json>");
+        eprintln!("usage: heso {verb} [--seed N] <file.json|plat-hash|->");
         return Err(ExitCode::from(2));
     };
     Ok((seed, path))
@@ -5352,9 +5600,7 @@ async fn cmd_action_hash_verify(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         FingerprintOutcome::Mismatch => {
-            eprintln!(
-                "INVALID `{path}`: recompute disagrees — file was modified after creation"
-            );
+            eprintln!("INVALID `{path}`: recompute disagrees — file was modified after creation");
             ExitCode::from(1)
         }
         FingerprintOutcome::WrongAlgorithm(tag) => {
@@ -5414,14 +5660,14 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let contents = match read_plat_input(&path) {
-        Ok(s) => s,
+    let (contents, source) = match read_plat_input_or_hash(&path, "run").await {
+        Ok(v) => v,
         Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{path}` is not valid JSON: {e}");
+            eprintln!("`{source}` is not valid JSON: {e}");
             return ExitCode::from(2);
         }
     };
@@ -5528,32 +5774,32 @@ async fn cmd_run(args: &[String]) -> ExitCode {
 /// - `2` — file unreadable, not JSON, or missing `steps` field.
 async fn cmd_replay(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso replay <plat.plat>");
+        eprintln!("usage: heso replay <plat.plat|plat-hash|->");
         eprintln!();
         eprintln!("Emits the recorded step log from a plat without re-executing.");
         eprintln!("To re-execute the plan against the plat's cassette, use `heso run`.");
         return ExitCode::from(2);
     }
-    let path = &args[0];
-    let contents = match read_plat_input(path) {
-        Ok(s) => s,
+    let input = &args[0];
+    let (contents, source) = match read_plat_input_or_hash(input, "replay").await {
+        Ok(v) => v,
         Err(code) => return code,
     };
     let value: serde_json::Value = match serde_json::from_str(&contents) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("`{path}` is not valid JSON: {e}");
+            eprintln!("`{source}` is not valid JSON: {e}");
             return ExitCode::from(2);
         }
     };
     let Some(steps) = value.get("steps") else {
         eprintln!(
-            "`{path}` has no `steps` field — it was not produced by `heso stamp` or `heso run`."
+            "`{source}` has no `steps` field — it was not produced by `heso stamp` or `heso run`."
         );
         return ExitCode::from(2);
     };
     let summary = serde_json::json!({
-        "source": path,
+        "source": source,
         "start_url": value.get("url").or_else(|| value.get("input_url")).cloned()
             .unwrap_or(serde_json::Value::Null),
         "steps_count": steps.as_array().map(|a| a.len()).unwrap_or(0),
@@ -5677,13 +5923,9 @@ async fn ensure_session(
         .await
         .map_err(|e| format!("fetch failed: {e}"))?;
     *current_actions = page.actions;
-    let (sess, _outcome) = open_js_session_with_cassette(
-        fetch,
-        &page.body_html,
-        current_url.clone(),
-        seed,
-    )
-    .map_err(|e| format!("js session open failed: {e}"))?;
+    let (sess, _outcome) =
+        open_js_session_with_cassette(fetch, &page.body_html, current_url.clone(), seed)
+            .map_err(|e| format!("js session open failed: {e}"))?;
     *session = Some(sess);
     Ok(())
 }
@@ -5699,10 +5941,7 @@ fn open_js_session_with_cassette(
     body_html: &str,
     url: Url,
     seed: Option<u64>,
-) -> Result<
-    (heso_engine_js::JsSession, heso_engine_js::ScriptOutcome),
-    heso_engine_js::EvalError,
-> {
+) -> Result<(heso_engine_js::JsSession, heso_engine_js::ScriptOutcome), heso_engine_js::EvalError> {
     let cassette_mode = fetch.cassette_mode().clone();
     let resolved_seed = seed.unwrap_or(0);
     // For Live + Recording paths the JS engine needs a `reqwest::Client`
@@ -6173,7 +6412,10 @@ async fn cmd_receipt_verify(args: &[String]) -> ExitCode {
             }
             _ => {
                 if file.is_some() {
-                    eprintln!("unexpected extra argument `{}`; pass a single <file>", args[i]);
+                    eprintln!(
+                        "unexpected extra argument `{}`; pass a single <file>",
+                        args[i]
+                    );
                     return ExitCode::from(2);
                 }
                 file = Some(&args[i]);
@@ -6311,6 +6553,10 @@ async fn main() -> ExitCode {
         Some("fill") => cmd_fill(&args[1..]).await,
         Some("submit") => cmd_submit(&args[1..]).await,
         Some("search") => search::cmd_search(&args[1..]).await,
+        Some("publish") => ecosystem::cmd_publish(&args[1..]).await,
+        Some("pull") => ecosystem::cmd_pull(&args[1..]).await,
+        Some("list") => ecosystem::cmd_list(&args[1..]).await,
+        Some("update") => cmd_update(&args[1..]).await,
         Some("serve") => serve::run().await,
         Some("action-hash") => cmd_action_hash(&args[1..]).await,
         Some("action-hash-verify") => cmd_action_hash_verify(&args[1..]).await,
@@ -6365,10 +6611,7 @@ mod tests {
         // is dropped; `custname` from CLI appears at the end.
         assert_eq!(
             merged,
-            vec![
-                pair("email", "from-data@x"),
-                pair("custname", "FROM-FIELD"),
-            ]
+            vec![pair("email", "from-data@x"), pair("custname", "FROM-FIELD"),]
         );
     }
 
@@ -6381,11 +6624,7 @@ mod tests {
         // is dropped; `b=TWO` from CLI lands at the end.
         assert_eq!(
             merged,
-            vec![
-                pair("a", "1"),
-                pair("c", "3"),
-                pair("b", "TWO"),
-            ]
+            vec![pair("a", "1"), pair("c", "3"), pair("b", "TWO"),]
         );
     }
 }
