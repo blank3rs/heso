@@ -140,6 +140,26 @@ jobs:
         run: python -m pip install --upgrade build wheel
         shell: bash
 
+      - name: Set Python package __version__ from tag
+        run: |
+          export VERSION="${GITHUB_REF_NAME#v}"
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["VERSION"]
+          path = Path("python/heso/__init__.py")
+          text = path.read_text(encoding="utf-8")
+          pattern = r'__version__\s*=\s*"\d+\.\d+\.\d+"'
+          if not re.search(pattern, text):
+              raise SystemExit("python/heso/__init__.py __version__ field was not found")
+          updated = re.sub(pattern, f'__version__ = "{version}"', text)
+          path.write_text(updated, encoding="utf-8", newline="")
+          PY
+          grep '__version__' python/heso/__init__.py
+        shell: bash
+
       # Stage the binary into python/heso/bin/ exactly where the
       # setuptools package_data glob looks for it.
       - name: Stage binary into python/heso/bin/
