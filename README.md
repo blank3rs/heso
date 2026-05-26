@@ -5,7 +5,7 @@
 The minimal web runtime for agents: **fetch, JS, DOM, forms, clicks → JSON.** No rendering pipeline, no Chromium, no Node. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss) — not opaque browser crashes. Every run can be **stamped** into a signed *plat* with an embedded network cassette, then **byte-identically re-executed** off-network with `heso run`. Anyone, any machine, same output.
 
 ```
-binary       9.73 MB
+binary       9.74 MB
 cold start   ~77 ms   (open https://example.com, network included)
 engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
@@ -32,7 +32,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/blank3rs/heso/releases/
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.ps1 | iex"
 ```
 
-> Shipping `v0.0.14` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.0.15` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 
 After install, `heso` is on `$PATH`:
 
@@ -399,7 +399,7 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 
 | Thing | Number |
 |---|---|
-| Binary size | 9.73 MB |
+| Binary size | 9.74 MB |
 | Cold start (`open https://example.com`, network included) | ~77 ms |
 | Engine-only (no network, local fixture) | ~28 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
@@ -420,7 +420,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-Pre-alpha. `v0.0.14` is on every registry. Worth trying if the use case fits; not worth depending on in production yet — APIs may still shift.
+Pre-alpha. `v0.0.15` is on every registry. Worth trying if the use case fits; not worth depending on in production yet — APIs may still shift.
 
 ## License
 
