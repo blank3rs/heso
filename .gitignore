@@ -75,6 +75,7 @@ heso-local-data/
 # JSON outputs from running heso against fixtures. Keep them on disk
 # while iterating; never commit.
 /AGENT_FINDINGS*.md
+/AUDIT_HARD_SITES.txt
 /REGRESSION_*.md
 /REGRESSION_*.json
 /COMPATIBILITY.md

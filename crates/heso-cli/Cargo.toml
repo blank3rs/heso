@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "heso — the agent-native web engine. No Chromium. No Node. One Rust binary."
+description = "heso — minimal web runtime for agents: fetch, JS, DOM, forms, clicks → JSON. No rendering pipeline, no Chromium, no Node."
 
 [[bin]]
 name = "heso"

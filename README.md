@@ -1,8 +1,8 @@
-# heso — Playwright for agents. Reproducible by hash. One Rust binary.
+# heso — The agent half of the web. One Rust binary.
 
 **Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
 
-A headless web engine for agents: fetches a URL, runs the JavaScript, clicks, fills forms, scrapes — and returns JSON. The load-bearing part: every run can be **stamped** into a signed *plat* with an embedded network cassette, then **byte-identically re-executed** off-network with `heso run`. Anyone, any machine, same output. No Chromium. No Node.
+The minimal web runtime for agents: **fetch, JS, DOM, forms, clicks → JSON.** No rendering pipeline, no Chromium, no Node. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss) — not opaque browser crashes. Every run can be **stamped** into a signed *plat* with an embedded network cassette, then **byte-identically re-executed** off-network with `heso run`. Anyone, any machine, same output.
 
 ```
 binary       9.73 MB
@@ -13,7 +13,7 @@ batch        ~1.1 s   for 8 URLs in parallel
 
 [![heso agent demo — 50 second screen recording](demo/poster.jpg)](https://www.heso.ca/#demo)
 
-A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no Node, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
+A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no rendering pipeline, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
 
 ## Install
 
@@ -149,6 +149,21 @@ Three sample plats live as release assets on v0.0.10:
 - **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `heso/<version>` so anything fingerprinting will see us coming. We detect Cloudflare interstitials and surface them as `partial_reason: "bot_challenge"` rather than pretending the page loaded.
 - **Service Workers, WebRTC, WebUSB, WebBluetooth.** Not implemented. The JS engine itself runs modern Next.js / React / Vue / Svelte / SSR sites cleanly; the gaps are in browser features above ECMAScript.
 - **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
+
+## Why not just use X?
+
+Partial overlap everywhere; no exact shelf neighbor. The win is not "smaller browser" — it is **smaller failure surface** when the task is structured data, not pixels.
+
+| Layer | Examples | What they ship | Gap vs heso |
+|---|---|---|---|
+| **Full Chromium stack** | [Playwright](https://playwright.dev/), [Puppeteer](https://pptr.dev/), [Browser Use](https://github.com/browser-use/browser-use), [Stagehand](https://www.browserbase.com/stagehand), [Skyvern](https://github.com/Skyvern-AI/skyvern) | V8 + full browser; often an AI planner on top | Heavy deps, opaque failures, no native JSON verb surface, no plat replay |
+| **Smaller browser engine** | [Lightpanda](https://lightpanda.io/) | Zig engine, V8, CDP — drop-in for Playwright/Puppeteer | Still a *browser* mental model; agents drive it through CDP/wrappers, not verbs; no plat/cassette/receipt story |
+| **Scraper APIs** | Firecrawl, Jina Reader, Crawl4AI | Fetch + extract markdown/JSON | Weak or no real click/fill/submit; often no honest partial-failure envelope |
+| **DOM simulators (Node)** | [jsdom](https://github.com/jsdom/jsdom), [happy-dom](https://github.com/capricorn86/happy-dom) | Minimal DOM + JS in JS | Proven lane for the agent-relevant half; test harnesses, not shipped agent products |
+| **Built-in fetch tools** | WebFetch (Claude), curl | Static HTML / no JS hydration | No DOM events, no forms, no session |
+| **heso** | this repo | QuickJS + agent-shaped DOM + verbs + plats | QuickJS ≠ V8 (honest limit); CAPTCHAs/hard bot-detect still stop you |
+
+**What heso adds on top of the capability list:** explicit in/out scope, verb-native JSON (no Playwright/CDP/Node required), structured partial failures, and byte-identical off-network replay via stamp/run.
 
 ## Use as a library
 
@@ -357,7 +372,7 @@ heso is built to be a tool an agent calls, not a library a human drives. The cle
 ```markdown
 ---
 name: heso
-description: Use the heso headless browser (one Rust binary, no Chromium, no Node) to search the web, fetch pages, run their JavaScript, extract content, navigate, fill forms, or click links. Prefer this over WebFetch when you need a DOM, stateful clicks, or framework-rendered content.
+description: Use heso, the agent-native page reader (one Rust binary, no Chromium, no Node) for fetch, JS, DOM, forms, clicks, and JSON — minimal failure surface for agent web tasks. Prefer this over WebFetch when you need a DOM, stateful clicks, or framework-rendered content.
 ---
 
 ## Verbs

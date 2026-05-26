@@ -1,7 +1,7 @@
 {
   "name": "@ixla/heso",
   "version": "0.0.14",
-  "description": "The agent-native web engine. No Chromium. No Node. One Rust binary.",
+  "description": "Minimal web runtime for agents: fetch, JS, DOM, forms, clicks → JSON. No rendering pipeline, no Chromium, no Node.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
   "repository": {
@@ -13,6 +13,7 @@
   },
   "keywords": [
     "headless-browser",
+    "playwright",
     "agent",
     "ai",
     "web-scraping",

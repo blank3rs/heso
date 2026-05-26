@@ -1,8 +1,8 @@
 # @ixla/heso
 
-**The agent-native web engine. No Chromium. No Node. One Rust binary.**
+**The minimal web runtime for agents: fetch, JS, DOM, forms, clicks → JSON. No rendering pipeline, no Chromium, no Node.**
 
-Fetches a URL, runs the JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — and returns everything as JSON so an agent can use it.
+Failures come back as structured data — not opaque browser crashes. Fetches a URL, runs JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — everything as JSON an agent can reason about.
 
 ```
 binary       9.73 MB
