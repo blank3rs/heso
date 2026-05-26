@@ -5433,18 +5433,25 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
 
-    // If the input plat carries a `cassette` field, re-execute under
-    // Replaying mode against it — no network access, every fetch
-    // looks up the cassette, misses surface as graceful errors. If
-    // the plat has no cassette (old format or a hand-written plan),
-    // fall back to live HTTP so `run` stays useful for legacy plats.
-    let fetch = match extract_cassette(&value) {
-        Some(cassette) => {
-            FetchEngine::with_replaying_cassette(std::sync::Arc::new(cassette))
+    // `run` is the cassette-replay verb. The input plat MUST carry
+    // a `cassette` field; replay then executes against it under
+    // Replaying mode — no network access, every fetch looks up the
+    // cassette, misses surface as structured errors. Per HESO/1.0
+    // §5.5, deterministic-mode runs MUST NOT degrade to live HTTP
+    // on a missing cassette; that's `stamp`'s job.
+    let cassette = match extract_cassette(&value) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "run: input plat carries no `cassette` field — `run` is the cassette-replay \
+                 verb and requires one (HESO/1.0 §5.5: deterministic mode must not fall back \
+                 to live network); use `heso stamp <plan>` to mint a fresh plat against the \
+                 live web instead"
+            );
+            return ExitCode::from(2);
         }
-        None => FetchEngine::new(),
     };
-    let fetch = match fetch {
+    let fetch = match FetchEngine::with_replaying_cassette(std::sync::Arc::new(cassette)) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("engine init failed: {e}");
@@ -5493,9 +5500,7 @@ async fn cmd_run(args: &[String]) -> ExitCode {
             serde_json::Value::Array(outcome.steps.clone()),
         );
         // Re-embed the cassette so `run`'s output plat is itself
-        // replayable. For Replaying mode this is the same cassette
-        // we read from the input; for the (rare) Live fallback path
-        // there's no cassette to carry forward.
+        // replayable — same bytes the input carried.
         if let Some(c) = value.get("cassette").cloned() {
             obj.insert("cassette".to_owned(), c);
         }

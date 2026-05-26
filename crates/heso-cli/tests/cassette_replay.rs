@@ -225,6 +225,44 @@ async fn replay_emits_step_log_without_executing() {
 }
 
 #[tokio::test]
+async fn run_refuses_plat_without_cassette() {
+    // A plat with a plan but no `cassette` field MUST be refused —
+    // `run` is the cassette-replay verb; falling back to live HTTP
+    // would silently violate HESO/1.0 §5.5 (deterministic mode must
+    // not degrade to a network fetch on a missing cassette). The
+    // operator should use `heso stamp <plan>` to mint a fresh plat
+    // against the live web instead.
+    let plat = serde_json::json!({
+        "plan": [{"verb": "open", "url": "https://example.com/"}],
+        "url": "https://example.com/",
+        "title": "no cassette here",
+    });
+    let plat_path = write_temp("plat-nocassette.json", plat.to_string().as_bytes());
+
+    let out = run_verb("run", &["--seed", "0", plat_path.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "run must refuse a plat with no cassette field"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "missing-required-field is exit 2 per the spec"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cassette"),
+        "stderr must mention `cassette`; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("stamp"),
+        "stderr should point operator at `heso stamp`; got: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(&plat_path);
+}
+
+#[tokio::test]
 async fn replay_refuses_plat_without_steps_field() {
     // Hand-build a plat with no `steps` field — `replay` should
     // exit 2 with a clear message rather than fabricating one.
