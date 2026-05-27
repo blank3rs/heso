@@ -155,7 +155,7 @@ Three sample plats live as release assets on v0.0.10:
 **Honest about failure.**
 
 - Every `open` / `read` / `fetch` response carries `http_status` (200, 403, 503, ...) — captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Cloudflare-style "Just a moment..." interstitials are detected via `__cf_chl_opt` / challenge-token markers and surfaced as `partial_reason: "bot_challenge"`. No more silent "I got something" when the server returned an error page.
-- `heso click @e7` on an `<a href="...">` actually follows the link — the response carries the destination page's `title`, `tree`, `actions`, and `http_status`, not the source page.
+- `heso click @e7` on an `<a href="...">` actually follows the link — the response carries the destination page's `title`, `tree`, `actions`, and `http_status`, not the source page. `final_url` reports where the navigation actually landed after following the destination's redirect chain, and `redirects[]` lists each `{from, to, status}` hop along the way (empty when the click did not navigate or the destination served a direct 200).
 
 **Web platform coverage.**
 

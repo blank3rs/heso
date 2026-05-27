@@ -481,6 +481,14 @@ def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
     Pass either a positional ``ref`` (e.g. ``"@e7"``) OR a locator
     kwarg: ``text="Sign in"``, ``selector="button.cta"``, or
     ``aria_label="Close"``.
+
+    The returned dict carries ``url`` (the page where the click
+    happened, post any redirects on that page's own fetch),
+    ``final_url`` (where navigation actually landed after following an
+    ``<a href>`` plus its own redirect chain — equals ``url`` for
+    non-navigating clicks), and ``redirects`` (the
+    ``{from, to, status}`` hops the navigation walked through, empty
+    for direct hits and for clicks that did not navigate).
     """
     extra = _kwargs_to_argv(kwargs)
     if ref is not None:
