@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Minimal web runtime for agents: fetch, JS, DOM, forms, clicks → JSON. No rendering pipeline, no Chromium, no Node."
+description = "The auditable layer for the agent web. A Rust runtime that lets an agent touch the web and signs every run into a replayable artifact."
 
 [[bin]]
 name = "heso"
