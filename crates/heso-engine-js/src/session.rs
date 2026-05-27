@@ -543,13 +543,14 @@ impl JsSession {
             status,
             content_type,
         } = response;
-        let _nav_outcome = self.navigate(&body, final_url.clone())?;
 
         // Clamp the body to the documented cap and surface a flag when
-        // we trimmed it. Truncation is byte-counted on a UTF-8 string;
-        // we rewind to the nearest char boundary so the result is
-        // valid UTF-8 (otherwise serde_json output would round-trip
-        // through a lossy fallback in some readers).
+        // we trimmed it. The cap is applied before DOM parsing so a
+        // multi-megabyte response can't drag the engine's memory
+        // footprint through html5ever. Truncation is byte-counted on
+        // a UTF-8 string; we rewind to the nearest char boundary so
+        // the result is valid UTF-8 (otherwise serde_json output would
+        // round-trip through a lossy fallback in some readers).
         let (body_for_output, truncated) = if body.len() > RESPONSE_BODY_TRUNCATE_BYTES {
             let mut cap = RESPONSE_BODY_TRUNCATE_BYTES;
             while cap > 0 && !body.is_char_boundary(cap) {
@@ -559,6 +560,8 @@ impl JsSession {
         } else {
             (body.clone(), false)
         };
+
+        let _nav_outcome = self.navigate(&body_for_output, final_url.clone())?;
 
         let mut value = serde_json::json!({
             "matched": true,
