@@ -97,6 +97,7 @@ pub mod intersection_observer;
 pub mod modules;
 pub(crate) mod mutation_observer;
 pub mod rng;
+pub(crate) mod sandbox_globals;
 pub mod scripts;
 pub mod session;
 pub mod timers;

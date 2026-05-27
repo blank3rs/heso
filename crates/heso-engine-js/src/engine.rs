@@ -632,6 +632,12 @@ impl JsEngine {
         );
 
         let context = Context::full(&runtime).map_err(|e| EvalError::Engine(e.to_string()))?;
+
+        // Strip `Atomics`, `SharedArrayBuffer`, and `Iterator.concat`
+        // from the global object before any other bootstrap can observe
+        // them. See [`crate::sandbox_globals`].
+        crate::sandbox_globals::disable_dangerous_globals(&context)?;
+
         let console_buffer: Arc<Mutex<Vec<ConsoleEntry>>> = Arc::new(Mutex::new(Vec::new()));
         // Mirror of `console_buffer` for per-script failures. Populated
         // by the `<script>` pump (see [`crate::scripts::run_scripts`])
