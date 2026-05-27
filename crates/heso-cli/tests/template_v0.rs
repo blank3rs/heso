@@ -57,10 +57,10 @@ fn template_check_accepts_minimal_template_and_reports_hash() {
     });
     let path = write_json(dir.path(), "template.json", &template);
 
-    let out = run(&["verify", path.to_str().unwrap()]);
-    assert_success(&out, "verify");
+    let out = run(&["info", path.to_str().unwrap(), "--format", "json"]);
+    assert_success(&out, "info");
 
-    let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify JSON");
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("info JSON");
     assert_eq!(body["ok"], serde_json::json!(true));
     assert_eq!(body["schema"], serde_json::json!("heso.template/v0"));
     assert_eq!(body["id"], serde_json::json!("ca.heso.tests.minimal"));
@@ -207,8 +207,8 @@ fn template_check_emits_stable_canonical_hash_for_known_template() {
     });
     let path = write_json(dir.path(), "pin.template.json", &template);
 
-    let out = run(&["verify", path.to_str().unwrap()]);
-    assert_success(&out, "verify");
+    let out = run(&["info", path.to_str().unwrap(), "--format", "json"]);
+    assert_success(&out, "info");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check JSON");
     let hash = body["template_hash"]
         .as_str()
@@ -240,7 +240,7 @@ fn template_check_rejects_open_url_outside_declared_domains() {
     });
     let path = write_json(dir.path(), "evil.template.json", &template);
 
-    let out = run(&["verify", path.to_str().unwrap()]);
+    let out = run(&["info", path.to_str().unwrap(), "--format", "json"]);
     assert_eq!(out.status.code(), Some(1), "expected exit 1");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error JSON");
     assert_eq!(body["ok"], serde_json::json!(false));
@@ -281,8 +281,8 @@ fn template_check_lists_secret_inputs_referenced_by_fill_steps() {
         ]
     });
     let used_path = write_json(dir.path(), "used.template.json", &used);
-    let out = run(&["verify", used_path.to_str().unwrap()]);
-    assert_success(&out, "verify (secret used)");
+    let out = run(&["info", used_path.to_str().unwrap(), "--format", "json"]);
+    assert_success(&out, "info (secret used)");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check JSON");
     assert_eq!(body["secret_warnings"], serde_json::json!(["password"]));
 
@@ -300,8 +300,8 @@ fn template_check_lists_secret_inputs_referenced_by_fill_steps() {
         ]
     });
     let unused_path = write_json(dir.path(), "unused.template.json", &unused);
-    let out = run(&["verify", unused_path.to_str().unwrap()]);
-    assert_success(&out, "verify (secret unused)");
+    let out = run(&["info", unused_path.to_str().unwrap(), "--format", "json"]);
+    assert_success(&out, "info (secret unused)");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check JSON");
     assert_eq!(body["secret_warnings"], serde_json::json!([]));
 }

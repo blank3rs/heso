@@ -386,7 +386,8 @@ fn info_template(raw: &str, format: Format) -> ExitCode {
                     "version": summary.version,
                     "template_hash": summary.template_hash,
                     "steps": summary.steps,
-                    "hash_matches": serde_json::Value::Null,
+                    "hash_matches": summary.hash_matches,
+                    "secret_warnings": summary.secret_warnings,
                 });
                 crate::print_json(&out)
             }
@@ -400,10 +401,24 @@ fn info_template(raw: &str, format: Format) -> ExitCode {
                 ExitCode::SUCCESS
             }
         },
-        Err(e) => {
-            eprintln!("invalid template: {e}");
-            ExitCode::from(2)
-        }
+        Err(e) => match format {
+            Format::Json => {
+                let out = json!({
+                    "kind": "template",
+                    "ok": false,
+                    "error": {
+                        "kind": "invalid_template",
+                        "message": e,
+                    },
+                });
+                crate::print_json(&out);
+                ExitCode::from(1)
+            }
+            Format::Text => {
+                eprintln!("invalid template: {e}");
+                ExitCode::from(1)
+            }
+        },
     }
 }
 

@@ -213,40 +213,69 @@ pub(crate) struct TemplateSummary {
     pub(crate) template_hash: String,
     pub(crate) steps: usize,
     pub(crate) schema: String,
+    /// `Some(true|false)` when the template body embedded a
+    /// `template_hash` field — `false` flags drift between the embedded
+    /// hash and the canonical recompute. `None` when no hash was
+    /// embedded.
+    pub(crate) hash_matches: Option<bool>,
+    /// Names of `secret: true` inputs actually bound into a Fill step's
+    /// value. Operators read this list to confirm a stamped run will
+    /// write each secret somewhere the page can observe.
+    pub(crate) secret_warnings: Vec<String>,
 }
 
 /// Parse + validate a `heso.template/v0` raw JSON string. Returns the
 /// summary on success or a single-line error message on failure.
 pub(crate) fn validate_template_raw(raw: &str) -> Result<TemplateSummary, String> {
-    let (doc, hash, _matches) = load_template(raw)?;
+    let (doc, hash, hash_matches) = load_template(raw)?;
+    let mut secret_warnings: Vec<String> = Vec::new();
+    for step in &doc.steps {
+        if let TemplateStep::Fill {
+            value: ValueExpr::Input { input },
+            ..
+        } = step
+        {
+            if doc
+                .inputs
+                .get(input)
+                .map(|s| s.secret)
+                .unwrap_or(false)
+                && !secret_warnings.contains(input)
+            {
+                secret_warnings.push(input.clone());
+            }
+        }
+    }
     Ok(TemplateSummary {
         id: doc.id.clone(),
         version: doc.version.clone(),
         template_hash: hash,
         steps: doc.steps.len(),
         schema: doc.schema.clone(),
+        hash_matches,
+        secret_warnings,
     })
 }
 
-/// Handle `heso stamp --template <PATH> [--values JSON|@FILE] [--seed N]`
+/// Handle `heso stamp --template [--seed N] [--param k=v ...] [--values JSON|@FILE] <PATH>`
 /// by translating the polymorphic flag suite into the shape
 /// [`cmd_template_stamp`] consumes, then delegating to its inner core.
-/// `--values JSON` accepts a flat JSON object of `{name: scalar}`;
-/// `--values @FILE` reads the same shape from disk.
+/// `--template` is a no-value marker that switches `stamp` into
+/// template mode. The template path is positional (last non-flag arg).
+/// `--param NAME=VALUE` may repeat. `--values JSON` accepts a flat
+/// JSON object of `{name: scalar}`; `--values @FILE` reads the same
+/// shape from disk; entries merge with explicit `--param` flags
+/// (params win on conflict).
 pub(crate) async fn cmd_stamp_from_template_args(args: &[String]) -> ExitCode {
     let mut template_path: Option<String> = None;
     let mut values_src: Option<String> = None;
     let mut seed: Option<String> = None;
+    let mut params: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--template" => {
-                let Some(v) = args.get(i + 1) else {
-                    eprintln!("stamp --template needs a path");
-                    return ExitCode::from(2);
-                };
-                template_path = Some(v.clone());
-                i += 2;
+                i += 1;
             }
             "--values" => {
                 let Some(v) = args.get(i + 1) else {
@@ -264,13 +293,25 @@ pub(crate) async fn cmd_stamp_from_template_args(args: &[String]) -> ExitCode {
                 seed = Some(v.clone());
                 i += 2;
             }
+            "--param" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("stamp --param needs NAME=VALUE");
+                    return ExitCode::from(2);
+                };
+                params.push(v.clone());
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("stamp --template: unknown flag `{other}`");
                 return ExitCode::from(2);
             }
             other => {
-                eprintln!("stamp --template: unexpected positional `{other}`");
-                return ExitCode::from(2);
+                if template_path.is_some() {
+                    eprintln!("stamp --template: unexpected positional `{other}`");
+                    return ExitCode::from(2);
+                }
+                template_path = Some(other.to_owned());
+                i += 1;
             }
         }
     }
@@ -283,6 +324,10 @@ pub(crate) async fn cmd_stamp_from_template_args(args: &[String]) -> ExitCode {
     if let Some(seed) = seed {
         delegated.push("--seed".to_owned());
         delegated.push(seed);
+    }
+    for param in params {
+        delegated.push("--param".to_owned());
+        delegated.push(param);
     }
     if let Some(values_src) = values_src.as_deref() {
         let raw = if let Some(rest) = values_src.strip_prefix('@') {
