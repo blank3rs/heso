@@ -120,6 +120,44 @@ const MAX_DDG_PAGES: usize = 4;
 /// need different behaviour can shell out to `heso fetch` directly.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Hard cap on a single search-backend response body. Wikipedia
+/// summaries and SearXNG JSON for one query are kilobyte-sized; 4 MiB
+/// is the headroom a hostile or misconfigured backend would need to
+/// push the CLI into multi-hundred-MB allocations.
+const MAX_SEARCH_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Read a search-backend response body, refusing payloads larger than
+/// [`MAX_SEARCH_RESPONSE_BYTES`]. Streams chunks so a hostile
+/// `Content-Length` header doesn't force a giant pre-alloc, and a
+/// chunked response without a declared length is still capped.
+async fn read_search_body_capped(
+    resp: reqwest::Response,
+    backend: &str,
+) -> Result<String, String> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_SEARCH_RESPONSE_BYTES {
+            return Err(format!(
+                "{backend} response too large: declared {len} bytes (cap {MAX_SEARCH_RESPONSE_BYTES})"
+            ));
+        }
+    }
+    let mut acc: Vec<u8> = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("{backend} body read failed: {e}"))?
+    {
+        if acc.len() + chunk.len() > MAX_SEARCH_RESPONSE_BYTES {
+            return Err(format!(
+                "{backend} response too large: exceeded {MAX_SEARCH_RESPONSE_BYTES} bytes"
+            ));
+        }
+        acc.extend_from_slice(&chunk);
+    }
+    String::from_utf8(acc).map_err(|e| format!("{backend} response is not UTF-8: {e}"))
+}
+
 /// Environment variable name for the SearXNG base URL. Read by both
 /// the CLI and the JSON-RPC `search` method when the request doesn't
 /// supply `searx_url` / `--searx-url` explicitly.
@@ -836,10 +874,7 @@ async fn wiki_summary(
     if !resp.status().is_success() {
         return Err(format!("wikipedia HTTP {}", resp.status()));
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("wikipedia body read failed: {e}"))?;
+    let body = read_search_body_capped(resp, "wikipedia").await?;
     let summary: WikiSummary = serde_json::from_str(&body)
         .map_err(|e| format!("wikipedia JSON parse failed: {e}"))?;
     if matches!(summary.page_type.as_deref(), Some("disambiguation")) {
@@ -904,10 +939,7 @@ async fn searxng_search(
     if !resp.status().is_success() {
         return Err(format!("searxng HTTP {}", resp.status()));
     }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("searxng body read failed: {e}"))?;
+    let body = read_search_body_capped(resp, "searxng").await?;
     let parsed: SearxResponse = serde_json::from_str(&body)
         .map_err(|e| format!("searxng JSON parse failed: {e}"))?;
     let out = parsed
