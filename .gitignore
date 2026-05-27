@@ -163,3 +163,4 @@ __pycache__/
 # /.agent/, /proposals/, or /bug-reports/. See AGENTS.md → "Where
 # transient agent reports go" and CLAUDE.md → "Don't" for the rule.
 /bug-reports/
+.pm-state.json

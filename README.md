@@ -4,7 +4,7 @@
 
 A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of what happened.
 
-Every run can be **stamped** into a *plat*: the plan that ran, the page observation, and the recorded network cassette, all hashed together. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. Tamper one byte and the hash flags it. Hand the artifact to an auditor.
+Every run can be **stamped** into a *plat* — a signed replay file holding the plan that ran, the page observation, and the recorded network cassette, all hashed together. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. Tamper one byte and the hash flags it. Hand the artifact to an auditor.
 
 Capabilities return JSON. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss), not opaque browser crashes. One Rust binary; no Chromium, no Node.
 
@@ -458,7 +458,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-Pre-alpha. `v0.1.3` is on every registry. Worth trying if the use case fits; not worth depending on in production yet — APIs may still shift.
+`v0.1.3` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the 259-test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
 
 ## License
 

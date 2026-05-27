@@ -93,7 +93,7 @@ fn install_and_platform_claims_match_release_artifacts() {
 
 #[test]
 fn wrapper_readmes_match_language_idioms_and_cli_semantics() {
-    assert!(NPM_README.contains("10.08 MB"));
+    assert!(NPM_README.contains("10.1 MB"));
     assert!(NPM_README.contains("~77 ms"));
     assert!(NPM_README.contains("~28 ms"));
     assert!(NPM_README.contains("selectorExists"));
