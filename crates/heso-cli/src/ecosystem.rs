@@ -395,8 +395,16 @@ pub async fn cmd_list(args: &[String]) -> ExitCode {
     };
 
     let base = base_url();
-    let mut url =
-        reqwest::Url::parse(&format!("{}/list", base.trim_end_matches('/'))).expect("list url");
+    let url_str = format!("{}/list", base.trim_end_matches('/'));
+    let mut url = match reqwest::Url::parse(&url_str) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!(
+                "list: invalid registry endpoint `{url_str}` (set HESO_ECOSYSTEM_URL to a valid base URL): {e}"
+            );
+            return ExitCode::from(2);
+        }
+    };
     {
         let mut q = url.query_pairs_mut();
         q.append_pair("sort", sort);

@@ -578,8 +578,13 @@ async fn cmd_cat(args: &[String]) -> ExitCode {
                 }
             },
             None => {
-                eprintln!("no element at ref `{want}`");
-                ExitCode::from(2)
+                let msg = format!("no element at ref `{want}`");
+                eprintln!("{msg}");
+                let _ = print_json(&serde_json::json!({
+                    "ok": false,
+                    "error": { "kind": "not_found", "message": msg },
+                }));
+                ExitCode::FAILURE
             }
         }
     } else {
@@ -589,7 +594,12 @@ async fn cmd_cat(args: &[String]) -> ExitCode {
                 "content": content,
             })),
             Err(e) => {
-                eprintln!("cat failed: {e}");
+                let msg = format!("cat failed: {e}");
+                eprintln!("{msg}");
+                let _ = print_json(&serde_json::json!({
+                    "ok": false,
+                    "error": { "kind": "not_found", "message": msg },
+                }));
                 ExitCode::FAILURE
             }
         }
@@ -3475,77 +3485,105 @@ pub(crate) fn normalize_ref(s: &str) -> String {
 /// Render a [`TargetError`] to stderr (with the candidate JSON when
 /// ambiguous) and return the right [`ExitCode`]. Single source of
 /// truth for the locator-failure user experience across all three
-/// write verbs.
+/// write verbs. Also emits a structured JSON envelope on stdout so
+/// scripts that parse the verb's normal JSON output have a
+/// consistent failure shape to branch on.
 fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
-    match err {
-        TargetError::NeitherRefNorLocator => {
-            eprintln!(
+    let (kind, human, extra): (&str, String, serde_json::Value) = match &err {
+        TargetError::NeitherRefNorLocator => (
+            "usage",
+            format!(
                 "{op_name}: need either an `@e<N>` ref OR one of --text/--selector/--aria-label"
-            );
-            ExitCode::from(2)
-        }
-        TargetError::RefAndLocatorMixed => {
-            eprintln!(
+            ),
+            serde_json::Value::Null,
+        ),
+        TargetError::RefAndLocatorMixed => (
+            "usage",
+            format!(
                 "{op_name}: cannot combine an `@e<N>` ref with --text/--selector/--aria-label"
-            );
-            ExitCode::from(2)
-        }
-        TargetError::UnknownRef(want) => {
-            eprintln!("no element at ref `{want}`");
-            ExitCode::from(2)
-        }
-        TargetError::BadSelector { selector, message } => {
-            eprintln!("invalid --selector `{selector}`: {message}");
-            ExitCode::from(2)
-        }
+            ),
+            serde_json::Value::Null,
+        ),
+        TargetError::UnknownRef(want) => (
+            "unknown_ref",
+            format!("no element at ref `{want}`"),
+            serde_json::json!({ "ref": want }),
+        ),
+        TargetError::BadSelector { selector, message } => (
+            "bad_selector",
+            format!("invalid --selector `{selector}`: {message}"),
+            serde_json::json!({ "selector": selector, "reason": message }),
+        ),
         TargetError::NoMatch {
             text,
             css_selector,
             aria_label,
-        } => {
-            eprintln!(
+        } => (
+            "no_match",
+            format!(
                 "no element matched locator {}",
-                format_locator(
-                    text.as_deref(),
-                    css_selector.as_deref(),
-                    aria_label.as_deref()
-                )
-            );
-            ExitCode::from(2)
-        }
+                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
+            ),
+            serde_json::json!({
+                "locator": {
+                    "text": text,
+                    "selector": css_selector,
+                    "aria_label": aria_label,
+                }
+            }),
+        ),
         TargetError::Ambiguous {
             text,
             css_selector,
             aria_label,
             candidates,
-        } => {
-            let n = candidates.len();
-            eprintln!(
-                "ambiguous: {n} elements matched locator {}",
-                format_locator(
-                    text.as_deref(),
-                    css_selector.as_deref(),
-                    aria_label.as_deref()
-                )
-            );
-            eprintln!("candidates (use one of these refs):");
-            for c in &candidates {
-                // Single-line candidate: `<ref> <role> <tag> "<name>"`.
-                // Cap snippet to 80 chars so a long button label
-                // doesn't blow up terminal width.
-                let name = c.name.as_deref().unwrap_or("");
-                let snippet = if name.chars().count() > 80 {
-                    let mut s: String = name.chars().take(80).collect();
-                    s.push('…');
-                    s
-                } else {
-                    name.to_owned()
-                };
-                eprintln!("  {} ({} {}) \"{}\"", c.ref_id, c.role, c.tag, snippet);
-            }
-            ExitCode::from(2)
+        } => (
+            "ambiguous",
+            format!(
+                "ambiguous: {} elements matched locator {}",
+                candidates.len(),
+                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
+            ),
+            serde_json::json!({
+                "locator": {
+                    "text": text,
+                    "selector": css_selector,
+                    "aria_label": aria_label,
+                },
+                "candidates": candidates,
+            }),
+        ),
+    };
+    eprintln!("{human}");
+    if let TargetError::Ambiguous { candidates, .. } = &err {
+        eprintln!("candidates (use one of these refs):");
+        for c in candidates {
+            let name = c.name.as_deref().unwrap_or("");
+            let snippet = if name.chars().count() > 80 {
+                let mut s: String = name.chars().take(80).collect();
+                s.push('…');
+                s
+            } else {
+                name.to_owned()
+            };
+            eprintln!("  {} ({} {}) \"{}\"", c.ref_id, c.role, c.tag, snippet);
         }
     }
+    let mut envelope = serde_json::json!({
+        "ok": false,
+        "error": { "kind": kind, "message": human },
+    });
+    if !extra.is_null() {
+        if let Some(obj) = envelope.as_object_mut() {
+            if let Some(extra_obj) = extra.as_object() {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    let _ = print_json(&envelope);
+    ExitCode::from(2)
 }
 
 /// Render the supplied locator filters back as a `{k: "v"}`-ish blob

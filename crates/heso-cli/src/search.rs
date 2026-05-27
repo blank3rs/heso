@@ -260,15 +260,32 @@ pub async fn cmd_search(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match serde_json::to_string_pretty(&value) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
-        }
+    // If every engine errored AND no knowledge block came back, the
+    // request didn't actually accomplish anything — exit 1 so scripts
+    // checking the return code don't treat an all-failed sweep as
+    // success.
+    let no_results = value
+        .get("results")
+        .and_then(|r| r.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(true);
+    let no_knowledge = value.get("knowledge").map(|k| k.is_null()).unwrap_or(true);
+    let had_errors = value
+        .get("errors")
+        .map(|e| !e.is_null())
+        .unwrap_or(false);
+    let serialized = match serde_json::to_string_pretty(&value) {
+        Ok(s) => s,
         Err(e) => {
             eprintln!("failed to serialize output: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+    println!("{serialized}");
+    if no_results && no_knowledge && had_errors {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -390,6 +407,7 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
     let mut searx_results: Vec<RawResult> = Vec::new();
     let mut knowledge: Option<KnowledgeBlock> = None;
     let mut engines_used: Vec<&'static str> = Vec::new();
+    let mut errors: Vec<serde_json::Value> = Vec::new();
 
     for eng in &req.engines {
         match eng {
@@ -409,6 +427,10 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
                 }
                 Err(e) => {
                     eprintln!("ddg search error: {e}");
+                    errors.push(serde_json::json!({
+                        "engine": "ddg",
+                        "message": e,
+                    }));
                 }
             },
             Engine::Wiki => match wiki_summary(&client, &req.query).await {
@@ -425,6 +447,10 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
                 }
                 Err(e) => {
                     eprintln!("wikipedia search error: {e}");
+                    errors.push(serde_json::json!({
+                        "engine": "wiki",
+                        "message": e,
+                    }));
                 }
             },
             Engine::SearxNg => {
@@ -434,6 +460,10 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
                         eprintln!(
                             "searxng engine requested but no --searx-url / HESO_SEARX_URL set; skipping"
                         );
+                        errors.push(serde_json::json!({
+                            "engine": "searxng",
+                            "message": "no --searx-url / HESO_SEARX_URL set",
+                        }));
                         continue;
                     }
                 };
@@ -444,6 +474,10 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
                     }
                     Err(e) => {
                         eprintln!("searxng search error: {e}");
+                        errors.push(serde_json::json!({
+                            "engine": "searxng",
+                            "message": e,
+                        }));
                     }
                 }
             }
@@ -468,6 +502,7 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
         "engines_used": engines_used,
         "results": results,
         "knowledge": knowledge,
+        "errors": if errors.is_empty() { Value::Null } else { Value::Array(errors) },
     });
     Ok(value)
 }
