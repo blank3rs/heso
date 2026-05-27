@@ -16,6 +16,13 @@ use serde_json::{json, Value};
 
 const DEFAULT_BASE_URL: &str = "https://heso.ca/api/ecosystem";
 
+/// Hard cap on a single registry response body. Plats are JSON
+/// artifacts of a few hundred KB at most; list pages cap at 100
+/// entries. 16 MiB is the headroom a misbehaving (or hostile)
+/// registry would need to push the CLI into multi-hundred-MB
+/// allocations.
+const MAX_REGISTRY_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
 fn base_url() -> String {
     std::env::var("HESO_ECOSYSTEM_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
 }
@@ -26,6 +33,35 @@ fn client() -> Result<reqwest::Client, String> {
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| format!("failed to build http client: {e}"))
+}
+
+/// Read a registry response body, refusing payloads larger than
+/// [`MAX_REGISTRY_RESPONSE_BYTES`]. Streams chunks so a hostile
+/// `Content-Length: 4_294_967_295` doesn't force a giant pre-alloc,
+/// and a chunked response without a declared length is still capped.
+async fn read_body_capped(resp: reqwest::Response) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > MAX_REGISTRY_RESPONSE_BYTES {
+            return Err(format!(
+                "registry response too large: declared {len} bytes (cap {MAX_REGISTRY_RESPONSE_BYTES})"
+            ));
+        }
+    }
+    let mut acc: Vec<u8> = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("read body failed: {e}"))?
+    {
+        if acc.len() + chunk.len() > MAX_REGISTRY_RESPONSE_BYTES {
+            return Err(format!(
+                "registry response too large: exceeded {MAX_REGISTRY_RESPONSE_BYTES} bytes"
+            ));
+        }
+        acc.extend_from_slice(&chunk);
+    }
+    Ok(acc)
 }
 
 const HEX64_LEN: usize = 64;
@@ -57,14 +93,11 @@ pub(crate) async fn download_plat(hash: &str) -> Result<Vec<u8>, String> {
         return Err(format!("no plat with hash {hash} in the registry"));
     }
     if !status.is_success() {
-        let txt = resp.text().await.unwrap_or_default();
+        let bytes = read_body_capped(resp).await.unwrap_or_default();
+        let txt = String::from_utf8_lossy(&bytes);
         return Err(format!("registry returned {status}: {txt}"));
     }
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("read body failed: {e}"))?;
-    Ok(bytes.to_vec())
+    read_body_capped(resp).await
 }
 
 pub(crate) async fn download_plat_text(hash: &str) -> Result<String, String> {
@@ -444,7 +477,14 @@ pub async fn cmd_list(args: &[String]) -> ExitCode {
         }
     };
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let bytes = match read_body_capped(resp).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let txt = String::from_utf8_lossy(&bytes);
     if !status.is_success() {
         eprintln!("list: registry returned {status}: {txt}");
         return ExitCode::FAILURE;
