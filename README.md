@@ -1,8 +1,12 @@
-# heso — The agent half of the web. One Rust binary.
+# heso — the auditable layer for the agent web.
 
 **Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
 
-The minimal web runtime for agents: **fetch, JS, DOM, forms, clicks → JSON.** No rendering pipeline, no Chromium, no Node. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss) — not opaque browser crashes. Every run can be **stamped** into a signed *plat* with an embedded network cassette, then **byte-identically re-executed** off-network with `heso run`. Anyone, any machine, same output.
+A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of what happened.
+
+Every run can be **stamped** into a *plat*: the plan that ran, the page observation, and the recorded network cassette, all hashed together. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. Tamper one byte and the hash flags it. Hand the artifact to an auditor.
+
+Capabilities return JSON. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss), not opaque browser crashes. One Rust binary; no Chromium, no Node.
 
 <!-- heso:perf:start -->
 ```

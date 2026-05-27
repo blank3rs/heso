@@ -1,12 +1,12 @@
 # @ixla/heso
 
-**The minimal web runtime for agents: fetch, JS, DOM, forms, clicks → JSON. No rendering pipeline, no Chromium, no Node.**
+**The auditable layer for the agent web.** A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of what happened.
 
-Failures come back as structured data — not opaque browser crashes. Fetches a URL, runs JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — everything as JSON an agent can reason about.
+Every run can be **stamped** into a *plat* with an embedded network cassette. `heso run` re-executes it off-network and the resulting `plat_hash` is byte-identical to the original. Hand the artifact to an auditor. Failures come back as structured data, not opaque browser crashes. One Rust binary; no Chromium, no Node.
 
 <!-- heso:perf:start -->
 ```
-binary       10.08 MB
+binary       10.1 MB
 cold start   ~77 ms   (open https://example.com, network included)
 engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
@@ -26,7 +26,7 @@ npx @ixla/heso open https://example.com   # one-shot
 > Ships prebuilt binaries for Windows x64, Linux x64 + arm64, and macOS x64 + arm64. `npm` picks the right `@ixla/heso-<platform>-<arch>` via `optionalDependencies` — no native build step.
 
 <!-- heso:version:start -->
-> Shipping `v0.1.2` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.1.3` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 <!-- heso:version:end -->
 
 ## Use as a CLI

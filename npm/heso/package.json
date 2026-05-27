@@ -1,7 +1,7 @@
 {
   "name": "@ixla/heso",
   "version": "0.1.3",
-  "description": "Minimal web runtime for agents: fetch, JS, DOM, forms, clicks → JSON. No rendering pipeline, no Chromium, no Node.",
+  "description": "The auditable layer for the agent web. A Rust runtime that lets an agent touch the web and signs every run into a replayable artifact.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
   "repository": {
