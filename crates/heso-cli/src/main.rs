@@ -5170,6 +5170,25 @@ async fn cmd_run(args: &[String]) -> ExitCode {
 
     let outcome = run_plan(&fetch, &plan.actions, seed, plan.start_url.clone()).await;
 
+    // Per-step replay check. The input plat may carry a `steps` array
+    // recorded when it was stamped; if so, compare each recorded
+    // `(status, observed)` pair against the freshly re-executed one
+    // and surface mismatches on stderr with the diverging field. Each
+    // mismatch is a tamper / drift signal: a cassette whose response
+    // bytes were rewritten to make a previously-partial step succeed
+    // (or vice versa) will pass byte-level cassette lookup but fail
+    // this check. The output plat is still minted so callers that
+    // want to inspect the re-executed result get one consistent
+    // shape; the exit code surfaces the per-step verdict.
+    let step_mismatches = value
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|recorded| compare_step_logs(recorded, &outcome.steps))
+        .unwrap_or_default();
+    for mismatch in &step_mismatches {
+        eprintln!("{mismatch}");
+    }
+
     // Mint a fresh plat over the post-run state — same shape as
     // `cmd_stamp`'s output, including a freshly-computed plat_hash.
     // For a Replaying run against an unmodified cassette this hash
@@ -5221,11 +5240,60 @@ async fn cmd_run(args: &[String]) -> ExitCode {
     if !write_json_to_stdout(&body) {
         return ExitCode::FAILURE;
     }
+    if !step_mismatches.is_empty() {
+        return ExitCode::FAILURE;
+    }
     if outcome.ok {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Diff a recorded `steps[]` array against a freshly re-executed one.
+/// Returns a one-line, operator-readable description for every step
+/// whose recorded `(status, observed)` pair diverges from the
+/// re-execution result. An empty return means every step matched.
+///
+/// Comparison is strict JSON equality on the `status` field and the
+/// `observed` field. Length mismatches surface as their own line.
+fn compare_step_logs(
+    recorded: &[serde_json::Value],
+    reexecuted: &[serde_json::Value],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if recorded.len() != reexecuted.len() {
+        out.push(format!(
+            "run: step-count mismatch — recorded {}, re-executed {}",
+            recorded.len(),
+            reexecuted.len()
+        ));
+    }
+    let common = recorded.len().min(reexecuted.len());
+    for i in 0..common {
+        let rec_status = recorded[i].get("status");
+        let new_status = reexecuted[i].get("status");
+        if rec_status != new_status {
+            out.push(format!(
+                "run: step {i} status mismatch — recorded {}, re-executed {}",
+                rec_status
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(missing)"),
+                new_status
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(missing)")
+            ));
+        }
+        let rec_observed = recorded[i].get("observed");
+        let new_observed = reexecuted[i].get("observed");
+        if rec_observed != new_observed {
+            out.push(format!(
+                "run: step {i} observed mismatch — recorded and re-executed \
+                 differ (compare `steps[{i}].observed` in input vs output plats)"
+            ));
+        }
+    }
+    out
 }
 
 /// `heso replay <plat.plat>` — emit the `steps` field of a plat
@@ -5352,6 +5420,12 @@ struct PlanOutcome {
 /// Execute a sequence of canonical actions and return the per-step log
 /// plus the post-execution session state. Shared by every verb that
 /// runs a plan (replay, stamp, …).
+///
+/// Each emitted step entry carries `status` (`ok` / `partial` / `error`),
+/// the verb-specific `observed` payload, and deterministic
+/// `started_at` / `finished_at` logical timestamps derived from the
+/// step's index — see [`heso_engine_fetch::step`] for the determinism
+/// contract this preserves.
 async fn run_plan(
     fetch: &FetchEngine,
     actions: &[Action],
@@ -5375,26 +5449,7 @@ async fn run_plan(
             seed,
         )
         .await;
-        let step = match &res {
-            Ok(detail) => serde_json::json!({
-                "index": i,
-                "verb": action.verb(),
-                "action": action,
-                "url_before": url_before.to_string(),
-                "url_after": current_url.to_string(),
-                "ok": true,
-                "result": detail,
-            }),
-            Err(err) => serde_json::json!({
-                "index": i,
-                "verb": action.verb(),
-                "action": action,
-                "url_before": url_before.to_string(),
-                "url_after": current_url.to_string(),
-                "ok": false,
-                "error": err,
-            }),
-        };
+        let step = build_step_entry(i, action, &url_before, &current_url, &res);
         steps.push(step);
         if res.is_err() {
             ok = false;
@@ -5408,6 +5463,112 @@ async fn run_plan(
         final_actions: current_actions,
         session,
     }
+}
+
+/// Assemble the JSON entry that lands in a plat's `steps` array for
+/// one executed action. The result carries the canonical fields the
+/// HESO/1.0 spec (§1 plat format) and the `step` module of
+/// `heso-engine-fetch` define:
+///
+/// - `status` — three-way outcome (`ok` / `partial` / `error`).
+/// - `observed` — the verb's structured result; absent on `error`.
+/// - `started_at` / `finished_at` — deterministic logical timestamps
+///   (see [`heso_engine_fetch::step::logical_step_timestamp`]).
+/// - `partial_reason` — token explaining a `partial` outcome (mirrors
+///   the top-level `partial_reason` envelope used elsewhere in the
+///   plat: `http_403`, `bot_challenge`, `selector_not_matched`, …).
+/// - `error` — message present only when `status == "error"`.
+///
+/// Replay (`heso run`) walks the recorded `steps[]` and compares each
+/// recorded `(status, observed)` pair against the re-executed one.
+pub(crate) fn build_step_entry(
+    index: usize,
+    action: &Action,
+    url_before: &Url,
+    url_after: &Url,
+    res: &Result<serde_json::Value, String>,
+) -> serde_json::Value {
+    use heso_engine_fetch::{logical_step_timestamp, StepBoundary, StepStatus};
+
+    let (status, partial_reason) = match res {
+        Ok(observed) => classify_step_status(observed),
+        Err(_) => (StepStatus::Error, None),
+    };
+
+    let mut entry = serde_json::Map::new();
+    entry.insert("index".to_owned(), serde_json::json!(index));
+    entry.insert("verb".to_owned(), serde_json::json!(action.verb()));
+    entry.insert(
+        "action".to_owned(),
+        serde_json::to_value(action).unwrap_or(serde_json::Value::Null),
+    );
+    entry.insert(
+        "url_before".to_owned(),
+        serde_json::Value::String(url_before.to_string()),
+    );
+    entry.insert(
+        "url_after".to_owned(),
+        serde_json::Value::String(url_after.to_string()),
+    );
+    entry.insert(
+        "status".to_owned(),
+        serde_json::Value::String(status.as_token().to_owned()),
+    );
+    entry.insert(
+        "started_at".to_owned(),
+        serde_json::Value::String(logical_step_timestamp(index, StepBoundary::Started)),
+    );
+    entry.insert(
+        "finished_at".to_owned(),
+        serde_json::Value::String(logical_step_timestamp(index, StepBoundary::Finished)),
+    );
+    match res {
+        Ok(observed) => {
+            entry.insert("observed".to_owned(), observed.clone());
+        }
+        Err(err) => {
+            entry.insert(
+                "error".to_owned(),
+                serde_json::Value::String(err.clone()),
+            );
+        }
+    }
+    if let Some(reason) = partial_reason {
+        entry.insert(
+            "partial_reason".to_owned(),
+            serde_json::Value::String(reason),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// Decide the per-step [`StepStatus`] from the verb's observed JSON.
+///
+/// Two signals promote an `Ok` result to `Partial`:
+///
+/// 1. The verb's HTTP-side `partial_reason` (4xx, 5xx, `bot_challenge`)
+///    when present in the observed payload — mirrors the top-level
+///    envelope rule from `partial_reason_for_status`.
+/// 2. The DOM-side `matched: false` signal from `click` / `fill` /
+///    `submit` — the action targeted a ref that resolved at the
+///    snapshot level but did not match in the live DOM. The agent
+///    needs to know the ref drifted; the canonical token is
+///    `selector_not_matched`.
+fn classify_step_status(
+    observed: &serde_json::Value,
+) -> (heso_engine_fetch::StepStatus, Option<String>) {
+    use heso_engine_fetch::StepStatus;
+
+    if let Some(reason) = observed.get("partial_reason").and_then(|v| v.as_str()) {
+        return (StepStatus::Partial, Some(reason.to_owned()));
+    }
+    if let Some(false) = observed.get("matched").and_then(|v| v.as_bool()) {
+        return (
+            StepStatus::Partial,
+            Some("selector_not_matched".to_owned()),
+        );
+    }
+    (StepStatus::Ok, None)
 }
 
 /// Ensure `*session` is `Some` before a non-Open action runs. If the
@@ -5493,6 +5654,9 @@ pub(crate) async fn execute_step_session(
             let page = <FetchEngine as EngineApi>::open(fetch, &new_url)
                 .await
                 .map_err(|e| format!("fetch failed: {e}"))?;
+            let http_status = page.http_status;
+            let partial_reason =
+                heso_engine_fetch::partial_reason_for_status(http_status, &page.body_html);
             *current_url = page.url().clone();
             *current_actions = page.actions.clone();
             let script_outcome = match session.as_mut() {
@@ -5511,11 +5675,18 @@ pub(crate) async fn execute_step_session(
                     .navigate(&page.body_html, current_url.clone())
                     .map_err(|e| format!("js session navigate failed: {e}"))?,
             };
-            Ok(serde_json::json!({
+            let mut obj = serde_json::json!({
                 "op": "open",
                 "navigated_to": current_url.to_string(),
+                "http_status": http_status,
                 "scripts": script_outcome_json(&script_outcome),
-            }))
+            });
+            if let Some(reason) = partial_reason {
+                obj.as_object_mut()
+                    .unwrap()
+                    .insert("partial_reason".into(), serde_json::Value::String(reason));
+            }
+            Ok(obj)
         }
         Action::Click { target } => {
             ensure_session(fetch, session, current_actions, current_url, seed).await?;
@@ -5581,6 +5752,9 @@ pub(crate) async fn execute_step_session(
                 let page = <FetchEngine as EngineApi>::open(fetch, &target_url)
                     .await
                     .map_err(|e| format!("fetch failed: {e}"))?;
+                let http_status = page.http_status;
+                let partial_reason =
+                    heso_engine_fetch::partial_reason_for_status(http_status, &page.body_html);
                 *current_url = page.url().clone();
                 *current_actions = page.actions.clone();
                 let sess = session.as_mut().expect("session ensured above");
@@ -5595,11 +5769,17 @@ pub(crate) async fn execute_step_session(
                     "href": href,
                     "from": from,
                     "navigated_to": current_url.to_string(),
+                    "http_status": http_status,
                     "matched": matched,
                     "defaultPrevented": false,
                     "console": click_outcome.console,
                     "scripts": script_outcome_json(&script_outcome),
                 });
+                if let Some(reason) = partial_reason {
+                    obj.as_object_mut()
+                        .unwrap()
+                        .insert("partial_reason".into(), serde_json::Value::String(reason));
+                }
                 if let Some(d) = drift {
                     obj.as_object_mut().unwrap().insert("ref_drift".into(), d);
                 }

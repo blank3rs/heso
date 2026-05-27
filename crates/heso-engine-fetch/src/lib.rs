@@ -68,6 +68,7 @@ pub mod explore;
 pub mod inline_data;
 pub mod metadata;
 pub mod plat;
+pub mod step;
 pub mod tree;
 
 pub use actions::{
@@ -87,6 +88,7 @@ pub use plat::{
     OpenOutcome as PlatOpenOutcome, SealError as PlatSealError, SealedPlat,
     VerifyError as PlatVerifyError,
 };
+pub use step::{logical_step_timestamp, StepBoundary, StepStatus};
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
 // `RedirectHop` / `RedirectedFetch` are defined inline below alongside
 // `FetchEngine`'s redirect-aware fetch method; both are `pub struct`

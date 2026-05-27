@@ -439,26 +439,7 @@ pub(crate) async fn cmd_template_stamp(args: &[String]) -> ExitCode {
         )
         .await;
 
-        let step = match &res {
-            Ok(detail) => json!({
-                "index": index,
-                "verb": action.verb(),
-                "action": action,
-                "url_before": url_before.to_string(),
-                "url_after": current_url.to_string(),
-                "ok": true,
-                "result": detail,
-            }),
-            Err(err) => json!({
-                "index": index,
-                "verb": action.verb(),
-                "action": action,
-                "url_before": url_before.to_string(),
-                "url_after": current_url.to_string(),
-                "ok": false,
-                "error": err,
-            }),
-        };
+        let step = crate::build_step_entry(index, &action, &url_before, &current_url, &res);
         steps.push(step);
         if let Err(err) = res {
             return fail_step("execute_failed", index, template_step, err, None);
