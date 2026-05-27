@@ -17,7 +17,18 @@ export class HesoError extends Error {
 
 /** Options accepted by most read-only verbs (open/read/search/wait/...). */
 export interface CommonOptions {
-  /** Wall-clock timeout in milliseconds. 0 = no timeout. */
+  /**
+   * Per-network-request timeout in milliseconds. Default 30000 (30s).
+   * Forwarded to the CLI as `--timeout <ms>`; the binary applies it as
+   * the reqwest client's total wall-clock cap on each fetch (including
+   * the TLS handshake, the redirect chain, and the response-body
+   * stream). On timeout the verb emits `{ok: false, error: {code:
+   * "timeout", timeout_ms, elapsed_ms, url}}` on stdout and exits 1
+   * (surfaced as a `HesoError` whose `stdout` carries the envelope).
+   * `0` opts out of the cap entirely. The Node side also installs a
+   * `timeout + 5_000ms` process-kill backstop so a hung binary still
+   * eventually unblocks the caller.
+   */
   timeout?: number;
   /** Override the `heso` binary path. Mainly for tests. */
   binary?: string;

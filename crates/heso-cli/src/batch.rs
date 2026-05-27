@@ -174,7 +174,7 @@ pub(crate) async fn cmd_batch(args: &[String]) -> ExitCode {
 /// CLI. URLs come from positionals; if none AND stdin is not a TTY,
 /// read one URL per line from stdin.
 async fn parse_args(args: &[String]) -> Result<BatchArgs, String> {
-    let usage = "usage: heso batch [open|read] <urls...> [--parallel N] [--timeout-per-url DUR] \
+    let usage = "usage: heso batch [open|read] <urls...> [--parallel N] [--timeout DUR | --timeout-per-url DUR] \
                  [--fail-fast] [--include CSV] [--js-fetch]\n\
                  stdin mode: cat urls.txt | heso batch [open|read]";
 
@@ -205,12 +205,20 @@ async fn parse_args(args: &[String]) -> Result<BatchArgs, String> {
                 }
                 i += 2;
             }
-            "--timeout-per-url" => {
+            "--timeout-per-url" | "--timeout" => {
+                // `--timeout-per-url` is the original, explicit name. `--timeout`
+                // is the global flag the other network verbs accept; in batch
+                // the only timeout dimension that makes sense is per-URL
+                // (a global batch budget would silently kill mid-stream work
+                // when one slow URL ate all the time), so the two names are
+                // aliases. When both appear, the latter wins — the user's
+                // most recent intent.
+                let flag = args[i].clone();
                 let Some(v) = args.get(i + 1) else {
-                    return Err(format!("--timeout-per-url needs a value\n{usage}"));
+                    return Err(format!("{flag} needs a value\n{usage}"));
                 };
                 timeout_per_url =
-                    parse_duration(v).map_err(|e| format!("--timeout-per-url: {e}\n{usage}"))?;
+                    parse_duration(v).map_err(|e| format!("{flag}: {e}\n{usage}"))?;
                 i += 2;
             }
             "--fail-fast" => {
