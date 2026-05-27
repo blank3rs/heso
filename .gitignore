@@ -82,6 +82,17 @@ heso-local-data/
 /tm*.json
 /todomvc.json
 
+# Pitch deck + supporting assets — local-only fundraising materials,
+# never published. Slide HTML + speaker notes + image assets live here
+# during prep; the public repo carries product code only.
+/pitch.html
+/pitch-assets/
+
+# Local prototypes / sandbox services that live alongside the repo for
+# convenience but ship out-of-band. Each subdirectory is its own thing
+# (e.g. services/ecosystem-api is the heso.ca/ecosystem backend).
+/services/
+
 # Environment / secrets
 .env
 .env.local
