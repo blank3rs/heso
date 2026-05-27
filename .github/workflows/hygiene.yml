@@ -98,11 +98,8 @@ jobs:
             /^\[workspace\.package\]/ { in_block=1; next }
             /^\[/                     { in_block=0 }
             in_block && /^version[[:space:]]*=/ {
-              gsub(/[" ]/, "", $3)
-              # field 3 is the version string after `version = "X"`
               match($0, /"[^"]+"/)
-              v=substr($0, RSTART+1, RLENGTH-2)
-              print v
+              print substr($0, RSTART+1, RLENGTH-2)
               exit
             }
           ' Cargo.toml)
