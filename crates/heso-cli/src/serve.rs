@@ -120,6 +120,17 @@ use crate::{
 /// that the linear LRU scan starts to feel silly.
 const SNAPSHOT_LRU_CAP: usize = 8;
 
+/// Cap on the live `pages` map. Without this, a long-lived `serve`
+/// session that opens new URLs without ever closing them would grow
+/// without bound — each [`PageRecord`] holds a parsed [`FetchPage`]
+/// (DOM tree, action graph, raw body HTML), and a lazy [`JsSession`]
+/// once a write verb touches it. 32 gives multi-tab agent flows
+/// plenty of headroom; an agent that hops across many more URLs in
+/// one session almost certainly only cares about the recent few.
+/// Explicit `close` removals are unaffected — eviction only fires
+/// when an insert would push past the cap.
+const PAGE_LRU_CAP: usize = 32;
+
 // ============================================================================
 // JSON-RPC types
 // ============================================================================
@@ -226,6 +237,12 @@ struct ServerState {
     /// holding the lock — they take the record briefly, do async work,
     /// then re-acquire.
     pages: Mutex<HashMap<String, PageRecord>>,
+    /// Insertion-ordered companion to `pages`, MRU at the front. Bounds
+    /// `pages` at [`PAGE_LRU_CAP`] entries: a fresh `dispatch_open`
+    /// pushes the new `page_id` here, and any tail past the cap is
+    /// evicted from both. Always locked AFTER `pages` to keep the lock
+    /// order linear and deadlock-free.
+    page_order: Mutex<Vec<String>>,
     /// Monotonic page id counter. `AtomicU64` avoids a second lock on
     /// every `open`.
     counter: AtomicU64,
@@ -253,6 +270,7 @@ impl ServerState {
         Ok(Self {
             engine: FetchEngine::new()?,
             pages: Mutex::new(HashMap::new()),
+            page_order: Mutex::new(Vec::new()),
             counter: AtomicU64::new(0),
             last_page_id: Mutex::new(None),
             snapshots: Mutex::new(Vec::new()),
@@ -297,6 +315,24 @@ fn install_snapshot(store: &mut Vec<(Url, ReadSnapshot)>, url: Url, snap: ReadSn
     store.insert(0, (url, snap));
     while store.len() > SNAPSHOT_LRU_CAP {
         store.pop();
+    }
+}
+
+/// Insert a new `PageRecord` keyed by `page_id` and evict beyond
+/// [`PAGE_LRU_CAP`]. The new entry lands at the front of `order`;
+/// any tail past the cap is dropped from both `pages` and `order`.
+fn install_page(
+    pages: &mut HashMap<String, PageRecord>,
+    order: &mut Vec<String>,
+    page_id: String,
+    record: PageRecord,
+) {
+    pages.insert(page_id.clone(), record);
+    order.insert(0, page_id);
+    while order.len() > PAGE_LRU_CAP {
+        if let Some(evict) = order.pop() {
+            pages.remove(&evict);
+        }
     }
 }
 
@@ -513,14 +549,16 @@ async fn dispatch_open(
         }
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
-    state
-        .pages
-        .lock()
-        .await
-        .insert(
-            page_id.clone(),
-            PageRecord::new_with_inject(page, p.inject_scripts),
-        );
+    let mut pages = state.pages.lock().await;
+    let mut order = state.page_order.lock().await;
+    install_page(
+        &mut pages,
+        &mut order,
+        page_id.clone(),
+        PageRecord::new_with_inject(page, p.inject_scripts),
+    );
+    drop(order);
+    drop(pages);
     *state.last_page_id.lock().await = Some(page_id);
     Ok(payload)
 }
@@ -617,6 +655,12 @@ async fn dispatch_close(
     let p: CloseParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let mut pages = state.pages.lock().await;
     let removed = pages.remove(&p.page_id);
+    let mut order = state.page_order.lock().await;
+    if let Some(idx) = order.iter().position(|id| id == &p.page_id) {
+        order.remove(idx);
+    }
+    drop(order);
+    drop(pages);
     // If the closed page_id was the most-recent default, clear it so
     // subsequent default-pageless write calls produce a clean "no
     // active session" error instead of dangling at a stale id.
