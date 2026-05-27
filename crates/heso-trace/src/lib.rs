@@ -498,7 +498,7 @@ pub fn verify_fingerprint(fp: &TraceFingerprint) -> FingerprintOutcome {
 /// assert_eq!(click.verb(), "click");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "verb", rename_all = "lowercase")]
+#[serde(tag = "verb", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Action {
     /// Navigate to a URL — equivalent to typing into the address bar.
     /// Fetches + parses + replaces the active page state.

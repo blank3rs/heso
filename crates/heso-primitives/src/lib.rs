@@ -170,7 +170,7 @@ pub enum EnvScope {
 /// assert_eq!(json["op"], "cd");
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PrimitiveOp {
     /// Print the working "directory" — current URL + page title.
     Pwd(PwdInput),
@@ -255,6 +255,7 @@ pub enum PrimitiveResult {
 
 /// Input to [`pwd`]. No fields.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PwdInput {}
 
 /// Output of [`pwd`].
@@ -292,6 +293,7 @@ pub enum LsTarget {
 
 /// Input to [`ls`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LsInput {
     /// What to list (defaults to the current page).
     pub target: LsTarget,
@@ -352,6 +354,7 @@ pub enum CdTarget {
 
 /// Input to [`cd`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CdInput {
     /// Where to go.
     pub target: CdTarget,
@@ -423,6 +426,7 @@ pub enum CatTarget {
 
 /// Input to [`cat`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatInput {
     /// What to read.
     pub target: CatTarget,
@@ -478,6 +482,7 @@ pub enum FindPredicate {
 
 /// Input to [`find`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FindInput {
     /// The predicate to match.
     pub predicate: FindPredicate,
@@ -503,6 +508,7 @@ pub fn find<E: EngineApi>(_engine: &E, _input: &FindInput) -> Result<FindOutput>
 
 /// Input to [`grep`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrepInput {
     /// The regex to search for.
     pub pattern: String,
@@ -559,6 +565,7 @@ pub enum EchoTarget {
 
 /// Input to [`echo`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EchoInput {
     /// The value to write.
     pub value: String,
@@ -607,6 +614,7 @@ pub enum RmTarget {
 
 /// Input to [`rm`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RmInput {
     /// What to remove.
     pub target: RmTarget,
@@ -629,6 +637,7 @@ pub fn rm<E: EngineApi>(_engine: &E, _input: &RmInput) -> Result<RmOutput> {
 
 /// Input to [`click`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClickInput {
     /// The element to click. Use [`cd`] instead for links that navigate; this
     /// op is for buttons, toggles, and custom interactive widgets where no
@@ -653,6 +662,7 @@ pub fn click<E: EngineApi>(_engine: &E, _input: &ClickInput) -> Result<ClickOutp
 
 /// Input to [`submit`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmitInput {
     /// The form to submit.
     pub form: ElementRef,
@@ -695,6 +705,7 @@ pub enum WgetTarget {
 
 /// Input to [`wget`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WgetInput {
     /// What to fetch.
     pub target: WgetTarget,
@@ -744,6 +755,7 @@ pub enum WaitCondition {
 
 /// Input to [`wait`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaitInput {
     /// The condition to block on.
     pub condition: WaitCondition,
@@ -771,6 +783,7 @@ pub fn wait<E: EngineApi>(_engine: &E, _input: &WaitInput) -> Result<WaitOutput>
 
 /// Input to [`screenshot`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScreenshotInput {
     /// If set, capture only this element; otherwise capture the full viewport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -801,6 +814,7 @@ pub fn screenshot<E: EngineApi>(_engine: &E, _input: &ScreenshotInput) -> Result
 
 /// Input to [`eval`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalInput {
     /// JS source to evaluate in the page context.
     pub source: String,
@@ -826,6 +840,7 @@ pub fn eval<E: EngineApi>(_engine: &E, _input: &EvalInput) -> Result<EvalOutput>
 
 /// Input to [`diff`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiffInput {
     /// The earlier snapshot.
     pub before: SnapshotId,
