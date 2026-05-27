@@ -1000,6 +1000,30 @@ mod tests {
                 }),
                 "e53bdc36b6aa0dbc27679d4c1a0dae825e9f500c48915357f9e34dfd49cb8c45",
             ),
+            (
+                "V8 plat with a single ok step (§1.4.1)",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Stepped",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "plan": [{"verb": "open", "url": "https://example.com/"}],
+                    "steps": [{
+                        "index": 0,
+                        "verb": "open",
+                        "action": {"verb": "open", "url": "https://example.com/"},
+                        "url_before": "https://example.com/",
+                        "url_after": "https://example.com/",
+                        "status": "ok",
+                        "observed": {"op": "open", "http_status": 200},
+                        "started_at": "1970-01-01T00:00:00.000Z",
+                        "finished_at": "1970-01-01T00:00:00.001Z"
+                    }]
+                }),
+                "f550be12cd6cff8d738d9f80947ecce676e375077c99e75a0bffc4ae8f847ad1",
+            ),
         ];
 
         for (name, body, expected_hash) in &vectors {

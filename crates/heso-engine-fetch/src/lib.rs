@@ -68,6 +68,7 @@ pub mod explore;
 pub mod inline_data;
 pub mod metadata;
 pub mod plat;
+pub mod step;
 pub mod tree;
 
 pub use actions::{
@@ -86,6 +87,7 @@ pub use plat::{
     seal as plat_seal, verify as plat_verify, OpenOutcome as PlatOpenOutcome,
     SealedPlat, VerifyError as PlatVerifyError,
 };
+pub use step::{logical_step_timestamp, StepBoundary, StepStatus};
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
 // `ResponseCookie` is defined inline below alongside `FetchPage` and is
 // already public via its `pub struct` declaration. The CLI uses it to

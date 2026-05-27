@@ -74,6 +74,7 @@ A plat is a JSON object. The following table defines the canonical top-level fie
 |---|---|---|
 | `plan` | array of Action | The action sequence the implementation executed. See §1.4. |
 | `cassette` | object | The recorded network observations. See §2. The cassette field IS hashed; tampering with it changes `plat_hash`. |
+| `steps` | array of Step | The per-action execution log produced by stamping or running the plan. One Step per executed Action, in execution order. See §1.4.1. The `steps` field IS hashed; per-step `status` and `observed` payloads contribute to `plat_hash`. |
 
 **Verb-dependent or optional fields:**
 
@@ -103,6 +104,81 @@ Each entry in `plan` is an Action — a JSON object internally tagged by a `verb
 | `submit` | `ref` (string) | `{"verb":"submit","ref":"@form1"}` |
 
 Implementations MUST reject Action objects with an unknown `verb` value per §4.4. Implementations MUST NOT silently ignore unknown fields within a known verb. Implementations MUST preserve the relative ordering of Action objects in `plan`.
+
+### §1.4.1 Step object
+
+Each entry in `steps` is a Step — a JSON object recording one executed Action and the outcome the implementation observed. The `steps` array MUST contain exactly one Step per Action the implementation attempted, in execution order, indexed contiguously from `0`.
+
+| Field | Type | Description |
+|---|---|---|
+| `index` | number | Zero-based position of the step within `steps`. MUST equal the array index. |
+| `verb` | string | The Action's `verb` field, repeated for ergonomics (lets a consumer scan `steps[].verb` without dereferencing `steps[].action.verb`). |
+| `action` | Action | The Action object exactly as it appears at `plan[index]`, byte-identical. |
+| `url_before` | string | The URL the engine was on when the step began. For step `0`, this is the plan's entry URL (the first `open` Action's `url`). |
+| `url_after` | string | The URL the engine is on when the step ends. For navigating verbs (`open`, `click` on an unhandled `<a href>`, `submit` that POSTs) this is the post-redirect final URL; otherwise it equals `url_before`. |
+| `status` | string | Three-way outcome (§1.4.1.1). Exactly one of `"ok"`, `"partial"`, `"error"`. |
+| `observed` | object | Verb-specific structured result. Present iff `status` is `"ok"` or `"partial"`; OMITTED when `status` is `"error"`. The shape is verb-dependent; the canonical form mirrors what the corresponding live verb (e.g. `heso open`) would emit on stdout. |
+| `partial_reason` | string | Token explaining a `partial` outcome (§1.4.1.2). REQUIRED when `status` is `"partial"`; absent otherwise. |
+| `error` | string | Human-readable failure message. REQUIRED when `status` is `"error"`; absent otherwise. |
+| `started_at` | string | Deterministic logical RFC 3339 timestamp at the step's beginning (§1.4.1.3). |
+| `finished_at` | string | Deterministic logical RFC 3339 timestamp at the step's end (§1.4.1.3). |
+
+Implementations MUST NOT add wall-clock-derived fields to a Step. Recording the host clock in any byte that contributes to `plat_hash` would violate the §1.7 Property 1 determinism contract; the `started_at` / `finished_at` construction in §1.4.1.3 is the spec-mandated alternative.
+
+When the plan halts on an `"error"` step, `steps` MUST contain entries for every Action up to and including the failing one. Actions after the failing one MUST NOT appear in `steps`.
+
+#### §1.4.1.1 Step `status` values
+
+| Value | Meaning |
+|---|---|
+| `"ok"` | The verb's contract was met end-to-end. For `open`: a 2xx response that is not a bot-challenge body. For `click` / `fill` / `submit`: the live DOM matched the target selector and the dispatched event was not rejected by the verb's own semantics. |
+| `"partial"` | The verb ran but produced a degraded outcome. The plan was not aborted; execution continues with the next step. A `partial_reason` token MUST accompany the step. |
+| `"error"` | The verb could not run. Examples: an `open` whose underlying network call failed, a `click` whose `ref` could not be resolved at all, a malformed Action. The plan MUST halt at this step. An `error` field MUST accompany the step. |
+
+#### §1.4.1.2 Step `partial_reason` tokens
+
+When `status` is `"partial"`, the `partial_reason` field carries one of the tokens below. The tokens are the same vocabulary used by the top-level plat `partial_reason` field (§1.3) — implementations SHOULD reuse them so consumers can apply the same handlers at both granularities.
+
+| Token | Trigger |
+|---|---|
+| `http_NNN` | HTTP response status in 3xx, 4xx, 5xx, or 1xx (literal status substituted, e.g. `http_404`). |
+| `http_5xx` | HTTP response in the 5xx range, when the implementation chooses the bucketed form over `http_NNN`. |
+| `bot_challenge` | A 2xx response whose body is recognised as a Cloudflare / generic anti-bot interstitial. |
+| `selector_not_matched` | A `click` / `fill` / `submit` whose Action ref resolved at the snapshot level but did not match in the live DOM (DOM mutation between snapshot and dispatch). |
+| `script_crash` | Page-owned JavaScript threw during the verb's execution. |
+| `fetch_failed` | A subresource fetch the verb triggered failed in a way that degraded the result without aborting it. |
+
+Implementations MAY define additional tokens for their own reference-implementation needs; spec-defined tokens MUST be used in preference when applicable.
+
+#### §1.4.1.3 Deterministic logical timestamps
+
+The `started_at` and `finished_at` fields are RFC 3339 UTC strings with millisecond precision (`YYYY-MM-DDTHH:MM:SS.sssZ`). Their values MUST be derived from the step `index` alone — never from the host wall clock, the OS monotonic clock, or any source that varies across hosts.
+
+Given a step index `i` (zero-based):
+
+```
+ms_started   := i * 2
+ms_finished  := i * 2 + 1
+started_at   := rfc3339_utc_ms(ms_started)    // ms offset from 1970-01-01T00:00:00.000Z
+finished_at  := rfc3339_utc_ms(ms_finished)
+```
+
+The construction yields a strictly monotonic, fully deterministic sequence in which each step occupies a 1 ms slice and adjacent steps do not share boundaries. Stamping and replay produce the same string for the same step index — the determinism contract in §1.7 Property 1 holds.
+
+The choice of synthetic epoch (`1970-01-01T00:00:00.000Z`) matches the virtual-clock origin in §5.4.1, so a consumer scanning `steps[].started_at` and the JS-side `Date.now()` traces sees one consistent zero point. Implementations MUST NOT emit a non-zero epoch offset for the `steps` timestamps in HESO/1.0; a future minor version MAY add an opt-in `epoch_offset_ms` field per the open-question note in §5.4.1.
+
+#### §1.4.1.4 Per-step replay assertion
+
+The `run` verb (§4.7) MUST, when the input plat carries a `steps` array, walk that array in execution order and compare each recorded Step against the corresponding re-executed Step:
+
+1. If the recorded and re-executed `steps` arrays differ in length, the implementation MUST report a length mismatch and surface it to the operator (stderr, structured error, or both).
+2. For each index `i` present in both arrays, the implementation MUST compare:
+   - The recorded `status[i]` against the re-executed `status[i]` (string equality).
+   - The recorded `observed[i]` against the re-executed `observed[i]` (JSON value equality).
+3. Any mismatch MUST be surfaced with at least the diverging step index and the name of the diverging field (`status` or `observed`).
+4. When at least one per-step mismatch is detected, the implementation MUST exit non-zero (per the §4.7 exit-code taxonomy, this is operational failure `1`).
+
+The per-step assertion is a defense-in-depth surface over the §1.6 plat-hash check: a cassette mutation that flips a step's observable behaviour will already change `plat_hash`, but the per-step diff localises the divergence to a specific Step and field, which is the diagnostic information the operator needs to triage a drifted page.
 
 ### §1.5 Canonical bytes
 
@@ -277,6 +353,19 @@ Demonstrates §1.7 Property 5 — a `title` field present with `""`, present wit
 #### V7 — Sealed envelope (TBD)
 
 Reserved for the next revision. Shape and verification steps are specified in §1.8; concrete signature bytes require a fixed test keypair generated from a published seed.
+
+#### V8 — Plat with a single `ok` step (§1.4.1)
+
+Pins the canonical bytes of a stamped plat containing one `steps[]` entry — exercises every required Step field (`index`, `verb`, `action`, `url_before`, `url_after`, `status`, `observed`, `started_at`, `finished_at`) and the deterministic logical-timestamp construction from §1.4.1.3.
+
+Input JSON (also canonical bytes):
+```
+{"actions":[],"description":"","input_url":"https://example.com/","plan":[{"url":"https://example.com/","verb":"open"}],"steps":[{"action":{"url":"https://example.com/","verb":"open"},"finished_at":"1970-01-01T00:00:00.001Z","index":0,"observed":{"http_status":200,"op":"open"},"started_at":"1970-01-01T00:00:00.000Z","status":"ok","url_after":"https://example.com/","url_before":"https://example.com/","verb":"open"}],"title":"Stepped","tree":[],"url":"https://example.com/"}
+```
+`plat_hash`:
+```
+f550be12cd6cff8d738d9f80947ecce676e375077c99e75a0bffc4ae8f847ad1
+```
 
 ### §1.10, §1.11 Tree and actions internal schema
 
@@ -626,9 +715,9 @@ For each tool verb the spec pins: command-line surface, input shape, top-level o
 |---|---|
 | `read` | Fetch + execute JS + return rich content (text, forms, cookies, console, scripts, framework, deltas). |
 | `wait` | Block until a condition is true on a fetched page (`--selector-exists`, `--text-contains`, `--url-matches`, `--network-idle`, `--time`). |
-| `stamp` | Execute a plan against the live web; mint a plat with embedded cassette. Exit non-zero if any step failed. |
-| `run` | Re-execute a plan against the embedded cassette in the input plat. MUST NOT fall back to live HTTP when the cassette is missing (§5.5). |
-| `replay` | Pure observation: extract and emit the `steps` field of a plat. No execution, no network. |
+| `stamp` | Execute a plan against the live web; mint a plat with embedded cassette and per-step `steps` log (§1.4.1). Exit non-zero if any step's `status` is `"error"`. |
+| `run` | Re-execute a plan against the embedded cassette in the input plat. MUST NOT fall back to live HTTP when the cassette is missing (§5.5). When the input plat carries a `steps` array, MUST perform the per-step replay assertion in §1.4.1.4 and exit non-zero on any mismatch. |
+| `replay` | Pure observation: extract and emit the `steps` field of a plat (§1.4.1). No execution, no network. |
 | `unpack` | Extract and emit the `plan` field of a plat for standalone editing. |
 | `identity-init` | Generate an Ed25519 keypair for signing. CLI surface MAY also expose `identity init` as a two-token subcommand. |
 | `notarize` | Attach an RFC 3161 trusted-timestamp anchor (§3.3.4) to an existing signed receipt by sending `HASH_ALG(canonical_receipt_bytes(R_pre))` to a Time-Stamp Authority and embedding the returned token. Re-signs the receipt with the same Ed25519 key so the signature continues to cover the full body. Refuses unsigned receipts and `mode: live` receipts. |
