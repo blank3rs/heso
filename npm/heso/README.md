@@ -6,9 +6,10 @@ Every run can be **stamped** into a *plat* with an embedded network cassette. `h
 
 <!-- heso:perf:start -->
 ```
-binary       10.1 MB
-cold start   ~77 ms   (open https://example.com, network included)
-engine only  ~28 ms   (no network)
+binary       10.11 MB
+cold start   ~10 ms   (help banner, no engine)
+js init      ~21 ms   (eval-js null)
+open URL     ~80 ms   (network included)
 batch        ~1.1 s   for 8 URLs in parallel
 ```
 <!-- heso:perf:end -->
@@ -26,7 +27,7 @@ npx @ixla/heso open https://example.com   # one-shot
 > Ships prebuilt binaries for Windows x64, Linux x64 + arm64, and macOS x64 + arm64. `npm` picks the right `@ixla/heso-<platform>-<arch>` via `optionalDependencies` — no native build step.
 
 <!-- heso:version:start -->
-> Shipping `v0.1.3` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.1.4` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 <!-- heso:version:end -->
 
 ## Use as a CLI
@@ -60,15 +61,16 @@ Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.
 
 ```js
 import {
-  open, search, read, evalDom, session, wait,
-  stamp, replay, unpack,
-  platHash, platVerify, platInfo, platDiff, platRedact, platSeal, platUnseal,
+  open, read, evalDom, session, wait,
+  stamp, replay,
+  verify, info, seal, unseal,
+  registry,
   HesoError,
 } from "@ixla/heso";
 
 // One-shot calls
 const page    = await open("https://example.com");
-const results = await search("rust web scraping", { limit: 5 });
+const results = await registry.search("rust web scraping", { limit: 5 });
 const content = await read("https://example.com", { complete: true });
 const value   = await evalDom("https://example.com", "document.title");
 
@@ -83,18 +85,15 @@ await session(async (s) => {
   await s.open("https://example.com");
   await s.click({ text: "More information..." });
   const page = await s.read({ include: "text,actions" });
-  const title = await s.eval({ js: "document.title" });
+  const title = await s.eval("document.title");
 });
 
-// Plat dev tools + envelope
-const hash    = await platHash("out.plat");                    // 64-char hex
-const ok      = await platVerify("out.plat");                  // boolean
-const summary = await platInfo("out.plat");                    // multi-line text
-const { identical, output } = await platDiff("a.plat", "b.plat");
-const clean   = await platRedact("cookies", "out.plat");       // plat with field stripped
-const sealed  = await platSeal("out.plat");                    // SealedPlat envelope
-const status  = await platUnseal("sealed.plat");               // { status: "valid", ... }
-const body    = await platUnseal("sealed.plat", { extract: true }); // inner plat
+// Polymorphic plat / receipt tools
+const info_out = await info("out.plat");                       // summary of any artifact
+const verdict  = await verify("out.plat");                     // { status: "valid", ... }
+const sealed   = await seal("out.plat");                       // SealedPlat envelope
+const status   = await unseal("sealed.plat");                  // { status: "valid", ... }
+const body     = await unseal("sealed.plat", { extract: true }); // inner plat
 ```
 
 All functions return `Promise<object>`. TypeScript declarations ship in `index.d.ts`.

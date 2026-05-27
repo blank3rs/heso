@@ -7,10 +7,27 @@
  * spawned, or produces stdout that doesn't parse as JSON.
  */
 export class HesoError extends Error {
+  constructor(
+    message: string,
+    init?: {
+      stdout?: string;
+      stderr?: string;
+      code?: number | null;
+      rpcCode?: number | null;
+      command?: string[];
+    },
+  );
   stdout: string;
   stderr: string;
-  /** Process exit code, or `null` if we never managed to spawn. */
+  /** Process exit code, or `null` if we never managed to spawn the binary. */
   code: number | null;
+  /**
+   * JSON-RPC error code (e.g. `-32601`), set when the error came from
+   * a `Session` (i.e. `heso serve`) call. `null` for subprocess errors.
+   */
+  rpcCode: number | null;
+  /** Snake-case alias for {@link rpcCode} (for cross-language parity). */
+  rpc_code: number | null;
   /** The exact argv (`[binary, ...args]`) we tried to invoke. */
   command: string[];
 }
@@ -98,6 +115,15 @@ export function read(url: string, options?: ReadOptions): Promise<Record<string,
 
 /** `heso wait <url>` — block until a page condition is satisfied. */
 export function wait(url: string, options?: WaitOptions): Promise<Record<string, unknown>>;
+
+/**
+ * `heso search <query>` — multi-backend web search (DDG HTML + Wikipedia,
+ * optional SearXNG). Alias for `registry.search`.
+ */
+export function search(
+  query: string,
+  options?: SearchOptions,
+): Promise<Record<string, unknown>>;
 
 /**
  * `heso click <url>` — dispatch a real click. Pass `ref` ("@e7") OR a

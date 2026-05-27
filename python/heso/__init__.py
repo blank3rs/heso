@@ -60,6 +60,7 @@ __all__ = [
     "open",
     "read",
     "wait",
+    "search",
     "click",
     "fill",
     "submit",
@@ -91,16 +92,21 @@ __all__ = [
 
 
 class HesoError(Exception):
-    """Raised when the ``heso`` binary exits non-zero or its stdout
-    doesn't parse as JSON.
+    """Raised when the ``heso`` binary exits non-zero, its stdout
+    doesn't parse as JSON, or a ``heso serve`` JSON-RPC call returns
+    an error envelope.
 
     Attributes:
         stdout: Captured stdout (str). May be empty.
         stderr: Captured stderr (str). May contain a human error line.
-        returncode: Exit code from the binary. ``2`` means a usage /
-            argument error (matches the CLI's convention); ``1`` means
-            a runtime failure; non-integer means we couldn't even
-            spawn the binary.
+        returncode: Subprocess exit code from the binary. ``2`` means a
+            usage / argument error (matches the CLI's convention); ``1``
+            means a runtime failure; ``None`` when the error came from
+            a session (JSON-RPC) call or we couldn't even spawn.
+        rpc_code: JSON-RPC error code (e.g. ``-32601``) when the error
+            came from a ``Session`` call. ``None`` for subprocess errors.
+            Kept separate from ``returncode`` so callers branching on
+            ``if e.returncode == 2`` don't misfire on wire-level errors.
         command: The full argv list we spawned, for debugging.
     """
 
@@ -111,12 +117,14 @@ class HesoError(Exception):
         stdout: str = "",
         stderr: str = "",
         returncode: Optional[int] = None,
+        rpc_code: Optional[int] = None,
         command: Optional[Sequence[str]] = None,
     ) -> None:
         super().__init__(message)
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
+        self.rpc_code = rpc_code
         self.command = list(command) if command is not None else []
 
 
@@ -150,6 +158,55 @@ def _find_binary() -> str:
         "or download a release binary from "
         "https://github.com/blank3rs/heso/releases."
     )
+
+
+# ---------------------------------------------------------------------------
+# Binary / wrapper version handshake
+# ---------------------------------------------------------------------------
+
+_version_check_done = False
+
+
+def _check_binary_version(binary_path: str) -> None:
+    """Compare the wrapper's declared ``__version__`` against ``heso
+    --version`` once per process. On mismatch, emit a single stderr
+    warning. Skip entirely when ``HESO_SKIP_VERSION_CHECK=1`` is set.
+    """
+    global _version_check_done
+    if _version_check_done:
+        return
+    _version_check_done = True
+    if os.environ.get("HESO_SKIP_VERSION_CHECK") == "1":
+        return
+    try:
+        proc = subprocess.run(
+            [binary_path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return
+    if proc.returncode != 0:
+        return
+    line = (proc.stdout or "").strip().splitlines()[0:1]
+    if not line:
+        return
+    # Banner shape: "heso 0.1.4". Take the second whitespace-split token.
+    parts = line[0].split()
+    if len(parts) < 2:
+        return
+    binary_version = parts[1]
+    if binary_version != __version__:
+        sys.stderr.write(
+            f"warning: heso wrapper version {__version__} found heso binary "
+            f"version {binary_version} at {binary_path}; behavior may differ. "
+            f"Set HESO_SKIP_VERSION_CHECK=1 to silence.\n"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +339,7 @@ def run(
             / ``command`` attached).
     """
     exe = binary or _find_binary()
+    _check_binary_version(exe)
     command = [exe, *args]
     try:
         # `text=True` decodes stdout/stderr as text using the locale
@@ -650,36 +708,10 @@ def unseal(path: Union[str, Path], **kwargs: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Registry namespace
+# Registry namespace — implementation lives in :mod:`heso.registry`.
+# Imported at the bottom of this module so its functions can reach the
+# subprocess-wrapper plumbing without circular-import gymnastics.
 # ---------------------------------------------------------------------------
-
-
-class registry:
-    """Registry operations: publish, pull, list, search."""
-
-    @staticmethod
-    def publish(path: Union[str, Path], *, description: str, tags: Optional[Union[str, Iterable[str]]] = None, **kwargs: Any) -> str:
-        if not isinstance(description, str) or not description.strip():
-            raise HesoError("registry.publish: `description=` is required (CLI flag -d)")
-        argv: list = [str(path), "-d", description]
-        if tags is not None:
-            csv = tags if isinstance(tags, str) else ",".join(str(t) for t in tags)
-            if csv:
-                argv.extend(["-t", csv])
-        argv.extend(_kwargs_to_argv(kwargs))
-        return run("registry", "publish", *argv, parse_json=False)
-
-    @staticmethod
-    def pull(hash: str, **kwargs: Any) -> str:
-        return run("registry", "pull", str(hash), *_kwargs_to_argv(kwargs), parse_json=False)
-
-    @staticmethod
-    def list(**kwargs: Any) -> str:
-        return run("registry", "list", *_kwargs_to_argv(kwargs), parse_json=False)
-
-    @staticmethod
-    def search(query: str, **kwargs: Any) -> dict:
-        return run("registry", "search", query, *_kwargs_to_argv(kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +771,7 @@ class Session:
         self._start()
 
     def _start(self) -> None:
+        _check_binary_version(self._binary)
         # `bufsize=1` => line-buffered text mode, which is what
         # newline-delimited JSON-RPC wants. text=True picks up
         # universal-newlines so \r\n on Windows still splits cleanly.
@@ -839,7 +872,7 @@ class Session:
                     err = resp["error"]
                     raise HesoError(
                         err.get("message", "unknown JSON-RPC error"),
-                        returncode=err.get("code"),
+                        rpc_code=err.get("code"),
                     )
                 return resp.get("result")
 
@@ -930,6 +963,30 @@ def session(binary: Optional[str] = None) -> Session:
     ``heso.Session()`` so ``with heso.session() as s: ...`` reads
     naturally."""
     return Session(binary=binary)
+
+
+# ---------------------------------------------------------------------------
+# Top-level search alias — `heso search <query>` dispatches the same way
+# `heso registry search <query>` does, so the wrapper exposes both
+# spellings. Keeps `heso.search("...")` calls (which the README has
+# always advertised) working without forcing every caller to reach
+# through the registry namespace.
+# ---------------------------------------------------------------------------
+
+
+def search(query: str, **kwargs: Any) -> dict:
+    """``heso search <query>`` — multi-backend web search (DDG + Wikipedia,
+    optional SearXNG). Alias for :func:`heso.registry.search`."""
+    return run("search", query, *_kwargs_to_argv(kwargs))
+
+
+# ---------------------------------------------------------------------------
+# Submodule registry — defined in heso.registry; imported here so
+# `heso.registry.publish(...)` keeps working under the same name the
+# previous `class registry:` exposed.
+# ---------------------------------------------------------------------------
+
+from . import registry  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------

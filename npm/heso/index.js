@@ -27,22 +27,66 @@
 
 "use strict";
 
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const path = require("path");
 const fs = require("fs");
-const { Readable } = require("stream");
+
+// Wrapper version — kept in sync with package.json by the deploy
+// script's version-bump pass. Compared against `heso --version` once
+// per process so a wrapper-binary mismatch surfaces as a warning
+// instead of silent behavior drift.
+const WRAPPER_VERSION = require("./package.json").version;
+let _versionCheckDone = false;
+
+function _checkBinaryVersion(binaryPath) {
+  if (_versionCheckDone) return;
+  _versionCheckDone = true;
+  if (process.env.HESO_SKIP_VERSION_CHECK === "1") return;
+  let out;
+  try {
+    out = spawnSync(binaryPath, ["--version"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      encoding: "utf8",
+      timeout: 5000,
+    });
+  } catch (_) {
+    return;
+  }
+  if (!out || out.status !== 0 || !out.stdout) return;
+  // Banner shape: "heso 0.1.4". Second token is the version.
+  const firstLine = out.stdout.split("\n", 1)[0] || "";
+  const parts = firstLine.trim().split(/\s+/);
+  if (parts.length < 2) return;
+  const binaryVersion = parts[1];
+  if (binaryVersion !== WRAPPER_VERSION) {
+    process.stderr.write(
+      `warning: heso wrapper version ${WRAPPER_VERSION} found heso binary ` +
+        `version ${binaryVersion} at ${binaryPath}; behavior may differ. ` +
+        `Set HESO_SKIP_VERSION_CHECK=1 to silence.\n`,
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
 
 class HesoError extends Error {
-  constructor(message, { stdout = "", stderr = "", code = null, command = [] } = {}) {
+  constructor(
+    message,
+    { stdout = "", stderr = "", code = null, rpcCode = null, command = [] } = {},
+  ) {
     super(message);
     this.name = "HesoError";
     this.stdout = stdout;
     this.stderr = stderr;
+    // `code` is the subprocess exit code (0/1/2). `rpcCode` is the
+    // JSON-RPC error code (-32601 etc.) — split so callers branching
+    // on `if (e.code === 2)` don't misfire when the error came over
+    // the wire from `heso serve`.
     this.code = code;
+    this.rpcCode = rpcCode;
+    this.rpc_code = rpcCode;
     this.command = command;
   }
 }
@@ -223,6 +267,7 @@ function _optsToArgv(opts) {
 
 function _spawn(args, { timeout = 0, binary = null } = {}) {
   const exe = binary || _findBinary();
+  _checkBinaryVersion(exe);
   const command = [exe, ...args];
   return new Promise((resolve, reject) => {
     const child = spawn(exe, args, { stdio: ["ignore", "pipe", "pipe"], shell: false });
@@ -337,6 +382,15 @@ function read(url, options) {
 /** `heso wait <url>` — block until a page condition is satisfied. */
 function wait(url, options) {
   return _spawnJson(["wait", url, ..._optsToArgv(options)]);
+}
+
+/**
+ * `heso search <query>` — multi-backend web search (DuckDuckGo HTML +
+ * Wikipedia summary, optional SearXNG). Alias for `registry.search`
+ * preserved for ergonomic compatibility with the public docs.
+ */
+function search(query, options) {
+  return _spawnJson(["search", String(query), ..._optsToArgv(options)]);
 }
 
 /**
@@ -573,8 +627,6 @@ class Session {
     this._binary = binary || _findBinary();
     this._idCounter = 0;
     this._pending = new Map();
-    this._queue = [];
-    this._inflight = false;
     this._buffer = "";
     this._closed = false;
     this._readyPromise = null;
@@ -582,6 +634,7 @@ class Session {
   }
 
   _start() {
+    _checkBinaryVersion(this._binary);
     this._proc = spawn(this._binary, ["serve"], {
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
@@ -625,7 +678,7 @@ class Session {
         if (msg.error) {
           pending.reject(
             new HesoError(msg.error.message || "JSON-RPC error", {
-              code: msg.error.code,
+              rpcCode: msg.error.code,
               command: [this._binary, "serve"],
             }),
           );
@@ -698,14 +751,6 @@ class Session {
     return this._request("submit", params);
   }
   eval(js, params = {}) {
-    // Accept both forms:
-    //   s.eval("document.title")                — positional string
-    //   s.eval({ js: "document.title" })        — options object (matches
-    //                                             s.read({...}), s.wait({...}))
-    // Picking one fixed shape would surprise users coming from either side.
-    if (typeof js === "object" && js !== null && "js" in js) {
-      return this._request("eval", { ...js, ...params });
-    }
     return this._request("eval", { js, ...params });
   }
   navigate(url, params = {}) {
@@ -770,6 +815,7 @@ module.exports = {
   open,
   read,
   wait,
+  search,
   click,
   fill,
   submit,
