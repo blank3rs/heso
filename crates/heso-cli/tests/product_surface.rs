@@ -11,7 +11,6 @@ const ROOT_README: &str = include_str!("../../../README.md");
 const PYPROJECT: &str = include_str!("../../../pyproject.toml");
 const PY_INIT: &str = include_str!("../../../python/heso/__init__.py");
 const NPM_PACKAGE: &str = include_str!("../../../npm/heso/package.json");
-const NPM_README: &str = include_str!("../../../npm/heso/README.md");
 const NPM_TYPES: &str = include_str!("../../../npm/heso/index.d.ts");
 const NPM_DARWIN_ARM64: &str = include_str!("../../../npm/platforms/darwin-arm64/package.json");
 const NPM_DARWIN_X64: &str = include_str!("../../../npm/platforms/darwin-x64/package.json");
@@ -93,14 +92,6 @@ fn install_and_platform_claims_match_release_artifacts() {
 
 #[test]
 fn wrapper_readmes_match_language_idioms_and_cli_semantics() {
-    assert!(NPM_README.contains("10.1 MB"));
-    assert!(NPM_README.contains("~77 ms"));
-    assert!(NPM_README.contains("~28 ms"));
-    assert!(NPM_README.contains("selectorExists"));
-    assert!(NPM_README.contains("bestEffort"));
-    assert!(!NPM_README.contains("selector_exists"));
-    assert!(!NPM_README.contains("best_effort"));
-
     assert!(NPM_TYPES.contains("Pure observation: no engine, no network"));
     assert!(!NPM_TYPES.contains("re-execute a plan\n * and return"));
     assert!(PY_INIT.contains("``--inject-script`` is repeatable"));

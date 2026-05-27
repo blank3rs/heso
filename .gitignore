@@ -127,6 +127,12 @@ identity/private/
 *.priv
 *.pem
 
+# Single-source the npm README from the repo root. `scripts/deploy.ps1`
+# copies `README.md` into `/npm/heso/README.md` right before the npm
+# publish step, then cleans it up afterwards. Source-tree checkouts
+# never carry the copy; only the release tarball does.
+/npm/heso/README.md
+
 # Bundled-binary slots — populated at release time, never committed.
 # The PyPI wheel build copies target/release/heso.exe into
 # python/heso/bin/; the npm publish step does the same for the

@@ -516,6 +516,13 @@ jobs:
           "
         shell: bash
 
+      # Single-source the npm README from the repo root. `npm/heso/README.md`
+      # is gitignored, so the checkout doesn't carry one; the publish job
+      # supplies the live root README right before `npm publish`.
+      - name: Sync npm README from root README.md
+        run: cp README.md npm/heso/README.md
+        shell: bash
+
       # Same idempotency contract as the platform-packages step above:
       # if the meta version is already on the registry, that's a skip,
       # not a fatal error. Lets us re-run a partially-failed tag without

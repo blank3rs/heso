@@ -65,31 +65,32 @@
 //!   across engines, dedupe by canonical URL. Wikipedia goes in
 //!   the top-level `knowledge` block, not in `results`. See
 //!   [`crate::search`] for the full design.
-//! - `heso plat-hash <file>` — Compute the BLAKE3 hash of a plat JSON
-//!   file (the output of `heso open`). Any embedded `plat_hash` field
-//!   is IGNORED during hashing; the printed value is the hash of the
-//!   rest of the content, exactly what `heso open` would have written.
-//! - `heso plat-verify <file>` — Verify a plat file's embedded `plat_hash`
-//!   against the recomputed hash of its content. Exit 0 = match, 1 =
-//!   mismatch (tampered/corrupted), 2 = malformed (missing or
-//!   non-string `plat_hash`).
-//! - `heso publish <plat-file> -d "description"` — Upload an existing
-//!   stamped plat to the public registry at heso.ca/ecosystem.
-//! - `heso pull <plat-hash> [-o output-path]` — Download a published plat
-//!   from the registry by its 64-character BLAKE3 content hash.
-//! - `heso list` — Browse the public plat registry.
-//! - `heso update` — Detect global heso installs owned by npm, PyPI
-//!   tooling, Cargo, or Homebrew and delegate updates to those managers.
+//! - `heso verify <file>` — Polymorphic content-identity check across plats,
+//!   sealed envelopes, and signed receipts. Recomputes the embedded hash
+//!   (BLAKE3 over the canonical content) and, for signed envelopes,
+//!   checks the Ed25519 signature against the optional `--trusted-keys`
+//!   allowlist. Exit 0 = valid, 1 = invalid (tamper / wrong signer /
+//!   `mode: live`), 2 = malformed input.
+//! - `heso info <file> [file2]` — Human summary of a plat (hash, plan and
+//!   cassette counts, sealed status). With two arguments, diffs the two
+//!   plats and reports what changed (plan, cassette URLs, fields).
+//! - `heso seal <file> [--key PATH]` — Wrap a plat in an Ed25519
+//!   envelope; defaults to the local identity at
+//!   `heso-local-data/identity.key`.
+//! - `heso unseal <file> [--extract]` — Verify a sealed envelope and
+//!   optionally print the inner plat body for piping.
+//! - `heso registry <publish|pull|list> ...` — Public-registry surface
+//!   for plats hosted at `heso.ca/ecosystem`. `publish` uploads a stamped
+//!   plat with a description; `pull` downloads by 64-character BLAKE3
+//!   hash; `list` browses with optional query, tag, and sort filters.
+//! - `heso update [--dry-run]` — Detect global heso installs owned by
+//!   npm, PyPI tooling, Cargo, or Homebrew and delegate updates to those
+//!   managers.
 //! - `heso serve` — long-running JSON-RPC 2.0 server over stdin/stdout.
 //!   Framework authors (Browser Use, Stagehand, custom agents) launch
 //!   ONE child process and pipe newline-delimited requests in, responses
 //!   out, instead of spawning per-call. Stateful page cache by `page_id`.
 //!   See [`crate::serve`].
-//! - `heso action-hash <url> [actions-json | -]` — Algorithm-derived
-//!   identity for a `(URL, actions)` pair. BLAKE3 over canonical JSON of
-//!   the normalized URL + a caller-supplied JSON array of actions. No
-//!   fetch, no storage — same inputs always produce the same hash. Useful
-//!   as a cache key or a content-free trace fingerprint.
 //!
 //! Per [ADR 0012], the static engine is `heso-engine-fetch`. Per [ADR 0014],
 //! the JS engine is `heso-engine-js` (QuickJS via `rquickjs`, Phase 1A
@@ -151,6 +152,13 @@ fn print_banner() {
     println!("  heso cat   <url> <path|@ref>  Fetch + read intro text at <path>, or the element at <@ref>");
     println!("  heso find  <url> [--role X] [--name SUBSTR] [--section /p]   List interactive elements (action graph)");
     println!("  heso meta  <url>              Fetch + extract metadata (JSON-LD, OpenGraph, SEO meta) as JSON");
+    println!("  heso search <query>           Multi-source web search: DDG HTML + Wikipedia summary (default).");
+    println!("                                Pure HTTP + HTML — no JS engine spin-up. No API key required.");
+    println!("    [--limit N]                    Max merged results (default 30, max 100). Wikipedia goes in");
+    println!("                                   the top-level `knowledge` block, not in `results`.");
+    println!("    [--engines ddg,wiki,searxng]   Pick subset (default ddg,wiki). Round-robin ranked merge,");
+    println!("                                   dedupe by canonical URL.");
+    println!("    [--searx-url URL]              Optional SearXNG base URL. Also reads HESO_SEARX_URL env.");
     println!("  heso open  <url>              Fetch once, return {{url,title,description,metadata,tree,actions,plat_hash}} (agent-facing)");
     println!("    [--explore-links N]            Pre-fetch up to --link-cap direct (depth=1) or nested (depth>=2) same-origin links");
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
@@ -164,6 +172,11 @@ fn print_banner() {
     );
     println!("  heso read  <url>              Like `open` PLUS post-hydration text, grouped forms, cookies, console, framework sniff, scripts");
     println!("    [--include CSV]                Filter the optional surface: text,forms,cookies,console,framework,scripts (default: all)");
+    println!("    [--complete]                   Auto-scroll the page to the bottom before reading (infinite-feed pages)");
+    println!("    [--since HASH]                 Skip elements whose hash matches a prior read — diff mode");
+    println!("    [--js-fetch]                   Run inline + linked <script src=...> through QuickJS via the page's fetch client");
+    println!("    [--best-effort]                Return whatever surface succeeded instead of failing the call");
+    println!("    [--inject-script JS]           Repeatable; inject arbitrary JS into the QuickJS run before snapshotting");
     println!("    [--receipt PATH] [--key PATH] [--mode M] [--seed N]   Same signed-receipt suite as `heso open`");
     println!("  heso batch [open|read] <urls...>");
     println!("                                Parallel multi-URL scraping in ONE process. Shared cookie jar + reqwest");
@@ -192,31 +205,6 @@ fn print_banner() {
     println!("                                --field name=value     repeatable; matched by input `name` attribute.");
     println!("                                --data '{{\"k\":\"v\"}}'    JSON dict alternative; --field wins on the same name.");
     println!("                                File inputs are skipped (FormData/Blob/File globals are unimplemented).");
-    println!("  heso search <query>           Multi-backend web search: DDG HTML + Wikipedia summary (default).");
-    println!("                                Pure HTTP + HTML — no JS engine spin-up. No API key required.");
-    println!("    [--limit N]                    Max merged results (default 30, max 100). Wikipedia goes in");
-    println!(
-        "                                   the top-level `knowledge` block, not in `results`."
-    );
-    println!("    [--engines ddg,wiki,searxng]   Pick subset (default ddg,wiki). Round-robin ranked merge,");
-    println!("                                   dedupe by canonical URL.");
-    println!("    [--searx-url URL]              Optional SearXNG base URL. Also reads HESO_SEARX_URL env.");
-    println!(
-        "                                   Most public instances disable JSON output by default."
-    );
-    println!("  heso verify <file>            Polymorphic verifier: receipts, plats, sealed envelopes, action-hash");
-    println!("                                fingerprints. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
-    println!("  heso info   <file>            Polymorphic summary of any artifact (plat, receipt, sealed plat, ...)");
-    println!("  heso seal   <file> [--key PATH]");
-    println!("                                Wrap a plat in an Ed25519 envelope (default key: heso-local-data/identity.key)");
-    println!("                                Refuses if the input's embedded plat_hash does not match its content.");
-    println!("  heso unseal <file> [--extract]");
-    println!("                                Verify a sealed envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
-    println!("                                With --extract, emit the inner plat body to stdout.");
-    println!("  heso registry <publish|pull|list|search> [args...]");
-    println!("                                Public plat registry. `publish <plat> -d \"…\"`, `pull <hash>`,");
-    println!("                                `list [-q …]`, `search <query>` (DDG + Wikipedia, optional SearXNG).");
-    println!("  heso update [--dry-run]      Update every detected global heso install channel.");
     println!("  heso eval-js [--seed N] <js>  Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window; use eval-dom for pages.");
     println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
@@ -226,7 +214,7 @@ fn print_banner() {
     println!("                                --seed N seeds the determinism shims (default 0). Default skips <script src=...>;");
     println!("                                pass --js-fetch to install the JS `fetch()` global and honor <script src=...>");
     println!("                                via the same `reqwest::Client` used for the page load (cookies + receipts coherent).");
-    println!("                                Under --seed N + --js-fetch, fetch() rejects with a clear cassette error (ADR 0008).");
+    println!("                                Under --seed N + --js-fetch, fetch() rejects with a clear cassette error.");
     println!("                                Async patterns: the engine deep-resolves Promises in the returned value, so all of");
     println!("                                  (a) `(async () => {{ const r = await fetch(URL); return await r.json(); }})()`,");
     println!("                                  (b) `fetch(URL).then(r => r.json())`,");
@@ -234,7 +222,6 @@ fn print_banner() {
     println!("                                resolve to their data before serialization. Bare side-effect reads like");
     println!("                                `globalThis.X = null; fetch(URL).then(j => globalThis.X = j); globalThis.X` will NOT");
     println!("                                work — the final expression captures `null` before the .then fires. Use shape (a).");
-    println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso stamp  [--seed N] <plan-or-plat>");
     println!("                                Execute a plan against the live web and mint a fresh plat that");
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
@@ -243,7 +230,7 @@ fn print_banner() {
     println!("  heso run    [--seed N] <plat.plat|plat-hash|->");
     println!("                                Re-execute the plan against the plat's embedded cassette — no");
     println!("                                network. Mints a fresh plat; for an unchanged cassette its");
-    println!("                                plat_hash equals the input's (byte-identical replay, ADR 0008).");
+    println!("                                plat_hash equals the input's (byte-identical replay).");
     println!("                                Misses (page drifted since stamp) surface as graceful errors.");
     println!("  heso refresh [--seed N] <plat.plat|->");
     println!("                                Re-stamp a plat against the live web and report whether it has");
@@ -252,18 +239,41 @@ fn print_banner() {
     println!("                                diff?}}. The plat MUST have a `plan` field.");
     println!("  heso replay [--plan] <plat.plat|plat-hash|->");
     println!("                                Emit the recorded step log from a plat. Pure observation — no");
-    println!("                                engine, no network, no JS. With --plan, emits the `plan` field");
-    println!("                                instead (pipe back into `stamp` for the edit/re-mint loop).");
+    println!("                                engine, no network, no JS. Use `run` to re-execute. With");
+    println!("                                --plan, extract just the `plan` field for editing.");
+    println!("  heso verify <file>            Polymorphic verification: detects whether <file> is a plat,");
+    println!("                                sealed plat, receipt, action-hash fingerprint, or template");
+    println!("                                and runs the right check. Exit codes follow the per-type");
+    println!("                                conventions of the dedicated verbs.");
+    println!("    [--trusted-keys PATH]          JSON file of allowlisted base64 pubkeys (also reads HESO_TRUSTED_KEYS env)");
+    println!("    [--require-tsa]                Reject receipts/sealed plats without a valid TSA timestamp");
+    println!("    [--tsa-trusted-roots PATH]     PEM bundle of trusted timestamp-authority roots");
+    println!("  heso info <file> [<file2>]    Human summary of a single artifact, or a diff between two");
+    println!("                                files (plats, sealed plats, receipts, fingerprints, templates).");
+    println!("    [--format json|text]           Output shape (default text)");
+    println!("    [--hash-only]                  Print just the content hash, nothing else");
+    println!("  heso seal   <file> [--key PATH]");
+    println!("                                Wrap a plat in an Ed25519 envelope (default key: heso-local-data/identity.key).");
+    println!("  heso unseal <file> [--extract]");
+    println!("                                Verify a sealed envelope. With --extract, also write the inner plat to stdout.");
+    println!("                                Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
+    println!("  heso registry <publish|pull|list|search> [args...]");
+    println!("                                Public plat ecosystem and web search, behind one dispatcher.");
+    println!("    publish <plat-file> -d \"...\" [-t \"tag1,tag2\"]   Upload a stamped plat to heso.ca/ecosystem.");
+    println!("    pull    <plat-hash> [-o PATH]                   Download a published plat by its 64-char BLAKE3 hash.");
+    println!("    list    [-q ...] [-t ...] [--sort ...] [--limit N]   Browse the public plat registry.");
+    println!("    search  <query> [--limit N] [--engines ddg,wiki,searxng] [--searx-url URL]");
+    println!("                                                    Multi-source web search: DDG HTML + Wikipedia summary.");
+    println!("                                                    Pure HTTP + HTML — no JS engine spin-up, no API key.");
+    println!("  heso update [--dry-run]       Update every detected global heso install channel.");
+    println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
     println!(
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
     );
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
-    println!("See state.json + decisions/0012-fetch-only-native-engine.md (static engine) and");
-    println!(
-        "decisions/0014-bundled-quickjs-agent-dom.md (JS engine, in progress) for the design."
-    );
+    println!("See README.md for usage and the full reference at heso.ca/docs.");
 }
 
 fn print_version() {
@@ -578,13 +588,8 @@ async fn cmd_cat(args: &[String]) -> ExitCode {
                 }
             },
             None => {
-                let msg = format!("no element at ref `{want}`");
-                eprintln!("{msg}");
-                let _ = print_json(&serde_json::json!({
-                    "ok": false,
-                    "error": { "kind": "not_found", "message": msg },
-                }));
-                ExitCode::FAILURE
+                eprintln!("no element at ref `{want}`");
+                ExitCode::from(2)
             }
         }
     } else {
@@ -594,12 +599,7 @@ async fn cmd_cat(args: &[String]) -> ExitCode {
                 "content": content,
             })),
             Err(e) => {
-                let msg = format!("cat failed: {e}");
-                eprintln!("{msg}");
-                let _ = print_json(&serde_json::json!({
-                    "ok": false,
-                    "error": { "kind": "not_found", "message": msg },
-                }));
+                eprintln!("cat failed: {e}");
                 ExitCode::FAILURE
             }
         }
@@ -2448,14 +2448,7 @@ fn detect_infinite_scroll_signals(html: &str) -> Vec<String> {
 pub(crate) struct ScrollSummary {
     iterations: usize,
     stop_reason: &'static str,
-    /// Virtual-clock milliseconds the loop advanced through. Stable
-    /// across runs in deterministic mode and the value `plat_hash`
-    /// commits to.
-    elapsed_ms: u64,
-    /// Wall-clock milliseconds the loop actually spent. Diagnostic
-    /// only; varies with the host's network + scheduler.
-    #[serde(rename = "wall_elapsed_ms_unsafe")]
-    wall_elapsed_ms: u128,
+    elapsed_ms: u128,
     final_content_hash: String,
 }
 
@@ -2515,17 +2508,12 @@ pub(crate) fn run_auto_scroll_loop(
     console: &mut Vec<heso_engine_js::ConsoleEntry>,
     post_html: &mut String,
 ) -> ScrollSummary {
-    let virtual_start_ms = session.engine().virtual_now_ms();
     let start = std::time::Instant::now();
     if !lazy_hints.more_content_likely {
         return ScrollSummary {
             iterations: 0,
             stop_reason: "no_lazy_content",
-            elapsed_ms: session
-                .engine()
-                .virtual_now_ms()
-                .saturating_sub(virtual_start_ms),
-            wall_elapsed_ms: start.elapsed().as_millis(),
+            elapsed_ms: start.elapsed().as_millis(),
             final_content_hash: html_snapshot_key(post_html),
         };
     }
@@ -2599,11 +2587,7 @@ pub(crate) fn run_auto_scroll_loop(
     ScrollSummary {
         iterations,
         stop_reason,
-        elapsed_ms: session
-            .engine()
-            .virtual_now_ms()
-            .saturating_sub(virtual_start_ms),
-        wall_elapsed_ms: start.elapsed().as_millis(),
+        elapsed_ms: start.elapsed().as_millis(),
         final_content_hash: html_snapshot_key(post_html),
     }
 }
@@ -3501,105 +3485,77 @@ pub(crate) fn normalize_ref(s: &str) -> String {
 /// Render a [`TargetError`] to stderr (with the candidate JSON when
 /// ambiguous) and return the right [`ExitCode`]. Single source of
 /// truth for the locator-failure user experience across all three
-/// write verbs. Also emits a structured JSON envelope on stdout so
-/// scripts that parse the verb's normal JSON output have a
-/// consistent failure shape to branch on.
+/// write verbs.
 fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
-    let (kind, human, extra): (&str, String, serde_json::Value) = match &err {
-        TargetError::NeitherRefNorLocator => (
-            "usage",
-            format!(
+    match err {
+        TargetError::NeitherRefNorLocator => {
+            eprintln!(
                 "{op_name}: need either an `@e<N>` ref OR one of --text/--selector/--aria-label"
-            ),
-            serde_json::Value::Null,
-        ),
-        TargetError::RefAndLocatorMixed => (
-            "usage",
-            format!(
+            );
+            ExitCode::from(2)
+        }
+        TargetError::RefAndLocatorMixed => {
+            eprintln!(
                 "{op_name}: cannot combine an `@e<N>` ref with --text/--selector/--aria-label"
-            ),
-            serde_json::Value::Null,
-        ),
-        TargetError::UnknownRef(want) => (
-            "unknown_ref",
-            format!("no element at ref `{want}`"),
-            serde_json::json!({ "ref": want }),
-        ),
-        TargetError::BadSelector { selector, message } => (
-            "bad_selector",
-            format!("invalid --selector `{selector}`: {message}"),
-            serde_json::json!({ "selector": selector, "reason": message }),
-        ),
+            );
+            ExitCode::from(2)
+        }
+        TargetError::UnknownRef(want) => {
+            eprintln!("no element at ref `{want}`");
+            ExitCode::from(2)
+        }
+        TargetError::BadSelector { selector, message } => {
+            eprintln!("invalid --selector `{selector}`: {message}");
+            ExitCode::from(2)
+        }
         TargetError::NoMatch {
             text,
             css_selector,
             aria_label,
-        } => (
-            "no_match",
-            format!(
+        } => {
+            eprintln!(
                 "no element matched locator {}",
-                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
-            ),
-            serde_json::json!({
-                "locator": {
-                    "text": text,
-                    "selector": css_selector,
-                    "aria_label": aria_label,
-                }
-            }),
-        ),
+                format_locator(
+                    text.as_deref(),
+                    css_selector.as_deref(),
+                    aria_label.as_deref()
+                )
+            );
+            ExitCode::from(2)
+        }
         TargetError::Ambiguous {
             text,
             css_selector,
             aria_label,
             candidates,
-        } => (
-            "ambiguous",
-            format!(
-                "ambiguous: {} elements matched locator {}",
-                candidates.len(),
-                format_locator(text.as_deref(), css_selector.as_deref(), aria_label.as_deref())
-            ),
-            serde_json::json!({
-                "locator": {
-                    "text": text,
-                    "selector": css_selector,
-                    "aria_label": aria_label,
-                },
-                "candidates": candidates,
-            }),
-        ),
-    };
-    eprintln!("{human}");
-    if let TargetError::Ambiguous { candidates, .. } = &err {
-        eprintln!("candidates (use one of these refs):");
-        for c in candidates {
-            let name = c.name.as_deref().unwrap_or("");
-            let snippet = if name.chars().count() > 80 {
-                let mut s: String = name.chars().take(80).collect();
-                s.push('…');
-                s
-            } else {
-                name.to_owned()
-            };
-            eprintln!("  {} ({} {}) \"{}\"", c.ref_id, c.role, c.tag, snippet);
-        }
-    }
-    let mut envelope = serde_json::json!({
-        "ok": false,
-        "error": { "kind": kind, "message": human },
-    });
-    if !extra.is_null() {
-        if let Some(obj) = envelope.as_object_mut() {
-            if let Some(extra_obj) = extra.as_object() {
-                for (k, v) in extra_obj {
-                    obj.insert(k.clone(), v.clone());
-                }
+        } => {
+            let n = candidates.len();
+            eprintln!(
+                "ambiguous: {n} elements matched locator {}",
+                format_locator(
+                    text.as_deref(),
+                    css_selector.as_deref(),
+                    aria_label.as_deref()
+                )
+            );
+            eprintln!("candidates (use one of these refs):");
+            for c in &candidates {
+                // Single-line candidate: `<ref> <role> <tag> "<name>"`.
+                // Cap snippet to 80 chars so a long button label
+                // doesn't blow up terminal width.
+                let name = c.name.as_deref().unwrap_or("");
+                let snippet = if name.chars().count() > 80 {
+                    let mut s: String = name.chars().take(80).collect();
+                    s.push('…');
+                    s
+                } else {
+                    name.to_owned()
+                };
+                eprintln!("  {} ({} {}) \"{}\"", c.ref_id, c.role, c.tag, snippet);
             }
+            ExitCode::from(2)
         }
     }
-    let _ = print_json(&envelope);
-    ExitCode::from(2)
 }
 
 /// Render the supplied locator filters back as a `{k: "v"}`-ish blob
@@ -4966,23 +4922,6 @@ async fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-
-    // If the input plat claims a top-level `plat_hash`, recompute it
-    // against the canonical bytes of the rest of the body and refuse
-    // to replay a body whose claim is already false. Bare plans and
-    // fingerprints have no `plat_hash` and skip the check.
-    if let Some(embedded_val) = value.get("plat_hash") {
-        if let Some(embedded) = embedded_val.as_str() {
-            let recomputed = heso_engine_fetch::plat_hash(&value);
-            if embedded != recomputed {
-                eprintln!(
-                    "plat_hash mismatch: input claims {embedded}, computed {recomputed}; run `heso verify` for details"
-                );
-                return ExitCode::from(2);
-            }
-        }
-    }
-
     let plan = match extract_plan(&value) {
         Ok(p) => p,
         Err(e) => {
@@ -5095,9 +5034,9 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
         eprintln!("usage: heso replay [--plan] <plat.plat|plat-hash|->");
         eprintln!();
         eprintln!("Emits the recorded step log from a plat without re-executing.");
-        eprintln!("With --plan, emits the plat's `plan` field instead (same JSON shape");
-        eprintln!("`heso unpack` returns). To re-execute the plan against the plat's");
-        eprintln!("cassette, use `heso run`.");
+        eprintln!("With --plan, emits the plat's `plan` field as standalone JSON —");
+        eprintln!("edit it and pipe back into `heso stamp` to re-mint a fresh plat.");
+        eprintln!("To re-execute the plan against the plat's cassette, use `heso run`.");
         return ExitCode::from(2);
     }
     let mut plan_only = false;
@@ -5788,6 +5727,7 @@ async fn main() -> ExitCode {
         Some("cat") => cmd_cat(&args[1..]).await,
         Some("find") => cmd_find(&args[1..]).await,
         Some("meta") => cmd_meta(&args[1..]).await,
+        Some("search") => search::cmd_search(&args[1..]).await,
         Some("open") => run_with_single_verb_timeout("open", cmd_open(&args[1..])).await,
         Some("read") => run_with_single_verb_timeout("read", cmd_read(&args[1..])).await,
         Some("batch") => batch::cmd_batch(&args[1..]).await,
@@ -5809,7 +5749,6 @@ async fn main() -> ExitCode {
         Some("seal") => cmd_seal::cmd_seal(&args[1..]).await,
         Some("unseal") => cmd_unseal::cmd_unseal(&args[1..]).await,
         Some("registry") => registry::cmd_registry(&args[1..]).await,
-        Some("search") => search::cmd_search(&args[1..]).await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             print_banner();
