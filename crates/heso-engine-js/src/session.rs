@@ -384,11 +384,10 @@ impl JsSession {
 
     /// Apply `(name, value)` field overrides to the form at `selector`,
     /// then submit. Combines `fill`-by-name with `submit` into one
-    /// in-process call — fixes the agent UX gap filed as `R2`/`F2` in
-    /// `agent regression testing` ("fill doesn't persist across verbs, so
-    /// the typed value never reaches submit"). Field overrides are keyed
-    /// by the input's `name` attribute (the WHATWG "successful control"
-    /// key), not by `@eN` action-graph ref.
+    /// in-process call so a typed value reaches submission without
+    /// needing the caller to persist DOM state across separate verbs.
+    /// Field overrides are keyed by the input's `name` attribute (the
+    /// WHATWG "successful control" key), not by `@eN` action-graph ref.
     ///
     /// File inputs are skipped (they can't have their value set from a
     /// string — full file upload lands with `FormData`/`Blob` plumbing,

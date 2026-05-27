@@ -96,6 +96,7 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use rquickjs::{
+    atom::PredefinedAtom,
     class::Trace,
     prelude::{Opt, This},
     Array, Class, Context, Ctx, Error as JsError, Exception, Function, JsLifetime, Object, Value,
@@ -221,8 +222,8 @@ impl DOMException {
     /// impl so Rust code and JS land print the same bytes.
     ///
     /// [`Display`]: std::fmt::Display
-    #[allow(clippy::inherent_to_string_shadow_display)]
-    fn to_string(&self) -> String {
+    #[qjs(rename = PredefinedAtom::ToString)]
+    fn to_string_method(&self) -> String {
         format!("{self}")
     }
 }

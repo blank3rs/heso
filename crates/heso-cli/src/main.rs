@@ -3764,28 +3764,28 @@ where
                 "value": outcome.value,
                 "console": outcome.console,
             });
-            // Bug A fix: when the clicked element is an `<a href>`,
-            // also resolve the href against the page URL, fetch the
-            // destination, and surface the destination page on the
-            // response. Today's behavior was to return `value: true`
-            // and leave the agent staring at the same page — every
-            // multi-step navigation chain hit this footgun (HN,
-            // GitHub, Stripe, lobste.rs). For non-anchor clicks
-            // (button, form-submit-button, JS-only handler) we leave
-            // the response shape alone — `submit` is the right tool
-            // for forms; pure JS handlers may not navigate at all.
+            // When the clicked element is an `<a href>`, resolve the
+            // href against the page URL, fetch the destination, and
+            // surface the destination page on the response — multi-
+            // step navigation chains (HN, GitHub, Stripe, lobste.rs)
+            // need this to make forward progress. For non-anchor
+            // clicks (button, form-submit-button, JS-only handler)
+            // the response shape is left alone — `submit` is the
+            // right tool for forms; pure JS handlers may not
+            // navigate at all.
             //
             // Behavioral notes:
             // - Empty href, `href="#"`, and `javascript:` URLs are
             //   skipped (no real navigation to perform).
-            // - `target="_blank"` etc. are ignored — we follow the
-            //   href in-process regardless. Agents don't have window
-            //   semantics; the destination is the destination.
+            // - `target="_blank"` etc. are ignored — the href is
+            //   followed in-process regardless. Agents don't have
+            //   window semantics; the destination is the destination.
             // - If the navigation fetch fails (DNS, TLS, status
-            //   error per the engine's reqwest semantics), we
-            //   surface `navigated: false` with a `nav_error` field
-            //   so the agent can see what happened. The original
-            //   click result (`value: true`, console) is preserved.
+            //   error per the engine's reqwest semantics), the
+            //   response carries `navigated: false` with a
+            //   `nav_error` field so the agent can see what
+            //   happened. The original click result (`value: true`,
+            //   console) is preserved.
             if op_name == "click" && action.tag == "a" {
                 if let Some(dest_url) = follow_anchor_href(&action, &final_url) {
                     body = augment_click_with_destination(body, &engine, &dest_url).await;

@@ -1613,4 +1613,48 @@ mod tests {
             other => panic!("expected Invalid after mutating plat hash, got {other:?}"),
         }
     }
+
+    #[test]
+    fn sign_then_verify_roundtrip_with_anchor_uses_post_anchor_scope() {
+        // When `tsa_anchor` is populated, both sign and verify must
+        // dispatch to PostAnchor so the canonical bytes line up. The
+        // signed payload covers the anchor itself — mutating any field
+        // inside it after signing must invalidate the signature.
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        r.tsa_anchor = Some(sample_anchor());
+        sign_receipt(&key, &mut r);
+        match verify_receipt(&r) {
+            VerifyOutcome::Valid => {}
+            other => panic!("expected Valid for anchored receipt, got {other:?}"),
+        }
+
+        // Mutate a field inside the anchor — verify must reject.
+        if let Some(anchor) = r.tsa_anchor.as_mut() {
+            anchor.gen_time = "2099-01-01T00:00:00Z".into();
+        }
+        match verify_receipt(&r) {
+            VerifyOutcome::Invalid(_) => {}
+            other => panic!("expected Invalid after mutating anchor gen_time, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anchored_signature_does_not_verify_under_preanchor_bytes() {
+        // Belt-and-suspenders: when an anchored receipt is signed under
+        // PostAnchor, recomputing the bytes under PreAnchor (which nulls
+        // out tsa_anchor) MUST yield bytes that fail signature
+        // verification — confirming the scope choice in verify_receipt
+        // is load-bearing, not cosmetic.
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        r.tsa_anchor = Some(sample_anchor());
+        sign_receipt(&key, &mut r);
+        let sig = r.signature.as_ref().expect("just signed").clone();
+        let pre_bytes = canonical_receipt_bytes(&r, SignatureScope::PreAnchor);
+        assert!(
+            sig.verify(&pre_bytes).is_err(),
+            "PostAnchor signature must not verify against PreAnchor bytes",
+        );
+    }
 }

@@ -741,11 +741,9 @@ impl JsEngine {
         crate::url_search_params::install_url(&context)?;
 
         // Install `Blob`, `File`, `Headers`, `FormData` globals
-        // (WHATWG File API §3-4, Fetch §5, XHR §5). Closes the gap
-        // documented in `agent regression testing` task F1 + "Top NEW
-        // bugs" item 4: file uploads and modern fetch() patterns were
-        // dead because these four constructors were undefined. See
-        // [`crate::web_apis`].
+        // (WHATWG File API §3-4, Fetch §5, XHR §5). File uploads and
+        // modern `fetch()` patterns assume these four constructors
+        // are defined. See [`crate::web_apis`].
         crate::web_apis::install_web_apis(&context)?;
 
         // Optional: install the `fetch` global.
@@ -1177,12 +1175,13 @@ impl JsEngine {
         // observe `drained == 0` and exit while a Promise nobody
         // settles still waits on the queued-but-undrained fetch.
         //
-        // After agent regression testing flagged this as silent-null:
-        // `await heso.flush()` + later `await fetch(...)` returned
-        // `null` because `heso.flush()` is `Promise.resolve()`, and
-        // every subsequent `await fetch(...)` lands in this same
-        // microtask-after-pump trap. The fix is symmetric — pump
-        // first, then drain, then loop until both report idle.
+        // `await heso.flush()` (which is `Promise.resolve()`) followed
+        // by `await fetch(...)` lands in exactly this same
+        // microtask-after-pump shape, so the order has to be
+        // symmetric: pump first, then drain, then loop until both
+        // report idle. Otherwise the fetch returns `null` because the
+        // queue is observed empty before the awaited continuation has
+        // had a chance to enqueue.
         //
         // We track whether each iteration did work; the loop only
         // exits when an iteration produced zero drained fetches AND
@@ -2207,9 +2206,9 @@ impl Drop for JsEngine {
     ///   to decrement an object whose ref count is already zero — a
     ///   classic double-decref.
     ///
-    /// Both reproduced on `https://astro.build/` and
-    /// `https://vercel.com/` before the fix landed — see the
-    /// in-process reproducers at
+    /// Both reproduce on `https://astro.build/` and
+    /// `https://vercel.com/` without the host-side cleanup below — see
+    /// the in-process reproducers at
     /// `crates/heso-engine-js/tests/engine_drop_reproducer.rs`.
     ///
     /// ## The upstream-known root cause
@@ -2223,9 +2222,9 @@ impl Drop for JsEngine {
     /// minimal repro is one statement:
     /// `document.querySelectorAll("span").values().find(e => false)`.
     ///
-    /// ## How the fix is layered
+    /// ## How teardown is layered
     ///
-    /// The complete fix has two parts:
+    /// Teardown lives in two places:
     ///
     /// 1. The `rquickjs/disable-assertions` feature in
     ///    `crates/heso-engine-js/Cargo.toml` compiles QuickJS with
@@ -4080,10 +4079,8 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     // when `self` is undefined the script throws on line 1 and the
     // rest of hydration never runs.  Same goes for `frames`, `parent`,
     // and `top` — top-level pages alias them to the window itself.
-    //
-    // V2 agent finding F3 saw 49 inline scripts on nextjs.org error
-    // with `ReferenceError: self is not defined`; this one-liner is
-    // the fix.  See agent regression testing (commit 039d006).
+    // Aliasing them to `globalThis` is enough for hydration on
+    // Next.js / nextjs.org-style inline scripts to find them.
     // -------------------------------------------------------------
 
     // `self` — WindowOrWorkerGlobalScope.self: returns the global object.
@@ -4685,7 +4682,6 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     // than racing against the first chunk's fallback assignment.
     // Both shapes are observed on supabase.com / stripe.com / any
     // Next.js Turbopack site that ships a webpack-style chunk loader.
-    // V7 agent run flagged `_N_E is not defined` on both sites.
     // -------------------------------------------------------------
     if (typeof globalThis.webpackChunk_N_E === 'undefined') {
         globalThis.webpackChunk_N_E = [];
@@ -4711,12 +4707,9 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     // once), the install-time inline scripts have already run by the
     // time later `$RC` / `$RX` / `$RB` references fire, and any that
     // reference symbols the installer hadn't published yet throw
-    // ReferenceError.
-    //
-    // V7 agent run on nextjs.org saw 13× `$RC is not defined`, 1×
-    // `$RB is not defined`, and 3× `$RX is not defined` — the page
-    // still hydrated (the Turbopack chunks already ran), but the
-    // streaming-reveal noise was the dominant remaining error class.
+    // ReferenceError.  On a streaming-hydration page like nextjs.org,
+    // `$RC` / `$RB` / `$RX` reads dominate the streaming-reveal noise
+    // class if these defensive stubs aren't installed.
     //
     // Spec source (verified against facebook/react main, MIT, file
     // `packages/react-dom-bindings/src/server/fizz-instruction-set/
@@ -4856,12 +4849,10 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
     // `$RV` should never fire from our code path.  But the
     // upgrade-to-view-transitions install script (a separate inline
     // emitted on view-transition pages) references `$RV` directly to
-    // wrap it for batching.  V7 agent run on nextjs.org saw 1×
-    // `$RV is not defined` after $RC/$RX were installed; observing
-    // that error before this stub was added confirmed Fizz emits a
-    // bare `$RV` read at boundary-group end.  The function takes a
-    // batch array and reveals it; for us that means draining the
-    // batch (we already did the work in $RC).
+    // wrap it for batching, and the boundary-group end emits a bare
+    // `$RV` read against the global.  The function takes a batch
+    // array and reveals it; for us that means draining the batch
+    // (we already did the work in $RC).
     if (typeof globalThis.$RV !== 'function') {
         globalThis.$RV = function $RV(batch) {
             if (batch && typeof batch.length === 'number') {

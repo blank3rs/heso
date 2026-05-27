@@ -1094,12 +1094,8 @@ impl Document {
     // time (each getter walks the tree and returns a plain Vec) for
     // the same reason `getElementsByTagName` does: real pages iterate
     // immediately, and re-reading the property produces an up-to-date
-    // snapshot anyway.
-    //
-    // Bug-of-record: V2 agent findings reported all five accessors
-    // return `undefined`, blocking the common scraping idiom of
-    // `Array.from(document.forms).filter(...)`. See agent regression testing
-    // "Bonus findings" + "Top NEW bugs" #6.
+    // snapshot anyway. Returning a Vec is what makes the common
+    // scraping idiom `Array.from(document.forms).filter(...)` work.
 
     /// `document.scripts` — array of every `<script>` element in the
     /// document, in document order.
@@ -3095,12 +3091,6 @@ impl Element {
     // `<input>` (`value`, `checked`) — Element is one shared Rust
     // type and the tag check sorts out which behaviors apply.
     //
-    // Bug-of-record: prior to this getter, `anchor.href` returned
-    // `undefined`, forcing every Playwright migration to fall back to
-    // `anchor.getAttribute('href')` (which, unlike `.href`, does NOT
-    // resolve relative URLs). See `agent regression testing` (commit
-    // `2cebf12`) for the original bug report.
-    //
     // Spec: <https://html.spec.whatwg.org/multipage/links.html#htmlhyperlinkelementutils>.
 
     /// `anchor.href` IDL getter per WHATWG HTML §4.6.6.
@@ -3114,12 +3104,9 @@ impl Element {
     /// 4. If parsing fails, fall back to the raw attribute value (the
     ///    spec's behavior when the URL record is unset).
     ///
-    /// **The reason this method exists:** the agent-driven HN
-    /// extraction test (May 2026) discovered `a.href` returned a
-    /// falsy value where it should have returned the resolved URL,
-    /// breaking every Playwright snippet that assumes `a.href` is the
-    /// canonical absolute string. `getAttribute('href')` was the
-    /// workaround; the real fix is here.
+    /// Unlike `getAttribute('href')`, this getter returns the resolved
+    /// absolute URL — which is what every Playwright snippet relying
+    /// on `a.href` assumes.
     #[qjs(get)]
     fn href<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<String> {
         let (doc, node_id) = {
@@ -3434,12 +3421,10 @@ impl Element {
     // here — the generic Element `.name` getter (further up) already
     // does attribute reflection that matches the form's `name` IDL.
     //
-    // Bug-of-record: prior to this batch, `form.method` / `form.action`
-    // / `form.enctype` all returned `undefined`, forcing scrapers to
-    // use `form.getAttribute(...)` (which doesn't normalize per spec).
-    // Sibling fix to the HTMLAnchorElement.href mixin landed in commit
-    // `17ddf77`. See `agent regression testing` "Bonus findings" + "Top NEW
-    // bugs" #3 for the original report.
+    // Unlike `form.getAttribute(...)`, these getters apply the spec's
+    // normalization (e.g. `method` lowercases and clamps to
+    // `get`/`post`/`dialog`; `action` resolves against the document
+    // base URL).
     //
     // Spec: <https://html.spec.whatwg.org/multipage/forms.html#the-form-element>.
 
@@ -3734,10 +3719,6 @@ impl Element {
     ///   client (`JsEngine::new()` rather than
     ///   `JsEngine::new_with_fetch`) — matches the spec's "no
     ///   browsing context" branch.
-    ///
-    /// Bug-of-record: V2 agent findings reported `form.submit()`
-    /// throws `TypeError: not a function`. After this PR it
-    /// dispatches a real HTTP request.
     fn submit<'js>(this: This<Class<'js, Self>>, ctx: Ctx<'js>) -> rquickjs::Result<()> {
         let (doc, node_id) = {
             let borrowed = this.0.borrow();
