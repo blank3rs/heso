@@ -105,19 +105,9 @@ pub mod wait_for;
 pub mod web_apis;
 pub mod xhr;
 
-pub use dom::{Document, DomTokenList, Element, ShadowRoot};
+pub use dom::Document;
 pub use engine::{ConsoleEntry, ConsoleLevel, EvalError, EvalOutcome, JsEngine};
-pub use events::{
-    AbortController, AbortSignal, CustomEvent, DOMException, Event, EventTarget, FocusEvent,
-    InputEvent, KeyboardEvent, MouseEvent, PointerEvent, UIEvent, WheelEvent,
-};
 pub use fetch::FetchMode;
-pub use import_map::{parse_import_map, ImportMap, ImportMapError};
-pub use modules::{HttpFetcher, HttpLoader, HttpResolver, ModuleCache, SharedImportMap};
-pub use rng::SeededRng;
 pub use scripts::{ScriptFailure, ScriptFetchPolicy, ScriptOutcome};
 pub use session::JsSession;
-pub use timers::VirtualClock;
-pub use url_search_params::{UrlClass, UrlSearchParamsClass};
 pub use wait_for::{wait_for_on_engine, WaitCondition, WaitOutcome};
-pub use web_apis::{Blob, File, FormData, Headers};

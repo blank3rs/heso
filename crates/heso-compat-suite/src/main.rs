@@ -281,10 +281,6 @@ const TARGETS: &[Target] = &[
     // robust whether or not JS hydration completes. `js_fetch: true` lets
     // the in-JS `fetch()` global resolve external <script> tags so the
     // framework code actually executes.
-    //
-    // TODO: follow-up — once we trust JS hydration end-to-end, add a
-    // second probe per framework that asserts on the hydrated `.new-todo`
-    // input or the framework's mounted DOM nodes.
     Target {
         name: "TodoMVC Preact",
         category: "spa",

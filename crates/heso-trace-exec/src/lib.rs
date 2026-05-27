@@ -300,8 +300,8 @@ mod tests {
     }
 
     // A test engine whose pages report a known body text so the runner
-    // can hash it into `pages_seen`. Mirrors the shape any real engine
-    // (`FetchEngine`, future Servo / CDP engines) takes.
+    // can hash it into `pages_seen`. Mirrors the shape `FetchEngine`
+    // exposes through `heso-engine-api`.
     struct TextEngine;
     struct TextPage(Url, &'static str);
 

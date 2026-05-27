@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Internal primitives layer — the ~12 operations the planner emits and the trace runner executes (ADR 0009)."
+description = "Internal primitive-operation types shared between the trace runner and the engine. Scheduled for deletion as part of the ADR 0017 phase-2 cleanup; new code should consume `heso-core` and `heso-engine-fetch` directly."
 
 [dependencies]
 heso-core = { path = "../heso-core" }

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "The EngineApi trait — the swappable boundary between heso and any underlying browser engine."
+description = "Minimal EngineApi trait the CLI dispatches through. Currently a thin abstraction over the single native fetch engine (`heso-engine-fetch`); scheduled for deletion in the ADR 0017 phase-2 cleanup once `heso-cli` moves to direct calls."
 
 [dependencies]
 heso-core = { path = "../heso-core" }

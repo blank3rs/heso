@@ -1113,6 +1113,19 @@ impl JsEngine {
             .pending_count()
     }
 
+    /// Current virtual-clock reading in milliseconds — the same value
+    /// that backs `Date.now()`, `performance.now()`, and the
+    /// `VirtualClock` `setTimeout` queue. Use this (not `Instant::now`)
+    /// whenever the value will be written into the canonical output
+    /// of a deterministic verb so the result stays byte-identical
+    /// across runs.
+    pub fn virtual_now_ms(&self) -> u64 {
+        self.timers
+            .lock()
+            .expect("timer scheduler poisoned")
+            .now_ms()
+    }
+
     /// Drain every pending `fetch()` call: dispatch the HTTP request
     /// through the engine's shared `reqwest::Client`, resolve (or
     /// reject) the Promise that `fetch()` returned, then loop until

@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Trace runner — executes a Trace against an EngineApi-backed primitives layer and produces a Receipt."
+description = "Trace runner used by `heso open --receipt`: walks a Trace, drives the engine, and produces a signed Receipt. Scheduled for deletion in the ADR 0017 phase-2 cleanup once receipt minting moves into `heso-cli` directly."
 
 [dependencies]
 heso-core = { path = "../heso-core" }

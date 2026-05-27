@@ -1,49 +1,19 @@
 //! # heso-primitives
 //!
-//! The **internal** primitives layer — a small, fixed set of operations the
-//! planner emits and the trace runner executes against an [`EngineApi`]
-//! instance. **Agents never see this crate.** They see one tool: `heso.run`.
-//!
-//! ## Mental model: the page is a directory
-//!
-//! Per [ADR 0010], heso models a browsing session like a Unix shell. The
-//! current page is the *working directory*. Elements on the page are *files*.
-//! Navigation is `cd`. Listing children is `ls`. Reading is `cat`. Writing is
-//! `echo`. Cookies and Web Storage live under `/env/`.
-//!
-//! This shape gives the planner (and the LLMs that *trained on* shell sessions)
-//! a strong prior for what each primitive does, and gives the agent a clear
-//! sense of *where it is* and *what's around it* at every step of a trace.
-//!
-//! ## Command reference
-//!
-//! | Op | Terminal analogue | Purpose |
-//! |---|---|---|
-//! | [`PrimitiveOp::Pwd`] | `pwd`        | Current URL + page title |
-//! | [`PrimitiveOp::Ls`]  | `ls [path]`  | List interactable elements (or virtual env contents) |
-//! | [`PrimitiveOp::Cd`]  | `cd <target>`| Navigate by URL or by clicking a link |
-//! | [`PrimitiveOp::Cat`] | `cat <path>` | Read element text or env value |
-//! | [`PrimitiveOp::Find`]| `find -<pred>`| Locate elements matching a predicate |
-//! | [`PrimitiveOp::Grep`]| `grep <re>`  | Regex-search page text |
-//! | [`PrimitiveOp::Echo`]| `echo v > p` | Write a value (field / cookie / storage) |
-//! | [`PrimitiveOp::Rm`]  | `rm <path>`  | Clear / delete (field / cookie / storage) |
-//! | [`PrimitiveOp::Click`]| (no direct) | Interact with a non-navigating element |
-//! | [`PrimitiveOp::Submit`]| (no direct)| Submit a form |
-//! | [`PrimitiveOp::Wget`]| `wget <url>` | Fetch URL or element resource as bytes |
-//! | [`PrimitiveOp::Wait`]| (no direct)  | Block until a condition holds |
-//! | [`PrimitiveOp::Screenshot`]| (no direct) | Capture viewport PNG |
-//! | [`PrimitiveOp::Eval`]| `sh -c <src>`| Execute JS in the page context (escape hatch) |
-//! | [`PrimitiveOp::Diff`]| `diff a b`   | Diff two snapshots |
+//! Internal primitive-operation enum + AST that the trace runner
+//! (`heso-trace-exec`) walks when minting a receipt. Carried over from
+//! the earlier planner-emits-AST design; the agent surface today is the
+//! verbs in `heso-cli` directly (see [ADR 0017]). The only primitive
+//! [`PrimitiveOp::Cd`] is wired through to [`EngineApi::open`]; every
+//! other variant returns [`Error::NotImplemented`].
 //!
 //! ## Status
 //!
-//! Skeleton. The op AST and types are complete and round-trip through JSON.
-//! Execution: [`cd`] delegates to [`EngineApi::open`] for URL navigation; the
-//! other primitives return [`Error::NotImplemented`] until T-013 grows the
-//! engine surface and T-014 / T-015 / T-017 land the determinism preconditions
-//! (software rendering, fake clock, network record/replay).
+//! Slated for deletion in the ADR 0017 phase-2 cleanup. New code should
+//! not depend on these types; the receipt-minting path will be folded
+//! into `heso-cli` directly.
 //!
-//! [ADR 0010]: ../../decisions/0010-primitives-as-terminal-commands.md
+//! [ADR 0017]: ../../decisions/0017-verbs-as-agent-surface.md
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

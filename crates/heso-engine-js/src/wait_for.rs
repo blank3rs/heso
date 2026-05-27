@@ -114,8 +114,17 @@ impl WaitCondition {
 pub struct WaitOutcome {
     /// Whether the condition was satisfied before timeout.
     pub ok: bool,
-    /// Wall-clock duration the wait actually took, in milliseconds.
+    /// Virtual-clock duration the wait covered, in milliseconds.
+    /// Reads the same `VirtualClock` that backs `Date.now()` and
+    /// `setTimeout`, so this value is byte-identical across runs in
+    /// deterministic mode and is what `to_json` writes into the
+    /// canonical envelope.
     pub elapsed_ms: u64,
+    /// Wall-clock duration the wait actually took, in milliseconds.
+    /// Real time spent in the loop. Diagnostic only — not stable
+    /// across runs and so written into the envelope under a
+    /// `_unsafe` suffix.
+    pub wall_elapsed_ms: u64,
     /// Stable label for the condition (see [`WaitCondition::label`]).
     pub condition: String,
     /// `"timeout"` when [`Self::ok`] is `false`; `None` on success.
@@ -123,19 +132,21 @@ pub struct WaitOutcome {
 }
 
 impl WaitOutcome {
-    fn ok(elapsed: Duration, condition: &str) -> Self {
+    fn ok(virtual_elapsed_ms: u64, wall_elapsed: Duration, condition: &str) -> Self {
         Self {
             ok: true,
-            elapsed_ms: ms_from_duration(elapsed),
+            elapsed_ms: virtual_elapsed_ms,
+            wall_elapsed_ms: ms_from_duration(wall_elapsed),
             condition: condition.to_owned(),
             error: None,
         }
     }
 
-    fn timeout(elapsed: Duration, condition: &str) -> Self {
+    fn timeout(virtual_elapsed_ms: u64, wall_elapsed: Duration, condition: &str) -> Self {
         Self {
             ok: false,
-            elapsed_ms: ms_from_duration(elapsed),
+            elapsed_ms: virtual_elapsed_ms,
+            wall_elapsed_ms: ms_from_duration(wall_elapsed),
             condition: condition.to_owned(),
             error: Some("timeout".to_owned()),
         }
@@ -146,6 +157,7 @@ impl WaitOutcome {
         let mut body = serde_json::json!({
             "ok": self.ok,
             "elapsed_ms": self.elapsed_ms,
+            "wall_elapsed_ms_unsafe": self.wall_elapsed_ms,
             "condition": self.condition,
         });
         if let Some(err) = self.error.as_deref() {
@@ -178,7 +190,11 @@ pub fn wait_for_on_engine(
     tick_ms: u64,
 ) -> Result<WaitOutcome, EvalError> {
     let label = condition.label();
-    let start = Instant::now();
+    let virtual_start_ms = engine.virtual_now_ms();
+    // Wall clock is for cancellation only — a `--timeout 30s` flag
+    // means 30 s of real time before we give up, regardless of how
+    // many virtual ms the engine advanced through hydration.
+    let wall_start = Instant::now();
 
     // TimeElapsed is special: it's a deterministic clock advance, not
     // a wall-clock wait. We jump the virtual clock by the full
@@ -187,14 +203,16 @@ pub fn wait_for_on_engine(
     if let WaitCondition::TimeElapsed { duration_ms } = condition {
         engine.advance_clock(*duration_ms)?;
         engine.run_pending_jobs()?;
-        return Ok(WaitOutcome::ok(start.elapsed(), &label));
+        let virtual_elapsed = engine.virtual_now_ms().saturating_sub(virtual_start_ms);
+        return Ok(WaitOutcome::ok(virtual_elapsed, wall_start.elapsed(), &label));
     }
 
     // For NetworkIdle we track how long the queue has been empty.
     // The condition is satisfied when the engine has had zero
     // pending fetches AND zero pending timers for a continuous
-    // `idle_window_ms`.
-    let mut idle_since: Option<Instant> = None;
+    // `idle_window_ms`. We track idleness in virtual ms so the
+    // reported elapsed time is deterministic.
+    let mut idle_since_virtual_ms: Option<u64> = None;
 
     let tick = Duration::from_millis(tick_ms.max(1));
 
@@ -223,25 +241,28 @@ pub fn wait_for_on_engine(
             WaitCondition::NetworkIdle { idle_window_ms } => {
                 let pending = engine.pending_fetches() + engine.pending_timers();
                 if pending == 0 {
-                    let since = *idle_since.get_or_insert_with(Instant::now);
-                    since.elapsed() >= Duration::from_millis(*idle_window_ms)
+                    let now_ms = engine.virtual_now_ms();
+                    let since = *idle_since_virtual_ms.get_or_insert(now_ms);
+                    now_ms.saturating_sub(since) >= *idle_window_ms
                 } else {
-                    idle_since = None;
+                    idle_since_virtual_ms = None;
                     false
                 }
             }
             WaitCondition::TimeElapsed { .. } => unreachable!("handled above"),
         };
 
+        let virtual_elapsed = engine.virtual_now_ms().saturating_sub(virtual_start_ms);
+
         if satisfied {
-            return Ok(WaitOutcome::ok(start.elapsed(), &label));
+            return Ok(WaitOutcome::ok(virtual_elapsed, wall_start.elapsed(), &label));
         }
 
         // (5) Timeout check is wall-clock, not virtual. A 30 s wait
         // means 30 s of real time the agent / CI is willing to spend.
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
-            return Ok(WaitOutcome::timeout(elapsed, &label));
+        let wall_elapsed = wall_start.elapsed();
+        if wall_elapsed >= timeout {
+            return Ok(WaitOutcome::timeout(virtual_elapsed, wall_elapsed, &label));
         }
 
         // (6) Sleep until the next tick. We sleep on real wall time
