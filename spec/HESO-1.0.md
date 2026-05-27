@@ -3,7 +3,7 @@
 **Status:** 1.0 (provisional)
 **Date:** 2026-05-26
 **Editor:** Akshay (blank3rs)
-**Reference implementation:** [`heso`](https://github.com/blank3rs/heso) v0.1.0
+**Reference implementation:** [`heso`](https://github.com/blank3rs/heso) v0.1.2
 **License:** CC0 1.0 (spec text) · MIT or Apache-2.0 (reference implementation)
 
 ---
@@ -400,6 +400,7 @@ A receipt is a JSON object. The following table defines the canonical top-level 
 | `failed_at` | number | 0-based index into `trace` of the first op that failed. OMITTED when the run completed without failures. |
 | `error` | string | Human-readable error message from the failed op. OMITTED when the run completed without failures. When `failed_at` is present, `error` MUST also be present. |
 | `signature` | object | Ed25519 signature envelope; see §3.3.3. OMITTED when the receipt is unsigned. An unsigned receipt is legal as an intermediate artifact but MUST NOT be presented as attestation. |
+| `tsa_anchor` | object | RFC 3161 trusted-timestamp anchor; see §3.3.4. OMITTED when the receipt has not been notarized. |
 
 #### §3.3.1 The `cost` object
 
@@ -431,6 +432,22 @@ When present, `signature` MUST be a JSON object with exactly three string fields
 | `signature` | string | Standard base64 of the 64-byte Ed25519 signature. MUST decode to exactly 64 bytes. |
 
 Implementations MUST use standard base64 (alphabet `A-Z a-z 0-9 + /`, padding `=`). Implementations MUST NOT use base64url (`-` / `_`).
+
+#### §3.3.4 The `tsa_anchor` object
+
+When present, `tsa_anchor` MUST be a JSON object with exactly these five string fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `tsa_url` | string | Absolute URL of the RFC 3161 Time-Stamp Authority that issued the token. Informational; verifiers MAY use it to fetch CRL/OCSP for revocation checking but MUST NOT depend on the URL being reachable at verify time. |
+| `hash_alg` | string | Lowercase identifier of the digest algorithm used for the TSA `messageImprint`. MUST be one of `"sha256"`, `"sha384"`, `"sha512"`. Implementations MUST reject any other value when deserializing. |
+| `message_imprint_hex` | string | Lowercase hexadecimal encoding of `HASH_ALG(canonical_receipt_bytes(R_pre))`, where `R_pre` is the receipt with BOTH `signature` and `tsa_anchor` cleared to JSON `null`, then canonicalized per §3.4. Length is 64 / 96 / 128 hex characters for `sha256` / `sha384` / `sha512` respectively. |
+| `token_b64` | string | Standard base64 (RFC 4648 §4, with `=` padding) of the DER-encoded RFC 3161 `TimeStampToken` returned by the TSA. The token is a CMS `ContentInfo` wrapping a `SignedData` (RFC 3161 §2.4.2). The full token bytes are embedded so a receipt is self-contained for offline verification. |
+| `gen_time` | string | ISO 8601 UTC timestamp extracted from the `TSTInfo.genTime` field inside the token. Informational and human-readable; the authoritative time is the field embedded inside the signed token bytes. |
+
+The `tsa_anchor` field participates in `canonical_receipt_bytes(R)` per §3.4 when present. The §3.6 signing payload therefore covers `tsa_anchor` whenever the field is present at signing time. A receipt produced by `notarize` (§4.7) has its Ed25519 signature re-issued after the anchor is attached, so the signature covers the anchor; the TSA's internal `messageImprint`, by contrast, covers the *pre-anchor* canonical bytes (R with both `signature` and `tsa_anchor` cleared). The two cryptographic proofs therefore commit to overlapping but not identical byte strings — this is intentional and load-bearing: the Ed25519 signature attests to the complete receipt including the anchor, while the TSA token attests to the bytes that existed before the anchor was attached.
+
+Implementations MUST emit standard base64 for `token_b64`. Implementations MUST NOT use base64url.
 
 ### §3.4 Canonical bytes
 
@@ -501,6 +518,9 @@ A verifier MUST apply the following checks in order, exiting on the first failur
 6. **Recompute canonical bytes.** Compute `canonical_receipt_bytes(R)` per §3.4 (with `signature` cleared).
 7. **Verify the signature.** Verify the Ed25519 signature over `canonical_receipt_bytes(R)` using the decoded public key. Implementations MUST use the strict verification variant (`verify_strict` per RFC 8032 §8.4).
 8. **Apply the trusted-key allowlist** per §3.9. If an allowlist is configured and `signature.public_key` is not in it, return `INVALID`.
+9. **Apply the `--require-tsa` policy** (verifier-side). If the verifier was invoked with a TSA-required policy (CLI flag, env, or library configuration) and `tsa_anchor` is absent from the receipt, return `INVALID` with a "TSA anchor required but absent" message. When the verifier is not configured to require a TSA anchor, skip this step regardless of whether `tsa_anchor` is present. The `--require-tsa` policy contributes nothing to the signed payload; it is a verifier-side policy layer.
+10. **Verify the TSA token signature** (only when `tsa_anchor` is present). Decode `tsa_anchor.token_b64` as standard base64 to recover the DER-encoded `TimeStampToken` (a CMS `ContentInfo` per RFC 3161 §2.4.2). Verify the token's internal signature using the signing certificate embedded in the token's `SignedData.certificates` field. If a trusted-roots policy is configured (`--tsa-trusted-roots`, equivalent env, or library configuration), additionally verify that the signing certificate chains to one of the configured root CAs per RFC 5280. Any failure returns `INVALID`. When no trusted-roots policy is configured, chain validation MUST be SKIPPED — the token's signature over the imprint is still verified using the embedded certificate, but the certificate is not checked against any external trust store.
+11. **Verify the imprint matches the pre-anchor canonical bytes** (only when `tsa_anchor` is present). Compute `R_pre` by cloning the receipt with both `signature` and `tsa_anchor` cleared to JSON `null`. Compute `expected_imprint = HASH_ALG(canonical_receipt_bytes(R_pre))` where `HASH_ALG` is identified by `tsa_anchor.hash_alg`. The 64/96/128-char lowercase hex of `expected_imprint` MUST equal `tsa_anchor.message_imprint_hex`. Additionally, the `messageImprint` field embedded inside the decoded `TSTInfo` MUST byte-equal `expected_imprint`. Either mismatch is a tamper signal and MUST return `INVALID` with a message that distinguishes the layer that failed (`message_imprint_hex mismatch` vs `TSTInfo messageImprint mismatch`).
 
 If all checks pass, return `VALID`.
 
@@ -521,6 +541,12 @@ The allowlist contributes nothing to the signed payload; it is a verifier-side p
 ### §3.10 Test vectors
 
 The conformance set for §3.4 canonicalization, §3.5 `trace_hash`, and §3.6 signing is reserved for a future revision. Reproducible signature vectors require a fixed Ed25519 keypair generated from a published seed. The same reservation applies to §1.9 V7; the two are tracked together because they share the fixed-keypair infrastructure.
+
+### §3.11 TSA test vectors
+
+The conformance set for §3.3.4 `tsa_anchor` verification is reserved for a future revision. Reproducible TSA-anchored vectors require either (a) a mock TSA producing deterministic `TimeStampToken` bytes for a known input, or (b) a captured exchange against a real TSA pinned to a stored response. The reference implementation's wiremock-backed integration tests in `crates/heso-cli/tests/notarize_round_trip.rs` exercise the full notarize → verify flow ahead of these vectors landing.
+
+When the §3.11 vectors land they will be numbered V1 (valid TSA anchor, sha256), V2 (valid TSA anchor, sha512), and V3 (tampered `token_b64` that MUST fail step 10 of §3.8). The vectors will share `heso-compat-tests` fixture infrastructure with §1.9 V7 and §3.10.
 
 ---
 
@@ -577,7 +603,7 @@ HESO/1.0 anchors trust on signing keys, not on verb names. A plat that uses `com
 
 ### §4.7 Core verb catalog (HESO/1.0)
 
-HESO/1.0 defines 16 core verbs. They divide into **action verbs** (appear in `plan` arrays per §1.4 and are executed by stamping or running a plat) and **tool verbs** (CLI / programmatic operations on plats, cassettes, receipts, and identity).
+HESO/1.0 defines 17 core verbs. They divide into **action verbs** (appear in `plan` arrays per §1.4 and are executed by stamping or running a plat) and **tool verbs** (CLI / programmatic operations on plats, cassettes, receipts, and identity).
 
 #### Action verbs (4)
 
@@ -590,7 +616,7 @@ These are the verbs that MAY appear as Action objects inside a `plan` array. The
 | `fill` | `ref`, `value` | Set the value of the input matching `ref` and fire `input` + `change`. |
 | `submit` | `ref` | Submit the form matching `ref`, serialize per `enctype`, POST, and observe the response. |
 
-#### Tool verbs (12)
+#### Tool verbs (13)
 
 These are HESO/1.0 operations that act on plats, receipts, keys, and conditions. They are not plan-resident; they appear as CLI / programmatic surface.
 
@@ -605,13 +631,14 @@ For each tool verb the spec pins: command-line surface, input shape, top-level o
 | `replay` | Pure observation: extract and emit the `steps` field of a plat. No execution, no network. |
 | `unpack` | Extract and emit the `plan` field of a plat for standalone editing. |
 | `identity-init` | Generate an Ed25519 keypair for signing. CLI surface MAY also expose `identity init` as a two-token subcommand. |
-| `receipt-verify` | Verify a receipt envelope per §3.8, applying the §3.9 allowlist. |
+| `notarize` | Attach an RFC 3161 trusted-timestamp anchor (§3.3.4) to an existing signed receipt by sending `HASH_ALG(canonical_receipt_bytes(R_pre))` to a Time-Stamp Authority and embedding the returned token. Re-signs the receipt with the same Ed25519 key so the signature continues to cover the full body. Refuses unsigned receipts and `mode: live` receipts. |
+| `receipt-verify` | Verify a receipt envelope per §3.8, applying the §3.9 allowlist and the optional §3.8 step 9–11 TSA checks. |
 | `plat-hash` | Recompute and print `lowercase_hex(BLAKE3(canonical_bytes(P)))` for a plat file. Output is plain text (one line). |
 | `plat-verify` | Recompute and compare against the embedded `plat_hash`. Output is plain text (one line). |
 | `plat-seal` | Wrap a plat in a §1.8 Ed25519 envelope. Refuses already-sealed input. |
 | `plat-unseal` | Verify a §1.8 envelope per §1.8. With `--extract`, emit the inner plat body for piping. |
 
-**Output format.** Action verbs and rich tool verbs (`read`, `stamp`, `run`, `replay`, `unpack`, `identity-init`, `plat-seal`, `plat-unseal`) emit JSON on stdout. The utility verbs `plat-hash`, `plat-verify`, and `receipt-verify` emit a single plain-text line for pipe-friendliness (`blake3:<hex>`, `OK blake3:<hex>`, `OK <pubkey>`). Implementations MAY offer a `--json` flag to switch utility verbs to JSON output; HESO/1.0 does not require it.
+**Output format.** Action verbs and rich tool verbs (`read`, `stamp`, `run`, `replay`, `unpack`, `identity-init`, `notarize`, `plat-seal`, `plat-unseal`) emit JSON on stdout. `notarize` emits the updated receipt object — i.e. the input receipt with the new `tsa_anchor` field added and the `signature` field re-issued over the new canonical bytes. The utility verbs `plat-hash`, `plat-verify`, and `receipt-verify` emit a single plain-text line for pipe-friendliness (`blake3:<hex>`, `OK blake3:<hex>`, `OK <pubkey>`). Implementations MAY offer a `--json` flag to switch utility verbs to JSON output; HESO/1.0 does not require it.
 
 **Exit codes.** Across all verbs:
 - `0` — success
@@ -622,7 +649,7 @@ Implementations MAY refine these (for example: distinct codes for "hash mismatch
 
 ### §4.8 Reference-implementation extras
 
-The reference implementation (`heso` v0.1.0) ships additional verbs not part of HESO/1.0: `tree`, `ls`, `cat`, `find`, `meta`, `batch`, `eval-js`, `eval-dom`, `search`, `serve`, `fetch`, `action-hash`, `plat-info`, `plat-diff`, `plat-redact`. These are reference-impl conveniences for agents and operators; they are not required for HESO/1.0 conformance and a second implementation MAY omit them.
+The reference implementation (`heso` v0.1.2) ships additional verbs not part of HESO/1.0: `tree`, `ls`, `cat`, `find`, `meta`, `batch`, `eval-js`, `eval-dom`, `search`, `serve`, `fetch`, `action-hash`, `action-hash-verify`, `refresh`, `plat-info`, `plat-diff`, `plat-redact`. These are reference-impl conveniences for agents and operators; they are not required for HESO/1.0 conformance and a second implementation MAY omit them.
 
 Future revisions of this specification MAY promote individual extras into the core catalog via the §4.5 process.
 

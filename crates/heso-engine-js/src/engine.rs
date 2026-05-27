@@ -34,7 +34,7 @@
 //! and Arrays — class instances (DOM Elements, Response objects, Map,
 //! Set, etc.) flow through unchanged.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use reqwest_cookie_store::CookieStoreMutex;
 use rquickjs::{
@@ -384,6 +384,15 @@ pub(crate) struct XhrState {
     pub(crate) mode: FetchMode,
 }
 
+/// Tracks whether the process-level `TZ=UTC` pin has been applied.
+///
+/// Set once on the first [`JsEngine::new_inner`] call. The pin shapes
+/// QuickJS's Unix-side `localtime_r` behavior (Windows reads the TZ
+/// via `GetTimeZoneInformation` and ignores `TZ` — the JS-side patch
+/// in [`install_date`] carries determinism on both platforms; this
+/// pin is belt-and-suspenders for Unix hosts).
+static UTC_PINNED: Once = Once::new();
+
 impl JsEngine {
     /// Create a fresh engine with conservative resource limits
     /// ([`DEFAULT_MEMORY_LIMIT_BYTES`], [`DEFAULT_MAX_STACK_BYTES`])
@@ -562,6 +571,18 @@ impl JsEngine {
         fetch_mode: Option<FetchMode>,
         cookie_jar: Option<Arc<CookieStoreMutex>>,
     ) -> Result<Self, EvalError> {
+        // Pin the process's effective timezone to UTC so QuickJS's
+        // Unix-side Date code (`localtime_r` → `tm.tm_gmtoff`) sees a
+        // zero offset. On Windows QuickJS reads via
+        // `GetTimeZoneInformation` and ignores `TZ`; the JS-side
+        // patch in [`install_date`] is what carries determinism there
+        // and is the same patch we rely on here too — this line is
+        // belt-and-suspenders for Unix hosts. Done at most once via
+        // [`UTC_PINNED`] because `set_var` mutates process-global
+        // state and we don't want to repeat it on every engine
+        // construction.
+        UTC_PINNED.call_once(|| std::env::set_var("TZ", "UTC"));
+
         let runtime = Runtime::new().map_err(|e| EvalError::Engine(e.to_string()))?;
         runtime.set_memory_limit(DEFAULT_MEMORY_LIMIT_BYTES);
         runtime.set_max_stack_size(DEFAULT_MAX_STACK_BYTES);
@@ -658,10 +679,10 @@ impl JsEngine {
 
         // Determinism shim for the host wall clock: route `Date.now()`
         // and zero-arg `new Date()` through the same `VirtualClock`
-        // that backs `setTimeout` / `setInterval`. Explicit-input forms
-        // (`new Date(ms)`, `new Date(str)`, `new Date(y,m,d,...)`,
-        // `Date.parse`, `Date.UTC`) are pure functions of their inputs
-        // and stay on the QuickJS built-in. See [`install_date`].
+        // that backs `setTimeout` / `setInterval`, and pin the engine's
+        // effective TZ to UTC so `new Date(y,m,d,...)`,
+        // `d.getHours()`, `d.toString()`, etc. produce the same bytes
+        // on every host. See [`install_date`].
         install_date(&context, timers.clone())?;
 
         // Install `globalThis.location` (and a `globalThis.window`
@@ -2963,7 +2984,11 @@ fn install_form_submit_now(
                     // wire-level request still happened (or didn't);
                     // the test asserts via the mock server, not via
                     // a JS-side return value.
-                    let _ = issue_request(&snapshot, &base, &native_client, &native_handle);
+                    let mode = FetchMode::Live {
+                        client: native_client.clone(),
+                        rt_handle: native_handle.clone(),
+                    };
+                    let _ = issue_request(&snapshot, &base, &mode);
                     Ok(())
                 },
             )?;
@@ -3050,12 +3075,12 @@ fn install_console(
 /// 3. **`crypto.randomUUID()`** — returns a v4-format UUID whose 16
 ///    bytes come from the same stream.
 ///
-/// `Date.now` and zero-arg `new Date()` are routed separately by
-/// [`install_date`], which shares the [`VirtualClock`](crate::timers)
-/// backing `setTimeout` / `setInterval`. Explicit-input `Date` forms
-/// (`new Date(ms)`, `new Date(str)`, `new Date(y,m,d,...)`,
-/// `Date.parse`, `Date.UTC`) are pure functions of their inputs and
-/// stay on the QuickJS built-in.
+/// `Date.now`, `new Date()`, and the engine's effective timezone are
+/// routed separately by [`install_date`], which shares the
+/// [`VirtualClock`](crate::timers) backing `setTimeout` /
+/// `setInterval` and pins the effective TZ to UTC so explicit-input
+/// `Date` forms (`new Date(ms)`, `new Date(str)`, `new Date(y,m,d,...)`,
+/// `Date.parse`, `Date.UTC`) produce host-independent bytes.
 fn install_rng(context: &Context, rng: SeededRng) -> Result<(), EvalError> {
     context
         .with(|ctx| -> rquickjs::Result<()> {
@@ -3169,7 +3194,15 @@ fn install_rng(context: &Context, rng: SeededRng) -> Result<(), EvalError> {
 /// Install the deterministic `Date` shim onto the context's globals
 /// (per [ADR 0008]).
 ///
-/// Two surfaces are intercepted; everything else stays on QuickJS's
+/// The engine's effective timezone is **always UTC** — every
+/// JavaScript-visible `Date` reading produces the same bytes regardless
+/// of the host machine's timezone. This is what makes the determinism
+/// contract hold across hosts: a page that does
+/// `new Date(2024, 0, 15).getTime()` produces `1705276800000` on every
+/// machine, not the host-TZ-shifted value QuickJS's built-in would
+/// otherwise return.
+///
+/// Three surfaces are intercepted; everything else stays on QuickJS's
 /// built-in `Date`:
 ///
 /// 1. **`Date.now()`** — returns the current
@@ -3184,10 +3217,35 @@ fn install_rng(context: &Context, rng: SeededRng) -> Result<(), EvalError> {
 ///    keep determinism.
 ///
 /// 2. **`new Date()`** (zero-arg construction) — pins the constructed
-///    `Date` instance to the same virtual time. All explicit-input
-///    forms (`new Date(ms)`, `new Date(str)`, `new Date(y, m, d, ...)`)
-///    are *pure functions of their inputs* and pass through to the
-///    QuickJS built-in unchanged.
+///    `Date` instance to the same virtual time.
+///
+/// 3. **`new Date(y, m, d, ...)`** (multi-arg construction) — args are
+///    interpreted as UTC (forwarded through `Date.UTC(...)`) rather
+///    than the host's local timezone. `new Date(ms)` and
+///    `new Date(str)` are already TZ-independent at construction time
+///    and pass through unchanged.
+///
+/// On the prototype side, every local-time accessor and mutator —
+/// `getHours`, `getDate`, `getMonth`, `getFullYear`, `getDay`,
+/// `getMinutes`, `getSeconds`, `getMilliseconds`, `getYear`,
+/// `getTimezoneOffset`, the matching `setX` family, and the rendered
+/// forms `toString` / `toDateString` / `toTimeString` /
+/// `toLocaleString` / `toLocaleDateString` / `toLocaleTimeString` —
+/// delegates to its UTC counterpart (or returns a UTC-formatted
+/// string). `getTimezoneOffset` returns `0`. `toString` returns the
+/// `toISOString` form so the rendered text is stable across hosts.
+///
+/// HESO/1.0 §5.4.3 says explicit-input Date forms "MUST NOT read the
+/// virtual clock" and "MUST leave these forms on the underlying
+/// JavaScript engine's built-in Date without modification." The
+/// virtual-clock half is honored verbatim: the multi-arg constructor
+/// never reads `Date.now()` or the virtual clock. The
+/// no-modification half is the tension the spec did not anticipate —
+/// QuickJS's built-in multi-arg constructor reads the host TZ via
+/// `GetTimeZoneInformation` on Windows and `localtime_r` on Unix, so
+/// "no modification" and "byte-identical `plat_hash` across hosts"
+/// (§5.7 conformance) are mutually exclusive. We honor conformance
+/// because that is the property the spec exists to guarantee.
 ///
 /// ## Why this shape (monkey-patch over JS)
 ///
@@ -3239,15 +3297,25 @@ fn install_date(
             //   - intercepts zero-arg `new Date()` → returns
             //     `new OriginalDate(Date.now())` (which now reads the
             //     virtual clock).
-            //   - forwards every other construction form unchanged.
+            //   - routes multi-arg `new Date(y, m, d, ...)` through
+            //     `Date.UTC(...)` so the args are interpreted as UTC
+            //     rather than the host's local timezone.
+            //   - forwards `new Date(ms)` and `new Date(str)` through
+            //     unchanged — both are TZ-independent at construction.
             //   - forwards calls without `new` (`Date()` returns a
-            //     string in the spec) to the original.
+            //     string in the spec) by stringifying the virtual-clock
+            //     reading via `toISOString` so the rendered text is
+            //     stable across hosts.
             //   - preserves `Date.prototype` so `instanceof Date` keeps
             //     working for both zero-arg and explicit-input
             //     instances.
             //   - copies the static surface (`now`, `parse`, `UTC`)
             //     across so `Date.parse` / `Date.UTC` / `Date.now`
             //     still resolve.
+            //   - rebinds every local-time prototype accessor / mutator
+            //     / rendered-string form to its UTC counterpart so a
+            //     page that calls `d.getHours()` or `d.toString()`
+            //     observes UTC regardless of the host's `TZ`.
             //
             // Note: we copy *all* own properties of the original Date
             // (rather than hardcoding {now, parse, UTC}) so any future
@@ -3259,23 +3327,33 @@ fn install_date(
                         // Called without `new` — per the spec,
                         // `Date(...)` returns a string representation
                         // of the current time, ignoring its arguments.
-                        // Defer to the original so we keep that
-                        // behavior; the original will route through
-                        // our patched `Date.now` via its own
-                        // construction path on most engines, but
-                        // QuickJS reads the host clock here, so we
-                        // pin it explicitly using the virtual clock.
+                        // Pin to the virtual clock and stringify via
+                        // toISOString so the rendered text doesn't
+                        // depend on the host TZ.
                         if (!(this instanceof WrappedDate)) {
-                            return new OriginalDate(OriginalDate.now()).toString();
+                            return new OriginalDate(OriginalDate.now()).toISOString();
                         }
                         // Zero-arg construction: pin to virtual clock.
                         if (args.length === 0) {
                             return new OriginalDate(OriginalDate.now());
                         }
-                        // Explicit-input forms — pass through.
-                        // Spread to preserve `new Date(y, m, d, ...)`
-                        // multi-arg shape.
-                        return new OriginalDate(...args);
+                        // Single-arg forms (`new Date(ms)` and
+                        // `new Date(str)`) are TZ-independent at the
+                        // constructor — `ms` is already UTC-epoch and
+                        // `str` is parsed per ISO 8601 / RFC 2822
+                        // rules that carry their own zone. Pass
+                        // through unchanged.
+                        if (args.length === 1) {
+                            return new OriginalDate(args[0]);
+                        }
+                        // Multi-arg form (`new Date(y, m, d, h, m, s,
+                        // ms)`) is local-time on the built-in. Route
+                        // through `Date.UTC` so the same args land on
+                        // the same epoch ms regardless of host TZ.
+                        // `Date.UTC` applies the year < 100 → +1900
+                        // adjustment internally, matching the built-in
+                        // constructor's adjustment for the same case.
+                        return new OriginalDate(OriginalDate.UTC(...args));
                     }
                     // Preserve prototype identity so
                     // `instanceof Date` works for instances created
@@ -3297,6 +3375,95 @@ fn install_date(
                         }
                     }
                     globalThis.Date = WrappedDate;
+
+                    // Rebind local-time prototype methods to their UTC
+                    // counterparts. This is what stops cross-machine
+                    // divergence on a page that reads `d.getHours()` /
+                    // `d.toString()` after constructing a Date by any
+                    // path (multi-arg, single-arg, or zero-arg).
+                    // `getTimezoneOffset` returns 0 because the
+                    // engine's effective offset is UTC.
+                    const proto = OriginalDate.prototype;
+                    const localToUtc = {
+                        getFullYear: 'getUTCFullYear',
+                        getMonth: 'getUTCMonth',
+                        getDate: 'getUTCDate',
+                        getDay: 'getUTCDay',
+                        getHours: 'getUTCHours',
+                        getMinutes: 'getUTCMinutes',
+                        getSeconds: 'getUTCSeconds',
+                        getMilliseconds: 'getUTCMilliseconds',
+                        setFullYear: 'setUTCFullYear',
+                        setMonth: 'setUTCMonth',
+                        setDate: 'setUTCDate',
+                        setHours: 'setUTCHours',
+                        setMinutes: 'setUTCMinutes',
+                        setSeconds: 'setUTCSeconds',
+                        setMilliseconds: 'setUTCMilliseconds',
+                    };
+                    for (const [local, utc] of Object.entries(localToUtc)) {
+                        const utcFn = proto[utc];
+                        if (typeof utcFn === 'function') {
+                            proto[local] = function (...rest) {
+                                return utcFn.apply(this, rest);
+                            };
+                        }
+                    }
+                    // `getYear` is the legacy (pre-Y2K) accessor:
+                    // returns (UTCFullYear - 1900). Implement directly.
+                    proto.getYear = function () {
+                        return proto.getUTCFullYear.call(this) - 1900;
+                    };
+                    // `setYear` mirrors the legacy form: takes a year
+                    // value that is either a 2-digit year (0-99,
+                    // interpreted as 19xx) or a full year, and updates
+                    // the UTC year while keeping month/day/time.
+                    proto.setYear = function (year) {
+                        const y = Number(year);
+                        if (!isFinite(y)) {
+                            return proto.setTime.call(this, NaN);
+                        }
+                        const adjusted = (y >= 0 && y <= 99) ? y + 1900 : y;
+                        return proto.setUTCFullYear.call(this, adjusted);
+                    };
+                    // The engine renders every Date in UTC. Match the
+                    // toString shape browsers produce (toUTCString-ish)
+                    // by routing toString, toDateString, toTimeString,
+                    // and the toLocale* family through the existing
+                    // UTC-formatted accessors.
+                    proto.toString = function () {
+                        return proto.toUTCString.call(this);
+                    };
+                    proto.toDateString = function () {
+                        const s = proto.toUTCString.call(this);
+                        // toUTCString shape: "Mon, 15 Jan 2024 00:00:00 GMT"
+                        // toDateString shape: "Mon Jan 15 2024".
+                        // Reconstruct from UTC accessors to keep the
+                        // shape predictable.
+                        const wd = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][proto.getUTCDay.call(this)];
+                        const mo = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][proto.getUTCMonth.call(this)];
+                        const d2 = String(proto.getUTCDate.call(this)).padStart(2, '0');
+                        const y = proto.getUTCFullYear.call(this);
+                        return wd + ' ' + mo + ' ' + d2 + ' ' + y;
+                    };
+                    proto.toTimeString = function () {
+                        const h = String(proto.getUTCHours.call(this)).padStart(2, '0');
+                        const m = String(proto.getUTCMinutes.call(this)).padStart(2, '0');
+                        const s = String(proto.getUTCSeconds.call(this)).padStart(2, '0');
+                        return h + ':' + m + ':' + s + ' GMT+0000 (Coordinated Universal Time)';
+                    };
+                    proto.toLocaleString = function () {
+                        return proto.toISOString.call(this);
+                    };
+                    proto.toLocaleDateString = function () {
+                        return proto.toDateString.call(this);
+                    };
+                    proto.toLocaleTimeString = function () {
+                        return proto.toTimeString.call(this);
+                    };
+                    proto.getTimezoneOffset = function () {
+                        return 0;
+                    };
                 })()
             "#;
             ctx.eval::<(), _>(bootstrap)?;
@@ -8412,10 +8579,12 @@ mod tests {
     // ===== Date virtualization (ADR 0008 determinism shim) =====
     //
     // The contract: `Date.now()` and zero-arg `new Date()` route
-    // through the engine's VirtualClock, while every explicit-input
-    // form (`new Date(ms)`, `new Date(str)`, `new Date(y, m, d, ...)`,
-    // `Date.parse`, `Date.UTC`) stays pure-of-input on the QuickJS
-    // built-in.
+    // through the engine's VirtualClock; explicit-input forms
+    // (`new Date(ms)`, `new Date(str)`, `new Date(y, m, d, ...)`,
+    // `Date.parse`, `Date.UTC`) are pure of their inputs; and every
+    // local-time prototype accessor / setter / rendered-string method
+    // produces UTC output so the engine's bytes are host-TZ
+    // independent.
 
     #[test]
     fn date_now_starts_at_zero_on_fresh_engine() {
@@ -8488,8 +8657,10 @@ mod tests {
         let out = e.eval("Date.UTC(2024, 0, 1, 0, 0, 0)").expect("eval ok");
         assert_eq!(out.value.as_f64(), Some(1704067200000.0));
 
-        // new Date(y, m, d, ...) — month is 0-indexed; we use UTC
-        // accessors to avoid timezone variance in test environments.
+        // new Date(y, m, d, ...) — month is 0-indexed. The shim
+        // routes the multi-arg constructor through `Date.UTC(...)`,
+        // so the local and UTC accessors produce the same number on
+        // every host.
         let out = e
             .eval("new Date(Date.UTC(2024, 0, 1)).getUTCFullYear()")
             .expect("eval ok");
@@ -8525,6 +8696,206 @@ mod tests {
             .eval("[typeof Date.now, Date.now()]")
             .expect("eval ok");
         assert_eq!(out.value, serde_json::json!(["function", 42]));
+    }
+
+    #[test]
+    fn new_date_explicit_inputs_use_utc() {
+        // `new Date(2024, 0, 15)` (month is 0-indexed → January 15,
+        // 2024) is interpreted as UTC midnight, producing the same
+        // epoch ms regardless of host TZ. On a built-in QuickJS in
+        // `America/Los_Angeles` the same expression would yield
+        // 1705305600000 (eight hours later); the shim's UTC routing
+        // makes the result host-independent.
+        let e = engine();
+        let out = e
+            .eval("new Date(2024, 0, 15).getTime()")
+            .expect("eval ok");
+        assert_eq!(out.value.as_f64(), Some(1_705_276_800_000.0));
+
+        // The seven-arg form (year, month, day, hour, min, sec, ms)
+        // lands on the same UTC ms as the equivalent `Date.UTC`
+        // invocation.
+        let out = e
+            .eval("new Date(2024, 5, 15, 12, 30, 45, 678).getTime()")
+            .expect("eval ok");
+        let expected = e
+            .eval("Date.UTC(2024, 5, 15, 12, 30, 45, 678)")
+            .expect("eval ok");
+        assert_eq!(out.value.as_f64(), expected.value.as_f64());
+
+        // Two-digit years still get the +1900 adjustment that the
+        // built-in applies (year 99 → 1999).
+        let out = e
+            .eval("new Date(99, 0, 1).getTime()")
+            .expect("eval ok");
+        let expected = e
+            .eval("Date.UTC(1999, 0, 1)")
+            .expect("eval ok");
+        assert_eq!(out.value.as_f64(), expected.value.as_f64());
+    }
+
+    #[test]
+    fn date_prototype_getters_return_utc() {
+        // Every local-time accessor must produce the same value as
+        // its UTC sibling, regardless of host TZ. We use epoch 0
+        // (1970-01-01T00:00:00Z) and the multi-arg construction form
+        // so both the constructor and the accessors are exercised.
+        let e = engine();
+        let out = e
+            .eval(
+                r#"(function () {
+                    const d = new Date(0);
+                    return {
+                        fullYear: d.getFullYear(),
+                        month: d.getMonth(),
+                        date: d.getDate(),
+                        day: d.getDay(),
+                        hours: d.getHours(),
+                        minutes: d.getMinutes(),
+                        seconds: d.getSeconds(),
+                        milliseconds: d.getMilliseconds(),
+                    };
+                })()"#,
+            )
+            .expect("eval ok");
+        assert_eq!(
+            out.value,
+            serde_json::json!({
+                "fullYear": 1970,
+                "month": 0,
+                "date": 1,
+                "day": 4,
+                "hours": 0,
+                "minutes": 0,
+                "seconds": 0,
+                "milliseconds": 0,
+            })
+        );
+
+        // Same check after constructing via the multi-arg form.
+        let out = e
+            .eval(
+                r#"(function () {
+                    const d = new Date(2024, 5, 15, 12, 30, 45);
+                    return [
+                        d.getUTCFullYear() === d.getFullYear(),
+                        d.getUTCMonth() === d.getMonth(),
+                        d.getUTCDate() === d.getDate(),
+                        d.getUTCHours() === d.getHours(),
+                        d.getUTCMinutes() === d.getMinutes(),
+                        d.getUTCSeconds() === d.getSeconds(),
+                    ];
+                })()"#,
+            )
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!([true, true, true, true, true, true]));
+    }
+
+    #[test]
+    fn date_get_timezone_offset_is_zero() {
+        // The engine renders every Date as UTC, so the JS-visible
+        // offset must be zero. A page that reads this value to
+        // compute a local-time adjustment will agree across hosts.
+        let e = engine();
+        let out = e
+            .eval("new Date(0).getTimezoneOffset()")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(0));
+
+        // Multi-arg constructed Date: same answer.
+        let out = e
+            .eval("new Date(2024, 5, 15, 12, 30).getTimezoneOffset()")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!(0));
+    }
+
+    #[test]
+    fn date_string_renderers_emit_utc_form() {
+        // `toString`, `toDateString`, `toTimeString`, and the
+        // `toLocale*` family must produce UTC-rendered text so the
+        // engine's stringified Date bytes are stable across hosts.
+        // A page that bakes one of these into the DOM (e.g.
+        // `document.title = new Date(...).toString()`) would otherwise
+        // drift between machines.
+        let e = engine();
+        let out = e
+            .eval(
+                r#"(function () {
+                    const d = new Date(0);
+                    return {
+                        toString: d.toString(),
+                        toDateString: d.toDateString(),
+                        toTimeString: d.toTimeString(),
+                        toLocaleString: d.toLocaleString(),
+                        toLocaleDateString: d.toLocaleDateString(),
+                        toLocaleTimeString: d.toLocaleTimeString(),
+                        toUTCString: d.toUTCString(),
+                        toISOString: d.toISOString(),
+                    };
+                })()"#,
+            )
+            .expect("eval ok");
+        // `toString` mirrors `toUTCString`, so the two fields are the
+        // exact same bytes. `toLocaleString` mirrors `toISOString`.
+        // The other three follow the reconstructed UTC shape installed
+        // by the shim.
+        let m = out.value.as_object().expect("object");
+        assert_eq!(
+            m.get("toString").and_then(|v| v.as_str()),
+            m.get("toUTCString").and_then(|v| v.as_str())
+        );
+        assert_eq!(
+            m.get("toLocaleString").and_then(|v| v.as_str()),
+            m.get("toISOString").and_then(|v| v.as_str())
+        );
+        assert_eq!(
+            m.get("toDateString").and_then(|v| v.as_str()),
+            Some("Thu Jan 01 1970")
+        );
+        assert_eq!(
+            m.get("toLocaleDateString").and_then(|v| v.as_str()),
+            Some("Thu Jan 01 1970")
+        );
+        assert_eq!(
+            m.get("toTimeString").and_then(|v| v.as_str()),
+            Some("00:00:00 GMT+0000 (Coordinated Universal Time)")
+        );
+    }
+
+    #[test]
+    fn date_legacy_get_year_returns_utc_year_minus_1900() {
+        // `getYear()` is the pre-Y2K legacy accessor. We route it
+        // through `getUTCFullYear` so the legacy contract (year -
+        // 1900) holds on UTC, not host-local time.
+        let e = engine();
+        let out = e
+            .eval("[new Date(0).getYear(), new Date(2024, 0, 1).getYear()]")
+            .expect("eval ok");
+        assert_eq!(out.value, serde_json::json!([70, 124]));
+    }
+
+    #[test]
+    fn date_setters_mutate_in_utc() {
+        // `setFullYear` / `setMonth` / `setHours` (and the rest of
+        // the local-time setters) must update the UTC fields so the
+        // post-mutation epoch ms is host-independent.
+        let e = engine();
+        let out = e
+            .eval(
+                r#"(function () {
+                    const d = new Date(0);
+                    d.setFullYear(2024);
+                    d.setMonth(5);
+                    d.setDate(15);
+                    d.setHours(12);
+                    d.setMinutes(30);
+                    d.setSeconds(45);
+                    return [d.getTime(), Date.UTC(2024, 5, 15, 12, 30, 45)];
+                })()"#,
+            )
+            .expect("eval ok");
+        let arr = out.value.as_array().expect("array");
+        assert_eq!(arr[0].as_f64(), arr[1].as_f64());
     }
 
     // -------------------------------------------------------------

@@ -405,6 +405,46 @@ async fn run_refuses_plat_without_cassette() {
 }
 
 #[tokio::test]
+async fn run_on_plat_with_malformed_cassette_emits_distinct_error() {
+    // A plat with a `cassette` field that's structurally wrong (here:
+    // the records array is replaced with a string) should NOT be
+    // confused for "plat has no cassette" — the operator-facing
+    // distinction is "missing" vs "tampered". Same exit code (2),
+    // different message.
+    let plat = serde_json::json!({
+        "plan": [{"verb": "open", "url": "https://example.com/"}],
+        "url": "https://example.com/",
+        "title": "malformed cassette here",
+        "cassette": {
+            "records": "not-an-array"
+        }
+    });
+    let plat_path = write_temp("plat-malformed-cassette.json", plat.to_string().as_bytes());
+
+    let out = run_verb("run", &["--seed", "0", plat_path.to_str().unwrap()]);
+    assert!(
+        !out.status.success(),
+        "run must refuse a plat with a malformed cassette"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "malformed-input is exit 2 per the spec"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("malformed cassette"),
+        "stderr must say `malformed cassette` (not `no cassette`); got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("carries no `cassette` field"),
+        "must not conflate malformed with missing; got: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(&plat_path);
+}
+
+#[tokio::test]
 async fn replay_refuses_plat_without_steps_field() {
     // Hand-build a plat with no `steps` field — `replay` should
     // exit 2 with a clear message rather than fabricating one.

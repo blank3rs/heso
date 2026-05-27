@@ -34,7 +34,8 @@
 //!       "request_body_b64":  "",
 //!       "status":  200,
 //!       "response_headers": [["content-type","text/html"], …],
-//!       "response_body_b64": "PCFET0NUWVBFIGh0bWw+…"
+//!       "response_body_b64":    "PCFET0NUWVBFIGh0bWw+…",
+//!       "response_body_blake3": "ab12…"
 //!     }
 //!   ]
 //! }
@@ -87,6 +88,28 @@ pub struct Record {
     pub response_headers: Vec<(String, String)>,
     /// Base64 of the response body bytes.
     pub response_body_b64: String,
+    /// BLAKE3 hex digest (lowercase, 64 chars) of the raw response
+    /// body bytes — the same bytes [`response_body_b64`] encodes.
+    /// Required redundancy in HESO/1.0 §2.4: at decode time a verifier
+    /// MUST check `response_body_blake3 ==
+    /// lowercase_hex(BLAKE3(base64_decode(response_body_b64)))` and
+    /// treat any mismatch as a malformed-cassette error.
+    /// [`decode_response_body`] enforces that check on every call,
+    /// returning [`DecodeError::BodyHashMismatch`] when the recorded
+    /// digest does not match the bytes — corruption or tampering
+    /// surfaces as a clean, named error class instead of leaking
+    /// downstream as a divergent plat hash.
+    ///
+    /// Empty here means "pre-§2.4 cassette" (the field is
+    /// `#[serde(default)]` so older locally-recorded JSON still
+    /// parses); the integrity check is skipped for that legacy
+    /// shape. Every new cassette emitted by [`Cassette::record`]
+    /// populates this field.
+    ///
+    /// [`response_body_b64`]: Self::response_body_b64
+    /// [`decode_response_body`]: Cassette::decode_response_body
+    #[serde(default)]
+    pub response_body_blake3: String,
 }
 
 /// A sequence of recorded requests captured during a stamping run.
@@ -137,6 +160,7 @@ impl Cassette {
             status,
             response_headers,
             response_body_b64: B64.encode(response_body),
+            response_body_blake3: blake3::hash(response_body).to_hex().to_string(),
         });
     }
 
@@ -157,11 +181,43 @@ impl Cassette {
             .find(|r| r.method == method_upper && r.url == url && r.request_body_b64 == body_b64)
     }
 
-    /// Decode the response body bytes for `record`. Helper that wraps
-    /// the base64 decode; reserved for callers that have a `&Record`
-    /// in hand from [`Self::lookup`] or by indexing `records`.
-    pub fn decode_response_body(record: &Record) -> Result<Vec<u8>, base64::DecodeError> {
-        B64.decode(record.response_body_b64.as_bytes())
+    /// Decode the response body bytes for `record` and verify the
+    /// HESO/1.0 §2.4 content-addressing invariant in one pass.
+    ///
+    /// Returns the decoded bytes when both checks pass:
+    ///
+    /// 1. `response_body_b64` decodes cleanly as standard base64.
+    /// 2. The BLAKE3 of the decoded bytes equals the digest stored
+    ///    in `response_body_blake3` (compared at the 32-byte raw
+    ///    representation, so hex casing can't mask a real mismatch).
+    ///
+    /// A record whose `response_body_blake3` is the empty string is
+    /// the legacy pre-§2.4 shape (the field is `#[serde(default)]`);
+    /// the integrity check is skipped for those records so an older
+    /// recording on disk keeps loading after the schema bump. Every
+    /// record minted by [`Self::record`] always carries the digest,
+    /// so this fast-path applies only to historical cassettes.
+    pub fn decode_response_body(record: &Record) -> Result<Vec<u8>, DecodeError> {
+        let bytes = B64
+            .decode(record.response_body_b64.as_bytes())
+            .map_err(DecodeError::Base64)?;
+        if record.response_body_blake3.is_empty() {
+            return Ok(bytes);
+        }
+        let actual = blake3::hash(&bytes);
+        let actual_hex = actual.to_hex().to_string();
+        let matches = blake3::Hash::from_hex(&record.response_body_blake3)
+            .map(|expected| expected.as_bytes() == actual.as_bytes())
+            .unwrap_or(false);
+        if !matches {
+            return Err(DecodeError::BodyHashMismatch {
+                method: record.method.clone(),
+                url: record.url.clone(),
+                expected: record.response_body_blake3.clone(),
+                actual: actual_hex,
+            });
+        }
+        Ok(bytes)
     }
 
     /// Total number of records on the cassette. Convenience for the
@@ -175,6 +231,48 @@ impl Cassette {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+}
+
+/// Errors produced by [`Cassette::decode_response_body`] — base64
+/// decode failures and HESO/1.0 §2.4 hash-mismatch failures kept as
+/// distinct variants so callers can render the right diagnostic.
+///
+/// The variants are intentionally narrow: a record either decodes or
+/// it doesn't, and when it does, its content-addressed digest either
+/// matches or it doesn't. Tampering and on-disk corruption both land
+/// on [`Self::BodyHashMismatch`]; the distinction between them is not
+/// recoverable from the cassette alone and isn't surfaced here.
+#[derive(Debug, thiserror::Error)]
+pub enum DecodeError {
+    /// `response_body_b64` is not valid standard base64. The cassette
+    /// was hand-edited or corrupted on disk.
+    #[error("cassette base64 decode error: {0}")]
+    Base64(#[from] base64::DecodeError),
+
+    /// `response_body_blake3` does not equal
+    /// `lowercase_hex(BLAKE3(base64_decode(response_body_b64)))` —
+    /// either the body bytes drifted from the recorded digest or the
+    /// digest itself is malformed. HESO/1.0 §2.4 classifies both as
+    /// malformed-cassette errors; the verifier MUST reject the record.
+    #[error(
+        "cassette body hash mismatch: {method} {url} \
+         expected blake3 {expected}, got {actual} \
+         (record tampered or corrupted)"
+    )]
+    BodyHashMismatch {
+        /// HTTP method of the offending record.
+        method: String,
+        /// URL of the offending record.
+        url: String,
+        /// The digest the cassette claims for the body — what a
+        /// verifier was promised. Empty when the record's
+        /// `response_body_blake3` was syntactically malformed.
+        expected: String,
+        /// The digest actually computed from the decoded bytes —
+        /// what a verifier sees. The mismatch with `expected` is
+        /// the integrity failure.
+        actual: String,
+    },
 }
 
 /// Surfaced when a replaying client is asked for a request that the
@@ -352,6 +450,120 @@ mod tests {
         let a = serde_jcs::to_string(&mk()).expect("jcs a");
         let b = serde_jcs::to_string(&mk()).expect("jcs b");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn record_emits_response_body_blake3_matching_body() {
+        let mut c = Cassette::new();
+        let body = b"<!doctype html><html><body>hi</body></html>";
+        c.record(
+            "GET",
+            "https://example.com/",
+            "https://example.com/",
+            &[],
+            200,
+            vec![],
+            body,
+        );
+        let expected = blake3::hash(body).to_hex().to_string();
+        assert_eq!(c.records[0].response_body_blake3, expected);
+        // Spec §2.3 requires 64 lowercase-hex chars.
+        assert_eq!(c.records[0].response_body_blake3.len(), 64);
+        assert!(c.records[0]
+            .response_body_blake3
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn legacy_cassette_without_blake3_field_still_loads() {
+        // Pre-§2.3 cassettes don't carry `response_body_blake3`. They
+        // still deserialize cleanly so an existing recording on disk
+        // keeps working after the schema bump.
+        let json = serde_json::json!({
+            "records": [{
+                "method": "GET",
+                "url": "https://example.com/",
+                "final_url": "https://example.com/",
+                "request_body_b64": "",
+                "status": 200,
+                "response_headers": [],
+                "response_body_b64": "aGk="
+            }]
+        });
+        let c: Cassette = serde_json::from_value(json).expect("legacy cassette deserializes");
+        assert_eq!(c.len(), 1);
+        let r = c.lookup("GET", "https://example.com/", &[]).expect("hit");
+        assert_eq!(Cassette::decode_response_body(r).unwrap(), b"hi");
+        assert!(
+            r.response_body_blake3.is_empty(),
+            "legacy field absence surfaces as the empty string"
+        );
+    }
+
+    #[test]
+    fn decode_rejects_tampered_body_when_blake3_present() {
+        // HESO/1.0 §2.4 makes the content-addressing redundancy
+        // load-bearing: a record whose stored blake3 does not match the
+        // BLAKE3 of its decoded body bytes MUST be rejected as a
+        // malformed cassette. This is the integrity check that catches
+        // on-disk corruption or hand-edited tampers at the cassette
+        // boundary instead of letting a divergent plat hash surface
+        // downstream with a less actionable error.
+        let mut c = Cassette::new();
+        c.record(
+            "GET",
+            "https://example.com/",
+            "https://example.com/",
+            &[],
+            200,
+            vec![],
+            b"hello",
+        );
+        // Swap in bytes whose BLAKE3 differs from the stored digest.
+        c.records[0].response_body_b64 = B64.encode(b"hellp");
+        match Cassette::decode_response_body(&c.records[0]) {
+            Ok(_) => panic!("tampered body must surface as BodyHashMismatch"),
+            Err(DecodeError::BodyHashMismatch {
+                method,
+                url,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(method, "GET");
+                assert_eq!(url, "https://example.com/");
+                assert_eq!(expected, blake3::hash(b"hello").to_hex().to_string());
+                assert_eq!(actual, blake3::hash(b"hellp").to_hex().to_string());
+            }
+            Err(e) => panic!("expected BodyHashMismatch, got {e:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_malformed_expected_blake3_hex() {
+        // A record whose `response_body_blake3` is non-empty but not
+        // valid 64-hex is malformed bookkeeping — the digest the
+        // cassette claims for its own body is unparseable. Treat as
+        // the same class of error as a mismatch: the record cannot be
+        // trusted to address its content.
+        let mut c = Cassette::new();
+        c.record(
+            "POST",
+            "https://example.com/api",
+            "https://example.com/api",
+            b"hi",
+            201,
+            vec![],
+            b"ok",
+        );
+        c.records[0].response_body_blake3 = "not-real-hex-just-garbage".into();
+        match Cassette::decode_response_body(&c.records[0]) {
+            Ok(_) => panic!("malformed expected-hex must surface as BodyHashMismatch"),
+            Err(DecodeError::BodyHashMismatch { url, .. }) => {
+                assert_eq!(url, "https://example.com/api");
+            }
+            Err(e) => panic!("expected BodyHashMismatch, got {e:?}"),
+        }
     }
 
     #[test]

@@ -1127,3 +1127,207 @@ async fn submit_response_body_is_truncated_above_64_kib() {
         body_field.len()
     );
 }
+
+// =====================================================================
+// Multipart cassette: distinct field values produce distinct
+// request_body_b64 keys (the boundary is deterministic across calls)
+// =====================================================================
+
+/// HTML scaffold for a multipart form with one text field that varies
+/// per test setup.
+fn multipart_form_html(action_url: &str, field_value: &str) -> String {
+    format!(
+        r#"<!doctype html><html><body>
+        <form id="f" method="post" action="{action_url}" enctype="multipart/form-data">
+            <input type="text" name="title" value="{field_value}">
+            <button type="submit">Upload</button>
+        </form>
+        </body></html>"#,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_request_body_uses_deterministic_boundary() {
+    // Two POSTs to the same URL with different field values must land
+    // in the cassette as two distinguishable records — `request_body`
+    // is the disambiguator, so the wire bytes have to differ. A
+    // random per-request boundary would defeat this: the bytes would
+    // differ on the boundary alone, which still distinguishes records,
+    // but more critically replay can't find them again. Pinning the
+    // boundary makes both record-time and lookup-time bytes line up.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/upload", server.uri());
+
+    let client = shared_client();
+    let rt = tokio::runtime::Handle::current();
+    let cassette = std::sync::Arc::new(std::sync::Mutex::new(
+        heso_engine_fetch::Cassette::new(),
+    ));
+
+    // First POST: title=alpha.
+    {
+        let engine = JsEngine::new_with_recording_cassette(
+            0,
+            client.clone(),
+            rt.clone(),
+            cassette.clone(),
+            None,
+        )
+        .expect("engine builds");
+        let html = multipart_form_html(&action_url, "alpha");
+        let (mut sess, _) = JsSession::open_on_engine(
+            engine,
+            &html,
+            Url::parse(&server.uri()).unwrap(),
+            ScriptFetchPolicy::default(),
+        )
+        .expect("session opens");
+        sess.submit("#f").expect("alpha submit ok");
+    }
+    // Second POST: title=beta.
+    {
+        let engine = JsEngine::new_with_recording_cassette(
+            0,
+            client.clone(),
+            rt.clone(),
+            cassette.clone(),
+            None,
+        )
+        .expect("engine builds");
+        let html = multipart_form_html(&action_url, "beta");
+        let (mut sess, _) = JsSession::open_on_engine(
+            engine,
+            &html,
+            Url::parse(&server.uri()).unwrap(),
+            ScriptFetchPolicy::default(),
+        )
+        .expect("session opens");
+        sess.submit("#f").expect("beta submit ok");
+    }
+
+    let recorded = cassette.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2, "expected two recorded multipart POSTs");
+    let a = &recorded.records[0];
+    let b = &recorded.records[1];
+    assert_eq!(a.method, "POST");
+    assert_eq!(b.method, "POST");
+    assert_eq!(a.url, action_url);
+    assert_eq!(b.url, action_url);
+    assert_ne!(
+        a.request_body_b64, b.request_body_b64,
+        "distinct field values must produce distinct request_body bytes; \
+         got both records carrying body `{}`",
+        a.request_body_b64
+    );
+    assert!(
+        !a.request_body_b64.is_empty(),
+        "multipart cassette record must carry the wire bytes, not an empty body"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multipart_cassette_replay_matches_request_body() {
+    // Record two distinct multipart POSTs against the live mock, then
+    // replay each one and verify the response page came from the
+    // matching record (not the other one). Confirms the lookup walk
+    // `(method, url, request_body)` distinguishes records that share
+    // method + URL.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                "<!doctype html><html><body><div id=\"r\">response-A</div></body></html>",
+            ),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/echo"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(
+                "<!doctype html><html><body><div id=\"r\">response-B</div></body></html>",
+            ),
+        )
+        .mount(&server)
+        .await;
+    let action_url = format!("{}/echo", server.uri());
+
+    let client = shared_client();
+    let rt = tokio::runtime::Handle::current();
+    let cassette = std::sync::Arc::new(std::sync::Mutex::new(
+        heso_engine_fetch::Cassette::new(),
+    ));
+
+    for value in ["X", "Y"] {
+        let engine = JsEngine::new_with_recording_cassette(
+            0,
+            client.clone(),
+            rt.clone(),
+            cassette.clone(),
+            None,
+        )
+        .expect("engine builds");
+        let html = multipart_form_html(&action_url, value);
+        let (mut sess, _) = JsSession::open_on_engine(
+            engine,
+            &html,
+            Url::parse(&server.uri()).unwrap(),
+            ScriptFetchPolicy::default(),
+        )
+        .expect("session opens");
+        sess.submit("#f").expect("record submit ok");
+    }
+
+    let recorded = cassette.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2, "expected two recorded POSTs");
+    let response_a = String::from_utf8(
+        heso_engine_fetch::Cassette::decode_response_body(&recorded.records[0]).expect("decode 0"),
+    )
+    .expect("utf8");
+    let response_b = String::from_utf8(
+        heso_engine_fetch::Cassette::decode_response_body(&recorded.records[1]).expect("decode 1"),
+    )
+    .expect("utf8");
+    assert!(
+        response_a.contains("response-A"),
+        "first record should carry response-A, got: {response_a}"
+    );
+    assert!(
+        response_b.contains("response-B"),
+        "second record should carry response-B, got: {response_b}"
+    );
+
+    // Replay each value against the same cassette and confirm the
+    // matching record's body comes back through the session.
+    let cassette_ro = std::sync::Arc::new(recorded);
+    drop(server);
+
+    for (value, expected_marker) in [("X", "response-A"), ("Y", "response-B")] {
+        let engine = JsEngine::new_with_replaying_cassette(0, cassette_ro.clone(), None)
+            .expect("engine builds");
+        let html = multipart_form_html(&action_url, value);
+        let (mut sess, _) = JsSession::open_on_engine(
+            engine,
+            &html,
+            Url::parse(&action_url).unwrap(),
+            ScriptFetchPolicy::default(),
+        )
+        .expect("session opens");
+        let outcome = sess.submit("#f").expect("replay submit ok");
+        let body = outcome.value["responseBody"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            body.contains(expected_marker),
+            "replay for value `{value}` should match `{expected_marker}`; got: {body}"
+        );
+    }
+}

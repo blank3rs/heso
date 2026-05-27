@@ -392,6 +392,14 @@ pub struct CdInput {
 pub struct CdOutput {
     /// URL after navigation (after redirects, if any).
     pub url: Url,
+    /// BLAKE3 hex digest of the page text the engine reported for the
+    /// landed page. Populated for every URL navigation that yielded a
+    /// readable body; absent when the engine couldn't surface text
+    /// (e.g. `cd ..` / `cd -` flows that don't load fresh content).
+    /// The trace runner threads this into the receipt's `pages_seen`
+    /// per HESO/1.0 §3.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 /// Navigate by URL or by clicking a link.
@@ -399,8 +407,14 @@ pub async fn cd<E: EngineApi>(engine: &E, input: &CdInput) -> Result<CdOutput> {
     match &input.target {
         CdTarget::Url { url } => {
             let page = engine.open(url).await?;
+            let content_hash = page
+                .text()
+                .await
+                .ok()
+                .map(|t| blake3::hash(t.as_bytes()).to_hex().to_string());
             Ok(CdOutput {
                 url: page.url().clone(),
+                content_hash,
             })
         }
         CdTarget::Element { .. } => Err(Error::NotImplemented(
@@ -1199,6 +1213,7 @@ mod tests {
     fn primitive_result_uses_same_op_tag_as_op() {
         let res = PrimitiveResult::Cd(CdOutput {
             url: u("https://example.com/"),
+            content_hash: None,
         });
         let json = serde_json::to_value(&res).unwrap();
         assert_eq!(json["op"], "cd");

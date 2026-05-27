@@ -832,6 +832,7 @@ dependencies = [
  "reqwest",
  "scraper",
  "serde",
+ "serde_jcs",
  "serde_json",
  "tempfile",
  "tokio",
@@ -939,6 +940,7 @@ dependencies = [
 name = "heso-primitives"
 version = "0.1.2"
 dependencies = [
+ "blake3",
  "heso-core",
  "heso-engine-api",
  "serde",
@@ -963,6 +965,7 @@ dependencies = [
 name = "heso-trace-exec"
 version = "0.1.2"
 dependencies = [
+ "blake3",
  "heso-core",
  "heso-engine-api",
  "heso-primitives",

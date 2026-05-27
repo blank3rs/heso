@@ -29,8 +29,6 @@
 //!
 //! - **Cost accounting.** `Receipt::cost` is zeroed today; the engine has to
 //!   feed back byte counts + CPU time once T-013/T-017 land.
-//! - **Page hashes.** `Receipt::pages_seen` is empty until the engine reports
-//!   content hashes for the pages it touched (T-013).
 //! - **Real determinism.** The runner is deterministic by construction (no
 //!   clocks/RNG of its own), but the engine isn't yet — T-014/T-015/T-017
 //!   land that. Until then, runs in [`Mode::Deterministic`] are *structurally*
@@ -45,7 +43,7 @@
 use heso_core::IdentityKey;
 use heso_engine_api::EngineApi;
 use heso_primitives::{execute, PrimitiveResult};
-use heso_trace::{sign_receipt, trace_hash, Cost, Mode, Receipt, Trace};
+use heso_trace::{sign_receipt, trace_hash, ContentHash, Cost, Mode, Receipt, Trace};
 
 /// Per-session configuration the runner needs to build a [`Receipt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,17 +80,26 @@ impl Default for SessionConfig {
 ///
 /// `Receipt::signature` is `None`. Pass an [`IdentityKey`] to
 /// [`run_signed`] (or call [`heso_trace::sign_receipt`] after) to add an
-/// Ed25519 signature. `pages_seen` empty until the engine reports content
-/// hashes (T-013). `cost` zeroed until the engine threads cost data
-/// through.
+/// Ed25519 signature. `Receipt::pages_seen` is built from the
+/// `content_hash` field of every successful `cd` result — one hash per
+/// page the engine reported during the run. `cost` zeroed until the
+/// engine threads cost data through.
 pub async fn run<E: EngineApi>(engine: &E, trace: &Trace, config: &SessionConfig) -> Receipt {
     let mut results: Vec<PrimitiveResult> = Vec::with_capacity(trace.len());
+    let mut pages_seen: Vec<ContentHash> = Vec::new();
     let mut failed_at: Option<usize> = None;
     let mut error: Option<String> = None;
 
     for (i, op) in trace.iter().enumerate() {
         match execute(engine, op).await {
-            Ok(r) => results.push(r),
+            Ok(r) => {
+                if let PrimitiveResult::Cd(out) = &r {
+                    if let Some(h) = &out.content_hash {
+                        pages_seen.push(ContentHash(h.clone()));
+                    }
+                }
+                results.push(r);
+            }
             Err(e) => {
                 failed_at = Some(i);
                 error = Some(e.to_string());
@@ -104,7 +111,7 @@ pub async fn run<E: EngineApi>(engine: &E, trace: &Trace, config: &SessionConfig
     Receipt {
         trace: trace.clone(),
         results,
-        pages_seen: Vec::new(),
+        pages_seen,
         trace_hash: trace_hash(trace),
         planner_id: config.planner_id.clone(),
         seed: config.seed,
@@ -288,5 +295,54 @@ mod tests {
             heso_trace::VerifyOutcome::Valid => {}
             other => panic!("expected Valid, got {other:?}"),
         }
+    }
+
+    // A test engine whose pages report a known body text so the runner
+    // can hash it into `pages_seen`. Mirrors the shape any real engine
+    // (`FetchEngine`, future Servo / CDP engines) takes.
+    struct TextEngine;
+    struct TextPage(Url, &'static str);
+
+    impl Page for TextPage {
+        fn url(&self) -> &Url {
+            &self.0
+        }
+        async fn text(&self) -> HesoResult<String> {
+            Ok(self.1.to_owned())
+        }
+    }
+
+    impl EngineApi for TextEngine {
+        type Page = TextPage;
+        async fn open(&self, url: &Url) -> HesoResult<Self::Page> {
+            Ok(TextPage(url.clone(), "<body>hello</body>"))
+        }
+    }
+
+    #[tokio::test]
+    async fn run_populates_pages_seen_with_blake3_of_page_text() {
+        let trace = vec![cd("https://example.com/")];
+        let r = run(&TextEngine, &trace, &SessionConfig::default()).await;
+        assert_eq!(r.pages_seen.len(), 1);
+        let expected = blake3::hash(b"<body>hello</body>").to_hex().to_string();
+        assert_eq!(r.pages_seen[0].0, expected);
+        assert_eq!(r.pages_seen[0].0.len(), 64);
+    }
+
+    #[tokio::test]
+    async fn pages_seen_is_omitted_when_empty_in_serde_output() {
+        let trace = vec![cd("https://example.com/")];
+        let r = run(&DummyEngine, &trace, &SessionConfig::default()).await;
+        // DummyPage::text returns Err, so no hash is collected.
+        assert!(
+            r.pages_seen.is_empty(),
+            "DummyEngine cannot produce content hashes; got {:?}",
+            r.pages_seen
+        );
+        let s = serde_json::to_string(&r).expect("serialize");
+        assert!(
+            !s.contains("pages_seen"),
+            "empty pages_seen MUST be omitted per HESO/1.0 §3.3.2; got: {s}"
+        );
     }
 }

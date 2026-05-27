@@ -452,6 +452,27 @@ function unpack(filePath) {
   return _spawnJson(["unpack", String(filePath)]);
 }
 
+// `heso run <plat>` — cassette-backed re-execution. Named `runPlat`
+// here so it doesn't collide with the low-level `run(args, opts)`
+// escape hatch exported below.
+function runPlat(filePath, options) {
+  return _spawnJson(["run", String(filePath), ..._optsToArgv(options)]);
+}
+
+// `heso refresh <plat>` — drift detection. The CLI exits 1 to signal
+// drift but the stdout is still a well-formed result body, so surface
+// that as a resolved value instead of an error.
+async function refresh(filePath, options) {
+  try {
+    return await _spawnJson(["refresh", String(filePath), ..._optsToArgv(options)]);
+  } catch (e) {
+    if (e instanceof HesoError && e.code === 1) {
+      return JSON.parse(e.stdout);
+    }
+    throw e;
+  }
+}
+
 // Plat dev tools + envelope. All take a file path (or `-` for stdin).
 // `platHash` returns just the hex string; `platVerify` and `platDiff`
 // boil their exit codes into booleans; the rest return parsed JSON.
@@ -522,6 +543,127 @@ function platSeal(filePath, options) {
  */
 function platUnseal(filePath, options) {
   return _spawnJson(["plat-unseal", String(filePath), ..._optsToArgv(options)]);
+}
+
+// ---------------------------------------------------------------------------
+// Ecosystem registry (publish / pull / list)
+// ---------------------------------------------------------------------------
+
+// The CLI's `publish` / `pull` / `list` verbs print human-readable
+// status banners on stdout, not JSON — see `crates/heso-cli/src/
+// ecosystem.rs`. The wrappers below resolve with the raw stdout string
+// so callers can log it; failures still surface as `HesoError` through
+// the shared `run()` spawn helper.
+
+/**
+ * `heso publish <plat-file> -d "<description>" [-t "tag1,tag2"]`.
+ * `tags` may be a string or an array (arrays are joined with `,`);
+ * `description` is required by the CLI.
+ */
+function publish(filePath, options) {
+  if (!options || typeof options.description !== "string" || options.description.trim() === "") {
+    return Promise.reject(
+      new HesoError("publish: `description` is required (CLI flag -d)", {
+        command: ["heso", "publish"],
+      }),
+    );
+  }
+  const argv = ["publish", String(filePath), "-d", options.description];
+  if (options.tags !== undefined && options.tags !== null) {
+    const csv = Array.isArray(options.tags) ? options.tags.join(",") : String(options.tags);
+    if (csv.length > 0) argv.push("-t", csv);
+  }
+  // Forward every other key as a flag (lets callers pass `timeout`,
+  // `binary`, or any future flag without us shipping a new release).
+  const passthrough = { ...options };
+  delete passthrough.description;
+  delete passthrough.tags;
+  delete passthrough.timeout;
+  delete passthrough.binary;
+  argv.push(..._optsToArgv(passthrough));
+  return run(argv, { parseJson: false, timeout: options.timeout, binary: options.binary });
+}
+
+/** `heso pull <plat-hash> [-o <output-path>]`. Writes the plat to disk. */
+function pull(hash, options) {
+  return run(["pull", String(hash), ..._optsToArgv(options)], {
+    parseJson: false,
+    timeout: options && options.timeout,
+    binary: options && options.binary,
+  });
+}
+
+/** `heso list [-q …] [-t …] [--sort …] [--limit N]` — browse the registry. */
+function list(options) {
+  return run(["list", ..._optsToArgv(options)], {
+    parseJson: false,
+    timeout: options && options.timeout,
+    binary: options && options.binary,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Identity / receipt / action-hash
+// ---------------------------------------------------------------------------
+
+/**
+ * `heso identity <subcommand> [args]`. Today's subcommands (`init`,
+ * `show`) accept `--path PATH` and emit
+ * `{path, public_key, algorithm}` JSON; this wrapper resolves with that.
+ */
+function identity(subcommand, ...args) {
+  if (typeof subcommand !== "string" || subcommand === "") {
+    return Promise.reject(
+      new HesoError("identity: subcommand is required (e.g. \"init\")", {
+        command: ["heso", "identity"],
+      }),
+    );
+  }
+  return _spawnJson(["identity", subcommand, ...args.map(String)]);
+}
+
+/**
+ * `heso receipt-verify [--trusted-keys PATH] <file>` — verify a signed
+ * receipt envelope. Resolves `true` on exit 0, `false` on exit 1
+ * (signature / trust / live-mode rejection). Rejects with `HesoError`
+ * on exit 2 (malformed / missing signature / bad allowlist source).
+ */
+async function receiptVerify(filePath, options) {
+  const argv = ["receipt-verify"];
+  if (options && options.trustedKeys) argv.push("--trusted-keys", String(options.trustedKeys));
+  argv.push(String(filePath));
+  try {
+    await _spawn(argv, options);
+    return true;
+  } catch (e) {
+    if (e instanceof HesoError && e.code === 1) return false;
+    throw e;
+  }
+}
+
+/**
+ * `heso action-hash <url> [actions-json | -]` — keyless fingerprint
+ * over `(URL, actions)`. Actions are inline JSON; omit for URL-only.
+ */
+function actionHash(url, actionsJson, options) {
+  const argv = ["action-hash", url];
+  if (typeof actionsJson === "string") argv.push(actionsJson);
+  argv.push(..._optsToArgv(options));
+  return _spawnJson(argv);
+}
+
+/**
+ * `heso action-hash-verify <file>` — recompute and compare. Resolves
+ * `true` (exit 0), `false` (exit 1). Rejects on exit 2 (malformed).
+ */
+async function actionHashVerify(filePath, options) {
+  try {
+    await _spawn(["action-hash-verify", String(filePath), ..._optsToArgv(options)]);
+    return true;
+  } catch (e) {
+    if (e instanceof HesoError && e.code === 1) return false;
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -754,6 +896,8 @@ module.exports = {
   stamp,
   replay,
   unpack,
+  runPlat,
+  refresh,
   // plat dev tools + envelope
   platHash,
   platVerify,
@@ -762,6 +906,15 @@ module.exports = {
   platRedact,
   platSeal,
   platUnseal,
+  // ecosystem registry
+  publish,
+  pull,
+  list,
+  // identity / receipt / action-hash
+  identity,
+  receiptVerify,
+  actionHash,
+  actionHashVerify,
   // session
   Session,
   session,

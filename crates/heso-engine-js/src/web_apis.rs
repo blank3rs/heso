@@ -27,7 +27,7 @@
 //!   the same JS-side walker `crate::form_submit` already uses. Entry
 //!   values are `string` or `Blob`. The fetch path serializes
 //!   `FormData` bodies as `multipart/form-data` with a generated
-//!   boundary, reusing `crate::form_submit::build_multipart_form`.
+//!   boundary via [`build_multipart_form_from_formdata`].
 //!
 //! ## Line-ending normalization
 //!
@@ -60,8 +60,8 @@
 //!   would reject a literal translation — but the structural moves
 //!   (slice-by-byte-range, single-canonical lowercase name map for
 //!   headers, generator-style multipart serializer) match.
-//! - `reqwest::multipart::Form` is reused via
-//!   [`crate::form_submit::build_multipart_form`] for the
+//! - `reqwest::multipart::Form` is used by
+//!   [`build_multipart_form_from_formdata`] for the
 //!   `fetch(body: FormData)` integration.
 //!
 //! [blob-spec]: https://w3c.github.io/FileAPI/#blob-section

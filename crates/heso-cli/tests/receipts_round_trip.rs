@@ -376,3 +376,43 @@ async fn round_trip_env_allowlist_passes_with_correct_pubkey() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("OK "), "expected OK, got: {stdout}");
 }
+
+// ============================================================================
+// 7. `pages_seen` carries one content hash per observed page
+// ============================================================================
+
+#[tokio::test]
+async fn receipt_pages_seen_includes_plat_hash_of_observed_page() {
+    let (_server, url) = start_mock_server().await;
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path();
+
+    let _pubkey = init_identity(cwd);
+    let receipt = sign_open(cwd, &url, "receipt.json");
+
+    let body: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt).expect("read receipt"))
+            .expect("receipt is JSON");
+
+    // `heso open <url> --receipt` traces one `cd <url>` op; the engine
+    // hashes the page text it just landed on and threads it into
+    // `pages_seen`.
+    let pages = body
+        .get("pages_seen")
+        .and_then(|v| v.as_array())
+        .expect("pages_seen array present");
+    assert_eq!(
+        pages.len(),
+        1,
+        "one `cd` op should yield exactly one page hash; got: {pages:?}"
+    );
+    let h = pages[0]
+        .as_str()
+        .expect("pages_seen[0] is a hex string");
+    assert_eq!(h.len(), 64, "BLAKE3 hex digest is 64 chars; got: {h}");
+    assert!(
+        h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "pages_seen[0] must be lowercase hex; got: {h}"
+    );
+}
+

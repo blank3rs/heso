@@ -11,6 +11,7 @@ description = "Internal primitives layer — the ~12 operations the planner emit
 [dependencies]
 heso-core = { path = "../heso-core" }
 heso-engine-api = { path = "../heso-engine-api" }
+blake3.workspace = true
 thiserror.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true

@@ -50,7 +50,7 @@ use url::Url;
 use crate::dom::Document;
 use crate::engine::{EvalError, EvalOutcome, JsEngine};
 use crate::form_submit::{
-    build_apply_fields_js, build_snapshot_js, issue_request, live_fetch_handle, FormSnapshot,
+    build_apply_fields_js, build_snapshot_js, issue_request, submit_fetch_mode, FormSnapshot,
     SubmitResponse, SubmitSkip,
 };
 use crate::scripts::{ScriptFetchPolicy, ScriptOutcome};
@@ -501,7 +501,7 @@ impl JsSession {
 
         // Phase 2: issue the request. Falls back to a no-network
         // outcome if the engine wasn't built with a fetch client.
-        let Some((client, rt_handle)) = live_fetch_handle(&self.engine) else {
+        let Some(fetch_mode) = submit_fetch_mode(&self.engine) else {
             let mut value = serde_json::json!({
                 "matched": true,
                 "defaultPrevented": false,
@@ -518,7 +518,7 @@ impl JsSession {
             });
         };
 
-        let response = match issue_request(&snapshot, &self.url, &client, &rt_handle) {
+        let response = match issue_request(&snapshot, &self.url, fetch_mode) {
             Ok(r) => r,
             Err(e) => {
                 let mut value = serde_json::json!({
@@ -677,11 +677,8 @@ fn is_json_content_type(content_type: &str) -> bool {
         .next()
         .map(|s| s.trim().to_ascii_lowercase())
         .unwrap_or_default();
-    media == "application/json"
-        || media == "text/json"
-        || media.ends_with("+json")
+    media == "application/json" || media == "text/json" || media.ends_with("+json")
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -747,8 +744,14 @@ mod tests {
             </body></html>
         "#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
-        assert_eq!(sess.click("#b").unwrap().value["matched"], serde_json::json!(true));
-        assert_eq!(sess.fill("#i", "x").unwrap().value["matched"], serde_json::json!(true));
+        assert_eq!(
+            sess.click("#b").unwrap().value["matched"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            sess.fill("#i", "x").unwrap().value["matched"],
+            serde_json::json!(true)
+        );
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();
@@ -837,7 +840,10 @@ mod tests {
         </body></html>"#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
         for _ in 0..5 {
-            assert_eq!(sess.click("#b").unwrap().value["matched"], serde_json::json!(true));
+            assert_eq!(
+                sess.click("#b").unwrap().value["matched"],
+                serde_json::json!(true)
+            );
         }
         let n = sess
             .eval("document.querySelector('#n').textContent")
@@ -859,7 +865,10 @@ mod tests {
             </script>
         </body></html>"#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
-        assert_eq!(sess.click("#b").unwrap().value["matched"], serde_json::json!(true));
+        assert_eq!(
+            sess.click("#b").unwrap().value["matched"],
+            serde_json::json!(true)
+        );
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();
@@ -946,7 +955,10 @@ mod tests {
         // And clicking it fires the listener that was attached at
         // creation time — which lives in the node-keyed registry the
         // same way as any other listener.
-        assert_eq!(sess.click("#dyn").unwrap().value["matched"], serde_json::json!(true));
+        assert_eq!(
+            sess.click("#dyn").unwrap().value["matched"],
+            serde_json::json!(true)
+        );
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();
@@ -966,9 +978,7 @@ mod tests {
         </body></html>"#;
         let (sess, _) = JsSession::open(html, test_url()).unwrap();
         sess.click("#b").unwrap();
-        let cls = sess
-            .eval("document.querySelector('#b').className")
-            .unwrap();
+        let cls = sess.eval("document.querySelector('#b').className").unwrap();
         // Class string should have lost "off", gained "on".
         let cls_s = cls.value.as_str().unwrap_or_default().to_owned();
         assert!(
@@ -1161,7 +1171,10 @@ mod tests {
             </script>
         </body></html>"#;
         let (mut sess, _) = JsSession::open(html, test_url()).unwrap();
-        assert_eq!(sess.submit("#f").unwrap().value["matched"], serde_json::json!(true));
+        assert_eq!(
+            sess.submit("#f").unwrap().value["matched"],
+            serde_json::json!(true)
+        );
         let out = sess
             .eval("document.querySelector('#out').textContent")
             .unwrap();

@@ -45,11 +45,10 @@
 //! cassette is loaded. Form submission goes through the same client
 //! shape as `fetch()`; in `FetchMode::DeterministicNoCassette` the
 //! caller path errors with a clear message rather than secretly
-//! issuing a request. Live recording / replay is item M.
+//! issuing a request. Recording and replay share the same cassette
+//! log as static fetches and in-JS `fetch()` calls.
 //!
 //! [spec]: https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#form-submission-algorithm
-
-use std::sync::Arc;
 
 use reqwest::Method;
 use url::Url;
@@ -213,44 +212,66 @@ pub(crate) fn serialize_text_plain(entries: &[FormEntry]) -> String {
     out
 }
 
-/// Build a `reqwest::multipart::Form` from an entry list.
+/// Fixed multipart boundary used by every `<form enctype="multipart/
+/// form-data">` POST. Reusing a single literal makes the wire bytes
+/// deterministic so the cassette key `(method, url, request_body)` can
+/// distinguish two POSTs whose only difference is the field values —
+/// `reqwest::multipart::Form` would otherwise generate a fresh random
+/// boundary per request and silently collapse them onto the same key.
 ///
-/// Text fields become `Part::text(...)` (no filename, no content type
-/// — `reqwest` emits `Content-Disposition: form-data; name="..."`).
-/// File entries become a part with `Content-Disposition` filename and
-/// `Content-Type` (defaulted to `application/octet-stream`) per
-/// §4.10.22.5 — the body is currently the filename string because we
-/// don't yet have access to the file contents (see module doc).
-pub(crate) fn build_multipart_form(entries: &[FormEntry]) -> reqwest::multipart::Form {
-    let mut form = reqwest::multipart::Form::new();
+/// The boundary just needs to not appear inside any field value; per
+/// RFC 7578 the encoding never escapes field bytes, so the only
+/// collision route is a field whose value contains this exact ASCII
+/// string. The 32 trailing hex chars are derived from a random
+/// generation at the time the literal was chosen — there is nothing
+/// special about the bits, just enough length to make accidental
+/// collisions vanishingly unlikely on real-world form payloads.
+pub(crate) const MULTIPART_BOUNDARY: &str = "----heso-multipart-boundary-d6b7e6c5f48e";
+
+/// Serialize an entry list as an RFC 7578 `multipart/form-data` body
+/// using `boundary` as the part separator. The output is exactly the
+/// bytes that go on the wire — no streaming, no random boundary.
+///
+/// Text fields emit a `Content-Disposition: form-data; name="..."`
+/// header followed by the value. File entries emit a part with an
+/// additional `filename="..."` parameter and a `Content-Type` header
+/// (defaulted to `application/octet-stream`) — the body of a file part
+/// is currently empty because there's no JS-side Blob source for plain
+/// `<input type="file">` (see module doc).
+pub(crate) fn serialize_multipart(boundary: &str, entries: &[FormEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
     for e in entries {
-        let name = e.name.clone();
+        out.extend_from_slice(b"--");
+        out.extend_from_slice(boundary.as_bytes());
+        out.extend_from_slice(b"\r\n");
         if e.kind == "file" {
-            let filename = e.filename.clone().unwrap_or_default();
+            let filename = e.filename.as_deref().unwrap_or("");
             let content_type = e
                 .content_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            // PR-1 limitation (see module doc): no file body yet — send
-            // an empty part with the filename header so the field is
-            // present.
-            let bare = reqwest::multipart::Part::bytes(Vec::new()).file_name(filename);
-            // `mime_str` consumes self and returns Result<Part, _>. On
-            // bad mime, fall back to a part with no explicit
-            // Content-Type — reqwest will emit the spec default
-            // (`text/plain` for text parts, `application/octet-stream`
-            // for byte parts).
-            let part = match bare.mime_str(&content_type) {
-                Ok(p) => p,
-                Err(_) => reqwest::multipart::Part::bytes(Vec::new())
-                    .file_name(e.filename.clone().unwrap_or_default()),
-            };
-            form = form.part(name, part);
+                .as_deref()
+                .unwrap_or("application/octet-stream");
+            out.extend_from_slice(b"Content-Disposition: form-data; name=\"");
+            out.extend_from_slice(e.name.as_bytes());
+            out.extend_from_slice(b"\"; filename=\"");
+            out.extend_from_slice(filename.as_bytes());
+            out.extend_from_slice(b"\"\r\nContent-Type: ");
+            out.extend_from_slice(content_type.as_bytes());
+            out.extend_from_slice(b"\r\n\r\n");
+            // PR-1 limitation: file part body is empty until the JS-side
+            // Blob source lands (see module doc).
+            out.extend_from_slice(b"\r\n");
         } else {
-            form = form.part(name, reqwest::multipart::Part::text(e.value.clone()));
+            out.extend_from_slice(b"Content-Disposition: form-data; name=\"");
+            out.extend_from_slice(e.name.as_bytes());
+            out.extend_from_slice(b"\"\r\n\r\n");
+            out.extend_from_slice(e.value.as_bytes());
+            out.extend_from_slice(b"\r\n");
         }
     }
-    form
+    out.extend_from_slice(b"--");
+    out.extend_from_slice(boundary.as_bytes());
+    out.extend_from_slice(b"--\r\n");
+    out
 }
 
 /// Build a JS snippet that walks `<form selector>`'s named controls
@@ -828,8 +849,7 @@ fn resolve_action(base: &Url, action: &str) -> Result<Url, EvalError> {
 pub(crate) fn issue_request(
     snapshot: &FormSnapshot,
     base_url: &Url,
-    client: &Arc<reqwest::Client>,
-    rt_handle: &tokio::runtime::Handle,
+    mode: &FetchMode,
 ) -> Result<SubmitResponse, EvalError> {
     let action_url = resolve_action(base_url, &snapshot.action)?;
     let method = match snapshot.method.as_str() {
@@ -840,20 +860,88 @@ pub(crate) fn issue_request(
 
     // GET method: serialize the entries as the query, replacing any
     // pre-existing query. Spec §4.10.22.3 step 18.1.
-    let (request_url, body_kind) = if method == Method::GET {
+    let (request_url, body_kind, request_body) = if method == Method::GET {
         let mut u = action_url.clone();
         let encoded = serialize_urlencoded(&snapshot.entries);
-        u.set_query(if encoded.is_empty() { None } else { Some(&encoded) });
-        (u, BodyKind::None)
+        u.set_query(if encoded.is_empty() {
+            None
+        } else {
+            Some(&encoded)
+        });
+        (u, BodyKind::None, Vec::new())
     } else {
         // POST: keep the action URL as-is; build the body per enctype.
-        let body = match enctype {
-            Enctype::Urlencoded => BodyKind::Urlencoded(serialize_urlencoded(&snapshot.entries)),
-            Enctype::TextPlain => BodyKind::TextPlain(serialize_text_plain(&snapshot.entries)),
-            Enctype::Multipart => BodyKind::Multipart(build_multipart_form(&snapshot.entries)),
+        let (body, request_body) = match enctype {
+            Enctype::Urlencoded => {
+                let s = serialize_urlencoded(&snapshot.entries);
+                let bytes = s.as_bytes().to_vec();
+                (BodyKind::Urlencoded(s), bytes)
+            }
+            Enctype::TextPlain => {
+                let s = serialize_text_plain(&snapshot.entries);
+                let bytes = s.as_bytes().to_vec();
+                (BodyKind::TextPlain(s), bytes)
+            }
+            Enctype::Multipart => {
+                let boundary = MULTIPART_BOUNDARY.to_owned();
+                let bytes = serialize_multipart(&boundary, &snapshot.entries);
+                let content_type = format!("multipart/form-data; boundary={boundary}");
+                let request_body = bytes.clone();
+                (
+                    BodyKind::MultipartBytes {
+                        content_type,
+                        body: bytes,
+                    },
+                    request_body,
+                )
+            }
         };
-        (action_url, body)
+        (action_url, body, request_body)
     };
+
+    let (client, rt_handle, recording_cassette) = match mode {
+        FetchMode::Live { client, rt_handle } => (client.clone(), rt_handle.clone(), None),
+        FetchMode::Recording {
+            client,
+            rt_handle,
+            cassette,
+        } => (client.clone(), rt_handle.clone(), Some(cassette.clone())),
+        FetchMode::Replaying { cassette } => {
+            let method = method.as_str();
+            let url = request_url.as_str();
+            let Some(record) = cassette.lookup(method, url, &request_body) else {
+                return Err(EvalError::Engine(format!(
+                    "cassette miss: {method} {url} not recorded (cassette has {} entries); the page may have changed since stamping",
+                    cassette.len()
+                )));
+            };
+            let body_bytes =
+                heso_engine_fetch::Cassette::decode_response_body(record).map_err(|e| {
+                    EvalError::Engine(format!(
+                        "cassette decode error for {} {}: {}",
+                        record.method, record.url, e
+                    ))
+                })?;
+            let final_url = Url::parse(&record.final_url)
+                .unwrap_or_else(|_| Url::parse("about:blank").expect("about:blank parses"));
+            return Ok(SubmitResponse {
+                final_url,
+                body: String::from_utf8_lossy(&body_bytes).to_string(),
+                status: record.status,
+                content_type: record
+                    .response_headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, value)| value.clone()),
+            });
+        }
+        FetchMode::DeterministicNoCassette => {
+            unreachable!("submit_fetch_mode filters DeterministicNoCassette")
+        }
+    };
+
+    let record_method = method.as_str().to_owned();
+    let record_url = request_url.as_str().to_owned();
 
     // Build the reqwest request and drive it via the engine's tokio
     // handle. `block_in_place` matches the pattern in `crate::fetch`
@@ -861,7 +949,8 @@ pub(crate) fn issue_request(
     // wires a multi_thread runtime, so this hands work to another
     // worker rather than deadlocking.
     let client = client.clone();
-    let result: Result<(Url, String, u16, Option<String>), reqwest::Error> =
+    type SubmitWire = (Url, String, u16, Vec<(String, String)>);
+    let result: Result<SubmitWire, reqwest::Error> =
         tokio::task::block_in_place(|| {
             rt_handle.block_on(async move {
                 let mut builder = client.request(method, request_url.as_str());
@@ -871,61 +960,83 @@ pub(crate) fn issue_request(
                         .header("Content-Type", "application/x-www-form-urlencoded")
                         .body(s),
                     BodyKind::TextPlain(s) => builder.header("Content-Type", "text/plain").body(s),
-                    BodyKind::Multipart(form) => builder.multipart(form),
+                    BodyKind::MultipartBytes { content_type, body } => {
+                        builder.header("Content-Type", content_type).body(body)
+                    }
                 };
                 let resp = builder.send().await?;
                 let status = resp.status().as_u16();
                 let final_url_str = resp.url().as_str().to_owned();
-                // Snapshot Content-Type BEFORE consuming the body
+                // Snapshot headers BEFORE consuming the body
                 // (resp.text() consumes self). `to_str()` strips any
                 // non-ASCII headers — fine here because the values we
                 // care about (`application/json`, `text/html`, etc.)
                 // are pure ASCII.
-                let content_type = resp
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_owned());
+                let mut headers: Vec<(String, String)> = Vec::new();
+                for (name, val) in resp.headers().iter() {
+                    if let Ok(s) = val.to_str() {
+                        headers.push((name.as_str().to_owned(), s.to_owned()));
+                    }
+                }
                 let body = resp.text().await?;
                 let final_url = Url::parse(&final_url_str)
                     .unwrap_or_else(|_| Url::parse("about:blank").expect("about:blank parses"));
-                Ok((final_url, body, status, content_type))
+                Ok((final_url, body, status, headers))
             })
         });
 
     match result {
-        Ok((final_url, body, status, content_type)) => Ok(SubmitResponse {
-            final_url,
-            body,
-            status,
-            content_type,
-        }),
+        Ok((final_url, body, status, headers)) => {
+            let content_type = headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                .map(|(_, value)| value.clone());
+            if let Some(cassette) = recording_cassette {
+                cassette.lock().expect("cassette mutex poisoned").record(
+                    &record_method,
+                    &record_url,
+                    final_url.as_str(),
+                    &request_body,
+                    status,
+                    headers,
+                    body.as_bytes(),
+                );
+            }
+            Ok(SubmitResponse {
+                final_url,
+                body,
+                status,
+                content_type,
+            })
+        }
         Err(e) => Err(EvalError::Engine(format!("form submit HTTP error: {e}"))),
     }
 }
 
-/// Body shape variants — kept out of the public surface because
-/// `reqwest::multipart::Form` is not `Clone`.
+/// Body shape variants. Multipart carries pre-serialized bytes so the
+/// same wire body becomes both the cassette key and the request body —
+/// `reqwest`'s built-in `Form` generates a random boundary, which would
+/// make two POSTs to the same URL collide on `(POST, url, b"")` even
+/// when their entries differ.
 enum BodyKind {
     None,
     Urlencoded(String),
     TextPlain(String),
-    Multipart(reqwest::multipart::Form),
+    MultipartBytes { content_type: String, body: Vec<u8> },
 }
 
-/// Borrow `(client, rt_handle)` out of the engine's fetch state, if any.
+/// Borrow the form-submit network mode out of the engine's fetch state.
 ///
 /// `None` when the engine was built without a fetch client (e.g.
-/// `JsEngine::new()`); the caller should fall back to the
-/// dispatch-only legacy path.
-pub(crate) fn live_fetch_handle(engine: &JsEngine) -> Option<(Arc<reqwest::Client>, tokio::runtime::Handle)> {
+/// `JsEngine::new()`) or with deterministic mode but no cassette; the
+/// caller should fall back to the dispatch-only legacy path.
+pub(crate) fn submit_fetch_mode(engine: &JsEngine) -> Option<&FetchMode> {
     let fs = engine.fetch_state_ref()?;
     match &fs.mode {
-        FetchMode::Live { client, rt_handle }
-        | FetchMode::Recording {
-            client, rt_handle, ..
-        } => Some((client.clone(), rt_handle.clone())),
-        FetchMode::Replaying { .. } | FetchMode::DeterministicNoCassette => None,
+        FetchMode::Live { .. } | FetchMode::Recording { .. } | FetchMode::Replaying { .. } => {
+            Some(&fs.mode)
+        }
+        FetchMode::DeterministicNoCassette => None,
     }
 }
 
@@ -950,10 +1061,7 @@ mod tests {
             entry("comments", "hello world & friends"),
         ];
         let out = serialize_urlencoded(&entries);
-        assert_eq!(
-            out,
-            "custname=Jane+Doe&comments=hello+world+%26+friends",
-        );
+        assert_eq!(out, "custname=Jane+Doe&comments=hello+world+%26+friends",);
     }
 
     #[test]

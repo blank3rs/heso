@@ -228,6 +228,42 @@ export function replay(
  */
 export function unpack(file: string): Promise<unknown[]>;
 
+/**
+ * `heso run <plat.plat>` — re-execute a stamped plat's plan against
+ * its embedded cassette. No network: cassette misses error out with
+ * structured details. Returns the new plat body whose `plat_hash` must
+ * match the input plat byte-for-byte if the cassette was unmodified
+ * (ADR 0008). Use {@link replay} for the no-engine inspector that just
+ * emits the recorded step log, and {@link stamp} to mint a fresh plat
+ * against the live web.
+ *
+ * Named `runPlat` to avoid collision with the low-level {@link run}
+ * escape hatch.
+ */
+export function runPlat(
+  file: string,
+  options?: PlanOptions,
+): Promise<Record<string, unknown>>;
+
+/** Result shape for `heso refresh`. */
+export interface RefreshResult {
+  ok: true;
+  drifted: boolean;
+  input_plat_hash: string;
+  live_plat_hash: string;
+  /** Present only when `drifted` is true. */
+  diff?: { plan_identical: boolean };
+}
+
+/**
+ * `heso refresh [--seed N] <plat>` — re-stamp a plat against the live
+ * web and return drift status. Resolves with `RefreshResult` whether or
+ * not drift was detected (the CLI distinguishes via the `drifted`
+ * boolean, not the exit code). Rejects with `HesoError` on usage errors
+ * (exit 2 — missing plan field, unreachable site).
+ */
+export function refresh(file: string, options?: PlanOptions): Promise<RefreshResult>;
+
 // Plat dev tools + envelope ---------------------------------------------
 
 export interface PlatSealOptions {
@@ -307,6 +343,129 @@ export function platUnseal(
   file: string,
   options?: PlatUnsealOptions,
 ): Promise<Record<string, unknown>>;
+
+// Ecosystem registry (publish / pull / list) ---------------------------
+
+/** Options for {@link publish}. */
+export interface PublishOptions extends CommonOptions {
+  /** Required by the CLI — passed through as `-d "…"`. */
+  description: string;
+  /**
+   * Comma-separated tag list passed through as `-t "a,b,c"`. Arrays are
+   * joined with `,` for you; empty entries are dropped.
+   */
+  tags?: string | string[];
+}
+
+/**
+ * `heso publish <plat-file> -d "<description>" [-t "tag1,tag2"]` —
+ * upload a stamped plat to the public registry at heso.ca/ecosystem.
+ *
+ * The CLI prints a multi-line confirmation (`✓ ok: <hash>` plus follow-up
+ * lines pointing at pull / view URLs) rather than JSON, so this wrapper
+ * resolves with the raw stdout string. Rejects with `HesoError` on
+ * registry / network failure (exit 1) or usage errors (exit 2).
+ */
+export function publish(file: string, options: PublishOptions): Promise<string>;
+
+/** Options for {@link pull}. */
+export interface PullOptions extends CommonOptions {
+  /** Output path; default is `./<hash>.plat`. Passed through as `-o`. */
+  out?: string;
+}
+
+/**
+ * `heso pull <plat-hash> [-o <output-path>]` — download a published
+ * plat by its 64-char lowercase BLAKE3 hash. Resolves with the raw
+ * stdout confirmation text (the CLI emits a `✓ pulled N bytes → <path>`
+ * banner, not JSON). The file is written to disk as a side effect.
+ */
+export function pull(hash: string, options?: PullOptions): Promise<string>;
+
+/** Options for {@link list}. */
+export interface ListOptions extends CommonOptions {
+  /** Substring match on description / URL / tags (`-q`). */
+  q?: string;
+  /** Single-tag filter (`-t`). */
+  tag?: string;
+  /** Ranking; default `trending` (`--sort`). */
+  sort?: "trending" | "downloads" | "newest";
+  /** 1..=100, default 20 (`--limit`). */
+  limit?: number;
+}
+
+/**
+ * `heso list [-q "<query>"] [-t <tag>] [--sort …] [--limit N]` — browse
+ * the public plat registry. Resolves with the raw stdout table the CLI
+ * prints (a formatted human listing — `HASH  DLs  PUBLISHED  DESCRIPTION`
+ * rows — not JSON).
+ */
+export function list(options?: ListOptions): Promise<string>;
+
+// Identity + receipt + action-hash --------------------------------------
+
+/**
+ * `heso identity <subcommand> [args]` — Ed25519 key management.
+ * Today's subcommands are `init` (mint a key) and `show` (print the
+ * pubkey). Both accept `[--path P]` (default
+ * `heso-local-data/identity.key`) and both emit
+ * `{path, public_key, algorithm}` JSON.
+ *
+ * One typed entry instead of one function per subcommand keeps the
+ * surface stable as new subcommands land.
+ */
+export function identity(
+  subcommand: string,
+  ...args: string[]
+): Promise<Record<string, unknown>>;
+
+/** Options for {@link receiptVerify}. */
+export interface ReceiptVerifyOptions extends CommonOptions {
+  /**
+   * Path to a JSON allowlist of base64 pubkeys. Also honored via the
+   * `HESO_TRUSTED_KEYS` env var. Receipts whose signer isn't in the
+   * allowlist are rejected (resolves `false`).
+   */
+  trustedKeys?: string;
+}
+
+/**
+ * `heso receipt-verify [--trusted-keys PATH] <file>` — verify an
+ * Ed25519-signed receipt envelope. Resolves `true` (CLI exit 0, valid +
+ * signer trusted) or `false` (exit 1: signature mismatch, untrusted
+ * signer, or `mode: live` — not replay-safe per ADR 0008). Rejects with
+ * `HesoError` on exit 2 (malformed / missing signature / unreadable
+ * input / bad `--trusted-keys` source).
+ */
+export function receiptVerify(
+  file: string,
+  options?: ReceiptVerifyOptions,
+): Promise<boolean>;
+
+/**
+ * `heso action-hash <url> [actions-json | -]` — keyless, deterministic
+ * fingerprint over `(URL, actions)`. Pass the action array as the
+ * second argument (inline JSON string) or omit it for a URL-only
+ * fingerprint. Returns the serialized `TraceFingerprint`
+ * (`{algorithm, url, actions, action_ids, site_id, trace_id}`).
+ */
+export function actionHash(
+  url: string,
+  actionsJson?: string,
+  options?: CommonOptions,
+): Promise<Record<string, unknown>>;
+
+/**
+ * `heso action-hash-verify <file>` — recompute every component in a
+ * saved fingerprint and confirm it matches. Resolves `true` (CLI exit 0
+ * — valid) or `false` (exit 1 — recompute disagrees or unknown
+ * algorithm tag). Rejects with `HesoError` on exit 2 (file missing /
+ * not a fingerprint JSON).
+ */
+export function actionHashVerify(
+  file: string,
+  options?: CommonOptions,
+): Promise<boolean>;
 
 /** Low-level: spawn `heso <args>` and parse stdout. */
 export function run(

@@ -103,6 +103,7 @@ mod ecosystem;
 mod receipts;
 mod search;
 mod serve;
+mod template;
 
 // Replace the system allocator with mimalloc. Windows' UCRT
 // allocator is the weakest standard allocator of any major platform;
@@ -216,6 +217,10 @@ fn print_banner() {
     );
     println!("  heso list    [-q query] [-t tag] [--sort trending|downloads|newest] [--limit N]");
     println!("                                Browse the public plat registry.");
+    println!("  heso template-check <template.json|->");
+    println!("                                EXPERIMENTAL: validate a heso.template/v0 authoring template.");
+    println!("  heso template-stamp [--seed N] --param k=v... <template.json|->");
+    println!("                                EXPERIMENTAL: live-record a template into an ordinary HESO/1.0 plat.");
     println!("  heso update [--dry-run]      Update every detected global heso install channel.");
     println!("  heso eval-js [--seed N] <js>  Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window; use eval-dom for pages.");
@@ -252,6 +257,11 @@ fn print_banner() {
     println!("                                network. Mints a fresh plat; for an unchanged cassette its");
     println!("                                plat_hash equals the input's (byte-identical replay, ADR 0008).");
     println!("                                Misses (page drifted since stamp) surface as graceful errors.");
+    println!("  heso refresh [--seed N] <plat.plat|->");
+    println!("                                Re-stamp a plat against the live web and report whether it has");
+    println!("                                drifted. Exit 0 no change / 1 drifted / 2 usage or input error.");
+    println!("                                Emits structured JSON: {{ok, drifted, input_plat_hash, live_plat_hash,");
+    println!("                                diff?}}. The plat MUST have a `plan` field.");
     println!("  heso replay <plat.plat|plat-hash|->");
     println!("                                Emit the recorded step log from a plat. Pure observation — no");
     println!("                                engine, no network, no JS. Use `run` to re-execute.");
@@ -494,7 +504,7 @@ async fn open_or_die(url_arg: &str) -> Result<heso_engine_fetch::FetchPage, Exit
     })
 }
 
-fn print_json(value: &serde_json::Value) -> ExitCode {
+pub(crate) fn print_json(value: &serde_json::Value) -> ExitCode {
     match serde_json::to_string_pretty(value) {
         Ok(s) => {
             println!("{s}");
@@ -2655,7 +2665,7 @@ pub(crate) fn run_auto_scroll_loop(
 /// Returns once either:
 /// - the snapshot has not changed for `DOM_QUIET_MS` of wall time, or
 /// - `PER_STEP_TIMEOUT_MS` total has elapsed (hard ceiling).
-fn wait_dom_quiet(session: &mut heso_engine_js::JsSession) {
+pub(crate) fn wait_dom_quiet(session: &mut heso_engine_js::JsSession) {
     let step_start = std::time::Instant::now();
     let tick = std::time::Duration::from_millis(25);
     let mut last_hash = html_content_hash(&session.document_html());
@@ -5275,6 +5285,33 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let body = match stamp_to_plat(&plan, seed).await {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let partial = body.get("error").is_some();
+    let _ = print_json(&body);
+    if partial {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Re-stamp a plan against the live web and return the fully-formed
+/// plat body (with embedded plan, cassette, step log, and `plat_hash`).
+///
+/// Returns `Ok(body)` for both clean and partial runs — partial runs
+/// carry an `"error"` key plus the per-step log, exactly like the
+/// stdout that `cmd_stamp` would have printed. The only `Err` case is
+/// engine initialization, which can't yield a meaningful plat at all.
+async fn stamp_to_plat(
+    plan: &PlanInput,
+    seed: Option<u64>,
+) -> Result<serde_json::Value, String> {
     // Fresh shared cassette: the static `FetchEngine` and the JS-side
     // `fetch` / XHR shims (via `open_js_session_with_cassette`) both
     // append into this one log during the run. After the plan finishes
@@ -5282,13 +5319,8 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
     // so `heso run <plat>` can play it back byte-identical.
     let cassette: std::sync::Arc<std::sync::Mutex<heso_engine_fetch::Cassette>> =
         std::sync::Arc::new(std::sync::Mutex::new(heso_engine_fetch::Cassette::new()));
-    let fetch = match FetchEngine::with_recording_cassette(cassette.clone()) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("engine init failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let fetch = FetchEngine::with_recording_cassette(cassette.clone())
+        .map_err(|e| format!("engine init failed: {e}"))?;
     let outcome = run_plan(&fetch, &plan.actions, seed, plan.start_url.clone()).await;
 
     // Build a FetchPage from the post-execution DOM (live JS state).
@@ -5313,7 +5345,7 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
     if !outcome.final_actions.is_empty() {
         page.actions = outcome.final_actions;
     }
-    page.plan = Some(plan.actions_json);
+    page.plan = Some(plan.actions_json.clone());
     let mut body = page.plat_body_base();
     if !outcome.ok {
         if let Some(obj) = body.as_object_mut() {
@@ -5347,12 +5379,142 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
-    let _ = print_json(&body);
-    if outcome.ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    Ok(body)
+}
+
+/// `heso refresh [--seed N] <plat.plat|->` — drift detection. Reads a
+/// plat, extracts its plan, re-stamps it against the live web, and
+/// compares the resulting `plat_hash` to the input's.
+///
+/// Exit codes:
+/// - 0: no drift (live `plat_hash` matches the input's byte-for-byte).
+/// - 1: drift detected.
+/// - 2: usage error or input that can't be refreshed (missing `plan`
+///   field, unreachable site, malformed JSON).
+///
+/// Output is always structured JSON on stdout: `{ok, drifted,
+/// input_plat_hash, live_plat_hash}` plus a `diff` object when drifted.
+/// Failures emit `{ok: false, error: {kind, message}}` instead.
+async fn cmd_refresh(args: &[String]) -> ExitCode {
+    let mut seed: Option<u64> = None;
+    let mut path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("usage: heso refresh [--seed N] <plat.plat|->");
+                return ExitCode::SUCCESS;
+            }
+            "--seed" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--seed needs a value");
+                    return ExitCode::from(2);
+                };
+                match v.parse::<u64>() {
+                    Ok(n) => seed = Some(n),
+                    Err(e) => {
+                        eprintln!("--seed: invalid u64 `{v}`: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            _ => {
+                if path.is_some() {
+                    eprintln!("unexpected positional `{}`", args[i]);
+                    return ExitCode::from(2);
+                }
+                path = Some(args[i].clone());
+                i += 1;
+            }
+        }
     }
+    let Some(path) = path else {
+        eprintln!("usage: heso refresh [--seed N] <plat.plat|->");
+        return ExitCode::from(2);
+    };
+
+    let contents = match read_plat_input(&path) {
+        Ok(s) => s,
+        Err(_) => {
+            return emit_refresh_error("invalid_input", format!("cannot read `{path}`"));
+        }
+    };
+    let input_value: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(e) => {
+            return emit_refresh_error(
+                "invalid_input",
+                format!("`{path}` is not valid JSON: {e}"),
+            );
+        }
+    };
+    let Some(input_hash) = input_value.get("plat_hash").and_then(|v| v.as_str()) else {
+        return emit_refresh_error(
+            "no_plat_hash",
+            "input has no `plat_hash` field — refresh needs a stamped plat",
+        );
+    };
+    let input_hash = input_hash.to_owned();
+    let plan = match extract_plan(&input_value) {
+        Ok(p) => p,
+        Err(e) => return emit_refresh_error("no_plan", e),
+    };
+    let live_body = match stamp_to_plat(&plan, seed).await {
+        Ok(b) => b,
+        Err(e) => return emit_refresh_error("stamp_failed", e),
+    };
+    if let Some(err) = live_body.get("error").and_then(|v| v.as_str()) {
+        return emit_refresh_error("stamp_partial", err);
+    }
+    let live_hash = live_body
+        .get("plat_hash")
+        .and_then(|v| v.as_str())
+        .expect("stamp_to_plat embeds plat_hash on every success body")
+        .to_owned();
+    let drifted = live_hash != input_hash;
+
+    let mut output = serde_json::json!({
+        "ok": true,
+        "drifted": drifted,
+        "input_plat_hash": input_hash,
+        "live_plat_hash": live_hash,
+    });
+    if drifted {
+        let plan_identical = input_value.get("plan") == live_body.get("plan");
+        if let Some(obj) = output.as_object_mut() {
+            obj.insert(
+                "diff".to_owned(),
+                serde_json::json!({ "plan_identical": plan_identical }),
+            );
+        }
+    }
+    let _ = print_json(&output);
+    if drifted {
+        eprintln!("drift detected: plat_hash changed");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Emit a `{ok: false, error: {kind, message}}` JSON document on stdout
+/// and return exit code 2 (usage / input error). Mirrors the structured
+/// failure shape used by the experimental template surface.
+fn emit_refresh_error(kind: &str, message: impl Into<String>) -> ExitCode {
+    let value = serde_json::json!({
+        "ok": false,
+        "error": {
+            "kind": kind,
+            "message": message.into(),
+        }
+    });
+    let _ = print_json(&value);
+    ExitCode::from(2)
 }
 
 /// `heso unpack <plat.plat>` — extract the `plan` array from a plat
@@ -5686,14 +5848,18 @@ async fn cmd_run(args: &[String]) -> ExitCode {
     // §5.5, deterministic-mode runs MUST NOT degrade to live HTTP
     // on a missing cassette; that's `stamp`'s job.
     let cassette = match extract_cassette(&value) {
-        Some(c) => c,
-        None => {
+        Ok(Some(c)) => c,
+        Ok(None) => {
             eprintln!(
                 "run: input plat carries no `cassette` field — `run` is the cassette-replay \
                  verb and requires one (HESO/1.0 §5.5: deterministic mode must not fall back \
                  to live network); use `heso stamp <plan>` to mint a fresh plat against the \
                  live web instead"
             );
+            return ExitCode::from(2);
+        }
+        Err(msg) => {
+            eprintln!("run: malformed cassette in plat: {msg}");
             return ExitCode::from(2);
         }
     };
@@ -5816,13 +5982,24 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
 }
 
 /// Extract the `cassette` field from a plat JSON and deserialize it
-/// into a usable [`heso_engine_fetch::Cassette`]. Returns `None` if
-/// the field is absent or malformed; `cmd_run`'s caller falls back
-/// to Live mode in that case, which matches the legacy behavior of
-/// the pre-cassette CLI.
-fn extract_cassette(plat: &serde_json::Value) -> Option<heso_engine_fetch::Cassette> {
-    let raw = plat.get("cassette")?;
-    serde_json::from_value(raw.clone()).ok()
+/// into a usable [`heso_engine_fetch::Cassette`].
+///
+/// - `Ok(None)` — no `cassette` field on the plat.
+/// - `Ok(Some(c))` — present and well-formed.
+/// - `Err(msg)` — present but malformed; the message carries the
+///   underlying serde error. `cmd_run` surfaces this as a distinct
+///   exit so the operator can tell "plat has no cassette at all"
+///   apart from "plat has a cassette but it's been tampered with /
+///   was produced by a different version".
+fn extract_cassette(
+    plat: &serde_json::Value,
+) -> Result<Option<heso_engine_fetch::Cassette>, String> {
+    let Some(raw) = plat.get("cassette") else {
+        return Ok(None);
+    };
+    serde_json::from_value(raw.clone())
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Result of running a plan against the live web.
@@ -5968,7 +6145,7 @@ fn open_js_session_with_cassette(
 /// through the live [`heso_engine_js::JsSession`] — so DOM mutations
 /// between steps persist (within the limits documented on
 /// [`heso_engine_js::JsSession`]).
-async fn execute_step_session(
+pub(crate) async fn execute_step_session(
     fetch: &FetchEngine,
     session: &mut Option<heso_engine_js::JsSession>,
     current_url: &mut Url,
@@ -6044,6 +6221,8 @@ async fn execute_step_session(
 
                 if matched && default_prevented {
                     // SPA router handled it — no real navigation.
+                    *current_actions =
+                        heso_engine_fetch::extract_actions_from_html(&sess_ref.document_html());
                     let mut obj = serde_json::json!({
                         "op": "click",
                         "kind": "dom-event",
@@ -6112,6 +6291,7 @@ async fn execute_step_session(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let drift = ref_drift_field(sess, &selector, &elem.tag);
+            *current_actions = heso_engine_fetch::extract_actions_from_html(&sess.document_html());
             let mut obj = serde_json::json!({
                 "op": "click",
                 "kind": "dom-event",
@@ -6149,6 +6329,7 @@ async fn execute_step_session(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let drift = ref_drift_field(sess, &selector, &elem.tag);
+            *current_actions = heso_engine_fetch::extract_actions_from_html(&sess.document_html());
             let mut obj = serde_json::json!({
                 "op": "fill",
                 "ref": want,
@@ -6190,6 +6371,8 @@ async fn execute_step_session(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let drift = ref_drift_field(sess, &selector, &elem.tag);
+            *current_url = sess.url().clone();
+            *current_actions = heso_engine_fetch::extract_actions_from_html(&sess.document_html());
             let mut obj = serde_json::json!({
                 "op": "submit",
                 "ref": want,
@@ -6556,10 +6739,13 @@ async fn main() -> ExitCode {
         Some("publish") => ecosystem::cmd_publish(&args[1..]).await,
         Some("pull") => ecosystem::cmd_pull(&args[1..]).await,
         Some("list") => ecosystem::cmd_list(&args[1..]).await,
+        Some("template-check") => template::cmd_template_check(&args[1..]).await,
+        Some("template-stamp") => template::cmd_template_stamp(&args[1..]).await,
         Some("update") => cmd_update(&args[1..]).await,
         Some("serve") => serve::run().await,
         Some("action-hash") => cmd_action_hash(&args[1..]).await,
         Some("action-hash-verify") => cmd_action_hash_verify(&args[1..]).await,
+        Some("refresh") => cmd_refresh(&args[1..]).await,
         Some("replay") => cmd_replay(&args[1..]).await,
         Some("run") => cmd_run(&args[1..]).await,
         Some("stamp") => cmd_stamp(&args[1..]).await,
