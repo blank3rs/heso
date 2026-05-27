@@ -93,6 +93,12 @@ heso-local-data/
 # (e.g. services/ecosystem-api is the heso.ca/ecosystem backend).
 /services/
 
+# Vendored source dropped locally for reference / experimentation —
+# never used by the build (rquickjs ships its own QuickJS). Anywhere a
+# `vendor/` directory shows up under the workspace, treat it as
+# local-only scratch and keep it out of git.
+vendor/
+
 # Environment / secrets
 .env
 .env.local
