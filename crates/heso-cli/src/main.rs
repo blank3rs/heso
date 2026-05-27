@@ -2448,7 +2448,14 @@ fn detect_infinite_scroll_signals(html: &str) -> Vec<String> {
 pub(crate) struct ScrollSummary {
     iterations: usize,
     stop_reason: &'static str,
-    elapsed_ms: u128,
+    /// Virtual-clock milliseconds the loop advanced through. Stable
+    /// across runs in deterministic mode and the value `plat_hash`
+    /// commits to.
+    elapsed_ms: u64,
+    /// Wall-clock milliseconds the loop actually spent. Diagnostic
+    /// only; varies with the host's network + scheduler.
+    #[serde(rename = "wall_elapsed_ms_unsafe")]
+    wall_elapsed_ms: u128,
     final_content_hash: String,
 }
 
@@ -2508,12 +2515,17 @@ pub(crate) fn run_auto_scroll_loop(
     console: &mut Vec<heso_engine_js::ConsoleEntry>,
     post_html: &mut String,
 ) -> ScrollSummary {
+    let virtual_start_ms = session.engine().virtual_now_ms();
     let start = std::time::Instant::now();
     if !lazy_hints.more_content_likely {
         return ScrollSummary {
             iterations: 0,
             stop_reason: "no_lazy_content",
-            elapsed_ms: start.elapsed().as_millis(),
+            elapsed_ms: session
+                .engine()
+                .virtual_now_ms()
+                .saturating_sub(virtual_start_ms),
+            wall_elapsed_ms: start.elapsed().as_millis(),
             final_content_hash: html_snapshot_key(post_html),
         };
     }
@@ -2587,7 +2599,11 @@ pub(crate) fn run_auto_scroll_loop(
     ScrollSummary {
         iterations,
         stop_reason,
-        elapsed_ms: start.elapsed().as_millis(),
+        elapsed_ms: session
+            .engine()
+            .virtual_now_ms()
+            .saturating_sub(virtual_start_ms),
+        wall_elapsed_ms: start.elapsed().as_millis(),
         final_content_hash: html_snapshot_key(post_html),
     }
 }
