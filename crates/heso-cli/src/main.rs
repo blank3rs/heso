@@ -3759,6 +3759,14 @@ where
                 "ok": true,
                 "op": op_name,
                 "url": final_url.to_string(),
+                // `final_url` and `redirects` are filled in for click's
+                // anchor-follow path by `augment_click_with_destination`
+                // below. For non-navigating ops (fill, submit, JS-only
+                // clicks, button clicks) the defaults `final_url == url`
+                // and `redirects = []` are the correct answer — nothing
+                // navigated, so there is no chain to report.
+                "final_url": final_url.to_string(),
+                "redirects": serde_json::Value::Array(Vec::new()),
                 "ref": want,
                 "selector": selector,
                 "value": outcome.value,
@@ -3820,6 +3828,13 @@ where
                 "ok": false,
                 "op": op_name,
                 "url": final_url.to_string(),
+                // Mirror the success-path defaults: no navigation
+                // happened (the JS engine failed before we could even
+                // try to follow an anchor), so the chain is empty and
+                // we never moved past the requested page's
+                // post-redirect URL.
+                "final_url": final_url.to_string(),
+                "redirects": serde_json::Value::Array(Vec::new()),
                 "ref": want,
                 "selector": selector,
                 "error": err_body,
@@ -3869,21 +3884,52 @@ fn follow_anchor_href(action: &heso_engine_fetch::ElementRef, page_url: &Url) ->
 /// Bug A helper: fetch the click destination and fold its page into
 /// the click response. Adds `navigated: true`, `navigated_to: <url>`,
 /// plus the destination's `title`, `description`, `tree`, `actions`,
-/// `metadata`, and `http_status`. On fetch failure, sets
+/// `metadata`, `http_status`, and the **redirect chain** the
+/// destination fetch walked through. `final_url` is overwritten with
+/// the post-redirect URL of where the navigation actually landed,
+/// and `redirects` is the ordered hop list (empty when the
+/// destination served a direct 200). On fetch failure, sets
 /// `navigated: false` + `nav_error: <msg>` and leaves the original
-/// click body intact.
+/// click body intact apart from those two fields.
 async fn augment_click_with_destination(
     mut body: serde_json::Value,
     engine: &FetchEngine,
     dest_url: &Url,
 ) -> serde_json::Value {
-    match engine.open(dest_url).await {
-        Ok(dest_page) => {
+    // Use the chain-aware fetch so we can populate `final_url` +
+    // `redirects` without paying for a second network round-trip.
+    // Parsing back into a `FetchPage` locally gives us the same
+    // `tree` / `actions` / `metadata` shape `engine.open()` would
+    // produce.
+    match engine.fetch_text_with_redirects(dest_url).await {
+        Ok(fetched) => {
+            let dest_page = FetchPage::from_html(
+                dest_url.as_str().to_owned(),
+                fetched.final_url.clone(),
+                fetched.http_status,
+                Vec::new(),
+                fetched.html,
+            );
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("navigated".to_owned(), serde_json::Value::Bool(true));
                 obj.insert(
                     "navigated_to".to_owned(),
                     serde_json::Value::String(dest_page.url().as_str().to_owned()),
+                );
+                // `final_url` reflects where the agent ended up after
+                // the click navigation finished resolving redirects;
+                // `redirects` is the chain that got us there. Both
+                // overwrite the placeholder values the default arm in
+                // `run_dispatch` seeded.
+                obj.insert(
+                    "final_url".to_owned(),
+                    serde_json::Value::String(dest_page.url().as_str().to_owned()),
+                );
+                obj.insert(
+                    "redirects".to_owned(),
+                    serde_json::to_value(&fetched.redirects).unwrap_or_else(|_| {
+                        serde_json::Value::Array(Vec::new())
+                    }),
                 );
                 obj.insert(
                     "title".to_owned(),
@@ -3930,6 +3976,15 @@ async fn augment_click_with_destination(
                 obj.insert("navigated".to_owned(), serde_json::Value::Bool(false));
                 obj.insert(
                     "navigated_to".to_owned(),
+                    serde_json::Value::String(dest_url.as_str().to_owned()),
+                );
+                // Navigation failed before we could observe a chain.
+                // Point `final_url` at the URL we tried to navigate
+                // to so the agent can see "I aimed for X but never
+                // arrived." `redirects` stays at its default empty
+                // array — we never walked any hops.
+                obj.insert(
+                    "final_url".to_owned(),
                     serde_json::Value::String(dest_url.as_str().to_owned()),
                 );
                 obj.insert(

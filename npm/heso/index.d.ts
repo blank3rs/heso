@@ -102,6 +102,14 @@ export function wait(url: string, options?: WaitOptions): Promise<Record<string,
 /**
  * `heso click <url>` — dispatch a real click. Pass `ref` ("@e7") OR a
  * locator option (`text`, `selector`, `ariaLabel`).
+ *
+ * The resolved JSON carries `url` (the page where the click happened,
+ * post any redirects on that page's own fetch), `final_url` (where
+ * navigation actually landed after following `<a href>` plus its own
+ * redirect chain — equals `url` for non-navigating clicks), and
+ * `redirects` (the `{from, to, status}` hops the navigation walked
+ * through, empty for direct hits and for clicks that did not
+ * navigate).
  */
 export function click(
   url: string,

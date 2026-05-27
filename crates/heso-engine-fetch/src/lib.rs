@@ -87,6 +87,10 @@ pub use plat::{
     SealedPlat, VerifyError as PlatVerifyError,
 };
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
+// `RedirectHop` / `RedirectedFetch` are defined inline below alongside
+// `FetchEngine`'s redirect-aware fetch method; both are `pub struct`
+// at the crate root, so callers reach them as
+// `heso_engine_fetch::RedirectHop` / `heso_engine_fetch::RedirectedFetch`.
 // `ResponseCookie` is defined inline below alongside `FetchPage` and is
 // already public via its `pub struct` declaration. The CLI uses it to
 // render a deterministic per-URL `cookies` field without re-reading the
@@ -464,6 +468,173 @@ impl FetchEngine {
             body_bytes,
         })
     }
+
+    /// HTTP-only fetch that returns the raw HTML **and** the redirect
+    /// chain that led to it: `RedirectedFetch { final_url, html,
+    /// http_status, redirects }`. Each hop is
+    /// [`RedirectHop`] `{ from, to, status }` recorded in the order
+    /// reqwest would follow them. An empty `redirects` vec means the
+    /// request returned a non-3xx on the first response.
+    ///
+    /// Uses a one-off `reqwest::Client` configured with
+    /// [`reqwest::redirect::Policy::none`] that shares this engine's
+    /// cookie jar — so `Set-Cookie` from any intermediate hop lands in
+    /// the same store the main engine reads from, and outgoing requests
+    /// carry the matching `Cookie` header on every hop. Honors the
+    /// same 20-hop ceiling [`Self::new`] applies (matching the default
+    /// auto-follow path); the 21st hop returns
+    /// [`reqwest::Error`] surfaced through [`Error::Http`].
+    ///
+    /// This method ALWAYS hits the live wire — it bypasses the
+    /// cassette layer. Callers that need cassette semantics for a
+    /// redirect chain must layer their own recording on top; the
+    /// HESO/1.0 §2 cassette wire format records only one
+    /// `(method, url) → (status, headers, body)` pair per request and
+    /// does not carry the chain.
+    pub async fn fetch_text_with_redirects(
+        &self,
+        url: &Url,
+    ) -> HesoResult<RedirectedFetch> {
+        // A redirect-aware fetch can only be honest when it sees every
+        // hop. The engine's default client auto-follows, swallowing the
+        // intermediate status codes the caller wants on
+        // `redirects[].status`. Build a sibling client with the same
+        // cookie jar but no auto-follow so each 3xx surfaces here.
+        let manual_client = Client::builder()
+            .user_agent(concat!("heso/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .cookie_provider(self.cookie_jar.clone())
+            .build()
+            .map_err(Error::from)?;
+
+        let mut current = url.clone();
+        let mut hops: Vec<RedirectHop> = Vec::new();
+        // Same ceiling the default client uses — `Policy::limited(20)`.
+        // Matches `Self::new`'s redirect policy so hitting the cap here
+        // and hitting it on a default fetch produce the same outcome.
+        const MAX_REDIRECTS: usize = 20;
+        for _ in 0..=MAX_REDIRECTS {
+            let response = manual_client
+                .get(current.as_str())
+                .send()
+                .await
+                .map_err(Error::from)?;
+            let status = response.status();
+            let status_u16 = status.as_u16();
+            if status.is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let Some(loc) = location else {
+                    // 3xx without a `Location` header is unusual but
+                    // legal; treat the response as terminal so the
+                    // caller sees the body of whatever the server
+                    // actually returned.
+                    let body_bytes = response.bytes().await.map_err(Error::from)?;
+                    let html = String::from_utf8_lossy(&body_bytes).into_owned();
+                    return Ok(RedirectedFetch {
+                        final_url: current,
+                        html,
+                        http_status: status_u16,
+                        redirects: hops,
+                    });
+                };
+                let next = match current.join(&loc) {
+                    Ok(u) => u,
+                    Err(_) => {
+                        let body_bytes = response.bytes().await.map_err(Error::from)?;
+                        let html = String::from_utf8_lossy(&body_bytes).into_owned();
+                        return Ok(RedirectedFetch {
+                            final_url: current,
+                            html,
+                            http_status: status_u16,
+                            redirects: hops,
+                        });
+                    }
+                };
+                hops.push(RedirectHop {
+                    from: current.to_string(),
+                    to: next.to_string(),
+                    status: status_u16,
+                });
+                current = next;
+                continue;
+            }
+            let body_bytes = response.bytes().await.map_err(Error::from)?;
+            let html = String::from_utf8_lossy(&body_bytes).into_owned();
+            return Ok(RedirectedFetch {
+                final_url: current,
+                html,
+                http_status: status_u16,
+                redirects: hops,
+            });
+        }
+        // Exceeded the hop budget. The 21st send() trips reqwest's own
+        // limited policy on the manual_client (which is `none`, so it
+        // doesn't redirect at all) and the next request would be
+        // another 3xx — break out so the caller sees a structured
+        // ceiling-hit rather than an unbounded loop. We return the
+        // body of the final 3xx response so the chain stays
+        // recoverable.
+        let response = manual_client
+            .get(current.as_str())
+            .send()
+            .await
+            .map_err(Error::from)?;
+        let final_url_str = response.url().as_str().to_owned();
+        let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
+        let http_status = response.status().as_u16();
+        let body_bytes = response.bytes().await.map_err(Error::from)?;
+        let html = String::from_utf8_lossy(&body_bytes).into_owned();
+        Ok(RedirectedFetch {
+            final_url,
+            html,
+            http_status,
+            redirects: hops,
+        })
+    }
+}
+
+// ============================================================================
+// RedirectHop / RedirectedFetch
+// ============================================================================
+
+/// One step in an HTTP redirect chain captured by
+/// [`FetchEngine::fetch_text_with_redirects`]. `from` is the URL the
+/// engine requested, `to` is the URL the server pointed at via the
+/// `Location` header, and `status` is the 3xx code that delivered the
+/// pointer (301, 302, 303, 307, 308). Both URLs are absolute
+/// (relative `Location` values are resolved against `from` per
+/// RFC 3986 §5.2 before recording).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedirectHop {
+    /// The URL that produced the 3xx response.
+    pub from: String,
+    /// The absolute URL the `Location` header pointed at.
+    pub to: String,
+    /// The 3xx status code that carried the redirect.
+    pub status: u16,
+}
+
+/// Result of [`FetchEngine::fetch_text_with_redirects`]. Carries the
+/// terminal response (`final_url` + `html` + `http_status`) and the
+/// ordered chain of `Location` hops that led to it. `redirects` is
+/// empty when the first response was non-3xx; in that case
+/// `final_url` equals the input URL.
+#[derive(Debug, Clone)]
+pub struct RedirectedFetch {
+    /// The URL the terminal (non-3xx) response was served from. Equal
+    /// to the requested URL when `redirects` is empty.
+    pub final_url: Url,
+    /// The terminal response body decoded with `String::from_utf8_lossy`.
+    pub html: String,
+    /// The HTTP status of the terminal response.
+    pub http_status: u16,
+    /// Ordered `(from, to, status)` triples for each 3xx hop the
+    /// chain walked through. Empty for direct hits.
+    pub redirects: Vec<RedirectHop>,
 }
 
 /// Raw HTTP response data captured by [`FetchEngine::do_http_get`].

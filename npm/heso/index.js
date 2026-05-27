@@ -343,6 +343,13 @@ function wait(url, options) {
  * `heso click <url> [<@ref> | --text | --selector | --aria-label]`.
  * Pass either `ref` as the second positional (e.g. "@e7") or a locator
  * option (`text`, `selector`, `ariaLabel`).
+ *
+ * The resolved JSON carries `url` (the page where the click happened,
+ * post any redirects on that page's own fetch), `final_url` (where
+ * navigation actually landed after following `<a href>` plus its own
+ * redirect chain — equals `url` for non-navigating clicks), and
+ * `redirects` (the `{from, to, status}` hops the navigation walked
+ * through, empty for direct hits and for clicks that did not navigate).
  */
 function click(url, refOrOptions, maybeOptions) {
   // Overload: click(url, "@e7") or click(url, { text: "Sign in" }).
