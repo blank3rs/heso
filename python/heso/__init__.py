@@ -558,6 +558,9 @@ def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
     clicks); and ``redirects`` is the ``{from, to, status}`` hops the
     navigation walked through, empty for direct hits and for clicks
     that did not navigate.
+
+    Accepts ``timeout=N`` (seconds, default 30) capping the underlying
+    HTTP request.
     """
     spawn, cli = _split_spawn_opts(kwargs)
     extra = _kwargs_to_argv(cli)
@@ -585,6 +588,9 @@ def fill(
     When the selector misses, ``ok`` is ``False`` and ``value`` still
     reflects the requested string so the caller can retry with a
     different locator.
+
+    Accepts ``timeout=N`` (seconds, default 30) capping the underlying
+    HTTP request.
     """
     spawn, cli = _split_spawn_opts(kwargs)
     extra = _kwargs_to_argv(cli)
@@ -601,6 +607,7 @@ def submit(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
         field: dict | list of pairs — repeated ``NAME=VALUE`` flags.
         data: dict — alternative ``--data`` JSON dict; ``field``
             wins on key collisions (matches the CLI).
+        timeout: float — per-request budget in seconds (default 30).
 
     Returns ``{ok, op: "submit", url, ref, selector, element_id,
     value: None, result, console, postUrl}``. ``value`` is ``None`` for
@@ -686,20 +693,23 @@ def batch(
 
 def meta(url: str, **kwargs: Any) -> dict:
     """``heso meta <url>`` — extract structured metadata (JSON-LD,
-    OpenGraph, SEO meta, canonical, icons, lang)."""
+    OpenGraph, SEO meta, canonical, icons, lang). Accepts ``timeout=N``
+    (seconds, default 30) capping the underlying HTTP request."""
     spawn, cli = _split_spawn_opts(kwargs)
     return run("meta", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def ls(url: str, path: str = "/", **kwargs: Any) -> dict:
-    """``heso ls <url> [path]`` — list children of a tree path."""
+    """``heso ls <url> [path]`` — list children of a tree path. Accepts
+    ``timeout=N`` (seconds, default 30) capping the underlying HTTP request."""
     spawn, cli = _split_spawn_opts(kwargs)
     return run("ls", url, path, *_kwargs_to_argv(cli), **spawn)
 
 
 def cat(url: str, target: str, **kwargs: Any) -> dict:
     """``heso cat <url> <path|@ref>`` — read a tree path's text or an
-    element ref's full record."""
+    element ref's full record. Accepts ``timeout=N`` (seconds, default 30)
+    capping the underlying HTTP request."""
     spawn, cli = _split_spawn_opts(kwargs)
     return run("cat", url, target, *_kwargs_to_argv(cli), **spawn)
 
@@ -712,13 +722,16 @@ def find(url: str, **kwargs: Any) -> dict:
         role: str — filter by ARIA role.
         name: str — filter by name substring.
         section: str — filter by section path, e.g. ``"/pricing"``.
+        timeout: float — per-request budget in seconds (default 30).
     """
     spawn, cli = _split_spawn_opts(kwargs)
     return run("find", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def tree(url: str, **kwargs: Any) -> dict:
-    """``heso tree <url>`` — full heading-derived page tree as JSON."""
+    """``heso tree <url>`` — full heading-derived page tree as JSON.
+    Accepts ``timeout=N`` (seconds, default 30) capping the underlying
+    HTTP request."""
     spawn, cli = _split_spawn_opts(kwargs)
     return run("tree", url, *_kwargs_to_argv(cli), **spawn)
 
@@ -789,6 +802,9 @@ def refresh(path: Union[str, Path], **kwargs: Any) -> dict:
     "live_plat_hash": str, "diff": {...}}``. The wrapper resolves
     regardless of drift status (exit 0 vs 1); raises :class:`HesoError`
     only on usage errors (exit 2 — missing plan field, unreachable site).
+
+    Accepts ``timeout=N`` (seconds, default 30) capping each per-step
+    HTTP request the re-stamp makes.
     """
     spawn, cli = _split_spawn_opts(kwargs)
     try:
@@ -829,7 +845,7 @@ def info(
 
 
 def seal(path: Union[str, Path], **kwargs: Any) -> dict:
-    """``heso seal <file> [--key PATH] [--tsa URL] [--no-resign]`` — Ed25519 envelope."""
+    """``heso seal <file> [--key PATH]`` — Ed25519 envelope."""
     spawn, cli = _split_spawn_opts(kwargs)
     return run("seal", str(path), *_kwargs_to_argv(cli), **spawn)
 
