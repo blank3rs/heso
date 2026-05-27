@@ -10,7 +10,7 @@ Capabilities return JSON. Failures come back as structured data (`partial: true`
 
 <!-- heso:perf:start -->
 ```
-binary       10.17 MB
+binary       10.18 MB
 cold start   ~77 ms   (open https://example.com, network included)
 engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/blank3rs/heso/rele
 ```
 
 <!-- heso:version:start -->
-> Shipping `v0.1.5` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+> Shipping `v0.1.6` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 <!-- heso:version:end -->
 
 After install, `heso` is on `$PATH`:
@@ -402,7 +402,7 @@ No registration server, no central authority. **Dispatch is local-only** (spec �
 
 DNS ownership prevents anyone but you from claiming names *under your domain* — same anti-impersonation model as Java packages, Android application IDs, Maven groups, and OCI image labels. It does NOT solve typosquatting (`com.exarnple.foo` and `com.example.foo` are distinct names that look identical to a human reader). HESO/1.0 anchors trust on signing keys, not verb names: pin receivers to trusted signers via the existing `verify --trusted-keys` allowlist (spec §3.9, §4.6).
 
-Today, the reference implementation (this binary, `v0.1.5`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary; to dispatch one today you implement HESO/1.0 yourself, in any language. The spec is what makes that implementation possible.
+Today, the reference implementation (this binary, `v0.1.6`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary; to dispatch one today you implement HESO/1.0 yourself, in any language. The spec is what makes that implementation possible.
 
 ## Use as an agent skill
 
@@ -458,7 +458,7 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 
 | Thing | Number |
 |---|---|
-| Binary size | 10.17 MB |
+| Binary size | 10.18 MB |
 | Cold start (`open https://example.com`, network included) | ~77 ms |
 | Engine-only (no network, local fixture) | ~28 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
@@ -479,7 +479,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-`v0.1.5` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the 259-test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
+`v0.1.6` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the 259-test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
 
 ## License
 
