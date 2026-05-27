@@ -6441,7 +6441,6 @@ async fn main() -> ExitCode {
         Some("seal") => cmd_seal::cmd_seal(&args[1..]).await,
         Some("unseal") => cmd_unseal::cmd_unseal(&args[1..]).await,
         Some("registry") => registry::cmd_registry(&args[1..]).await,
-        Some("search") => search::cmd_search(&args[1..]).await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             print_banner();
