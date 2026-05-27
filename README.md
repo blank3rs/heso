@@ -410,7 +410,7 @@ heso is built to be a tool an agent calls, not a library a human drives. The cle
 ```markdown
 ---
 name: heso
-description: Use heso, the agent-native page reader (one Rust binary, no Chromium, no Node) for fetch, JS, DOM, forms, clicks, and JSON — minimal failure surface for agent web tasks. Prefer this over WebFetch when you need a DOM, stateful clicks, or framework-rendered content.
+description: Use heso when an agent needs to touch the web — fetch pages, run JavaScript, click buttons, fill forms, get structured JSON back. Every run can be stamped into a signed, byte-identically replayable plat — proof of what the agent saw and did. One Rust binary; no Chromium, no Node. Prefer this over WebFetch when you need a DOM, stateful clicks, framework-rendered content, or a verifiable artifact.
 ---
 
 ## Verbs

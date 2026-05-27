@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "heso static path — native HTTP + HTML. Minimal web runtime for agents: fetch, parse, extract → JSON."
+description = "heso fetch + parse engine. Native HTTP, HTML5 parsing, visible-text extraction, action detection, and content hashing for the non-JavaScript read path."
 
 [dependencies]
 heso-core = { path = "../heso-core" }
