@@ -221,8 +221,12 @@ async fn fill_persists_across_rpc_calls() {
     );
     assert_eq!(fill_result["ok"], serde_json::json!(true));
     assert_eq!(
-        fill_result["value"]["matched"], serde_json::json!(true),
-        "fill must report matched=true; got: {fill_result}"
+        fill_result["result"]["matched"], serde_json::json!(true),
+        "fill must report result.matched=true; got: {fill_result}"
+    );
+    assert_eq!(
+        fill_result["value"], serde_json::json!("alice"),
+        "fill's `value` carries the literal string written; got: {fill_result}"
     );
 
     // Eval against the SAME session — the input value must persist.
@@ -327,9 +331,11 @@ async fn click_dispatches_event_through_session() {
     let click = client.call("click", serde_json::json!({"ref": button_ref}));
     assert_eq!(click["ok"], serde_json::json!(true));
     assert_eq!(
-        click["value"]["matched"], serde_json::json!(true),
-        "click must report matched=true; got: {click}"
+        click["result"]["matched"], serde_json::json!(true),
+        "click must report result.matched=true; got: {click}"
     );
+    // Click doesn't take a string to write — `value` is null.
+    assert_eq!(click["value"], serde_json::Value::Null);
 
     // The listener should have flipped the flag.
     let observe = client.call("eval", serde_json::json!({"js": "globalThis.__clicked"}));
@@ -397,12 +403,13 @@ async fn submit_returns_response_body_and_parsed_json() {
     // Submit.
     let submit = client.call("submit", serde_json::json!({"ref": form_ref}));
     assert_eq!(submit["ok"], serde_json::json!(true));
+    assert_eq!(submit["value"], serde_json::Value::Null);
     assert_eq!(
-        submit["value"]["submitted"], serde_json::json!(true),
+        submit["result"]["submitted"], serde_json::json!(true),
         "submit must succeed; got: {submit}"
     );
-    assert_eq!(submit["value"]["responseStatus"], serde_json::json!(200));
-    let body = submit["value"]["responseBody"]
+    assert_eq!(submit["result"]["responseStatus"], serde_json::json!(200));
+    let body = submit["result"]["responseBody"]
         .as_str()
         .expect("responseBody is a string");
     assert!(
@@ -411,10 +418,10 @@ async fn submit_returns_response_body_and_parsed_json() {
     );
     // The JSON content-type triggers responseJson parsing.
     assert_eq!(
-        submit["value"]["responseJson"]["ok"], serde_json::json!(true),
+        submit["result"]["responseJson"]["ok"], serde_json::json!(true),
         "responseJson missing or wrong shape: {submit}"
     );
-    assert_eq!(submit["value"]["responseJson"]["got"], serde_json::json!("bob"));
+    assert_eq!(submit["result"]["responseJson"]["got"], serde_json::json!("bob"));
 }
 
 // ============================================================================
@@ -545,7 +552,8 @@ async fn end_to_end_multi_step_open_fill_fill_submit() {
         serde_json::json!({"ref": custname_ref, "value": "alice"}),
     );
     assert_eq!(f1["ok"], serde_json::json!(true));
-    assert_eq!(f1["value"]["matched"], serde_json::json!(true));
+    assert_eq!(f1["result"]["matched"], serde_json::json!(true));
+    assert_eq!(f1["value"], serde_json::json!("alice"));
 
     // 4) fill custemail → alice@example.com — proving the second fill
     //    didn't wipe the first.
@@ -554,7 +562,8 @@ async fn end_to_end_multi_step_open_fill_fill_submit() {
         serde_json::json!({"ref": custemail_ref, "value": "alice@example.com"}),
     );
     assert_eq!(f2["ok"], serde_json::json!(true));
-    assert_eq!(f2["value"]["matched"], serde_json::json!(true));
+    assert_eq!(f2["result"]["matched"], serde_json::json!(true));
+    assert_eq!(f2["value"], serde_json::json!("alice@example.com"));
 
     // Cross-check via eval: both inputs still hold their typed values.
     let snapshot = client.call(
@@ -573,8 +582,9 @@ async fn end_to_end_multi_step_open_fill_fill_submit() {
     // 5) submit
     let submit = client.call("submit", serde_json::json!({"ref": form_ref}));
     assert_eq!(submit["ok"], serde_json::json!(true));
+    assert_eq!(submit["value"], serde_json::Value::Null);
     assert_eq!(
-        submit["value"]["submitted"], serde_json::json!(true),
+        submit["result"]["submitted"], serde_json::json!(true),
         "submit didn't succeed: {submit}"
     );
 
@@ -644,7 +654,8 @@ async fn submit_with_field_overrides() {
             "field": {"who": "OVERRIDE"},
         }),
     );
-    assert_eq!(submit["value"]["submitted"], serde_json::json!(true));
+    assert_eq!(submit["result"]["submitted"], serde_json::json!(true));
+    assert_eq!(submit["value"], serde_json::Value::Null);
 
     let reqs = server.received_requests().await.unwrap();
     let post = reqs.iter().find(|r| r.method == wiremock::http::Method::POST).expect("a POST");
@@ -886,7 +897,8 @@ async fn click_via_locator_text() {
         serde_json::json!({"locator": {"text": "Submit"}}),
     );
     assert_eq!(resp["ok"], serde_json::json!(true));
-    assert_eq!(resp["value"]["matched"], serde_json::json!(true));
+    assert_eq!(resp["result"]["matched"], serde_json::json!(true));
+    assert_eq!(resp["value"], serde_json::Value::Null);
 
     let observe = client.call("eval", serde_json::json!({"js": "globalThis.__which"}));
     assert_eq!(observe["value"], serde_json::json!("b"));

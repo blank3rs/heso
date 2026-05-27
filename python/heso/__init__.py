@@ -403,6 +403,23 @@ def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
     Pass either a positional ``ref`` (e.g. ``"@e7"``) OR a locator
     kwarg: ``text="Sign in"``, ``selector="button.cta"``, or
     ``aria_label="Close"``.
+
+    Returns the unified writing-verb envelope::
+
+        {
+          "ok": True | False,
+          "op": "click",
+          "url": ...,
+          "ref": "@eN",
+          "selector": "<resolved CSS selector>",
+          "element_id": "<id attr>" | None,
+          "value": None,             # click doesn't take a string
+          "result": {...},           # engine-specific payload
+          "console": [...]
+        }
+
+    A selector miss surfaces as ``ok: False`` with
+    ``error: {"code": "selector_not_matched", "message": ...}``.
     """
     extra = _kwargs_to_argv(kwargs)
     if ref is not None:
@@ -423,6 +440,12 @@ def fill(
     - ``heso.fill(url, "@e3", "hello")`` — positional ref + value.
     - ``heso.fill(url, "hello", text="Email")`` — value first when
       using a locator kwarg.
+
+    Returns the unified writing-verb envelope with ``value`` carrying
+    the exact string passed in (the typed bytes), not a success flag.
+    When the selector misses, ``ok`` is ``False`` and ``value`` still
+    reflects the requested string so the caller can retry with a
+    different locator.
     """
     extra = _kwargs_to_argv(kwargs)
     if value is not None:
@@ -438,6 +461,13 @@ def submit(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
         field: dict | list of pairs — repeated ``NAME=VALUE`` flags.
         data: dict — alternative ``--data`` JSON dict; ``field``
             wins on key collisions (matches the CLI).
+
+    Returns ``{ok, op: "submit", url, ref, selector, element_id,
+    value: None, result, console, postUrl}``. ``value`` is ``None`` for
+    submit; the structured form-submission outcome (``matched``,
+    ``submitted``, ``responseStatus``, ``responseJson``,
+    ``fieldsApplied``, ...) lives under ``result``. ``postUrl`` is the
+    response URL after redirects.
     """
     extra = _kwargs_to_argv(kwargs)
     if ref is not None:

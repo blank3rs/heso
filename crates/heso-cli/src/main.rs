@@ -3685,9 +3685,40 @@ pub(crate) fn parse_locator_flags(
 /// `url`, resolves `ref_str` in the action graph, builds a CSS
 /// selector, and hands `(html, selector)` to `op`. `op` is the
 /// engine method to call — `dispatch_click`, `set_input_value`, or
-/// `submit_form`. Prints the unified `{ok, url, value, console}` JSON
-/// the existing eval-* commands use and returns a [`ExitCode`].
-async fn run_dispatch<F>(url_arg: &str, target: &LocatorTarget, op_name: &str, op: F) -> ExitCode
+/// `submit_form`.
+///
+/// `written_value` is the literal string the verb wrote (`Some(s)` for
+/// `fill`, `None` for `click` / `submit` which don't take a string).
+/// It is surfaced as the response's `value` field — the canonical
+/// "what was written" answer that previously collided with the
+/// engine's selector-matched boolean.
+///
+/// Response envelope (unified across writing verbs):
+///
+/// ```json
+/// {
+///   "ok": true | false,
+///   "op": "<verb>",
+///   "url": "<final URL>",
+///   "ref": "<@eN>",
+///   "selector": "<resolved CSS selector>",
+///   "element_id": "<id attr>" | null,
+///   "value": "<written string>" | null,
+///   "result": { /* verb-specific structured payload */ },
+///   "console": [...]
+/// }
+/// ```
+///
+/// `ok: false` is returned when the selector did not match an element
+/// in the loaded DOM, or when the engine threw — both cases include an
+/// `error: {code, message}` field and exit non-zero.
+async fn run_dispatch<F>(
+    url_arg: &str,
+    target: &LocatorTarget,
+    op_name: &str,
+    written_value: Option<&str>,
+    op: F,
+) -> ExitCode
 where
     F: FnOnce(
         &heso_engine_js::JsEngine,
@@ -3726,6 +3757,11 @@ where
         Err(e) => return report_target_error(op_name, e),
     };
     let want = action.ref_id.clone();
+    let element_id = action
+        .attrs
+        .get("id")
+        .filter(|s| !s.is_empty())
+        .cloned();
     let selector = match selector_for_action(&action) {
         Some(s) => s,
         None => {
@@ -3753,15 +3789,55 @@ where
         }
     };
 
+    let value_field: serde_json::Value = match written_value {
+        Some(s) => serde_json::Value::String(s.to_owned()),
+        None => serde_json::Value::Null,
+    };
+
     match op(&js_engine, &html, &selector) {
         Ok(outcome) => {
+            // `dispatch_click` / `set_input_value` return a bare bool
+            // (`true` = selector hit, `false` = no element matched).
+            // `submit_form` returns a structured object with a
+            // `matched` key. Either way, a "didn't find it" outcome
+            // means the verb did NOT do what the agent asked, so we
+            // collapse that to `ok: false` with a typed error code —
+            // an agent must not mistake "selector missed" for success.
+            let matched = engine_matched(&outcome.value);
+            if !matched {
+                let body = serde_json::json!({
+                    "ok": false,
+                    "op": op_name,
+                    "url": final_url.to_string(),
+                    "ref": want,
+                    "selector": selector,
+                    "element_id": element_id,
+                    "value": value_field,
+                    "error": {
+                        "code": "selector_not_matched",
+                        "message": format!("no element matched selector `{selector}` in the loaded DOM"),
+                    },
+                    "result": outcome.value,
+                    "console": outcome.console,
+                });
+                match serde_json::to_string_pretty(&body) {
+                    Ok(s) => println!("{s}"),
+                    Err(e) => {
+                        eprintln!("failed to serialize result: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                return ExitCode::FAILURE;
+            }
             let mut body = serde_json::json!({
                 "ok": true,
                 "op": op_name,
                 "url": final_url.to_string(),
                 "ref": want,
                 "selector": selector,
-                "value": outcome.value,
+                "element_id": element_id,
+                "value": value_field,
+                "result": outcome.value,
                 "console": outcome.console,
             });
             // When the clicked element is an `<a href>`, resolve the
@@ -3784,7 +3860,7 @@ where
             //   error per the engine's reqwest semantics), the
             //   response carries `navigated: false` with a
             //   `nav_error` field so the agent can see what
-            //   happened. The original click result (`value: true`,
+            //   happened. The original click result (`value: null`,
             //   console) is preserved.
             if op_name == "click" && action.tag == "a" {
                 if let Some(dest_url) = follow_anchor_href(&action, &final_url) {
@@ -3803,15 +3879,19 @@ where
         Err(e) => {
             let err_body = match &e {
                 heso_engine_js::EvalError::Exception { message, stack } => serde_json::json!({
+                    "code": "engine_exception",
                     "kind": "exception",
                     "message": message,
                     "stack": stack,
                 }),
                 heso_engine_js::EvalError::ThrownValue { value } => serde_json::json!({
+                    "code": "engine_thrown_value",
                     "kind": "thrown_value",
+                    "message": "JS code threw a non-Error value",
                     "value": value,
                 }),
                 heso_engine_js::EvalError::Engine(msg) => serde_json::json!({
+                    "code": "engine_failure",
                     "kind": "engine",
                     "message": msg,
                 }),
@@ -3822,6 +3902,8 @@ where
                 "url": final_url.to_string(),
                 "ref": want,
                 "selector": selector,
+                "element_id": element_id,
+                "value": value_field,
                 "error": err_body,
             });
             match serde_json::to_string_pretty(&body) {
@@ -3833,6 +3915,26 @@ where
             }
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Did the engine's writing-verb call land on a real element?
+///
+/// `dispatch_click` / `set_input_value` evaluate to a bare bool — `true`
+/// for "matched", `false` for "no element with that selector". The
+/// stateless `submit_form` returns the same bool shape. The stateful
+/// session paths (`JsSession::*`) return objects with a `matched` key.
+/// Treat anything else as "matched" so an unexpectedly-rich payload
+/// from future engine work doesn't accidentally trip the not-matched
+/// branch.
+pub(crate) fn engine_matched(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Object(map) => match map.get("matched") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(_) | None => true,
+        },
+        _ => true,
     }
 }
 
@@ -3957,8 +4059,26 @@ async fn augment_click_with_destination(
 /// snippet — useful for click-through behaviors a planner sets up
 /// inline.
 ///
-/// Output: `{ok, op, url, ref, selector, value, console}`. `value`
-/// is `true` when the selector matched and the click was dispatched.
+/// Output envelope (shared by `click` / `fill` / `submit`):
+///
+/// ```json
+/// {
+///   "ok": true | false,
+///   "op": "click",
+///   "url": "<final URL>",
+///   "ref": "<@eN>",
+///   "selector": "<resolved CSS selector>",
+///   "element_id": "<id attr>" | null,
+///   "value": null,
+///   "result": { /* engine-specific payload */ },
+///   "console": [...]
+/// }
+/// ```
+///
+/// `value` is `null` for `click` — the verb doesn't accept a string to
+/// write. The boolean "did the selector hit anything?" answer is
+/// folded into `ok`: a miss returns `ok: false` with
+/// `error.code: "selector_not_matched"`.
 ///
 /// Locator flags (alternatives to `@ref`):
 /// - `--text "<string>"` — case-insensitive substring match against the
@@ -3967,9 +4087,10 @@ async fn augment_click_with_destination(
 /// - `--aria-label "<string>"` — case-insensitive substring match
 ///   against the `aria-label` attribute.
 ///
-/// Exit codes: 0 on success, 1 on fetch/JS failure, 2 on usage error,
-/// unknown ref, zero locator matches, ambiguous matches (with the
-/// candidate refs printed to stderr), or invalid CSS selector.
+/// Exit codes: 0 on success, 1 on fetch/JS failure or selector miss,
+/// 2 on usage error, unknown ref, zero locator matches, ambiguous
+/// matches (with the candidate refs printed to stderr), or invalid
+/// CSS selector.
 async fn cmd_click(args: &[String]) -> ExitCode {
     let (target, extra) = match parse_locator_flags(args, "click") {
         Ok(p) => p,
@@ -3980,7 +4101,7 @@ async fn cmd_click(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let url_arg = &extra[0];
-    run_dispatch(url_arg, &target, "click", |eng, html, sel| {
+    run_dispatch(url_arg, &target, "click", None, |eng, html, sel| {
         eng.dispatch_click(html, sel)
     })
     .await
@@ -3991,9 +4112,12 @@ async fn cmd_click(args: &[String]) -> ExitCode {
 /// `value` to `<value>`, and dispatch first an `"input"` then a
 /// `"change"` event (matching real browser behavior when a user types).
 ///
-/// Output shape mirrors `heso click`: `{ok, op, url, ref, selector,
-/// value, console}` where `value: true` indicates the selector
-/// matched. Exit codes match `heso click`.
+/// Output envelope mirrors `heso click` with one key difference:
+/// `value` carries the exact string the verb wrote (the same bytes
+/// passed on the command line). When the selector misses, `ok` is
+/// `false` with `error.code: "selector_not_matched"` and `value`
+/// still reflects what the agent asked to write — the request shape
+/// is preserved so the caller can retry with a different locator.
 async fn cmd_fill(args: &[String]) -> ExitCode {
     let (target, extra) = match parse_locator_flags(args, "fill") {
         Ok(p) => p,
@@ -4007,9 +4131,14 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
     }
     let url_arg = extra[0].clone();
     let value = extra[1].clone();
-    run_dispatch(&url_arg, &target, "fill", move |eng, html, sel| {
-        eng.set_input_value(html, sel, &value)
-    })
+    let value_for_op = value.clone();
+    run_dispatch(
+        &url_arg,
+        &target,
+        "fill",
+        Some(&value),
+        move |eng, html, sel| eng.set_input_value(html, sel, &value_for_op),
+    )
     .await
 }
 
@@ -4294,6 +4423,11 @@ async fn cmd_submit_inner(
         Err(e) => return report_target_error("submit", e),
     };
     let want = action.ref_id.clone();
+    let element_id = action
+        .attrs
+        .get("id")
+        .filter(|s| !s.is_empty())
+        .cloned();
     let selector = match selector_for_action(&action) {
         Some(s) => s,
         None => {
@@ -4353,15 +4487,19 @@ async fn cmd_submit_inner(
         Err(e) => {
             let err_body = match &e {
                 heso_engine_js::EvalError::Exception { message, stack } => serde_json::json!({
+                    "code": "engine_exception",
                     "kind": "exception",
                     "message": message,
                     "stack": stack,
                 }),
                 heso_engine_js::EvalError::ThrownValue { value } => serde_json::json!({
+                    "code": "engine_thrown_value",
                     "kind": "thrown_value",
+                    "message": "JS code threw a non-Error value",
                     "value": value,
                 }),
                 heso_engine_js::EvalError::Engine(msg) => serde_json::json!({
+                    "code": "engine_failure",
                     "kind": "engine",
                     "message": msg,
                 }),
@@ -4372,6 +4510,8 @@ async fn cmd_submit_inner(
                 "url": final_url.to_string(),
                 "ref": want,
                 "selector": selector,
+                "element_id": element_id,
+                "value": serde_json::Value::Null,
                 "error": err_body,
             });
             let _ = serde_json::to_string_pretty(&body).map(|s| println!("{s}"));
@@ -4379,18 +4519,27 @@ async fn cmd_submit_inner(
         }
     };
 
+    // Submit's "did the form actually accept the click?" answer lives
+    // in `outcome.value.matched`. Collapse a `matched: false` outcome
+    // to `ok: false` for symmetry with `click` / `fill` — the agent
+    // asked us to submit a form and we couldn't, regardless of which
+    // verb-specific reason the JS engine reported in `result`.
+    let submit_matched = engine_matched(&outcome.value);
+    let post_url = session.url().to_string();
     let body = serde_json::json!({
-        "ok": true,
+        "ok": submit_matched,
         "op": "submit",
         "url": final_url.to_string(),
         "ref": want,
         "selector": selector,
-        "value": outcome.value,
+        "element_id": element_id,
+        "value": serde_json::Value::Null,
+        "result": outcome.value,
         "console": outcome.console,
         // Post-submit URL: when the request succeeded, this is the
         // response URL; otherwise the page we started on. Lets a
         // subsequent `heso eval-dom $POST_URL` script the result.
-        "postUrl": session.url().to_string(),
+        "postUrl": post_url,
     });
     match serde_json::to_string_pretty(&body) {
         Ok(s) => println!("{s}"),
@@ -4399,7 +4548,11 @@ async fn cmd_submit_inner(
             return ExitCode::FAILURE;
         }
     }
-    ExitCode::SUCCESS
+    if submit_matched {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 // ============================================================================
