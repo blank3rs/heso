@@ -290,6 +290,21 @@ pub async fn cmd_pull(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let value: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("pull: downloaded plat `{hash}` is not valid JSON: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let embedded = value.get("plat_hash").and_then(Value::as_str);
+    let recomputed = heso_engine_fetch::plat_hash(&value);
+    if embedded != Some(hash) || recomputed != hash {
+        eprintln!("pull: registry returned a plat that does not match requested hash `{hash}`");
+        eprintln!("  embedded:   {}", embedded.unwrap_or("(missing)"));
+        eprintln!("  recomputed: {recomputed}");
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = tokio::fs::write(&target, &bytes).await {
         eprintln!("pull: write `{target}` failed: {e}");
         return ExitCode::FAILURE;
