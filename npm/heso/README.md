@@ -4,12 +4,14 @@
 
 Failures come back as structured data — not opaque browser crashes. Fetches a URL, runs JavaScript, lets you click, fill forms, search the web, and scrape many pages in parallel — everything as JSON an agent can reason about.
 
+<!-- heso:perf:start -->
 ```
-binary       9.73 MB
+binary       10.08 MB
 cold start   ~77 ms   (open https://example.com, network included)
 engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
 ```
+<!-- heso:perf:end -->
 
 **Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **GitHub:** [blank3rs/heso](https://github.com/blank3rs/heso) · **PyPI:** [heso](https://pypi.org/project/heso/)
 
@@ -22,6 +24,10 @@ npx @ixla/heso open https://example.com   # one-shot
 ```
 
 > Ships prebuilt binaries for Windows x64, Linux x64 + arm64, and macOS x64 + arm64. `npm` picks the right `@ixla/heso-<platform>-<arch>` via `optionalDependencies` — no native build step.
+
+<!-- heso:version:start -->
+> Shipping `v0.1.2` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+<!-- heso:version:end -->
 
 ## Use as a CLI
 

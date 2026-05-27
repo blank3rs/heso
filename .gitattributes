@@ -1,0 +1,22 @@
+# Belt-and-braces against agent-process files ever reaching a publish
+# tarball. `.gitignore` keeps them from being tracked in the first
+# place; `export-ignore` here strips them from `cargo publish` archives
+# and `git archive` output even if one ever slipped past gitignore.
+#
+# Mirror the gitignored set in `.gitignore` and the AGENTS.md > "Where
+# transient agent reports go" table.
+.agent/             export-ignore
+decisions/          export-ignore
+proposals/          export-ignore
+research/           export-ignore
+bug-reports/        export-ignore
+scripts/            export-ignore
+services/           export-ignore
+.pr-test/           export-ignore
+heso-test-agent/    export-ignore
+AGENT_FINDINGS*.md  export-ignore
+REGRESSION_*.md     export-ignore
+COMPATIBILITY.md    export-ignore
+AUDIT_*.txt         export-ignore
+pitch.html          export-ignore
+pitch-assets/       export-ignore

@@ -1,0 +1,277 @@
+name: Hygiene
+
+# Four gates that have to be green before a release commit can ship:
+#   1. no-agent-md      — no `.md` lands outside the small public allowlist.
+#   2. version-sync     — every manifest agrees on the version + description.
+#   3. pre-commit       — same .pre-commit-config.yaml a developer runs
+#                         locally, so `--no-verify` at commit time still
+#                         fails on push.
+#   4. readme-sync-blocks — the version + perf blocks in README.md and
+#                         npm/heso/README.md stay byte-identical.
+#
+# Cross-repo drift against heso-web (the sibling site) is handled
+# out-of-band: the deploy script bumps the website on every release,
+# and a periodic manual spot-check covers the in-between case.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: hygiene-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # --------------------------------------------------------------------
+  # 1. New .md files outside the public allowlist are refused.
+  #    Same regex as .pre-commit-config.yaml — if the file passed the
+  #    local hook, it passes here. This job is the catch for someone
+  #    using `git commit --no-verify`.
+  # --------------------------------------------------------------------
+  no-agent-md:
+    name: No agent .md outside allowlist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute diff base
+        id: base
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            base="${{ github.event.before }}"
+          fi
+          # Fresh-branch / first-push case: github.event.before is all
+          # zeros. Fall back to merge-base with origin/main so we still
+          # only inspect what this push added.
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            git fetch origin main --depth=1 || true
+            base=$(git merge-base origin/main HEAD || git rev-list --max-parents=0 HEAD | tail -1)
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "diffing against $base"
+        shell: bash
+      - name: Refuse new .md outside public allowlist
+        run: |
+          set -euo pipefail
+          allow='^(README\.md|SECURITY\.md|crates/[^/]+/README\.md|npm/heso/README\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$'
+          added=$(git diff --name-only --diff-filter=A "${{ steps.base.outputs.base }}" HEAD -- '*.md' || true)
+          if [ -z "$added" ]; then
+            echo "no new .md files in this push"
+            exit 0
+          fi
+          echo "newly-added .md files:"
+          printf '  %s\n' $added
+          bad=$(printf '%s\n' $added | grep -Ev "$allow" || true)
+          if [ -n "$bad" ]; then
+            echo "::error::the following .md files are not in the public allowlist:"
+            printf '::error::  %s\n' $bad
+            echo "::error::Agent-process docs belong in a gitignored directory."
+            echo "::error::See AGENTS.md > 'Where transient agent reports go'."
+            exit 1
+          fi
+        shell: bash
+
+  # --------------------------------------------------------------------
+  # 2. Every manifest agrees on the workspace version + the heso-cli
+  #    description string. Catches the v0.0.X-vs-v0.0.Y drift we have
+  #    historically introduced by bumping one package by hand.
+  # --------------------------------------------------------------------
+  version-sync:
+    name: Version + description sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert version + description are in lockstep
+        run: |
+          set -euo pipefail
+
+          # Truth: workspace Cargo.toml.
+          truth=$(awk '
+            /^\[workspace\.package\]/ { in_block=1; next }
+            /^\[/                     { in_block=0 }
+            in_block && /^version[[:space:]]*=/ {
+              gsub(/[" ]/, "", $3)
+              # field 3 is the version string after `version = "X"`
+              match($0, /"[^"]+"/)
+              v=substr($0, RSTART+1, RLENGTH-2)
+              print v
+              exit
+            }
+          ' Cargo.toml)
+          if [ -z "$truth" ]; then
+            echo "::error::could not read workspace version from Cargo.toml"
+            exit 1
+          fi
+          echo "workspace version: $truth"
+
+          fail=0
+          assert_eq() {
+            # $1 = file, $2 = label, $3 = actual
+            if [ "$3" = "$truth" ]; then
+              echo "  ok   $1 ($2 = $3)"
+            else
+              echo "::error::$1: $2 = '$3', expected '$truth'"
+              fail=1
+            fi
+          }
+
+          # pyproject.toml: version = "X"
+          py=$(awk '
+            /^\[project\]/ { in_block=1; next }
+            /^\[/          { in_block=0 }
+            in_block && /^version[[:space:]]*=/ {
+              match($0, /"[^"]+"/)
+              print substr($0, RSTART+1, RLENGTH-2)
+              exit
+            }
+          ' pyproject.toml)
+          assert_eq pyproject.toml version "$py"
+
+          # python/heso/__init__.py: __version__ = "X"
+          pyinit=$(grep -E '^__version__\s*=' python/heso/__init__.py | sed -E 's/.*"([^"]+)".*/\1/')
+          assert_eq python/heso/__init__.py __version__ "$pyinit"
+
+          # npm/heso/package.json: "version": "X"
+          npm_meta=$(node -e "console.log(require('./npm/heso/package.json').version)")
+          assert_eq npm/heso/package.json version "$npm_meta"
+
+          # npm/heso/package.json: optionalDependencies['@ixla/heso-<plat>']: "X"
+          for plat in win32-x64 linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            pin=$(node -e "console.log(require('./npm/heso/package.json').optionalDependencies['@ixla/heso-$plat'])")
+            assert_eq npm/heso/package.json "optionalDependencies['@ixla/heso-$plat']" "$pin"
+          done
+
+          # npm/platforms/*/package.json: "version": "X"
+          for plat in win32-x64 linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            v=$(node -e "console.log(require('./npm/platforms/$plat/package.json').version)")
+            assert_eq "npm/platforms/$plat/package.json" version "$v"
+          done
+
+          # README.md: every `v<X>` token MUST equal truth, with one
+          # carve-out — `v0.0.10` is the deliberately frozen release
+          # tag that hosts the sample-plat assets shown in the
+          # "Replay a published plat" section. Both the /releases/
+          # /download/v0.0.10/ URLs AND the prose line that introduces
+          # them stay pinned across releases, by design.
+          stripped=$(grep -v 'v0\.0\.10' README.md || true)
+          tokens=$(printf '%s\n' "$stripped" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -u || true)
+          for t in $tokens; do
+            if [ "${t#v}" != "$truth" ]; then
+              echo "::error::README.md: visible token '$t' != workspace '$truth'"
+              fail=1
+            else
+              echo "  ok   README.md (token $t)"
+            fi
+          done
+
+          # heso-cli description MUST match pyproject + npm description
+          # byte-for-byte. crates.io renders it prominently; the npm and
+          # PyPI listings carry the same line. Drift here surfaces on
+          # every registry.
+          cli_desc=$(awk '
+            /^\[package\]/ { in_block=1; next }
+            /^\[/          { in_block=0 }
+            in_block && /^description[[:space:]]*=/ {
+              match($0, /"[^"]+"/)
+              print substr($0, RSTART+1, RLENGTH-2)
+              exit
+            }
+          ' crates/heso-cli/Cargo.toml)
+          py_desc=$(awk '
+            /^\[project\]/ { in_block=1; next }
+            /^\[/          { in_block=0 }
+            in_block && /^description[[:space:]]*=/ {
+              match($0, /"[^"]+"/)
+              print substr($0, RSTART+1, RLENGTH-2)
+              exit
+            }
+          ' pyproject.toml)
+          npm_desc=$(node -e "console.log(require('./npm/heso/package.json').description)")
+
+          echo "descriptions:"
+          echo "  crates/heso-cli/Cargo.toml: $cli_desc"
+          echo "  pyproject.toml:             $py_desc"
+          echo "  npm/heso/package.json:      $npm_desc"
+
+          if [ "$cli_desc" != "$py_desc" ] || [ "$py_desc" != "$npm_desc" ]; then
+            echo "::error::description fields disagree across crates/heso-cli/Cargo.toml, pyproject.toml, npm/heso/package.json"
+            fail=1
+          fi
+
+          if [ $fail -ne 0 ]; then
+            exit 1
+          fi
+          echo "all manifests + README + descriptions agree on $truth"
+        shell: bash
+
+  # --------------------------------------------------------------------
+  # 3. The same hooks a developer runs locally, executed against the
+  #    PR's full file set. Belt for someone bypassing the local hook
+  #    via `git commit --no-verify`.
+  # --------------------------------------------------------------------
+  pre-commit:
+    name: pre-commit (local hooks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: pre-commit/action@v3.0.1
+
+  # --------------------------------------------------------------------
+  # 4. The version + perf blocks in README.md and npm/heso/README.md
+  #    are wrapped in HTML-comment markers and MUST match byte-for-byte.
+  #    Install lines legitimately diverge (npm README documents
+  #    `npm install`, root documents all three managers), so we only
+  #    sync the blocks that are supposed to be shared.
+  # --------------------------------------------------------------------
+  readme-sync-blocks:
+    name: README sync blocks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare marker blocks across READMEs
+        run: |
+          set -euo pipefail
+          extract() {
+            # $1 = file, $2 = marker name. Prints the lines strictly
+            # between <!-- heso:NAME:start --> and <!-- heso:NAME:end -->.
+            awk -v name="$2" '
+              $0 == "<!-- heso:" name ":start -->" { capture=1; next }
+              $0 == "<!-- heso:" name ":end -->"   { capture=0 }
+              capture { print }
+            ' "$1"
+          }
+          fail=0
+          for block in version perf; do
+            a=$(extract README.md "$block")
+            b=$(extract npm/heso/README.md "$block")
+            if [ -z "$a" ]; then
+              echo "::error::README.md is missing the <!-- heso:$block:start --> marker"
+              fail=1
+              continue
+            fi
+            if [ -z "$b" ]; then
+              echo "::error::npm/heso/README.md is missing the <!-- heso:$block:start --> marker"
+              fail=1
+              continue
+            fi
+            if [ "$a" != "$b" ]; then
+              echo "::error::README sync drift in block '$block'"
+              diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") || true
+              fail=1
+            else
+              echo "  ok   block '$block' matches across READMEs"
+            fi
+          done
+          exit $fail
+        shell: bash

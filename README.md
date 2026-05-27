@@ -4,14 +4,16 @@
 
 The minimal web runtime for agents: **fetch, JS, DOM, forms, clicks → JSON.** No rendering pipeline, no Chromium, no Node. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss) — not opaque browser crashes. Every run can be **stamped** into a signed *plat* with an embedded network cassette, then **byte-identically re-executed** off-network with `heso run`. Anyone, any machine, same output.
 
+<!-- heso:perf:start -->
 ```
-binary       9.87 MB
+binary       10.08 MB
 cold start   ~77 ms   (open https://example.com, network included)
 engine only  ~28 ms   (no network)
 batch        ~1.1 s   for 8 URLs in parallel
 ```
+<!-- heso:perf:end -->
 
-[![heso agent demo — 50 second screen recording](demo/poster.jpg)](https://www.heso.ca/#demo)
+[![heso agent demo — 50 second screen recording](https://raw.githubusercontent.com/blank3rs/heso/main/demo/poster.jpg)](https://www.heso.ca/#demo)
 
 A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no rendering pipeline, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
 
@@ -50,7 +52,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/blank3rs/heso/releases/
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/blank3rs/heso/releases/latest/download/heso-cli-installer.ps1 | iex"
 ```
 
+<!-- heso:version:start -->
 > Shipping `v0.1.2` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
+<!-- heso:version:end -->
 
 After install, `heso` is on `$PATH`:
 
@@ -432,7 +436,7 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 
 | Thing | Number |
 |---|---|
-| Binary size | 9.87 MB |
+| Binary size | 10.08 MB |
 | Cold start (`open https://example.com`, network included) | ~77 ms |
 | Engine-only (no network, local fixture) | ~28 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
