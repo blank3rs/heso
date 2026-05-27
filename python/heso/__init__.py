@@ -940,4 +940,4 @@ def session(binary: Optional[str] = None) -> Session:
 # version into setup.cfg / pyproject for the wheel build). The value
 # here is the same default the workspace ships with; it gets bumped
 # at release time.
-__version__ = "0.1.3"
+__version__ = "0.1.4"

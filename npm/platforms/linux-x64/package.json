@@ -1,6 +1,6 @@
 {
   "name": "@ixla/heso-linux-x64",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Linux x86_64 binary for @ixla/heso. Do not install directly.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
