@@ -39,8 +39,9 @@
 //!   (`responseStatus`, `responseUrl`, `responseBody` ≤ 64 KB,
 //!   `responseContentType`, and `responseJson` when the server sent
 //!   `application/json`). One-shot: fetch + fill + submit + observe in
-//!   a single CLI invocation, fixing the stateless-fill gap that
-//!   `agent regression testing` filed.
+//!   a single CLI invocation — each verb runs in its own process, so
+//!   a separate `heso fill` cannot carry values forward into the next
+//!   `heso submit`.
 //! - `heso meta <url>` — Fetch + extract structured metadata (JSON-LD,
 //!   OpenGraph, Twitter cards, SEO meta, canonical, icons, lang). Returns
 //!   the [`PageMetadata`] as JSON.
@@ -60,9 +61,9 @@
 //! - `heso search <query>` — First-class multi-source web search verb.
 //!   DDG HTML + Wikipedia REST summary by default (no API keys);
 //!   optional SearXNG via `--searx-url` or `HESO_SEARX_URL`. Pure HTTP
-//!   + HTML parsing — no JS engine. Round-robin ranked merge across
-//!   engines, dedupe by canonical URL. Wikipedia goes in the
-//!   top-level `knowledge` block, not in `results`. See
+//!   plus HTML parsing — no JS engine. Round-robin ranked merge
+//!   across engines, dedupe by canonical URL. Wikipedia goes in
+//!   the top-level `knowledge` block, not in `results`. See
 //!   [`crate::search`] for the full design.
 //! - `heso plat-hash <file>` — Compute the BLAKE3 hash of a plat JSON
 //!   file (the output of `heso open`). Any embedded `plat_hash` field
@@ -98,9 +99,15 @@
 //! [ADR 0014]: ../../decisions/0014-bundled-quickjs-agent-dom.md
 //! [ADR 0016]: ../../decisions/0016-positioning-headless-browser-for-agents.md
 
+mod artifact_sniffer;
 mod batch;
+mod cmd_info;
+mod cmd_seal;
+mod cmd_unseal;
+mod cmd_verify;
 mod ecosystem;
 mod receipts;
+mod registry;
 mod search;
 mod serve;
 mod template;
@@ -124,14 +131,13 @@ use heso_engine_fetch::{
     LocatorError, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
 use heso_trace::{
-    parse_actions, trace_fingerprint, verify_fingerprint, verify_receipt, Action,
-    FingerprintOutcome, Receipt, TraceFingerprint, VerifyOutcome,
+    parse_actions, verify_fingerprint, Action, FingerprintOutcome, TraceFingerprint,
 };
 
 /// Default identity-key path used by `heso identity init` / `show` when
 /// the caller doesn't pass `--path`. Lives under the gitignored
 /// `heso-local-data/` directory.
-const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
+pub(crate) const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
 
 fn print_banner() {
     let version = env!("CARGO_PKG_VERSION");
@@ -186,7 +192,7 @@ fn print_banner() {
     println!("                                dispatch submit, POST per enctype, return response body + status + parsed JSON.");
     println!("                                --field name=value     repeatable; matched by input `name` attribute.");
     println!("                                --data '{{\"k\":\"v\"}}'    JSON dict alternative; --field wins on the same name.");
-    println!("                                File inputs are skipped (PR-X4 will ship FormData/Blob/File globals).");
+    println!("                                File inputs are skipped (FormData/Blob/File globals are unimplemented).");
     println!("  heso search <query>           Multi-backend web search: DDG HTML + Wikipedia summary (default).");
     println!("                                Pure HTTP + HTML — no JS engine spin-up. No API key required.");
     println!("    [--limit N]                    Max merged results (default 30, max 100). Wikipedia goes in");
@@ -505,74 +511,27 @@ async fn open_or_die(url_arg: &str) -> Result<heso_engine_fetch::FetchPage, Exit
 }
 
 pub(crate) fn print_json(value: &serde_json::Value) -> ExitCode {
-    match serde_json::to_string_pretty(value) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to serialize output: {e}");
-            ExitCode::FAILURE
-        }
+    if write_json_to_stdout(value) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
-async fn cmd_fetch(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: heso fetch <url>");
-        return ExitCode::from(2);
-    }
-    let url = match Url::parse(&args[0]) {
-        Ok(u) => u,
-        Err(e) => {
-            if ecosystem::is_plat_hash(&args[0]) {
-                eprintln!(
-                    "`{}` looks like a plat hash, not a URL. Use `heso run {}` to replay the published plat, or `heso pull {}` to download it.",
-                    args[0], args[0], args[0]
-                );
-            } else {
-                eprintln!("invalid URL `{}`: {e}", args[0]);
-            }
-            return ExitCode::from(2);
-        }
-    };
-
-    let engine = match FetchEngine::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to build engine: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let page = match engine.open(&url).await {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("fetch failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let text = match page.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("text() failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let body = serde_json::json!({
-        "url": page.url().as_str(),
-        "text": text,
-    });
-    match serde_json::to_string_pretty(&body) {
+/// Pretty-print `value` to stdout and return whether serialization
+/// succeeded. Used at sites that need to combine the serialization
+/// outcome with a caller-owned exit code (e.g. `cmd_wait` returns
+/// non-zero on a wait timeout regardless of whether the body
+/// serialized cleanly).
+pub(crate) fn write_json_to_stdout(value: &serde_json::Value) -> bool {
+    match serde_json::to_string_pretty(value) {
         Ok(s) => {
             println!("{s}");
-            ExitCode::SUCCESS
+            true
         }
         Err(e) => {
             eprintln!("failed to serialize output: {e}");
-            ExitCode::FAILURE
+            false
         }
     }
 }
@@ -771,6 +730,16 @@ async fn cmd_meta(args: &[String]) -> ExitCode {
     }
 }
 
+/// Result tuple from the hydration step inside [`cmd_open`]:
+/// `(failed_scripts, console_errors_count, post_hydrate)` where
+/// `post_hydrate` carries the post-hydration HTML, console buffer, and
+/// post-hydration title for the `--inject-script` branch.
+type OpenHydrationResult = (
+    Vec<heso_engine_js::ScriptFailure>,
+    usize,
+    Option<(String, Vec<heso_engine_js::ConsoleEntry>, Option<String>)>,
+);
+
 /// `heso open <url>` — fetch once, return the agent-shaped payload.
 ///
 /// Flags (must appear AFTER the URL or before — order-tolerant):
@@ -783,7 +752,7 @@ async fn cmd_meta(args: &[String]) -> ExitCode {
 ///   [`DEFAULT_LINK_CAP`], hard max [`HARD_LINK_CAP`]).
 async fn cmd_open(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... <url>");
         return ExitCode::from(2);
     }
 
@@ -794,7 +763,6 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let mut url_arg: Option<String> = None;
     let mut explore_depth: u8 = 0;
     let mut link_cap: usize = DEFAULT_LINK_CAP;
-    let mut best_effort = false;
     let mut inject_scripts: Vec<String> = Vec::new();
     let mut sign_flags = receipts::SignFlags::default();
     let mut i = 0;
@@ -846,10 +814,6 @@ async fn cmd_open(args: &[String]) -> ExitCode {
                 }
                 i += 2;
             }
-            "--best-effort" => {
-                best_effort = true;
-                i += 1;
-            }
             "--inject-script" => {
                 let Some(v) = args.get(i + 1) else {
                     eprintln!("--inject-script needs a value (inline JS or @filepath)");
@@ -866,7 +830,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
+                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -884,7 +848,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     }
 
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--best-effort] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
         return ExitCode::from(2);
     };
 
@@ -910,9 +874,8 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             // Hard fetch failures (DNS, connection refused, HTTP error
-            // before any body returned) stay non-zero even under
-            // `--best-effort`: no payload was produced, so there's
-            // nothing to partially return.
+            // before any body returned) exit non-zero — no payload was
+            // produced, so there's nothing to partially return.
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
         }
@@ -925,11 +888,8 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     // path below. Without inject scripts we take the cheap
     // [`hydrate_for_failure_envelope`] path (still spins QuickJS but
     // doesn't keep the session around for post-hydrate snapshots).
-    let (failed_scripts, console_errors_count, post_hydrate): (
-        Vec<heso_engine_js::ScriptFailure>,
-        usize,
-        Option<(String, Vec<heso_engine_js::ConsoleEntry>, Option<String>)>,
-    ) = if !inject_scripts.is_empty() {
+    let (failed_scripts, console_errors_count, post_hydrate): OpenHydrationResult =
+        if !inject_scripts.is_empty() {
         let client = engine.client();
         let cookie_jar = engine.cookie_jar();
         let rt_handle = tokio::runtime::Handle::current();
@@ -992,7 +952,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             hydrate_for_failure_envelope(&engine, &page.body_html, page.url().clone());
         (failed, console_errors, None)
     };
-    let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts, console_errors_count);
+    let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts);
     // HTTP truthfulness wins over JS classification — a 403 with a
     // Cloudflare challenge body shouldn't pretend to be a `script_crash`
     // from the missing CF JS. Same upstream signal for 5xx, etc.
@@ -1010,12 +970,9 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         page.tree.root.children.len(),
         &failed_scripts,
     );
-    // Without `--best-effort`, today's contract is "open always
-    // returns the page even if hydration errors happen" — we keep
-    // that. The new partial fields are additive; the flag only
-    // becomes load-bearing on `read` / `wait` where exit-code
-    // semantics change.
-    let _ = best_effort;
+    // `cmd_open` always returns the page even if hydration errors
+    // happen — the new partial fields are additive. Exit-code change
+    // semantics live on `read` / `wait`, which take `--best-effort`.
 
     // Agent-facing single payload — one subprocess gets the page URL,
     // title, description, full structured metadata, the navigable tree,
@@ -1146,7 +1103,6 @@ fn hydrate_for_failure_envelope(
 ///   failures here; soft signals stay informational.
 pub(crate) fn classify_failure_envelope(
     failed_scripts: &[heso_engine_js::ScriptFailure],
-    _console_errors_count: usize,
 ) -> (bool, &'static str) {
     for f in failed_scripts {
         match f.reason.as_str() {
@@ -1979,7 +1935,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // the schema bump. Under `--best-effort` we additionally guarantee
     // exit 0 — the existing happy path already returns success here
     // since `JsSession::open_on_engine` succeeded.
-    let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts, console_errors_count);
+    let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts);
     let (partial, partial_reason) =
         apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
     let (partial, partial_reason) = apply_extraction_truthfulness(
@@ -1997,10 +1953,6 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         &failed_scripts,
         console_errors_count,
     );
-    // `best_effort` is consumed in the hydrate-failure short-circuit
-    // above; on this path we always exit 0 anyway (the only way to
-    // reach here is JsSession::open success).
-    let _ = best_effort;
 
     // lazy_hints always emits; scroll only under --complete.
     body["lazy_hints"] = serde_json::to_value(&lazy_hints).unwrap_or(serde_json::Value::Null);
@@ -2552,16 +2504,16 @@ const PER_STEP_TIMEOUT_MS: u64 = 2_000;
 ///    immediately with `stop_reason: "no_lazy_content"` and
 ///    `iterations: 0`. Honest signal that there's nothing to do.
 /// 2. Up to `MAX_ITERATIONS` times:
-///    a. Hash the current `post_html`.
-///    b. Call `flush_intersection_observers()` to wake up any IO whose
+///    1. Hash the current `post_html`.
+///    2. Call `flush_intersection_observers()` to wake up any IO whose
 ///       targets were appended since last fire.
-///    c. If there are surfaced "Load more" actions, click the first one.
-///    d. Wait for the DOM to be quiet (no new HTML for
+///    3. If there are surfaced "Load more" actions, click the first one.
+///    4. Wait for the DOM to be quiet (no new HTML for
 ///       `DOM_QUIET_MS`, with a `PER_STEP_TIMEOUT_MS` ceiling).
-///    e. Re-snapshot `post_html` + the action graph.
-///    f. If the new hash equals the snapshot → `dom_quiet`, done.
-///    g. If we hit `MAX_ITERATIONS` → `max_iterations`, done.
-///    h. If we hit `MAX_ELAPSED_MS` → `timeout`, done.
+///    5. Re-snapshot `post_html` + the action graph.
+///    6. If the new hash equals the snapshot → `dom_quiet`, done.
+///    7. If we hit `MAX_ITERATIONS` → `max_iterations`, done.
+///    8. If we hit `MAX_ELAPSED_MS` → `timeout`, done.
 ///
 /// Pagination ("Next" links) is INTENTIONALLY not clicked — that's a
 /// page transition, a different intent than "load more on this page."
@@ -2579,7 +2531,7 @@ pub(crate) fn run_auto_scroll_loop(
             iterations: 0,
             stop_reason: "no_lazy_content",
             elapsed_ms: start.elapsed().as_millis(),
-            final_content_hash: html_content_hash(post_html),
+            final_content_hash: html_snapshot_key(post_html),
         };
     }
 
@@ -2591,7 +2543,7 @@ pub(crate) fn run_auto_scroll_loop(
             stop_reason = "timeout";
             break;
         }
-        let snapshot_hash = html_content_hash(post_html);
+        let snapshot_hash = html_snapshot_key(post_html);
 
         // a) Fire any pending IntersectionObserver targets so JS that
         // gates content on visibility wakes up.
@@ -2634,7 +2586,7 @@ pub(crate) fn run_auto_scroll_loop(
         *lazy_hints = compute_lazy_hints(session.engine(), post_html, actions);
 
         iterations += 1;
-        let new_hash = html_content_hash(post_html);
+        let new_hash = html_snapshot_key(post_html);
         if new_hash == snapshot_hash {
             stop_reason = "dom_quiet";
             break;
@@ -2653,7 +2605,7 @@ pub(crate) fn run_auto_scroll_loop(
         iterations,
         stop_reason,
         elapsed_ms: start.elapsed().as_millis(),
-        final_content_hash: html_content_hash(post_html),
+        final_content_hash: html_snapshot_key(post_html),
     }
 }
 
@@ -2668,7 +2620,7 @@ pub(crate) fn run_auto_scroll_loop(
 pub(crate) fn wait_dom_quiet(session: &mut heso_engine_js::JsSession) {
     let step_start = std::time::Instant::now();
     let tick = std::time::Duration::from_millis(25);
-    let mut last_hash = html_content_hash(&session.document_html());
+    let mut last_hash = html_snapshot_key(&session.document_html());
     let mut quiet_since = std::time::Instant::now();
     loop {
         let elapsed = step_start.elapsed().as_millis() as u64;
@@ -2681,7 +2633,7 @@ pub(crate) fn wait_dom_quiet(session: &mut heso_engine_js::JsSession) {
         // will see in `console` on the next drain.
         let _ = session.engine().run_pending_jobs();
         let snapshot = session.document_html();
-        let h = html_content_hash(&snapshot);
+        let h = html_snapshot_key(&snapshot);
         if h != last_hash {
             last_hash = h;
             quiet_since = std::time::Instant::now();
@@ -2692,13 +2644,19 @@ pub(crate) fn wait_dom_quiet(session: &mut heso_engine_js::JsSession) {
     }
 }
 
-/// 32-bit-prefix BLAKE3 of the HTML string. We don't need the full 256
-/// bits for the "did it change?" comparison; the prefix keeps the JSON
-/// payload short while still effectively zero collision risk for
-/// a single page-load's snapshots.
-fn html_content_hash(html: &str) -> String {
+/// Number of hex chars from the BLAKE3 digest used as the change-detect
+/// snapshot key. 16 hex chars = 64 bits, more than enough for "did the
+/// HTML change between two snapshots of one page load."
+const DOM_HASH_PREFIX_HEX_CHARS: usize = 16;
+
+/// Truncated BLAKE3 key of an HTML string, used as a "did it change?"
+/// fingerprint between snapshots in the same page load. NOT a content
+/// hash — the digest is intentionally truncated to keep the JSON
+/// payload short, so the `snap:` prefix labels it as a snapshot key
+/// rather than a full hash.
+fn html_snapshot_key(html: &str) -> String {
     let h = blake3::hash(html.as_bytes());
-    format!("blake3:{}", &h.to_hex().as_str()[..16])
+    format!("snap:{}", &h.to_hex().as_str()[..DOM_HASH_PREFIX_HEX_CHARS])
 }
 
 /// Group the action-graph entries into `<form>` clusters. Each form's
@@ -3208,7 +3166,7 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
     // the page lifecycle (the spec is: "timeout-with-best-effort →
     // partial_reason wait_timeout").
     let (mut partial, mut partial_reason): (bool, &'static str) =
-        classify_failure_envelope(&failed_scripts, console_errors_count);
+        classify_failure_envelope(&failed_scripts);
     if !outcome.ok {
         partial = true;
         partial_reason = "wait_timeout";
@@ -3230,7 +3188,9 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
     } else {
         ExitCode::from(1)
     };
-    let _ = print_json(&body);
+    if !write_json_to_stdout(&body) {
+        return ExitCode::FAILURE;
+    }
     exit
 }
 
@@ -3903,10 +3863,7 @@ fn follow_anchor_href(action: &heso_engine_fetch::ElementRef, page_url: &Url) ->
     // `Url::join` handles relative-URL resolution per WHATWG URL
     // (item-25 / RFC 3986 §5.2). Strips fragments only when the
     // input is purely a fragment; preserves the rest.
-    match page_url.join(trimmed) {
-        Ok(u) => Some(u),
-        Err(_) => None,
-    }
+    page_url.join(trimmed).ok()
 }
 
 /// Bug A helper: fetch the click destination and fold its page into
@@ -4064,14 +4021,10 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
 /// engine's shared `reqwest::Client`, follow redirects, and report the
 /// post-redirect URL + status + response body.
 ///
-/// Pre-PR-1 behavior dispatched a click on the submit button without
-/// issuing any HTTP traffic — filed as the top write-side gap in
-/// `agent regression testing`. PR-1 closed that. PR-X1 (this revision) closes
-/// the next layer of the same gap that `agent regression testing` filed:
-/// in V2 every CLI invocation was a fresh process, so `heso fill`'s
-/// typed-in value never reached the next `heso submit` invocation. The
-/// `--field NAME=VALUE` / `--data JSON` flags make submit a one-shot:
-/// fetch + fill + submit + return-response in one process.
+/// `--field NAME=VALUE` / `--data JSON` keep submit a one-shot:
+/// fetch + fill + submit + return-response in one process, since each
+/// CLI invocation is a fresh process and a `heso fill` from a separate
+/// invocation cannot otherwise carry typed values forward.
 ///
 /// Flag shape:
 ///
@@ -4361,11 +4314,11 @@ async fn cmd_submit_inner(
     };
 
     // Build a fetch-capable JS engine so the form submission can
-    // actually go out over the wire (per PR-1). Share the same
-    // `reqwest::Client` AND the same cookie jar as the static path
-    // so a server's `Set-Cookie` response on the page load is sent
-    // back on the form-submit `POST`, and any `document.cookie =`
-    // writes the page made before submission travel on the wire.
+    // actually go out over the wire. Share the same `reqwest::Client`
+    // AND the same cookie jar as the static path so a server's
+    // `Set-Cookie` response on the page load is sent back on the
+    // form-submit `POST`, and any `document.cookie =` writes the page
+    // made before submission travel on the wire.
     let client = engine.client();
     let cookie_jar = engine.cookie_jar();
     let rt_handle = tokio::runtime::Handle::current();
@@ -4379,9 +4332,9 @@ async fn cmd_submit_inner(
         };
 
     // Open the page in a stateful session so the post-submit
-    // navigation lands somewhere observable. `--seed` / determinism
-    // is out of scope for PR-1; record/replay (item M) is the
-    // determinism path for live writes.
+    // navigation lands somewhere observable. Record/replay (item M)
+    // is the determinism path for live writes; `--seed` is not
+    // honored on this verb.
     let (mut session, _open_outcome) = match heso_engine_js::JsSession::open_on_engine(
         js_engine,
         &html,
@@ -4449,719 +4402,19 @@ async fn cmd_submit_inner(
     ExitCode::SUCCESS
 }
 
-async fn cmd_plat_hash(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: heso plat-hash <file|plat-hash>");
-        return ExitCode::from(2);
-    }
-    let input = &args[0];
-    let (contents, source) = match read_plat_input_or_hash(input, "plat-hash").await {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-    let value: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("`{source}` is not valid JSON: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let hash = heso_engine_fetch::plat_hash(&value);
-    println!("{hash}");
-    ExitCode::SUCCESS
-}
-
-/// `heso plat-verify <file>` — verify a plat JSON file's embedded
-/// `plat_hash` against the recomputed hash of its content. Exits 0 if
-/// they match, 1 if they don't, 2 if the input is malformed (missing or
-/// non-string `plat_hash`).
-async fn cmd_plat_verify(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: heso plat-verify <file|plat-hash>");
-        return ExitCode::from(2);
-    }
-    let input = &args[0];
-    let (contents, source) = match read_plat_input_or_hash(input, "plat-verify").await {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-    let value: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("`{source}` is not valid JSON: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match heso_engine_fetch::plat_verify(&value) {
-        Ok(true) => {
-            let embedded = value
-                .get("plat_hash")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown)");
-            println!("OK {embedded}");
-            ExitCode::SUCCESS
-        }
-        Ok(false) => {
-            let embedded = value
-                .get("plat_hash")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown)");
-            let recomputed = heso_engine_fetch::plat_hash(&value);
-            eprintln!("MISMATCH");
-            eprintln!("  embedded:   {embedded}");
-            eprintln!("  recomputed: {recomputed}");
-            ExitCode::from(1)
-        }
-        Err(e) => {
-            eprintln!("verify failed: {e}");
-            ExitCode::from(2)
-        }
-    }
-}
-
 // ============================================================================
-// Plat dev tools: info / diff / redact
-// ============================================================================
-//
-// Text-only inspection tools for `.plat` files. Live in the main binary
-// (not a separate package) because they are tiny and the alternative —
-// "install another binary just to grep a plat" — is worse UX than baked-in.
-
-/// Format a byte count as `B` / `KB` / `MB` for human-readable output.
-fn plat_format_bytes(n: usize) -> String {
-    if n < 1024 {
-        format!("{n} B")
-    } else if n < 1024 * 1024 {
-        format!("{:.1} KB", n as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
-    }
-}
-
-fn changed_top_level_fields(a: &serde_json::Value, b: &serde_json::Value) -> Vec<String> {
-    let mut keys = std::collections::BTreeSet::new();
-    if let Some(obj) = a.as_object() {
-        keys.extend(obj.keys().filter(|k| k.as_str() != "plat_hash").cloned());
-    }
-    if let Some(obj) = b.as_object() {
-        keys.extend(obj.keys().filter(|k| k.as_str() != "plat_hash").cloned());
-    }
-    keys.into_iter().filter(|k| a.get(k) != b.get(k)).collect()
-}
-
-/// `heso plat-info <file>` — print a human summary of a plat: hash,
-/// size, url/title, plan/cassette/steps counts, sealed status, partial
-/// flag.
-///
-/// Exit codes: `0` ok, `1` file unreadable or not JSON, `2` usage.
-async fn cmd_plat_info(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: heso plat-info <file|plat-hash>");
-        eprintln!();
-        eprintln!("Print a human summary of a plat: plat_hash, plan length,");
-        eprintln!("cassette record count, step count, sealed status, and partial flag.");
-        return ExitCode::from(2);
-    }
-    let input = &args[0];
-    let (contents, source) = match read_plat_input_or_hash(input, "plat-info").await {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-    let size_bytes = contents.len();
-    let value: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("`{source}` is not valid JSON: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let embedded_hash = value
-        .get("plat_hash")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(not present)");
-    let url = value
-        .get("url")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(no url)");
-    let title = value
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(no title)");
-
-    let plan_summary = match value.get("plan").and_then(|v| v.as_array()) {
-        Some(arr) if arr.is_empty() => "0 actions".to_owned(),
-        Some(arr) => {
-            let verbs: Vec<&str> = arr
-                .iter()
-                .filter_map(|a| a.get("verb").and_then(|v| v.as_str()))
-                .collect();
-            if verbs.is_empty() {
-                format!("{} actions (unknown shape)", arr.len())
-            } else {
-                format!("{} actions ({})", arr.len(), verbs.join(" → "))
-            }
-        }
-        None => "(no plan)".to_owned(),
-    };
-
-    let cassette_summary = match value
-        .get("cassette")
-        .and_then(|c| c.get("records"))
-        .and_then(|r| r.as_array())
-    {
-        Some(records) if records.is_empty() => "0 records".to_owned(),
-        Some(records) => {
-            let mut methods: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-            let mut body_bytes: usize = 0;
-            for r in records {
-                let method = r
-                    .get("method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_owned();
-                *methods.entry(method).or_insert(0) += 1;
-                if let Some(body_b64) = r.get("response_body_b64").and_then(|v| v.as_str()) {
-                    body_bytes += body_b64.len() * 3 / 4;
-                }
-            }
-            let method_parts: Vec<String> =
-                methods.iter().map(|(m, c)| format!("{c} {m}")).collect();
-            format!(
-                "{} records ({}; ~{} body data)",
-                records.len(),
-                method_parts.join(", "),
-                plat_format_bytes(body_bytes)
-            )
-        }
-        None => "(no cassette)".to_owned(),
-    };
-
-    let steps_summary = match value.get("steps").and_then(|s| s.as_array()) {
-        Some(steps) => {
-            let total = steps.len();
-            let errors = steps.iter().filter(|s| s.get("error").is_some()).count();
-            let ok = total - errors;
-            format!("{total} steps ({ok} ok, {errors} errors)")
-        }
-        None => "(no steps)".to_owned(),
-    };
-
-    let sealed = value.get("alg").is_some() && value.get("signature").is_some();
-    let partial = value
-        .get("partial")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let partial_reason = value
-        .get("partial_reason")
-        .and_then(|v| v.as_str())
-        .filter(|s| *s != "ok" && !s.is_empty());
-
-    let verified = match heso_engine_fetch::plat_verify(&value) {
-        Ok(true) => "yes (hash matches content)",
-        Ok(false) => "NO (embedded hash does not match recomputed)",
-        Err(_) => "n/a (missing or malformed plat_hash)",
-    };
-
-    println!("plat_hash:    {embedded_hash}");
-    println!("verified:     {verified}");
-    println!("size:         {}", plat_format_bytes(size_bytes));
-    println!("url:          {url}");
-    println!("title:        {title}");
-    println!("plan:         {plan_summary}");
-    println!("cassette:     {cassette_summary}");
-    println!("steps:        {steps_summary}");
-    println!(
-        "sealed:       {}",
-        if sealed {
-            "yes (Ed25519 envelope)"
-        } else {
-            "no"
-        }
-    );
-    let partial_line = match (partial, partial_reason) {
-        (false, _) => "false".to_owned(),
-        (true, Some(reason)) => format!("true ({reason})"),
-        (true, None) => "true".to_owned(),
-    };
-    println!("partial:      {partial_line}");
-
-    ExitCode::SUCCESS
-}
-
-/// `heso plat-diff <a> <b>` — show what changed between two plats:
-/// `plat_hash`, plan, cassette URL set + per-URL response bodies,
-/// changed top-level fields, and key scalar fields.
-///
-/// Output is a small, human-readable report — not a unified diff. For a
-/// full structural diff, pipe each plat through `jq` and use `diff`.
-///
-/// Exit codes: `0` plats have the same canonical content hash, `1`
-/// plats differ, `2` usage / unreadable.
-async fn cmd_plat_diff(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("usage: heso plat-diff <a> <b>");
-        eprintln!();
-        eprintln!("Show what changed between two plats. Exit 0 if their");
-        eprintln!("plat_hash matches, 1 if they differ, 2 on usage error");
-        eprintln!("or unreadable file.");
-        return ExitCode::from(2);
-    }
-    let (file_a, file_b) = (&args[0], &args[1]);
-
-    async fn load(path: &str) -> Result<serde_json::Value, String> {
-        let s = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| format!("failed to read `{path}`: {e}"))?;
-        serde_json::from_str(&s).map_err(|e| format!("`{path}` is not valid JSON: {e}"))
-    }
-
-    let a = match load(file_a).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let b = match load(file_b).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let hash_a = heso_engine_fetch::plat_hash(&a);
-    let hash_b = heso_engine_fetch::plat_hash(&b);
-
-    if hash_a == hash_b {
-        println!("plat_hash:    IDENTICAL ({hash_a})");
-        println!();
-        println!("The plats are byte-equivalent under HESO/1.0 §1.5 canonicalization.");
-        return ExitCode::SUCCESS;
-    }
-
-    println!("plat_hash:    DIFFERENT");
-    println!("              a: {hash_a}");
-    println!("              b: {hash_b}");
-    println!();
-
-    // Plan diff: lengths + verb sequence.
-    let plan_a = a.get("plan").and_then(|v| v.as_array());
-    let plan_b = b.get("plan").and_then(|v| v.as_array());
-    match (plan_a, plan_b) {
-        (Some(pa), Some(pb)) if pa == pb => {
-            println!("plan:         IDENTICAL ({} actions)", pa.len());
-        }
-        (Some(pa), Some(pb)) => {
-            println!(
-                "plan:         DIFFERENT (a: {} actions, b: {} actions)",
-                pa.len(),
-                pb.len()
-            );
-        }
-        (Some(_), None) => println!("plan:         only in a"),
-        (None, Some(_)) => println!("plan:         only in b"),
-        (None, None) => {}
-    }
-
-    // Cassette diff: URL set difference + per-URL response body diff.
-    fn cassette_records(v: &serde_json::Value) -> Vec<(&str, &str, &str)> {
-        v.get("cassette")
-            .and_then(|c| c.get("records"))
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .map(|r| {
-                        let method = r.get("method").and_then(|v| v.as_str()).unwrap_or("?");
-                        let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-                        let body = r
-                            .get("response_body_b64")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        (method, url, body)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-    let recs_a = cassette_records(&a);
-    let recs_b = cassette_records(&b);
-    if !recs_a.is_empty() || !recs_b.is_empty() {
-        let keys_a: std::collections::BTreeMap<(&str, &str), &str> =
-            recs_a.iter().map(|(m, u, b)| ((*m, *u), *b)).collect();
-        let keys_b: std::collections::BTreeMap<(&str, &str), &str> =
-            recs_b.iter().map(|(m, u, b)| ((*m, *u), *b)).collect();
-        let only_a: Vec<&(&str, &str)> =
-            keys_a.keys().filter(|k| !keys_b.contains_key(*k)).collect();
-        let only_b: Vec<&(&str, &str)> =
-            keys_b.keys().filter(|k| !keys_a.contains_key(*k)).collect();
-        let changed: Vec<&(&str, &str)> = keys_a
-            .iter()
-            .filter_map(|(k, va)| {
-                let vb = keys_b.get(k)?;
-                if vb != va {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if only_a.is_empty() && only_b.is_empty() && changed.is_empty() {
-            println!("cassette:     IDENTICAL ({} records)", keys_a.len());
-        } else {
-            println!(
-                "cassette:     DIFFERENT (a: {} records, b: {} records)",
-                keys_a.len(),
-                keys_b.len()
-            );
-            for k in &only_a {
-                println!("              - {} {}  (in a only)", k.0, k.1);
-            }
-            for k in &only_b {
-                println!("              + {} {}  (in b only)", k.0, k.1);
-            }
-            for k in &changed {
-                println!("              ~ {} {}  (response body differs)", k.0, k.1);
-            }
-        }
-    }
-
-    let top_changed = changed_top_level_fields(&a, &b);
-    if !top_changed.is_empty() {
-        println!("fields:       {} differ", top_changed.join(", "));
-    }
-
-    // Key top-level scalars that often differ in obvious ways.
-    for field in &["url", "title", "description"] {
-        let av = a.get(*field).and_then(|v| v.as_str()).unwrap_or("");
-        let bv = b.get(*field).and_then(|v| v.as_str()).unwrap_or("");
-        if av != bv {
-            println!("{field}: DIFFERENT");
-            println!("              a: {av}");
-            println!("              b: {bv}");
-        }
-    }
-
-    ExitCode::from(1)
-}
-
-/// `heso plat-redact <field> <file>` — strip a top-level field from a
-/// plat and emit the result on stdout with a freshly-recomputed
-/// `plat_hash`. Refuses to operate on a sealed envelope (would break
-/// the signature). Removing any present field changes the hash and
-/// invalidates any previous attestation.
-///
-/// Exit codes: `0` redaction applied (field removed or already absent),
-/// `1` refused (sealed envelope), `2` usage / unreadable / not a plat.
-async fn cmd_plat_redact(args: &[String]) -> ExitCode {
-    if args.len() < 2 {
-        eprintln!("usage: heso plat-redact <field> <file>");
-        eprintln!();
-        eprintln!("Strip a top-level field from a plat and emit the result on");
-        eprintln!("stdout with a recomputed plat_hash. Useful for sharing a plat");
-        eprintln!("without sensitive bytes (cookies, console output, etc.).");
-        eprintln!();
-        eprintln!("Refuses sealed envelopes — extract `content` first if needed.");
-        return ExitCode::from(2);
-    }
-    let field = &args[0];
-    let file = &args[1];
-    let contents = match tokio::fs::read_to_string(file).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to read `{file}`: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let mut value: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("`{file}` is not valid JSON: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    if value.get("alg").is_some() && value.get("signature").is_some() {
-        eprintln!("refused: `{file}` looks like a sealed envelope (has `alg` + `signature`).");
-        eprintln!("redacting it would break the signature. Extract `content` first:");
-        eprintln!("  jq .content {file} | heso plat-redact {field} -");
-        return ExitCode::from(1);
-    }
-
-    if !value.is_object() {
-        eprintln!("`{file}` is not a JSON object (plats are objects).");
-        return ExitCode::from(2);
-    }
-
-    let old_hash = heso_engine_fetch::plat_hash(&value);
-    let was_present = value
-        .as_object_mut()
-        .expect("checked object above")
-        .remove(field.as_str())
-        .is_some();
-
-    // Strip the existing plat_hash, recompute against the modified body,
-    // re-embed.
-    value
-        .as_object_mut()
-        .expect("checked object above")
-        .remove("plat_hash");
-    let new_hash = heso_engine_fetch::plat_hash(&value);
-    if !was_present {
-        eprintln!("note: field `{field}` was not present; plat_hash unchanged.");
-    } else if old_hash == new_hash {
-        eprintln!("note: removed `{field}`; canonical content hash is unchanged.");
-    } else {
-        eprintln!(
-            "warning: removed `{field}`; the output plat has a NEW plat_hash and any prior signature is invalidated."
-        );
-    }
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("plat_hash".to_owned(), serde_json::Value::String(new_hash));
-    }
-
-    match serde_json::to_string(&value) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to serialize redacted plat: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-// ============================================================================
-// Sealed envelope: seal / unseal
-// ============================================================================
-//
-// `plat-seal` wraps a plat body in an Ed25519 envelope; `plat-unseal`
-// checks one. The envelope is the unit of trust — holding it plus the
-// `heso` binary is sufficient to decide whether the content was produced
-// by the holder of the public key and is byte-for-byte what was signed.
-// No network, no clock, no key material needed at verify time.
-
-/// `heso plat-seal <file> [--key PATH]` — wrap a plat body in an
-/// Ed25519 envelope. The envelope is self-describing JSON
-/// (`{alg, content, signature}`) — verifying it offline requires only
-/// the envelope and the `heso` binary.
-///
-/// Refuses an input that already looks sealed (has `alg` + `signature`):
-/// double-sealing is almost always a mistake. Extract `.content` first.
-///
-/// Exit codes: `0` sealed, `1` input unreadable / not JSON / key load
-/// failed / pre-sealed input, `2` usage.
-async fn cmd_plat_seal(args: &[String]) -> ExitCode {
-    let mut file: Option<&str> = None;
-    let mut key_path: Option<PathBuf> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--key" => {
-                let Some(v) = args.get(i + 1) else {
-                    eprintln!("--key needs a value");
-                    return ExitCode::from(2);
-                };
-                key_path = Some(PathBuf::from(v));
-                i += 2;
-            }
-            other if other.starts_with("--") => {
-                eprintln!("unknown flag `{other}`");
-                return ExitCode::from(2);
-            }
-            other => {
-                if file.is_some() {
-                    eprintln!("unexpected positional `{other}` (expected a single file argument)");
-                    return ExitCode::from(2);
-                }
-                file = Some(other);
-                i += 1;
-            }
-        }
-    }
-    let Some(file) = file else {
-        eprintln!("usage: heso plat-seal <file> [--key PATH]");
-        eprintln!();
-        eprintln!("Wrap a plat body in an Ed25519 envelope, printed as JSON on stdout.");
-        eprintln!("Pass `-` to read the plat from stdin. --key defaults to");
-        eprintln!("`{DEFAULT_IDENTITY_PATH}` (init with `heso identity init`).");
-        return ExitCode::from(2);
-    };
-
-    let contents = match read_plat_input(file) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let body: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("`{file}` is not valid JSON: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if body.get("alg").is_some() && body.get("signature").is_some() {
-        eprintln!("refused: input looks like a sealed envelope already (has `alg` + `signature`).");
-        eprintln!("double-sealing is almost always a mistake. Extract `content` first:");
-        eprintln!("  jq .content {file} | heso plat-seal -");
-        return ExitCode::FAILURE;
-    }
-
-    let path = key_path.unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH));
-    let key = match IdentityKey::load(&path) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("failed to load identity at `{}`: {e}", path.display());
-            eprintln!("run `heso identity init` first, or pass --key <PATH>.");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let sealed = heso_engine_fetch::plat_seal(&key, body);
-    match serde_json::to_string(&sealed) {
-        Ok(s) => {
-            println!("{s}");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to serialize sealed envelope: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// `heso plat-unseal <file> [--extract]` — verify a sealed envelope.
-/// Without `--extract`, prints a small JSON status object to stdout.
-/// With `--extract`, prints the inner `content` (the plat body) to
-/// stdout instead — pipe it into anything that takes a plat.
-///
-/// Exit codes:
-/// * `0` envelope is valid (signature + embedded hash both match);
-/// * `1` envelope is invalid — content was mutated (`HashMismatch`) or
-///   the signature does not verify (`InvalidSignature`);
-/// * `2` envelope is malformed (not a SealedPlat shape) OR carries an
-///   algorithm tag this binary does not know (`WrongAlgorithm`), OR a
-///   usage error.
-async fn cmd_plat_unseal(args: &[String]) -> ExitCode {
-    let mut file: Option<&str> = None;
-    let mut extract = false;
-    for a in args {
-        match a.as_str() {
-            "--extract" => extract = true,
-            other if other.starts_with("--") => {
-                eprintln!("unknown flag `{other}`");
-                return ExitCode::from(2);
-            }
-            other => {
-                if file.is_some() {
-                    eprintln!("unexpected positional `{other}` (expected a single file argument)");
-                    return ExitCode::from(2);
-                }
-                file = Some(other);
-            }
-        }
-    }
-    let Some(file) = file else {
-        eprintln!("usage: heso plat-unseal <file> [--extract]");
-        eprintln!();
-        eprintln!(
-            "Verify a sealed plat envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed."
-        );
-        eprintln!("Pass `-` to read the envelope from stdin. With --extract, also print the inner");
-        eprintln!("plat body (the `content` field) to stdout for piping into another verb.");
-        return ExitCode::from(2);
-    };
-
-    let contents = match read_plat_input(file) {
-        Ok(s) => s,
-        Err(code) => return code,
-    };
-    let sealed: heso_engine_fetch::SealedPlat = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("`{file}` is not a sealed envelope: {e}");
-            eprintln!("expected JSON with `alg`, `content`, and `signature` fields.");
-            return ExitCode::from(2);
-        }
-    };
-
-    match heso_engine_fetch::plat_open(&sealed) {
-        heso_engine_fetch::PlatOpenOutcome::Valid => {
-            if extract {
-                match serde_json::to_string(&sealed.content) {
-                    Ok(s) => {
-                        println!("{s}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => {
-                        eprintln!("failed to serialize content: {e}");
-                        ExitCode::FAILURE
-                    }
-                }
-            } else {
-                let body = serde_json::json!({
-                    "status": "valid",
-                    "alg": sealed.alg,
-                    "public_key": sealed.signature.public_key,
-                    "plat_hash": sealed.content
-                        .get("plat_hash")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(""),
-                });
-                match serde_json::to_string(&body) {
-                    Ok(s) => {
-                        println!("{s}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(e) => {
-                        eprintln!("failed to serialize status: {e}");
-                        ExitCode::FAILURE
-                    }
-                }
-            }
-        }
-        heso_engine_fetch::PlatOpenOutcome::HashMismatch => {
-            let embedded = sealed
-                .content
-                .get("plat_hash")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(unknown)");
-            let recomputed = heso_engine_fetch::plat_hash(&sealed.content);
-            eprintln!("INVALID: content `plat_hash` does not match recomputed BLAKE3");
-            eprintln!("  embedded:   {embedded}");
-            eprintln!("  recomputed: {recomputed}");
-            eprintln!("the content has been mutated since sealing.");
-            ExitCode::from(1)
-        }
-        heso_engine_fetch::PlatOpenOutcome::InvalidSignature(e) => {
-            eprintln!("INVALID: signature does not verify: {e}");
-            ExitCode::from(1)
-        }
-        heso_engine_fetch::PlatOpenOutcome::WrongAlgorithm(tag) => {
-            eprintln!("WRONG ALGORITHM: envelope carries `{tag}`, this binary only knows `heso-plat/v1+ed25519`.");
-            ExitCode::from(2)
-        }
-    }
-}
-
-// ============================================================================
-// Plan lifecycle: stamp / replay / unpack
+// Plan lifecycle: stamp / replay
 // ============================================================================
 //
 // A *plat* is the static observation. A *plan* is the action sequence
-// that produced it. The three verbs below close the loop:
+// that produced it. The two verbs below close the loop:
 //
 //   stamp  plan -> plat   (execute + validate + mint)
 //   replay plat -> log    (re-execute, report what happened)
-//   unpack plat -> plan   (extract the plan field, copyable)
 //
-// `stamp` and `replay` share `run_plan`. `unpack` is a thin field
-// extractor. All three accept the same plan-bearing inputs (plat with
-// embedded `plan`, bare action array, or `TraceFingerprint`) so a user
-// can compose them freely.
+// Both share `run_plan` and accept the same plan-bearing inputs (plat
+// with embedded `plan`, bare action array, or `TraceFingerprint`) so a
+// user can compose them freely.
 
 /// Input shape accepted by `stamp` / `replay`. Holds the parsed plan
 /// plus the entry URL the plan starts from.
@@ -5263,6 +4516,15 @@ fn first_open_url(actions: &[Action]) -> Option<Url> {
 /// any action failed (still prints the partial plat with an `error`
 /// field so the caller can see how far it got).
 async fn cmd_stamp(args: &[String]) -> ExitCode {
+    // Detect the template-stamp polymorphic shape:
+    //   heso stamp --template <path> [--values JSON|@FILE] [--seed N]
+    // When both `--template` and `--values` (or just `--template`) are
+    // present, forward to the template-stamp inner core. Otherwise fall
+    // through to the legacy plan-stamp behavior unchanged.
+    if args.iter().any(|a| a == "--template") {
+        return template::cmd_stamp_from_template_args(args).await;
+    }
+
     let (seed, path) = match parse_seed_and_path(args, "stamp") {
         Ok(v) => v,
         Err(code) => return code,
@@ -5293,7 +4555,9 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
         }
     };
     let partial = body.get("error").is_some();
-    let _ = print_json(&body);
+    if !write_json_to_stdout(&body) {
+        return ExitCode::FAILURE;
+    }
     if partial {
         ExitCode::FAILURE
     } else {
@@ -5493,7 +4757,9 @@ async fn cmd_refresh(args: &[String]) -> ExitCode {
             );
         }
     }
-    let _ = print_json(&output);
+    if !write_json_to_stdout(&output) {
+        return ExitCode::FAILURE;
+    }
     if drifted {
         eprintln!("drift detected: plat_hash changed");
         ExitCode::FAILURE
@@ -5513,46 +4779,17 @@ fn emit_refresh_error(kind: &str, message: impl Into<String>) -> ExitCode {
             "message": message.into(),
         }
     });
-    let _ = print_json(&value);
+    if !write_json_to_stdout(&value) {
+        return ExitCode::FAILURE;
+    }
     ExitCode::from(2)
 }
 
-/// `heso unpack <plat.plat>` — extract the `plan` array from a plat
-/// and print it. Exits 2 if the file has no `plan` field (a plat that
-/// was produced by single-URL `heso open` instead of `heso stamp`).
-async fn cmd_unpack(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: heso unpack <plat.plat|plat-hash|->");
-        eprintln!();
-        eprintln!("Extracts the `plan` array from a plat so it can be edited");
-        eprintln!("standalone and stamped back into a fresh plat with `heso stamp`.");
-        return ExitCode::from(2);
-    }
-    let input = &args[0];
-    let (contents, source) = match read_plat_input_or_hash(input, "unpack").await {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-    let value: serde_json::Value = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("`{source}` is not valid JSON: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let Some(plan) = value.get("plan") else {
-        eprintln!("`{source}` has no `plan` field — it was not produced by `heso stamp`");
-        eprintln!("(plats minted by single-URL `heso open` carry no plan).");
-        return ExitCode::from(2);
-    };
-    print_json(plan)
-}
-
-/// Read the input JSON for `stamp` / `run` / `replay` / `unpack` —
-/// either from `path` (file on disk) or from stdin when `path` is
-/// `-`. The stdin branch unlocks the headline one-liner
-/// `curl <plat-url> | heso run -` so a published plat anywhere on
-/// the internet replays byte-identically without a download step.
+/// Read the input JSON for `stamp` / `run` / `replay` — either from
+/// `path` (file on disk) or from stdin when `path` is `-`. The stdin
+/// branch unlocks the headline one-liner `curl <plat-url> | heso run -`
+/// so a published plat anywhere on the internet replays byte-identically
+/// without a download step.
 fn read_plat_input(path: &str) -> Result<String, ExitCode> {
     if path == "-" {
         use std::io::Read;
@@ -5575,7 +4812,7 @@ fn read_plat_input(path: &str) -> Result<String, ExitCode> {
 
 /// Read a plat from stdin, a local file, or the public registry when
 /// the argument is a bare 64-char plat hash.
-async fn read_plat_input_or_hash(input: &str, verb: &str) -> Result<(String, String), ExitCode> {
+pub(crate) async fn read_plat_input_or_hash(input: &str, verb: &str) -> Result<(String, String), ExitCode> {
     if input != "-" && !Path::new(input).exists() && ecosystem::is_plat_hash(input) {
         match ecosystem::download_plat_text(input).await {
             Ok(s) => {
@@ -5643,137 +4880,6 @@ fn parse_seed_and_path(args: &[String], verb: &str) -> Result<(Option<u64>, Stri
         return Err(ExitCode::from(2));
     };
     Ok((seed, path))
-}
-
-/// `heso action-hash <url> [actions-json | -]` — derive a keyless,
-/// tamper-evident fingerprint for an intended `(URL, actions)` pair.
-///
-/// **Two strangers doing the same actions on the same site get the same
-/// hash.** Deterministic, no key, no clock, no server. See
-/// [`heso_trace::trace_fingerprint`] for the algorithm (versioned
-/// `heso-trace-fp/v1` — domain-separated site / action / chain steps).
-///
-/// Actions are a JSON array, schema-free — callers choose how to encode
-/// their intent (e.g. `[{"verb":"click","ref":"@e3"}]`). Pass the array
-/// inline as the second positional argument, pass `-` to read it from
-/// stdin, or omit it entirely for a URL-only fingerprint.
-///
-/// Output: a serialized [`TraceFingerprint`] — every component (the
-/// algorithm tag, normalized URL, action array, per-action `action_ids`,
-/// `site_id`, and headline `trace_id`) so callers can save the JSON and
-/// re-verify it later with `heso action-hash-verify`. The save is
-/// tamper-evident: changing any field invalidates the recompute.
-async fn cmd_action_hash(args: &[String]) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("usage: heso action-hash <url> [actions-json | -]");
-        eprintln!();
-        eprintln!("Computes a keyless, deterministic fingerprint over (URL, actions).");
-        eprintln!("No key, no server, no clock — two strangers doing the same actions");
-        eprintln!("on the same site get the same hash.");
-        eprintln!();
-        eprintln!("Actions: a JSON array. Pass inline as the second arg, or `-` for stdin.");
-        eprintln!("Omit it for a URL-only fingerprint (actions = []).");
-        return ExitCode::from(2);
-    }
-
-    let url = match Url::parse(&args[0]) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("invalid URL `{}`: {e}", args[0]);
-            return ExitCode::from(2);
-        }
-    };
-
-    let raw: Option<String> = match args.get(1).map(String::as_str) {
-        None => None,
-        Some("-") => {
-            use std::io::Read;
-            let mut buf = String::new();
-            if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-                eprintln!("failed reading stdin: {e}");
-                return ExitCode::FAILURE;
-            }
-            Some(buf)
-        }
-        Some(s) => Some(s.to_owned()),
-    };
-
-    let actions: serde_json::Value = match raw {
-        Some(t) => match serde_json::from_str(&t) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("actions is not valid JSON: {e}");
-                return ExitCode::from(2);
-            }
-        },
-        None => serde_json::Value::Array(Vec::new()),
-    };
-    if !actions.is_array() {
-        eprintln!("actions must be a JSON array");
-        return ExitCode::from(2);
-    }
-
-    let fp = trace_fingerprint(&url, &actions);
-    let val = match serde_json::to_value(&fp) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("failed to serialize fingerprint: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    print_json(&val)
-}
-
-/// `heso action-hash-verify <file>` — re-derive every ID in a saved
-/// fingerprint file and confirm it matches.
-///
-/// **No key needed.** Tamper-evidence comes from the algorithm being a
-/// pure function of `url` + `actions`; any drift between the stored IDs
-/// and the recompute means the file was modified after it was produced.
-///
-/// Exit codes mirror `receipt-verify`:
-/// - `0` — every component matches (`Valid`).
-/// - `1` — at least one component disagrees, or the algorithm tag is
-///   unknown to this version (`Mismatch` / `WrongAlgorithm`).
-/// - `2` — file missing, unreadable, or not a valid fingerprint JSON
-///   (`Malformed`).
-async fn cmd_action_hash_verify(args: &[String]) -> ExitCode {
-    let Some(path) = args.first() else {
-        eprintln!("usage: heso action-hash-verify <file>");
-        return ExitCode::from(2);
-    };
-    let contents = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("MISSING `{path}`: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let fp: TraceFingerprint = match serde_json::from_str(&contents) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("MALFORMED `{path}`: not a valid fingerprint JSON: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    match verify_fingerprint(&fp) {
-        FingerprintOutcome::Valid => {
-            println!("OK {} {}", fp.algorithm, fp.trace_id);
-            ExitCode::SUCCESS
-        }
-        FingerprintOutcome::Mismatch => {
-            eprintln!("INVALID `{path}`: recompute disagrees — file was modified after creation");
-            ExitCode::from(1)
-        }
-        FingerprintOutcome::WrongAlgorithm(tag) => {
-            eprintln!("INVALID `{path}`: unknown algorithm tag `{tag}` (this build supports only `heso-trace-fp/v1`)");
-            ExitCode::from(1)
-        }
-        FingerprintOutcome::Malformed(reason) => {
-            eprintln!("MALFORMED `{path}`: {reason}");
-            ExitCode::from(2)
-        }
-    }
 }
 
 // ============================================================================
@@ -5921,7 +5027,9 @@ async fn cmd_run(args: &[String]) -> ExitCode {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
-    let _ = print_json(&body);
+    if !write_json_to_stdout(&body) {
+        return ExitCode::FAILURE;
+    }
     if outcome.ok {
         ExitCode::SUCCESS
     } else {
@@ -5940,13 +5048,36 @@ async fn cmd_run(args: &[String]) -> ExitCode {
 /// - `2` — file unreadable, not JSON, or missing `steps` field.
 async fn cmd_replay(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso replay <plat.plat|plat-hash|->");
+        eprintln!("usage: heso replay [--plan] <plat.plat|plat-hash|->");
         eprintln!();
         eprintln!("Emits the recorded step log from a plat without re-executing.");
-        eprintln!("To re-execute the plan against the plat's cassette, use `heso run`.");
+        eprintln!("With --plan, emits the plat's `plan` field instead (same JSON shape");
+        eprintln!("`heso unpack` returns). To re-execute the plan against the plat's");
+        eprintln!("cassette, use `heso run`.");
         return ExitCode::from(2);
     }
-    let input = &args[0];
+    let mut plan_only = false;
+    let mut input: Option<&str> = None;
+    for a in args {
+        match a.as_str() {
+            "--plan" => plan_only = true,
+            other if other.starts_with("--") && other != "-" => {
+                eprintln!("replay: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                if input.is_some() {
+                    eprintln!("replay: unexpected positional `{other}`");
+                    return ExitCode::from(2);
+                }
+                input = Some(other);
+            }
+        }
+    }
+    let Some(input) = input else {
+        eprintln!("usage: heso replay [--plan] <plat.plat|plat-hash|->");
+        return ExitCode::from(2);
+    };
     let (contents, source) = match read_plat_input_or_hash(input, "replay").await {
         Ok(v) => v,
         Err(code) => return code,
@@ -5958,6 +5089,15 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if plan_only {
+        let Some(plan) = value.get("plan") else {
+            eprintln!(
+                "`{source}` has no `plan` field — it was not produced by `heso stamp`."
+            );
+            return ExitCode::from(2);
+        };
+        return print_json(plan);
+    }
     let Some(steps) = value.get("steps") else {
         eprintln!(
             "`{source}` has no `steps` field — it was not produced by `heso stamp` or `heso run`."
@@ -6352,8 +5492,8 @@ pub(crate) async fn execute_step_session(
                 .clone();
             let selector = selector_for_action(&elem)
                 .ok_or_else(|| format!("no selector for ref `{want}`"))?;
-            // `submit` is `&mut self` since PR-1 — the real-HTTP path
-            // can replace the session document on success. Take a
+            // `submit` takes `&mut self` because the real-HTTP path
+            // can replace the session document on success. Take the
             // `&mut` borrow up front; `ref_drift_field` below only
             // needs `&` and runs after the submit returns.
             let sess = session.as_mut().expect("session ensured above");
@@ -6430,8 +5570,8 @@ fn ref_drift_field(
 /// Accept both `@e7` and `e7` for the ref argument — matches the
 /// ergonomics of `heso click` / `heso fill` / `heso submit`.
 fn normalize_replay_ref(s: &str) -> String {
-    if let Some(stripped) = s.strip_prefix('@') {
-        format!("@{stripped}")
+    if s.starts_with('@') {
+        s.to_owned()
     } else {
         format!("@{s}")
     }
@@ -6554,153 +5694,6 @@ fn cmd_identity_show(args: &[String]) -> ExitCode {
     }
 }
 
-/// `heso receipt-verify <file> [--trusted-keys PATH]` — read a receipt
-/// JSON, verify its embedded Ed25519 signature against an optional
-/// pubkey allowlist, and refuse any receipt that's structurally
-/// unverifiable (e.g. `mode: live`).
-///
-/// Exit codes:
-/// - 0 — signature valid AND (allowlist empty OR signing pubkey present
-///   in the allowlist).
-/// - 1 — signature invalid (tampered receipt, wrong key, signing
-///   pubkey not in the supplied allowlist, OR `mode: live` — live-mode
-///   runs aren't replay-safe per ADR 0008).
-/// - 2 — receipt missing/malformed/no `signature` field, OR
-///   `--trusted-keys` source failed to load.
-///
-/// The allowlist source precedence is `--trusted-keys PATH` >
-/// `HESO_TRUSTED_KEYS=PATH` env var > no allowlist (with a stderr
-/// warning).
-async fn cmd_receipt_verify(args: &[String]) -> ExitCode {
-    // Parse `--trusted-keys PATH` (order-tolerant) plus the positional
-    // receipt file. Keep the surface minimal — no `clap` here, same
-    // shape as the rest of the heso CLI verbs.
-    let mut file: Option<&String> = None;
-    let mut trusted_keys: Option<std::path::PathBuf> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--trusted-keys" => {
-                let Some(v) = args.get(i + 1) else {
-                    eprintln!("--trusted-keys needs a value (path to JSON allowlist)");
-                    return ExitCode::from(2);
-                };
-                trusted_keys = Some(std::path::PathBuf::from(v));
-                i += 2;
-            }
-            other if other.starts_with("--") => {
-                eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso receipt-verify [--trusted-keys PATH] <file>");
-                return ExitCode::from(2);
-            }
-            _ => {
-                if file.is_some() {
-                    eprintln!(
-                        "unexpected extra argument `{}`; pass a single <file>",
-                        args[i]
-                    );
-                    return ExitCode::from(2);
-                }
-                file = Some(&args[i]);
-                i += 1;
-            }
-        }
-    }
-    let Some(file) = file else {
-        eprintln!("usage: heso receipt-verify [--trusted-keys PATH] <file>");
-        return ExitCode::from(2);
-    };
-
-    // Resolve the allowlist before reading the receipt — a bad
-    // `--trusted-keys` source is a usage error (exit 2) regardless
-    // of whether the receipt itself is valid.
-    let allowlist = match receipts::load_trusted_keys(trusted_keys.as_deref()) {
-        receipts::AllowlistResult::Loaded(v) => Some(v),
-        receipts::AllowlistResult::Empty => {
-            // Inform the user that the trust anchor is unset. This
-            // converts the previous silent "any-pubkey passes" gap
-            // into something the operator can't miss in their logs.
-            eprintln!(
-                "warning: no pubkey allowlist configured (pass --trusted-keys PATH or set {} \
-                 to bind receipts to a known signer; verifying signatures without identity)",
-                receipts::TRUSTED_KEYS_ENV
-            );
-            None
-        }
-        receipts::AllowlistResult::Error(msg) => {
-            eprintln!("{msg}");
-            return ExitCode::from(2);
-        }
-    };
-
-    let contents = match tokio::fs::read_to_string(file).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("failed to read `{file}`: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let receipt: Receipt = match serde_json::from_str(&contents) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("`{file}` is not a valid Receipt JSON: {e}");
-            return ExitCode::from(2);
-        }
-    };
-
-    // Live-mode rejection (P1 fix): per ADR 0008 the deterministic
-    // execution guarantees that make a Receipt replay-safe (fake
-    // clock, seeded RNG, recorded network) don't apply in
-    // `Mode::Live` — wall-clock time, real RNG, real network. The
-    // signature is over the *trace + per-op results* the live run
-    // produced, but those results aren't reproducible. A verifier
-    // that "OK"s a `mode: live` receipt has no way to check the
-    // receipt against a replay. Refuse the file before we even get
-    // to the signature check.
-    if matches!(receipt.mode, heso_trace::Mode::Live) {
-        eprintln!(
-            "INVALID: receipt `mode: live` is not replay-safe — per ADR 0008, only \
-             `deterministic` and `recording` receipts can be verified (live runs use \
-             wall-clock time and real network, so the signature has no replay value)"
-        );
-        return ExitCode::from(1);
-    }
-
-    match verify_receipt(&receipt) {
-        VerifyOutcome::Valid => {
-            let pk = receipt
-                .signature
-                .as_ref()
-                .map(|s| s.public_key.as_str())
-                .unwrap_or("(unknown)");
-            // Allowlist gate (P1 fix): when a non-empty allowlist is
-            // configured, the signing pubkey MUST appear in it.
-            // Otherwise the receipt comes from an unknown signer and
-            // is rejected with exit 1 — the same exit code as a bad
-            // signature, since both are "I don't trust this receipt"
-            // outcomes from the verifier's perspective.
-            if let Some(allow) = allowlist.as_ref() {
-                if !allow.is_empty() && !receipts::pubkey_in_allowlist(pk, allow) {
-                    eprintln!(
-                        "INVALID: signing pubkey `{pk}` is not in the trusted-keys allowlist"
-                    );
-                    return ExitCode::from(1);
-                }
-            }
-            println!("OK {pk}");
-            ExitCode::SUCCESS
-        }
-        VerifyOutcome::Invalid(e) => {
-            eprintln!("INVALID: {e}");
-            ExitCode::from(1)
-        }
-        VerifyOutcome::Missing => {
-            eprintln!("MISSING: receipt has no `signature` field");
-            ExitCode::from(2)
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -6713,7 +5706,6 @@ async fn main() -> ExitCode {
             print_version();
             ExitCode::SUCCESS
         }
-        Some("fetch") => cmd_fetch(&args[1..]).await,
         Some("tree") => cmd_tree(&args[1..]).await,
         Some("ls") => cmd_ls(&args[1..]).await,
         Some("cat") => cmd_cat(&args[1..]).await,
@@ -6723,35 +5715,23 @@ async fn main() -> ExitCode {
         Some("read") => cmd_read(&args[1..]).await,
         Some("batch") => batch::cmd_batch(&args[1..]).await,
         Some("wait") => cmd_wait(&args[1..]).await,
-        Some("plat-hash") => cmd_plat_hash(&args[1..]).await,
-        Some("plat-verify") => cmd_plat_verify(&args[1..]).await,
-        Some("plat-info") => cmd_plat_info(&args[1..]).await,
-        Some("plat-diff") => cmd_plat_diff(&args[1..]).await,
-        Some("plat-redact") => cmd_plat_redact(&args[1..]).await,
-        Some("plat-seal") => cmd_plat_seal(&args[1..]).await,
-        Some("plat-unseal") => cmd_plat_unseal(&args[1..]).await,
         Some("eval-js") => cmd_eval_js(&args[1..]).await,
         Some("eval-dom") => cmd_eval_dom(&args[1..]).await,
         Some("click") => cmd_click(&args[1..]).await,
         Some("fill") => cmd_fill(&args[1..]).await,
         Some("submit") => cmd_submit(&args[1..]).await,
-        Some("search") => search::cmd_search(&args[1..]).await,
-        Some("publish") => ecosystem::cmd_publish(&args[1..]).await,
-        Some("pull") => ecosystem::cmd_pull(&args[1..]).await,
-        Some("list") => ecosystem::cmd_list(&args[1..]).await,
-        Some("template-check") => template::cmd_template_check(&args[1..]).await,
-        Some("template-stamp") => template::cmd_template_stamp(&args[1..]).await,
         Some("update") => cmd_update(&args[1..]).await,
         Some("serve") => serve::run().await,
-        Some("action-hash") => cmd_action_hash(&args[1..]).await,
-        Some("action-hash-verify") => cmd_action_hash_verify(&args[1..]).await,
         Some("refresh") => cmd_refresh(&args[1..]).await,
         Some("replay") => cmd_replay(&args[1..]).await,
         Some("run") => cmd_run(&args[1..]).await,
         Some("stamp") => cmd_stamp(&args[1..]).await,
-        Some("unpack") => cmd_unpack(&args[1..]).await,
         Some("identity") => cmd_identity(&args[1..]),
-        Some("receipt-verify") => cmd_receipt_verify(&args[1..]).await,
+        Some("verify") => cmd_verify::cmd_verify(&args[1..]).await,
+        Some("info") => cmd_info::cmd_info(&args[1..]).await,
+        Some("seal") => cmd_seal::cmd_seal(&args[1..]).await,
+        Some("unseal") => cmd_unseal::cmd_unseal(&args[1..]).await,
+        Some("registry") => registry::cmd_registry(&args[1..]).await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             print_banner();

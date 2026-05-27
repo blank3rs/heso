@@ -39,7 +39,7 @@ fn heso_bin() -> PathBuf {
 // ============================================================================
 
 fn run_search(args: &[&str]) -> std::process::Output {
-    let mut cmd_args = vec!["search"];
+    let mut cmd_args = vec!["registry", "search"];
     cmd_args.extend_from_slice(args);
     Command::new(heso_bin())
         .args(&cmd_args)
@@ -219,7 +219,7 @@ async fn searxng_5xx_does_not_crash_returns_empty() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_engine_rejected_with_usage() {
     let out = Command::new(heso_bin())
-        .args(["search", "anything", "--engines", "google"])
+        .args(["registry", "search", "anything", "--engines", "google"])
         .output()
         .expect("spawn heso search");
     assert!(!out.status.success(), "expected non-zero exit");
@@ -233,7 +233,7 @@ async fn unknown_engine_rejected_with_usage() {
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_query_rejected_with_usage() {
     let out = Command::new(heso_bin())
-        .args(["search"])
+        .args(["registry", "search"])
         .output()
         .expect("spawn heso search");
     assert!(!out.status.success(), "expected non-zero exit");
@@ -260,7 +260,7 @@ async fn searxng_via_env_var() {
         .await;
 
     let out = Command::new(heso_bin())
-        .args(["search", "any", "--engines", "searxng"])
+        .args(["registry", "search", "any", "--engines", "searxng"])
         .env("HESO_SEARX_URL", server.uri())
         .output()
         .expect("spawn heso search");

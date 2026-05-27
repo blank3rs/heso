@@ -62,7 +62,7 @@
 //! Pages are cached server-side keyed by the returned `page_id` (`p1`,
 //! `p2`, …). Drop with `close` when done.
 //!
-//! ## Stateful write methods (PR-Y2)
+//! ## Stateful write methods
 //!
 //! `fill`, `click`, `submit`, `eval`, and `navigate` operate on a
 //! per-page-id `JsSession` that is created lazily on the first
@@ -628,7 +628,7 @@ async fn dispatch_close(
 }
 
 // ============================================================================
-// Method handlers — write methods (PR-Y2)
+// Method handlers — write methods
 // ============================================================================
 
 /// Locator shape mirrored from the CLI flags. When provided as a
@@ -1330,8 +1330,7 @@ async fn dispatch_read(
     // partial_reason vocabulary. Body fields (text/forms/cookies/etc.)
     // are composed inside Phase 1 above, where `current_actions` and
     // `post_html` are still in scope.
-    let (partial, partial_reason) =
-        classify_failure_envelope(&failed_scripts, console_errors_count);
+    let (partial, partial_reason) = classify_failure_envelope(&failed_scripts);
     attach_failure_envelope(
         &mut body,
         partial,
@@ -1475,8 +1474,7 @@ async fn dispatch_wait(
         .count();
 
     let mut body = outcome.to_json();
-    let (mut partial, mut partial_reason) =
-        classify_failure_envelope(&failed_scripts, console_errors_count);
+    let (mut partial, mut partial_reason) = classify_failure_envelope(&failed_scripts);
     if !outcome.ok {
         // Timeout dominates over a stale script-crash signal — same
         // policy as the CLI verb.

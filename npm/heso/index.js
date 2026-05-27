@@ -12,10 +12,10 @@
 //
 // Two surfaces:
 //
-//   - Per-call subprocess (one-shot): `open`, `read`, `search`,
-//     `click`, `fill`, `submit`, `evalJs`, `evalDom`, `batch`, `wait`.
-//     Each spawns a fresh `heso <verb> ...`, resolves with the
-//     parsed JSON, rejects with a `HesoError` on failure.
+//   - Per-call subprocess (one-shot): `open`, `read`, `click`, `fill`,
+//     `submit`, `evalJs`, `evalDom`, `batch`, `wait`, `verify`, `info`,
+//     `seal`, `unseal`. Each spawns a fresh `heso <verb> ...`, resolves
+//     with the parsed JSON, rejects with a `HesoError` on failure.
 //
 //   - Long-lived session: `new Session()` (or `await session(fn)`)
 //     spawns one `heso serve` child and pipes newline-delimited
@@ -334,11 +334,6 @@ function read(url, options) {
   return _spawnJson(["read", url, ..._optsToArgv(options)]);
 }
 
-/** `heso search <query>` — multi-backend web search. */
-function search(query, options) {
-  return _spawnJson(["search", query, ..._optsToArgv(options)]);
-}
-
 /** `heso wait <url>` — block until a page condition is satisfied. */
 function wait(url, options) {
   return _spawnJson(["wait", url, ..._optsToArgv(options)]);
@@ -431,25 +426,19 @@ function cat(url, target, options) {
 function find(url, options) {
   return _spawnJson(["find", url, ..._optsToArgv(options)]);
 }
-function fetchUrl(url, options) {
-  return _spawnJson(["fetch", url, ..._optsToArgv(options)]);
-}
 function tree(url, options) {
   return _spawnJson(["tree", url, ..._optsToArgv(options)]);
 }
 
-// Plan lifecycle: stamp / replay / unpack. See README — `stamp` mints
-// a plat from a plan, `replay` re-runs a plat's embedded plan and
-// returns the per-step log (no plat output), `unpack` extracts the
-// plan field for editing.
+// Plan lifecycle: stamp / replay. `stamp` mints a plat from a plan;
+// `replay` re-runs a plat's embedded plan and returns the per-step log
+// (no plat output). Pass `plan: true` to `replay` to extract the plan
+// field for editing instead.
 function stamp(filePath, options) {
   return _spawnJson(["stamp", String(filePath), ..._optsToArgv(options)]);
 }
 function replay(filePath, options) {
   return _spawnJson(["replay", String(filePath), ..._optsToArgv(options)]);
-}
-function unpack(filePath) {
-  return _spawnJson(["unpack", String(filePath)]);
 }
 
 // `heso run <plat>` — cassette-backed re-execution. Named `runPlat`
@@ -473,138 +462,83 @@ async function refresh(filePath, options) {
   }
 }
 
-// Plat dev tools + envelope. All take a file path (or `-` for stdin).
-// `platHash` returns just the hex string; `platVerify` and `platDiff`
-// boil their exit codes into booleans; the rest return parsed JSON.
+// ---------------------------------------------------------------------------
+// Polymorphic verbs
+// ---------------------------------------------------------------------------
 
-/** `heso plat-hash <file>` — BLAKE3 over the plat's canonical JSON. */
-async function platHash(filePath) {
-  const raw = await run(["plat-hash", String(filePath)], { parseJson: false });
-  return raw.trim();
-}
-
-/** `heso plat-verify <file>` — embedded plat_hash matches recomputed? */
-async function platVerify(filePath) {
-  try {
-    await _spawn(["plat-verify", String(filePath)]);
-    return true;
-  } catch (e) {
-    if (e instanceof HesoError && e.code === 1) return false;
-    throw e;
-  }
-}
-
-/** `heso plat-info <file>` — human-readable plat summary (multi-line text). */
-async function platInfo(filePath) {
-  return run(["plat-info", String(filePath)], { parseJson: false });
+/** `heso verify <file>` — verify integrity and/or signature of a plat, receipt, or sealed envelope. */
+function verify(filePath, options) {
+  return _spawnJson(["verify", String(filePath), ..._optsToArgv(options)]);
 }
 
 /**
- * `heso plat-diff <a> <b>` — structured diff of two plats.
- * Returns `{ identical, output }` where `identical` is true iff the CLI
- * exited 0 and `output` is the full stdout (human-readable diff text).
+ * `heso info <file> [<file2>]` — display metadata for a plat, or diff two plats.
+ * Pass a single path string or a two-element array for diff mode.
  */
-async function platDiff(aPath, bPath) {
-  try {
-    const { stdout } = await _spawn(["plat-diff", String(aPath), String(bPath)]);
-    return { identical: true, output: stdout };
-  } catch (e) {
-    if (e instanceof HesoError && e.code === 1) {
-      return { identical: false, output: e.stdout };
+function info(filePathOrPaths, options) {
+  const paths = Array.isArray(filePathOrPaths)
+    ? filePathOrPaths.map(String)
+    : [String(filePathOrPaths)];
+  return _spawnJson(["info", ...paths, ..._optsToArgv(options)]);
+}
+
+/** `heso seal <file> [--key PATH] [--tsa URL] [--no-resign]` — Ed25519 envelope. */
+function seal(filePath, options) {
+  return _spawnJson(["seal", String(filePath), ..._optsToArgv(options)]);
+}
+
+/** `heso unseal <file> [--extract]` — verify a sealed envelope. */
+function unseal(filePath, options) {
+  return _spawnJson(["unseal", String(filePath), ..._optsToArgv(options)]);
+}
+
+// ---------------------------------------------------------------------------
+// Registry namespace
+// ---------------------------------------------------------------------------
+
+const registry = {
+  publish(filePath, options) {
+    if (!options || typeof options.description !== "string" || options.description.trim() === "") {
+      return Promise.reject(
+        new HesoError("registry.publish: `description` is required (CLI flag -d)", {
+          command: ["heso", "registry", "publish"],
+        }),
+      );
     }
-    throw e;
-  }
-}
+    const argv = ["registry", "publish", String(filePath), "-d", options.description];
+    if (options.tags !== undefined && options.tags !== null) {
+      const csv = Array.isArray(options.tags) ? options.tags.join(",") : String(options.tags);
+      if (csv.length > 0) argv.push("-t", csv);
+    }
+    const passthrough = { ...options };
+    delete passthrough.description;
+    delete passthrough.tags;
+    delete passthrough.timeout;
+    delete passthrough.binary;
+    argv.push(..._optsToArgv(passthrough));
+    return run(argv, { parseJson: false, timeout: options.timeout, binary: options.binary });
+  },
 
-/**
- * `heso plat-redact <field> <file>` — strip a top-level field and emit a
- * fresh plat with recomputed plat_hash. Returns the parsed redacted plat.
- */
-function platRedact(field, filePath) {
-  return _spawnJson(["plat-redact", String(field), String(filePath)]);
-}
+  pull(hash, options) {
+    return run(["registry", "pull", String(hash), ..._optsToArgv(options)], {
+      parseJson: false,
+      timeout: options && options.timeout,
+      binary: options && options.binary,
+    });
+  },
 
-/**
- * `heso plat-seal <file> [--key PATH]` — Ed25519 envelope.
- * Default key is `heso-local-data/identity.key` (`heso identity init`
- * to mint). Returns the parsed `SealedPlat` JSON envelope.
- */
-function platSeal(filePath, options) {
-  return _spawnJson(["plat-seal", String(filePath), ..._optsToArgv(options)]);
-}
+  list(options) {
+    return run(["registry", "list", ..._optsToArgv(options)], {
+      parseJson: false,
+      timeout: options && options.timeout,
+      binary: options && options.binary,
+    });
+  },
 
-/**
- * `heso plat-unseal <file> [--extract]` — verify a sealed envelope.
- * Resolves with parsed JSON on exit 0 (a status object, or the inner
- * `content` plat body when `extract: true`). On exit 1 (`HashMismatch`
- * / `InvalidSignature`) or 2 (`WrongAlgorithm` / malformed) throws a
- * `HesoError` carrying `code` and `stderr` so callers can branch on
- * the failure mode.
- */
-function platUnseal(filePath, options) {
-  return _spawnJson(["plat-unseal", String(filePath), ..._optsToArgv(options)]);
-}
-
-// ---------------------------------------------------------------------------
-// Ecosystem registry (publish / pull / list)
-// ---------------------------------------------------------------------------
-
-// The CLI's `publish` / `pull` / `list` verbs print human-readable
-// status banners on stdout, not JSON — see `crates/heso-cli/src/
-// ecosystem.rs`. The wrappers below resolve with the raw stdout string
-// so callers can log it; failures still surface as `HesoError` through
-// the shared `run()` spawn helper.
-
-/**
- * `heso publish <plat-file> -d "<description>" [-t "tag1,tag2"]`.
- * `tags` may be a string or an array (arrays are joined with `,`);
- * `description` is required by the CLI.
- */
-function publish(filePath, options) {
-  if (!options || typeof options.description !== "string" || options.description.trim() === "") {
-    return Promise.reject(
-      new HesoError("publish: `description` is required (CLI flag -d)", {
-        command: ["heso", "publish"],
-      }),
-    );
-  }
-  const argv = ["publish", String(filePath), "-d", options.description];
-  if (options.tags !== undefined && options.tags !== null) {
-    const csv = Array.isArray(options.tags) ? options.tags.join(",") : String(options.tags);
-    if (csv.length > 0) argv.push("-t", csv);
-  }
-  // Forward every other key as a flag (lets callers pass `timeout`,
-  // `binary`, or any future flag without us shipping a new release).
-  const passthrough = { ...options };
-  delete passthrough.description;
-  delete passthrough.tags;
-  delete passthrough.timeout;
-  delete passthrough.binary;
-  argv.push(..._optsToArgv(passthrough));
-  return run(argv, { parseJson: false, timeout: options.timeout, binary: options.binary });
-}
-
-/** `heso pull <plat-hash> [-o <output-path>]`. Writes the plat to disk. */
-function pull(hash, options) {
-  return run(["pull", String(hash), ..._optsToArgv(options)], {
-    parseJson: false,
-    timeout: options && options.timeout,
-    binary: options && options.binary,
-  });
-}
-
-/** `heso list [-q …] [-t …] [--sort …] [--limit N]` — browse the registry. */
-function list(options) {
-  return run(["list", ..._optsToArgv(options)], {
-    parseJson: false,
-    timeout: options && options.timeout,
-    binary: options && options.binary,
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Identity / receipt / action-hash
-// ---------------------------------------------------------------------------
+  search(query, options) {
+    return _spawnJson(["registry", "search", String(query), ..._optsToArgv(options)]);
+  },
+};
 
 /**
  * `heso identity <subcommand> [args]`. Today's subcommands (`init`,
@@ -620,50 +554,6 @@ function identity(subcommand, ...args) {
     );
   }
   return _spawnJson(["identity", subcommand, ...args.map(String)]);
-}
-
-/**
- * `heso receipt-verify [--trusted-keys PATH] <file>` — verify a signed
- * receipt envelope. Resolves `true` on exit 0, `false` on exit 1
- * (signature / trust / live-mode rejection). Rejects with `HesoError`
- * on exit 2 (malformed / missing signature / bad allowlist source).
- */
-async function receiptVerify(filePath, options) {
-  const argv = ["receipt-verify"];
-  if (options && options.trustedKeys) argv.push("--trusted-keys", String(options.trustedKeys));
-  argv.push(String(filePath));
-  try {
-    await _spawn(argv, options);
-    return true;
-  } catch (e) {
-    if (e instanceof HesoError && e.code === 1) return false;
-    throw e;
-  }
-}
-
-/**
- * `heso action-hash <url> [actions-json | -]` — keyless fingerprint
- * over `(URL, actions)`. Actions are inline JSON; omit for URL-only.
- */
-function actionHash(url, actionsJson, options) {
-  const argv = ["action-hash", url];
-  if (typeof actionsJson === "string") argv.push(actionsJson);
-  argv.push(..._optsToArgv(options));
-  return _spawnJson(argv);
-}
-
-/**
- * `heso action-hash-verify <file>` — recompute and compare. Resolves
- * `true` (exit 0), `false` (exit 1). Rejects on exit 2 (malformed).
- */
-async function actionHashVerify(filePath, options) {
-  try {
-    await _spawn(["action-hash-verify", String(filePath), ..._optsToArgv(options)]);
-    return true;
-  } catch (e) {
-    if (e instanceof HesoError && e.code === 1) return false;
-    throw e;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,7 +769,6 @@ module.exports = {
   // verbs
   open,
   read,
-  search,
   wait,
   click,
   fill,
@@ -891,30 +780,19 @@ module.exports = {
   ls,
   cat,
   find,
-  fetch: fetchUrl,
   tree,
   stamp,
   replay,
-  unpack,
   runPlat,
   refresh,
-  // plat dev tools + envelope
-  platHash,
-  platVerify,
-  platInfo,
-  platDiff,
-  platRedact,
-  platSeal,
-  platUnseal,
-  // ecosystem registry
-  publish,
-  pull,
-  list,
-  // identity / receipt / action-hash
+  verify,
+  info,
+  seal,
+  unseal,
+  // registry
+  registry,
+  // identity
   identity,
-  receiptVerify,
-  actionHash,
-  actionHashVerify,
   // session
   Session,
   session,

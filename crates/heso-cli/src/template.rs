@@ -27,12 +27,15 @@ struct TemplateDoc {
     id: String,
     version: String,
     #[serde(default)]
+    #[allow(dead_code)]
     title: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     description: Option<String>,
     #[serde(default)]
     domains: Vec<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     tags: Vec<String>,
     #[serde(default)]
     inputs: BTreeMap<String, InputSpec>,
@@ -201,68 +204,122 @@ impl From<String> for TemplateExecError {
     }
 }
 
-pub(crate) async fn cmd_template_check(args: &[String]) -> ExitCode {
-    if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
-        println!("usage: heso template-check <template.json|->");
-        return ExitCode::from(0);
-    }
-    let Some(path) = args.first() else {
-        eprintln!("usage: heso template-check <template.json|->");
-        return ExitCode::from(2);
-    };
-    if args.len() != 1 {
-        eprintln!("template-check: too many arguments");
-        return ExitCode::from(2);
-    }
-
-    let raw = match read_input(path) {
-        Ok(s) => s,
-        Err(e) => return fail("read_error", e),
-    };
-    match load_template(&raw) {
-        Ok((doc, hash, hash_matches)) => {
-            let secret_warnings = secret_fill_inputs(&doc);
-            print_json(&json!({
-                "ok": true,
-                "schema": doc.schema,
-                "id": doc.id,
-                "version": doc.version,
-                "title": doc.title,
-                "description": doc.description,
-                "domains": doc.domains,
-                "tags": doc.tags,
-                "template_hash": hash,
-                "hash_matches": hash_matches,
-                "inputs": doc.inputs.keys().collect::<Vec<_>>(),
-                "steps": doc.steps.len(),
-                "secret_warnings": secret_warnings,
-                "experimental": true,
-            }))
-        }
-        Err(e) => fail("invalid_template", e),
-    }
+/// Minimal post-validation summary surfaced by [`validate_template_raw`].
+/// Carries only the fields the polymorphic `heso verify` and `heso info`
+/// verbs need.
+pub(crate) struct TemplateSummary {
+    pub(crate) id: String,
+    pub(crate) version: String,
+    pub(crate) template_hash: String,
+    pub(crate) steps: usize,
+    pub(crate) schema: String,
 }
 
-fn secret_fill_inputs(doc: &TemplateDoc) -> Vec<String> {
-    let mut out = Vec::new();
-    for step in &doc.steps {
-        if let TemplateStep::Fill {
-            value: ValueExpr::Input { input },
-            ..
-        } = step
-        {
-            if doc
-                .inputs
-                .get(input)
-                .map(|spec| spec.secret)
-                .unwrap_or(false)
-                && !out.contains(input)
-            {
-                out.push(input.clone());
+/// Parse + validate a `heso.template/v0` raw JSON string. Returns the
+/// summary on success or a single-line error message on failure.
+pub(crate) fn validate_template_raw(raw: &str) -> Result<TemplateSummary, String> {
+    let (doc, hash, _matches) = load_template(raw)?;
+    Ok(TemplateSummary {
+        id: doc.id.clone(),
+        version: doc.version.clone(),
+        template_hash: hash,
+        steps: doc.steps.len(),
+        schema: doc.schema.clone(),
+    })
+}
+
+/// Handle `heso stamp --template <PATH> [--values JSON|@FILE] [--seed N]`
+/// by translating the polymorphic flag suite into the shape
+/// [`cmd_template_stamp`] consumes, then delegating to its inner core.
+/// `--values JSON` accepts a flat JSON object of `{name: scalar}`;
+/// `--values @FILE` reads the same shape from disk.
+pub(crate) async fn cmd_stamp_from_template_args(args: &[String]) -> ExitCode {
+    let mut template_path: Option<String> = None;
+    let mut values_src: Option<String> = None;
+    let mut seed: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--template" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("stamp --template needs a path");
+                    return ExitCode::from(2);
+                };
+                template_path = Some(v.clone());
+                i += 2;
+            }
+            "--values" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("stamp --values needs a JSON object or @FILE");
+                    return ExitCode::from(2);
+                };
+                values_src = Some(v.clone());
+                i += 2;
+            }
+            "--seed" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("stamp --seed needs a u64");
+                    return ExitCode::from(2);
+                };
+                seed = Some(v.clone());
+                i += 2;
+            }
+            other if other.starts_with("--") => {
+                eprintln!("stamp --template: unknown flag `{other}`");
+                return ExitCode::from(2);
+            }
+            other => {
+                eprintln!("stamp --template: unexpected positional `{other}`");
+                return ExitCode::from(2);
             }
         }
     }
-    out
+    let Some(template_path) = template_path else {
+        eprintln!("stamp --template requires a template path");
+        return ExitCode::from(2);
+    };
+
+    let mut delegated: Vec<String> = Vec::new();
+    if let Some(seed) = seed {
+        delegated.push("--seed".to_owned());
+        delegated.push(seed);
+    }
+    if let Some(values_src) = values_src.as_deref() {
+        let raw = if let Some(rest) = values_src.strip_prefix('@') {
+            match std::fs::read_to_string(rest) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("stamp --values: cannot read `{rest}`: {e}");
+                    return ExitCode::from(2);
+                }
+            }
+        } else {
+            values_src.to_owned()
+        };
+        let parsed: Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("stamp --values: not valid JSON: {e}");
+                return ExitCode::from(2);
+            }
+        };
+        let Some(obj) = parsed.as_object() else {
+            eprintln!("stamp --values: expected a JSON object of {{name: scalar}}");
+            return ExitCode::from(2);
+        };
+        for (name, value) in obj {
+            let Some(scalar) = value_as_scalar_string(value) else {
+                eprintln!(
+                    "stamp --values: value for `{name}` must be a string, number, or boolean"
+                );
+                return ExitCode::from(2);
+            };
+            delegated.push("--param".to_owned());
+            delegated.push(format!("{name}={scalar}"));
+        }
+    }
+    delegated.push(template_path);
+    cmd_template_stamp(&delegated).await
 }
 
 pub(crate) async fn cmd_template_stamp(args: &[String]) -> ExitCode {

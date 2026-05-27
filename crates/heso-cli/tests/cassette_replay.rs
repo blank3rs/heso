@@ -223,14 +223,14 @@ async fn registry_hash_run_replay_and_verify_work() {
     let expected_source = format!("registry:{hash}");
     assert_eq!(replay["source"].as_str(), Some(expected_source.as_str()));
 
-    let verify_out = run_verb_with_env("plat-verify", &[&hash], &envs);
+    let verify_out = run_verb_with_env("verify", &[&hash], &envs);
     assert!(
         verify_out.status.success(),
-        "plat-verify <hash> failed: {}",
+        "verify <hash> failed: {}",
         String::from_utf8_lossy(&verify_out.stderr)
     );
     let verify_stdout = String::from_utf8_lossy(&verify_out.stdout);
-    assert!(verify_stdout.contains(&format!("OK {hash}")));
+    assert!(verify_stdout.contains(&format!("OK plat {hash}")));
 
     let _ = std::fs::remove_file(&plan_path);
 }

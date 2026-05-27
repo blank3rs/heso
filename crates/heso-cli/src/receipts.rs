@@ -41,6 +41,8 @@ use heso_primitives::{CdInput, CdTarget, PrimitiveOp};
 use heso_trace::{Mode, Trace};
 use heso_trace_exec::SessionConfig;
 
+use crate::DEFAULT_IDENTITY_PATH;
+
 /// Parsed `--receipt … --key … --mode … --seed …` flag bundle.
 ///
 /// Constructed by [`try_consume_sign_flag`]; consumed by
@@ -143,10 +145,6 @@ pub(crate) fn try_consume_sign_flag(
         _ => Ok(None),
     }
 }
-
-/// Default identity-key path used by sign flags when `--key` is absent.
-/// Matches the default `heso identity init` writes.
-const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
 
 /// Build the [`Trace`] that corresponds to a single "open this URL"
 /// action — the natural trace for `heso open <url>` and `heso read <url>`.

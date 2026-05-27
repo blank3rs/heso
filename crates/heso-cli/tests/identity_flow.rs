@@ -1,4 +1,4 @@
-//! Integration tests for the identity / receipt-verify CLI flow.
+//! Integration tests for the identity / verify CLI flow.
 //!
 //! These exercise the actual `heso` binary as a subprocess, mirroring
 //! exactly what an external user / agent would invoke. Each test runs in
@@ -119,7 +119,7 @@ fn identity_show_missing_file_fails_gracefully() {
 
 /// Generate a key, write it via the *library* (not the CLI), pre-sign a
 /// stub receipt also via the library, then write it to disk and run
-/// `heso receipt-verify` on it. Avoids the cost of a network fetch in
+/// `heso verify` on it. Avoids the cost of a network fetch in
 /// `heso run`.
 #[test]
 fn receipt_verify_returns_zero_for_a_valid_signed_receipt() {
@@ -144,6 +144,8 @@ fn receipt_verify_returns_zero_for_a_valid_signed_receipt() {
         failed_at: None,
         error: None,
         signature: None,
+        tsa_anchor: None,
+        produced_plat_hash: None,
     };
     heso_trace::sign_receipt(&key, &mut receipt);
     let json = serde_json::to_string_pretty(&receipt).unwrap();
@@ -151,7 +153,7 @@ fn receipt_verify_returns_zero_for_a_valid_signed_receipt() {
 
     let out = run_in(
         dir.path(),
-        &["receipt-verify", receipt_path.to_str().unwrap()],
+        &["verify", receipt_path.to_str().unwrap()],
     );
     assert!(
         out.status.success(),
@@ -189,6 +191,8 @@ fn receipt_verify_returns_one_for_tampered_receipt() {
         failed_at: None,
         error: None,
         signature: None,
+        tsa_anchor: None,
+        produced_plat_hash: None,
     };
     heso_trace::sign_receipt(&key, &mut receipt);
     // Tamper: mutate the seed AFTER signing.
@@ -198,7 +202,7 @@ fn receipt_verify_returns_one_for_tampered_receipt() {
 
     let out = run_in(
         dir.path(),
-        &["receipt-verify", receipt_path.to_str().unwrap()],
+        &["verify", receipt_path.to_str().unwrap()],
     );
     let code = out.status.code().unwrap_or(-1);
     assert_eq!(
@@ -236,13 +240,15 @@ fn receipt_verify_returns_two_for_unsigned_receipt() {
         failed_at: None,
         error: None,
         signature: None,
+        tsa_anchor: None,
+        produced_plat_hash: None,
     };
     let json = serde_json::to_string_pretty(&receipt).unwrap();
     std::fs::write(&receipt_path, json).unwrap();
 
     let out = run_in(
         dir.path(),
-        &["receipt-verify", receipt_path.to_str().unwrap()],
+        &["verify", receipt_path.to_str().unwrap()],
     );
     let code = out.status.code().unwrap_or(-1);
     assert_eq!(
@@ -265,7 +271,7 @@ fn receipt_verify_returns_two_for_malformed_json() {
     std::fs::write(&receipt_path, "{this is not json").unwrap();
     let out = run_in(
         dir.path(),
-        &["receipt-verify", receipt_path.to_str().unwrap()],
+        &["verify", receipt_path.to_str().unwrap()],
     );
     let code = out.status.code().unwrap_or(-1);
     assert_eq!(code, 2, "malformed JSON must exit 2");
@@ -274,7 +280,7 @@ fn receipt_verify_returns_two_for_malformed_json() {
 #[test]
 fn receipt_verify_returns_two_for_missing_file() {
     let dir = TempDir::new().unwrap();
-    let out = run_in(dir.path(), &["receipt-verify", "does-not-exist.json"]);
+    let out = run_in(dir.path(), &["verify", "does-not-exist.json"]);
     let code = out.status.code().unwrap_or(-1);
     assert_eq!(code, 2, "missing file must exit 2");
 }

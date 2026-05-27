@@ -1,7 +1,7 @@
 //! End-to-end round-trip tests for the signed-receipts pipeline.
 //!
 //! These exercise the headline pitch ("`heso open --receipt PATH`
-//! signs a Receipt; `heso receipt-verify` checks it") through the
+//! signs a Receipt; `heso verify` checks it") through the
 //! actual CLI binary, against a hermetic [`wiremock`] HTTP server so
 //! the tests don't depend on the public internet.
 //!
@@ -142,7 +142,7 @@ async fn round_trip_sign_then_verify_with_correct_allowlist_passes() {
     let out = run_in(
         cwd,
         &[
-            "receipt-verify",
+            "verify",
             "--trusted-keys",
             allowlist.to_str().unwrap(),
             receipt.to_str().unwrap(),
@@ -187,7 +187,7 @@ async fn round_trip_verify_with_wrong_allowlist_is_rejected() {
     let out = run_in(
         cwd,
         &[
-            "receipt-verify",
+            "verify",
             "--trusted-keys",
             allowlist.to_str().unwrap(),
             receipt.to_str().unwrap(),
@@ -238,7 +238,7 @@ async fn round_trip_tampered_receipt_is_rejected() {
     let out = run_in(
         cwd,
         &[
-            "receipt-verify",
+            "verify",
             "--trusted-keys",
             allowlist.to_str().unwrap(),
             receipt.to_str().unwrap(),
@@ -282,7 +282,7 @@ async fn round_trip_mode_live_receipt_is_rejected() {
     let out = run_in(
         cwd,
         &[
-            "receipt-verify",
+            "verify",
             "--trusted-keys",
             allowlist.to_str().unwrap(),
             receipt.to_str().unwrap(),
@@ -324,7 +324,7 @@ async fn round_trip_no_allowlist_warns_and_still_passes() {
     // invariant is "if you don't tell heso a trust anchor, you get
     // an exit-0 verify + a warning."
     let mut cmd = Command::new(heso_bin());
-    cmd.args(["receipt-verify", receipt.to_str().unwrap()])
+    cmd.args(["verify", receipt.to_str().unwrap()])
         .current_dir(cwd)
         .env_remove("HESO_TRUSTED_KEYS");
     let out = cmd.output().expect("spawn heso");
@@ -363,7 +363,7 @@ async fn round_trip_env_allowlist_passes_with_correct_pubkey() {
     // Set HESO_TRUSTED_KEYS=<path> on the child process — exact
     // same shape as `--trusted-keys`, just an alternate source.
     let mut cmd = Command::new(heso_bin());
-    cmd.args(["receipt-verify", receipt.to_str().unwrap()])
+    cmd.args(["verify", receipt.to_str().unwrap()])
         .current_dir(cwd)
         .env("HESO_TRUSTED_KEYS", &allowlist);
     let out = cmd.output().expect("spawn heso");

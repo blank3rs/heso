@@ -96,12 +96,6 @@ export function open(url: string, options?: OpenOptions): Promise<Record<string,
  */
 export function read(url: string, options?: ReadOptions): Promise<Record<string, unknown>>;
 
-/** `heso search <query>` — multi-backend web search (DDG + Wikipedia by default). */
-export function search(
-  query: string,
-  options?: SearchOptions,
-): Promise<Record<string, unknown>>;
-
 /** `heso wait <url>` — block until a page condition is satisfied. */
 export function wait(url: string, options?: WaitOptions): Promise<Record<string, unknown>>;
 
@@ -186,9 +180,6 @@ export function find(
   options?: CommonOptions & { role?: string; name?: string; section?: string },
 ): Promise<Record<string, unknown>>;
 
-/** `heso fetch <url>` — raw GET, returns `{ url, text }`. */
-export function fetch(url: string, options?: CommonOptions): Promise<Record<string, unknown>>;
-
 /** `heso tree <url>` — full heading-derived page tree. */
 export function tree(url: string, options?: CommonOptions): Promise<Record<string, unknown>>;
 
@@ -196,6 +187,12 @@ export function tree(url: string, options?: CommonOptions): Promise<Record<strin
 export interface PlanOptions extends CommonOptions {
   /** Seeds determinism shims (`Math.random`, `crypto.getRandomValues`, timers). */
   seed?: number;
+  /** `replay` only: return the plan field instead of the per-step log. */
+  plan?: boolean;
+  /** `stamp` only: load a v0 plan template from disk. */
+  template?: string;
+  /** `stamp` only: substitution map for `{{name}}` placeholders in the template. */
+  values?: Record<string, string>;
 }
 
 /**
@@ -220,13 +217,6 @@ export function replay(
   file: string,
   options?: PlanOptions,
 ): Promise<Record<string, unknown>>;
-
-/**
- * `heso unpack <plat.plat>` — extract the `plan` field of a plat for
- * editing. Returns the action array directly. Rejects with
- * `HesoError` when the file has no `plan` field.
- */
-export function unpack(file: string): Promise<unknown[]>;
 
 /**
  * `heso run <plat.plat>` — re-execute a stamped plat's plan against
@@ -264,14 +254,38 @@ export interface RefreshResult {
  */
 export function refresh(file: string, options?: PlanOptions): Promise<RefreshResult>;
 
-// Plat dev tools + envelope ---------------------------------------------
+// Polymorphic verbs ----------------------------------------------------
 
-export interface PlatSealOptions {
-  /** Identity-key path. Default: `heso-local-data/identity.key`. */
-  key?: string;
+/** Options for {@link verify}. */
+export interface VerifyOptions extends CommonOptions {
+  /** Path to a JSON allowlist of base64 pubkeys for sealed envelopes / receipts. */
+  trustedKeys?: string;
+  /** Require a Time-Stamping Authority countersignature on the envelope. */
+  requireTsa?: boolean;
+  /** Path to a PEM bundle of trusted TSA root certificates. */
+  tsaTrustedRoots?: string;
 }
 
-export interface PlatUnsealOptions {
+/** Options for {@link info}. */
+export interface InfoOptions extends CommonOptions {
+  /** `"json"` for parseable output, `"text"` for the human-readable summary. */
+  format?: "json" | "text";
+  /** Print only the BLAKE3 hash of the plat (mutually exclusive with diff mode). */
+  hashOnly?: boolean;
+}
+
+/** Options for {@link seal}. */
+export interface SealOptions extends CommonOptions {
+  /** Identity-key path. Default: `heso-local-data/identity.key`. */
+  key?: string;
+  /** Time-Stamping Authority URL to countersign the envelope. */
+  tsa?: string;
+  /** Skip the resign step when re-sealing an already-sealed plat. */
+  noResign?: boolean;
+}
+
+/** Options for {@link unseal}. */
+export interface UnsealOptions extends CommonOptions {
   /**
    * When true, stdout is the inner `content` plat body (parsed) instead
    * of the small `{status, alg, public_key, plat_hash}` envelope.
@@ -280,73 +294,47 @@ export interface PlatUnsealOptions {
 }
 
 /**
- * `heso plat-hash <file>` — BLAKE3 over the plat's canonical-JSON bytes.
- * Returns the 64-char lowercase hex string.
+ * `heso verify <file>` — verify integrity and/or signature of a plat,
+ * receipt, or sealed envelope. Returns a parsed status object; the
+ * shape depends on the input kind.
  */
-export function platHash(file: string): Promise<string>;
-
-/**
- * `heso plat-verify <file>` — embedded `plat_hash` matches recomputed?
- * Resolves to `true` (CLI exit 0) or `false` (exit 1 = mismatch).
- * Rejects with `HesoError` on usage/file errors (exit 2).
- */
-export function platVerify(file: string): Promise<boolean>;
-
-/**
- * `heso plat-info <file>` — human-readable plat summary (multi-line
- * text: `plat_hash`, `verified`, `size`, `url`, `title`, plan/cassette
- * counts, sealed status, partial flag).
- */
-export function platInfo(file: string): Promise<string>;
-
-/**
- * `heso plat-diff <a> <b>` — structured diff of two plats.
- * Resolves with `{identical, output}`; `identical` is `true` iff CLI
- * exited 0; `output` is the full stdout.
- */
-export function platDiff(
-  a: string,
-  b: string,
-): Promise<{ identical: boolean; output: string }>;
-
-/**
- * `heso plat-redact <field> <file>` — strip a top-level field and emit
- * a new plat with a recomputed `plat_hash`. Removing any present content
- * field changes the hash and invalidates any prior signature. Refuses
- * sealed envelopes (rejects with `HesoError`).
- */
-export function platRedact(
-  field: string,
+export function verify(
   file: string,
+  options?: VerifyOptions,
 ): Promise<Record<string, unknown>>;
 
 /**
- * `heso plat-seal <file> [--key PATH]` — Ed25519 envelope wrapper.
- * Default key is `heso-local-data/identity.key`; mint one with
- * `heso identity init`. Returns the parsed `SealedPlat` JSON object
- * (`{alg, content, signature}`).
+ * `heso info <file> [<file2>]` — display metadata for a plat, or diff
+ * two plats. Pass a single path to inspect one plat; pass a two-element
+ * tuple to diff.
  */
-export function platSeal(
-  file: string,
-  options?: PlatSealOptions,
+export function info(
+  fileOrFiles: string | [string, string],
+  options?: InfoOptions,
 ): Promise<Record<string, unknown>>;
 
 /**
- * `heso plat-unseal <file> [--extract]` — verify a sealed envelope
- * offline. Resolves with the parsed status JSON
- * (`{status, alg, public_key, plat_hash}`), or with the extracted
- * inner plat body when `extract: true`. Rejects with `HesoError` on
- * exit 1 (`HashMismatch` / `InvalidSignature`) or exit 2
- * (`WrongAlgorithm` / malformed envelope); branch on `err.code`.
+ * `heso seal <file> [--key PATH] [--tsa URL] [--no-resign]` — wrap a
+ * plat in an Ed25519 envelope (and optionally a TSA countersignature).
  */
-export function platUnseal(
+export function seal(
   file: string,
-  options?: PlatUnsealOptions,
+  options?: SealOptions,
 ): Promise<Record<string, unknown>>;
 
-// Ecosystem registry (publish / pull / list) ---------------------------
+/**
+ * `heso unseal <file> [--extract]` — verify a sealed envelope offline.
+ * Resolves with the parsed status JSON, or with the extracted inner
+ * plat body when `extract: true`.
+ */
+export function unseal(
+  file: string,
+  options?: UnsealOptions,
+): Promise<Record<string, unknown>>;
 
-/** Options for {@link publish}. */
+// Registry namespace (publish / pull / list / search) ------------------
+
+/** Options for {@link registry.publish}. */
 export interface PublishOptions extends CommonOptions {
   /** Required by the CLI — passed through as `-d "…"`. */
   description: string;
@@ -357,32 +345,13 @@ export interface PublishOptions extends CommonOptions {
   tags?: string | string[];
 }
 
-/**
- * `heso publish <plat-file> -d "<description>" [-t "tag1,tag2"]` —
- * upload a stamped plat to the public registry at heso.ca/ecosystem.
- *
- * The CLI prints a multi-line confirmation (`✓ ok: <hash>` plus follow-up
- * lines pointing at pull / view URLs) rather than JSON, so this wrapper
- * resolves with the raw stdout string. Rejects with `HesoError` on
- * registry / network failure (exit 1) or usage errors (exit 2).
- */
-export function publish(file: string, options: PublishOptions): Promise<string>;
-
-/** Options for {@link pull}. */
+/** Options for {@link registry.pull}. */
 export interface PullOptions extends CommonOptions {
   /** Output path; default is `./<hash>.plat`. Passed through as `-o`. */
   out?: string;
 }
 
-/**
- * `heso pull <plat-hash> [-o <output-path>]` — download a published
- * plat by its 64-char lowercase BLAKE3 hash. Resolves with the raw
- * stdout confirmation text (the CLI emits a `✓ pulled N bytes → <path>`
- * banner, not JSON). The file is written to disk as a side effect.
- */
-export function pull(hash: string, options?: PullOptions): Promise<string>;
-
-/** Options for {@link list}. */
+/** Options for {@link registry.list}. */
 export interface ListOptions extends CommonOptions {
   /** Substring match on description / URL / tags (`-q`). */
   q?: string;
@@ -395,14 +364,20 @@ export interface ListOptions extends CommonOptions {
 }
 
 /**
- * `heso list [-q "<query>"] [-t <tag>] [--sort …] [--limit N]` — browse
- * the public plat registry. Resolves with the raw stdout table the CLI
- * prints (a formatted human listing — `HASH  DLs  PUBLISHED  DESCRIPTION`
- * rows — not JSON).
+ * Registry namespace — `heso registry <publish|pull|list|search>`.
+ *
+ * `publish` / `pull` / `list` print human-readable banners on stdout
+ * and resolve with the raw stdout string; `search` returns parsed JSON.
+ * All failures surface as `HesoError`.
  */
-export function list(options?: ListOptions): Promise<string>;
+export declare const registry: {
+  publish(file: string, options: PublishOptions): Promise<string>;
+  pull(hash: string, options?: PullOptions): Promise<string>;
+  list(options?: ListOptions): Promise<string>;
+  search(query: string, options?: SearchOptions): Promise<Record<string, unknown>>;
+};
 
-// Identity + receipt + action-hash --------------------------------------
+// Identity --------------------------------------------------------------
 
 /**
  * `heso identity <subcommand> [args]` — Ed25519 key management.
@@ -418,54 +393,6 @@ export function identity(
   subcommand: string,
   ...args: string[]
 ): Promise<Record<string, unknown>>;
-
-/** Options for {@link receiptVerify}. */
-export interface ReceiptVerifyOptions extends CommonOptions {
-  /**
-   * Path to a JSON allowlist of base64 pubkeys. Also honored via the
-   * `HESO_TRUSTED_KEYS` env var. Receipts whose signer isn't in the
-   * allowlist are rejected (resolves `false`).
-   */
-  trustedKeys?: string;
-}
-
-/**
- * `heso receipt-verify [--trusted-keys PATH] <file>` — verify an
- * Ed25519-signed receipt envelope. Resolves `true` (CLI exit 0, valid +
- * signer trusted) or `false` (exit 1: signature mismatch, untrusted
- * signer, or `mode: live` — not replay-safe per ADR 0008). Rejects with
- * `HesoError` on exit 2 (malformed / missing signature / unreadable
- * input / bad `--trusted-keys` source).
- */
-export function receiptVerify(
-  file: string,
-  options?: ReceiptVerifyOptions,
-): Promise<boolean>;
-
-/**
- * `heso action-hash <url> [actions-json | -]` — keyless, deterministic
- * fingerprint over `(URL, actions)`. Pass the action array as the
- * second argument (inline JSON string) or omit it for a URL-only
- * fingerprint. Returns the serialized `TraceFingerprint`
- * (`{algorithm, url, actions, action_ids, site_id, trace_id}`).
- */
-export function actionHash(
-  url: string,
-  actionsJson?: string,
-  options?: CommonOptions,
-): Promise<Record<string, unknown>>;
-
-/**
- * `heso action-hash-verify <file>` — recompute every component in a
- * saved fingerprint and confirm it matches. Resolves `true` (CLI exit 0
- * — valid) or `false` (exit 1 — recompute disagrees or unknown
- * algorithm tag). Rejects with `HesoError` on exit 2 (file missing /
- * not a fingerprint JSON).
- */
-export function actionHashVerify(
-  file: string,
-  options?: CommonOptions,
-): Promise<boolean>;
 
 /** Low-level: spawn `heso <args>` and parse stdout. */
 export function run(

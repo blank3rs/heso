@@ -57,10 +57,10 @@ fn template_check_accepts_minimal_template_and_reports_hash() {
     });
     let path = write_json(dir.path(), "template.json", &template);
 
-    let out = run(&["template-check", path.to_str().unwrap()]);
-    assert_success(&out, "template-check");
+    let out = run(&["verify", path.to_str().unwrap()]);
+    assert_success(&out, "verify");
 
-    let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("template-check JSON");
+    let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("verify JSON");
     assert_eq!(body["ok"], serde_json::json!(true));
     assert_eq!(body["schema"], serde_json::json!("heso.template/v0"));
     assert_eq!(body["id"], serde_json::json!("ca.heso.tests.minimal"));
@@ -139,14 +139,15 @@ async fn template_stamp_materializes_plan_and_run_replays_byte_identically() {
     let template_path = write_json(dir.path(), "search.template.json", &template);
 
     let stamp = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--seed",
         "0",
         "--param",
         "q=BRCA1",
         template_path.to_str().unwrap(),
     ]);
-    assert_success(&stamp, "template-stamp");
+    assert_success(&stamp, "stamp --template");
     let plat: serde_json::Value = serde_json::from_slice(&stamp.stdout).expect("stamped plat");
 
     assert!(plat.get("template_hash").is_none());
@@ -206,8 +207,8 @@ fn template_check_emits_stable_canonical_hash_for_known_template() {
     });
     let path = write_json(dir.path(), "pin.template.json", &template);
 
-    let out = run(&["template-check", path.to_str().unwrap()]);
-    assert_success(&out, "template-check");
+    let out = run(&["verify", path.to_str().unwrap()]);
+    assert_success(&out, "verify");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check JSON");
     let hash = body["template_hash"]
         .as_str()
@@ -223,7 +224,7 @@ fn template_check_emits_stable_canonical_hash_for_known_template() {
 }
 
 /// Open URLs outside the declared domain allowlist must be caught at
-/// `template-check` time (not just at `template-stamp` time), so authors
+/// `verify` time (not just at `stamp --template` time), so authors
 /// see the problem before runtime.
 #[test]
 fn template_check_rejects_open_url_outside_declared_domains() {
@@ -239,7 +240,7 @@ fn template_check_rejects_open_url_outside_declared_domains() {
     });
     let path = write_json(dir.path(), "evil.template.json", &template);
 
-    let out = run(&["template-check", path.to_str().unwrap()]);
+    let out = run(&["verify", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1), "expected exit 1");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error JSON");
     assert_eq!(body["ok"], serde_json::json!(false));
@@ -280,8 +281,8 @@ fn template_check_lists_secret_inputs_referenced_by_fill_steps() {
         ]
     });
     let used_path = write_json(dir.path(), "used.template.json", &used);
-    let out = run(&["template-check", used_path.to_str().unwrap()]);
-    assert_success(&out, "template-check (secret used)");
+    let out = run(&["verify", used_path.to_str().unwrap()]);
+    assert_success(&out, "verify (secret used)");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check JSON");
     assert_eq!(body["secret_warnings"], serde_json::json!(["password"]));
 
@@ -299,8 +300,8 @@ fn template_check_lists_secret_inputs_referenced_by_fill_steps() {
         ]
     });
     let unused_path = write_json(dir.path(), "unused.template.json", &unused);
-    let out = run(&["template-check", unused_path.to_str().unwrap()]);
-    assert_success(&out, "template-check (secret unused)");
+    let out = run(&["verify", unused_path.to_str().unwrap()]);
+    assert_success(&out, "verify (secret unused)");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("check JSON");
     assert_eq!(body["secret_warnings"], serde_json::json!([]));
 }
@@ -328,7 +329,7 @@ fn template_stamp_missing_required_param_emits_invalid_bindings_error() {
     });
     let path = write_json(dir.path(), "missing.template.json", &template);
 
-    let out = run(&["template-stamp", path.to_str().unwrap()]);
+    let out = run(&["stamp", "--template", path.to_str().unwrap()]);
     assert_eq!(out.status.code(), Some(1), "expected exit 1");
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("error JSON");
     assert_eq!(body["ok"], serde_json::json!(false));
@@ -389,12 +390,13 @@ async fn template_stamp_uses_default_when_param_omitted() {
     let template_path = write_json(dir.path(), "default.template.json", &template);
 
     let out = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--seed",
         "0",
         template_path.to_str().unwrap(),
     ]);
-    assert_success(&out, "template-stamp");
+    assert_success(&out, "stamp --template");
     let plat: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stamped plat");
     let plan = plat["plan"].as_array().expect("plan array");
     assert_eq!(plan.len(), 2);
@@ -422,7 +424,8 @@ fn template_stamp_rejects_value_outside_enum() {
     let path = write_json(dir.path(), "enum.template.json", &template);
 
     let out = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--param",
         "color=green",
         path.to_str().unwrap(),
@@ -483,14 +486,15 @@ async fn template_stamp_url_encodes_query_param_with_special_chars() {
 
     let original = "hello world & friends";
     let out = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--seed",
         "0",
         "--param",
         &format!("q={original}"),
         template_path.to_str().unwrap(),
     ]);
-    assert_success(&out, "template-stamp (url encode)");
+    assert_success(&out, "stamp --template (url encode)");
     let plat: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stamped plat");
     let plan = plat["plan"].as_array().expect("plan array");
     let raw_url = plan[0]["url"].as_str().expect("plan[0].url string");
@@ -568,14 +572,15 @@ async fn template_param_drives_first_page_navigation() {
 
     let stamp = |value: &str| {
         let out = run(&[
-            "template-stamp",
+            "stamp",
+            "--template",
             "--seed",
             "0",
             "--param",
             &format!("q={value}"),
             template_path.to_str().unwrap(),
         ]);
-        assert_success(&out, "template-stamp (driven nav)");
+        assert_success(&out, "stamp --template (driven nav)");
         let plat: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stamped plat");
         plat
     };
@@ -639,7 +644,8 @@ async fn template_stamp_ambiguous_locator_returns_structured_candidates() {
     let template_path = write_json(dir.path(), "ambiguous.template.json", &template);
 
     let out = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--seed",
         "0",
         template_path.to_str().unwrap(),
@@ -706,7 +712,8 @@ async fn template_stamp_locator_miss_exits_nonzero_with_structured_error() {
     let template_path = write_json(dir.path(), "miss.template.json", &template);
 
     let out = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--seed",
         "0",
         template_path.to_str().unwrap(),
@@ -778,12 +785,13 @@ async fn template_stamp_dom_insertion_does_not_break_subsequent_selector_locator
     let template_path = write_json(dir.path(), "refresh.template.json", &template);
 
     let out = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--seed",
         "0",
         template_path.to_str().unwrap(),
     ]);
-    assert_success(&out, "template-stamp (consecutive fills)");
+    assert_success(&out, "stamp --template (consecutive fills)");
     let plat: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stamped plat");
     let plan = plat["plan"].as_array().expect("plan array");
     assert_eq!(plan.len(), 3);
@@ -873,14 +881,15 @@ async fn template_stamp_then_run_replay_plat_hash_is_pinned_golden_value() {
     let template_path = write_json(dir.path(), "golden.template.json", &template);
 
     let stamp = run(&[
-        "template-stamp",
+        "stamp",
+        "--template",
         "--seed",
         "0",
         "--param",
         "q=BRCA1",
         template_path.to_str().unwrap(),
     ]);
-    assert_success(&stamp, "template-stamp");
+    assert_success(&stamp, "stamp --template");
     let plat: serde_json::Value = serde_json::from_slice(&stamp.stdout).expect("stamped plat");
     let stamp_hash = plat["plat_hash"]
         .as_str()

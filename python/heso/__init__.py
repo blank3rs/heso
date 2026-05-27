@@ -43,7 +43,6 @@ still works on ``PATH`` (the setuptools console script delegates to
 
 from __future__ import annotations
 
-import builtins
 import json
 import os
 import shutil
@@ -54,18 +53,12 @@ from itertools import count
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence, Union
 
-# Internal alias used in spots where `list` would otherwise resolve to
-# the module-level `list()` verb wrapper instead of the builtin
-# constructor.
-_builtin_list = builtins.list
-
 __all__ = [
     "HesoError",
     "Session",
     "session",
     "open",
     "read",
-    "search",
     "wait",
     "click",
     "fill",
@@ -77,27 +70,17 @@ __all__ = [
     "ls",
     "cat",
     "find",
-    "fetch",
     "tree",
     "stamp",
     "replay",
-    "unpack",
     "run_plat",
     "refresh",
-    "plat_hash",
-    "plat_verify",
-    "plat_info",
-    "plat_diff",
-    "plat_redact",
-    "plat_seal",
-    "plat_unseal",
-    "publish",
-    "pull",
-    "list",
+    "verify",
+    "info",
+    "seal",
+    "unseal",
+    "registry",
     "identity",
-    "receipt_verify",
-    "action_hash",
-    "action_hash_verify",
     "run",
 ]
 
@@ -134,7 +117,7 @@ class HesoError(Exception):
         self.stdout = stdout
         self.stderr = stderr
         self.returncode = returncode
-        self.command = _builtin_list(command) if command is not None else []
+        self.command = list(command) if command is not None else []
 
 
 # ---------------------------------------------------------------------------
@@ -396,19 +379,6 @@ def read(url: str, **kwargs: Any) -> dict:
     return run("read", url, *_kwargs_to_argv(kwargs))
 
 
-def search(query: str, **kwargs: Any) -> dict:
-    """``heso search <query>`` — multi-backend web search.
-
-    Returns ``{query, results: [...], knowledge: {...}, ...}``.
-
-    Common kwargs:
-        limit: int — max results (default 30, hard max 100).
-        engines: str — comma list, e.g. ``"ddg,wiki"``.
-        searx_url: str — optional SearXNG base URL.
-    """
-    return run("search", query, *_kwargs_to_argv(kwargs))
-
-
 def wait(url: str, **kwargs: Any) -> dict:
     """``heso wait <url>`` — block until a page condition is satisfied.
 
@@ -515,7 +485,7 @@ def batch(
         include: str — passed through to the read subverb.
         js_fetch: bool — passed through to the read subverb.
     """
-    url_list = _builtin_list(urls)
+    url_list = list(urls)
     raw = run(
         "batch",
         subverb,
@@ -566,13 +536,6 @@ def find(url: str, **kwargs: Any) -> dict:
     return run("find", url, *_kwargs_to_argv(kwargs))
 
 
-def fetch(url: str, **kwargs: Any) -> dict:
-    """``heso fetch <url>`` — raw GET via the native fetch engine.
-
-    Returns ``{url, text}``."""
-    return run("fetch", url, *_kwargs_to_argv(kwargs))
-
-
 def tree(url: str, **kwargs: Any) -> dict:
     """``heso tree <url>`` — full heading-derived page tree as JSON."""
     return run("tree", url, *_kwargs_to_argv(kwargs))
@@ -588,8 +551,14 @@ def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
     ``steps`` fields documenting which step failed, and ``run`` raises
     :class:`HesoError` (with the partial plat still on ``stdout``).
 
-    Keyword arguments (e.g. ``seed=42``) become CLI flags via the same
-    rules as every other verb.
+    Common kwargs:
+        seed: int — RNG seed (default 0).
+        template: str — load a v0 plan template from disk.
+        values: dict — substitution map for ``{{name}}`` placeholders
+            in the template.
+
+    Keyword arguments become CLI flags via the same rules as every
+    other verb.
     """
     return run("stamp", str(path), *_kwargs_to_argv(kwargs))
 
@@ -601,20 +570,10 @@ def replay(path: Union[str, Path], **kwargs: Any) -> dict:
     ``heso run`` verb when you want cassette-backed re-execution.
 
     Returns a dict shaped ``{steps_count, plat_hash, cassette_records,
-    steps}``.
+    steps}``. Pass ``plan=True`` to return the plat's ``plan`` field
+    instead, for editing.
     """
     return run("replay", str(path), *_kwargs_to_argv(kwargs))
-
-
-def unpack(path: Union[str, Path]) -> list:
-    """``heso unpack <plat.plat>`` — extract the ``plan`` field of a
-    plat for editing. Returns the action list directly.
-
-    Raises :class:`HesoError` when the file has no ``plan`` field
-    (i.e. it was produced by single-URL ``heso open`` rather than by
-    :func:`stamp`).
-    """
-    return run("unpack", str(path))
 
 
 def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
@@ -657,171 +616,74 @@ def refresh(path: Union[str, Path], **kwargs: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Plat dev tools + envelope
+# Polymorphic verbs
 # ---------------------------------------------------------------------------
 
 
-def plat_hash(path: Union[str, Path]) -> str:
-    """``heso plat-hash <file>`` — BLAKE3 over the plat's canonical
-    JSON bytes. Returns the 64-char lowercase hex string.
-    """
-    return run("plat-hash", str(path), parse_json=False).strip()
+def verify(path: Union[str, Path], **kwargs: Any) -> dict:
+    """``heso verify <file>`` — verify integrity and/or signature of a plat, receipt, or sealed envelope."""
+    return run("verify", str(path), *_kwargs_to_argv(kwargs))
 
 
-def plat_verify(path: Union[str, Path]) -> bool:
-    """``heso plat-verify <file>`` — embedded ``plat_hash`` matches the
-    recomputed BLAKE3?
-
-    Returns ``True`` (CLI exit 0) or ``False`` (exit 1 = mismatch).
-    Raises :class:`HesoError` on usage / unreadable / not-JSON (exit 2).
-    """
-    try:
-        run("plat-verify", str(path), parse_json=False)
-        return True
-    except HesoError as e:
-        if e.returncode == 1:
-            return False
-        raise
-
-
-def plat_info(path: Union[str, Path]) -> str:
-    """``heso plat-info <file>`` — human-readable plat summary
-    (multi-line text: ``plat_hash``, ``verified``, ``size``, ``url``,
-    ``title``, plan/cassette counts, sealed status, and partial flag).
-    """
-    return run("plat-info", str(path), parse_json=False)
-
-
-def plat_diff(a: Union[str, Path], b: Union[str, Path]) -> dict:
-    """``heso plat-diff <a> <b>`` — structured diff of two plats.
-
-    Returns ``{"identical": bool, "output": str}``. ``identical`` is
-    ``True`` iff the CLI exited 0; ``output`` is the full stdout (the
-    human-readable diff text). Raises :class:`HesoError` on usage /
-    unreadable input (exit 2).
-    """
-    try:
-        out = run("plat-diff", str(a), str(b), parse_json=False)
-        return {"identical": True, "output": out}
-    except HesoError as e:
-        if e.returncode == 1:
-            return {"identical": False, "output": e.stdout}
-        raise
-
-
-def plat_redact(field: str, path: Union[str, Path]) -> dict:
-    """``heso plat-redact <field> <file>`` — strip a top-level field
-    and emit a fresh plat with a recomputed ``plat_hash``.
-
-    Removing any present content field changes the hash and invalidates
-    any prior signature. Refuses sealed envelopes (raises
-    :class:`HesoError` with ``returncode=1``).
-    """
-    return run("plat-redact", str(field), str(path))
-
-
-def plat_seal(path: Union[str, Path], *, key: Optional[Union[str, Path]] = None) -> dict:
-    """``heso plat-seal <file> [--key PATH]`` — wrap a plat in an
-    Ed25519 envelope.
-
-    Default key path is ``heso-local-data/identity.key``; mint one with
-    ``heso identity init``. Returns the parsed ``SealedPlat`` JSON
-    object ``{alg, content, signature}``.
-    """
-    extra: list[str] = []
-    if key is not None:
-        extra.extend(["--key", str(key)])
-    return run("plat-seal", str(path), *extra)
-
-
-def plat_unseal(path: Union[str, Path], *, extract: bool = False) -> dict:
-    """``heso plat-unseal <file> [--extract]`` — verify a sealed
-    envelope offline (no network, no clock, no key material).
-
-    Returns parsed JSON: a small status object
-    ``{status, alg, public_key, plat_hash}`` by default, or the
-    extracted inner plat body when ``extract=True``. Raises
-    :class:`HesoError` on exit 1 (``HashMismatch`` /
-    ``InvalidSignature``) or exit 2 (``WrongAlgorithm`` / malformed
-    envelope); branch on ``err.returncode``.
-    """
-    extra: list[str] = ["--extract"] if extract else []
-    return run("plat-unseal", str(path), *extra)
-
-
-# ---------------------------------------------------------------------------
-# Ecosystem registry (publish / pull / list)
-# ---------------------------------------------------------------------------
-#
-# The CLI's `publish` / `pull` / `list` verbs print human-readable
-# status banners on stdout, not JSON — see
-# `crates/heso-cli/src/ecosystem.rs`. The wrappers below return the raw
-# stdout string so callers can log it; failures surface as `HesoError`.
-
-
-def publish(
-    path: Union[str, Path],
-    *,
-    description: str,
-    tags: Optional[Union[str, Iterable[str]]] = None,
+def info(
+    path_or_paths: Union[str, Path, Sequence[Union[str, Path]]],
     **kwargs: Any,
-) -> str:
-    """``heso publish <plat-file> -d "<description>" [-t "tag1,tag2"]``
-    — upload a stamped plat to the public registry at
-    heso.ca/ecosystem.
+) -> dict:
+    """``heso info <file> [<file2>]`` — display plat metadata, or diff two plats.
 
-    ``description`` is required by the CLI (passes as ``-d``).
-    ``tags`` may be a string or an iterable of strings; iterables are
-    joined with ``,`` for the single ``-t`` flag the CLI accepts.
-
-    Returns the raw stdout string (a multi-line ``✓ ok: <hash>`` banner,
-    not JSON). Raises :class:`HesoError` on registry / network failure
-    or usage errors.
+    Pass a single path to inspect one plat. Pass a two-element sequence to diff.
     """
-    if not isinstance(description, str) or not description.strip():
-        raise HesoError("publish: `description=` is required (CLI flag -d)")
-    argv: list[str] = [str(path), "-d", description]
-    if tags is not None:
-        if isinstance(tags, str):
-            csv = tags
-        else:
-            csv = ",".join(str(t) for t in tags)
-        if csv:
-            argv.extend(["-t", csv])
-    argv.extend(_kwargs_to_argv(kwargs))
-    return run("publish", *argv, parse_json=False)
+    if isinstance(path_or_paths, (str, Path)):
+        return run("info", str(path_or_paths), *_kwargs_to_argv(kwargs))
+    paths = [str(p) for p in path_or_paths]
+    return run("info", *paths, *_kwargs_to_argv(kwargs))
 
 
-def pull(hash: str, **kwargs: Any) -> str:
-    """``heso pull <plat-hash> [-o <output-path>]`` — download a
-    published plat by its 64-char lowercase BLAKE3 hash.
-
-    Pass ``out="path"`` to override the default (``./<hash>.plat``).
-    The file is written to disk as a side effect. Returns the raw stdout
-    confirmation text (``✓ pulled N bytes → <path>``), not JSON.
-    """
-    return run("pull", str(hash), *_kwargs_to_argv(kwargs), parse_json=False)
+def seal(path: Union[str, Path], **kwargs: Any) -> dict:
+    """``heso seal <file> [--key PATH] [--tsa URL] [--no-resign]`` — Ed25519 envelope."""
+    return run("seal", str(path), *_kwargs_to_argv(kwargs))
 
 
-def list(**kwargs: Any) -> str:  # noqa: A001 — mirrors the CLI verb name
-    """``heso list [-q "<query>"] [-t <tag>] [--sort …] [--limit N]`` —
-    browse the public plat registry.
-
-    Returns the raw stdout table the CLI prints (``HASH  DLs  PUBLISHED
-    DESCRIPTION`` rows — not JSON). Common kwargs: ``q``, ``tag``,
-    ``sort`` (``trending`` | ``downloads`` | ``newest``), ``limit``
-    (1..=100, default 20).
-
-    The function name shadows Python's builtin ``list`` to mirror the
-    CLI verb; use ``builtins.list`` for the type, or import this
-    function under another name (``from heso import list as
-    heso_list``).
-    """
-    return run("list", *_kwargs_to_argv(kwargs), parse_json=False)
+def unseal(path: Union[str, Path], **kwargs: Any) -> dict:
+    """``heso unseal <file> [--extract]`` — verify a sealed envelope."""
+    return run("unseal", str(path), *_kwargs_to_argv(kwargs))
 
 
 # ---------------------------------------------------------------------------
-# Identity / receipt / action-hash
+# Registry namespace
+# ---------------------------------------------------------------------------
+
+
+class registry:
+    """Registry operations: publish, pull, list, search."""
+
+    @staticmethod
+    def publish(path: Union[str, Path], *, description: str, tags: Optional[Union[str, Iterable[str]]] = None, **kwargs: Any) -> str:
+        if not isinstance(description, str) or not description.strip():
+            raise HesoError("registry.publish: `description=` is required (CLI flag -d)")
+        argv: list = [str(path), "-d", description]
+        if tags is not None:
+            csv = tags if isinstance(tags, str) else ",".join(str(t) for t in tags)
+            if csv:
+                argv.extend(["-t", csv])
+        argv.extend(_kwargs_to_argv(kwargs))
+        return run("registry", "publish", *argv, parse_json=False)
+
+    @staticmethod
+    def pull(hash: str, **kwargs: Any) -> str:
+        return run("registry", "pull", str(hash), *_kwargs_to_argv(kwargs), parse_json=False)
+
+    @staticmethod
+    def list(**kwargs: Any) -> str:
+        return run("registry", "list", *_kwargs_to_argv(kwargs), parse_json=False)
+
+    @staticmethod
+    def search(query: str, **kwargs: Any) -> dict:
+        return run("registry", "search", query, *_kwargs_to_argv(kwargs))
+
+
+# ---------------------------------------------------------------------------
+# Identity
 # ---------------------------------------------------------------------------
 
 
@@ -839,67 +701,6 @@ def identity(subcommand: str, *args: str, **kwargs: Any) -> dict:
     if not isinstance(subcommand, str) or not subcommand:
         raise HesoError("identity: subcommand is required (e.g. 'init')")
     return run("identity", subcommand, *(str(a) for a in args), *_kwargs_to_argv(kwargs))
-
-
-def receipt_verify(
-    path: Union[str, Path],
-    *,
-    trusted_keys: Optional[Union[str, Path]] = None,
-) -> bool:
-    """``heso receipt-verify [--trusted-keys PATH] <file>`` — verify an
-    Ed25519-signed receipt envelope.
-
-    Returns ``True`` (CLI exit 0 — valid + signer trusted) or ``False``
-    (exit 1 — signature mismatch, untrusted signer, or ``mode: live``
-    rejected per ADR 0008). Raises :class:`HesoError` on exit 2
-    (malformed / missing signature / unreadable / bad ``--trusted-keys``
-    source).
-
-    ``trusted_keys`` is also honored via the ``HESO_TRUSTED_KEYS`` env
-    var when omitted here.
-    """
-    extra: list[str] = []
-    if trusted_keys is not None:
-        extra.extend(["--trusted-keys", str(trusted_keys)])
-    try:
-        run("receipt-verify", *extra, str(path), parse_json=False)
-        return True
-    except HesoError as e:
-        if e.returncode == 1:
-            return False
-        raise
-
-
-def action_hash(url: str, actions_json: Optional[str] = None, **kwargs: Any) -> dict:
-    """``heso action-hash <url> [actions-json | -]`` — keyless,
-    deterministic fingerprint over ``(URL, actions)``.
-
-    Pass the action array as ``actions_json`` (an inline JSON string)
-    or omit it for a URL-only fingerprint. Returns the serialized
-    ``TraceFingerprint``: ``{algorithm, url, actions, action_ids,
-    site_id, trace_id}``.
-    """
-    extra = _kwargs_to_argv(kwargs)
-    if actions_json is not None:
-        return run("action-hash", url, actions_json, *extra)
-    return run("action-hash", url, *extra)
-
-
-def action_hash_verify(path: Union[str, Path], **kwargs: Any) -> bool:
-    """``heso action-hash-verify <file>`` — recompute every component
-    in a saved fingerprint and confirm it matches.
-
-    Returns ``True`` (CLI exit 0) or ``False`` (exit 1 — recompute
-    disagrees, or unknown algorithm tag). Raises :class:`HesoError` on
-    exit 2 (file missing / not a valid fingerprint JSON).
-    """
-    try:
-        run("action-hash-verify", str(path), *_kwargs_to_argv(kwargs), parse_json=False)
-        return True
-    except HesoError as e:
-        if e.returncode == 1:
-            return False
-        raise
 
 
 # ---------------------------------------------------------------------------

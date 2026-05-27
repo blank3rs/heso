@@ -92,7 +92,7 @@ A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`
 - `heso stamp <plan.json>` — executes the plan against the live web and mints a fresh plat that embeds the plan, the recorded cassette, and a per-step log. Accepts a bare `Action[]` array, a plat with a `"plan"` field, or a `TraceFingerprint`. Exit 0 on a clean run; 1 if any step failed (still prints the partial plat with `error` + `steps`).
 - `heso run <plat.plat>` — re-executes the plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay (ADR 0008). If the cassette has drifted (page changed since stamping), the failing step carries a structured `cassette miss: METHOD URL not recorded` error and `run` exits 1 — graceful, never silent.
 - `heso replay <plat.plat>` — pure observation. Reads the recorded step log from the plat and prints it. No engine, no JS, no cassette lookup, no network. Use `run` if you want to re-execute.
-- `heso unpack <plat.plat>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint a fresh plat (with a fresh cassette since the requests changed).
+- `heso replay --plan <plat.plat>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint a fresh plat (with a fresh cassette since the requests changed).
 
 ```sh
 cat > plan.json <<EOF
@@ -106,25 +106,22 @@ EOF
 heso stamp plan.json > out.plat           # plan → plat (records cassette)
 heso run out.plat > replay.plat           # plat → plat (off-network, byte-identical)
 heso replay out.plat                      # plat → step log (pure read, no execution)
-heso unpack out.plat > plan-again.json    # plat → plan (edit, restamp)
+heso replay --plan out.plat > plan-again.json    # plat → plan (edit, restamp)
 ```
 
-The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso plat-verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
+The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
 
 **Inspect a plat.** Text dev tools, all baked into the main binary:
 
 ```sh
-heso plat-info   out.plat                       # human summary: hash, plan / cassette / steps counts, sealed status
-heso plat-diff   before.plat after.plat         # what changed (plan, cassette URLs, fields, url / title / description)
-heso plat-redact cookies   my.plat > clean.plat # strip a top-level field; recomputes plat_hash
-heso plat-seal   my.plat > sealed.plat          # wrap in Ed25519 envelope (default key: heso-local-data/identity.key)
-heso plat-unseal sealed.plat                    # verify; exit 0 valid / 1 invalid / 2 wrong-alg or malformed
-heso plat-unseal sealed.plat --extract          # verify, then print the inner plat body for piping
+heso info   out.plat                       # human summary: hash, plan / cassette / steps counts, sealed status
+heso info   before.plat after.plat         # what changed (plan, cassette URLs, fields, url / title / description)
+heso seal   my.plat > sealed.plat          # wrap in Ed25519 envelope (default key: heso-local-data/identity.key)
+heso unseal sealed.plat                    # verify; exit 0 valid / 1 invalid / 2 wrong-alg or malformed
+heso unseal sealed.plat --extract          # verify, then print the inner plat body for piping
 ```
 
-`plat-redact` refuses sealed envelopes (would break the signature). Removing any present content field recomputes `plat_hash`; if the field contributed to the plat body, the hash changes and any prior signature is invalidated. The top-level `plat_hash` field itself is bookkeeping and is excluded from its own digest.
-
-`plat-seal` produces a `SealedPlat` JSON envelope (`{alg, content, signature}`) that any holder of the envelope + the `heso` binary can verify offline — no key material, no network, no clock. Mint a key once with `heso identity init`; from then on the same key signs every plat. `plat-unseal` checks the algorithm tag, the embedded `plat_hash`, and the Ed25519 signature in order, and refuses to silently treat an unknown `alg` as Ed25519.
+`seal` produces a `SealedPlat` JSON envelope (`{alg, content, signature}`) that any holder of the envelope + the `heso` binary can verify offline — no key material, no network, no clock. Mint a key once with `heso identity init`; from then on the same key signs every plat. `unseal` checks the algorithm tag, the embedded `plat_hash`, and the Ed25519 signature in order, and refuses to silently treat an unknown `alg` as Ed25519.
 
 **Replay a published plat in one command.** Install `heso` (`uv tool install heso` / `pipx install heso` / `npm install -g @ixla/heso`), then:
 
@@ -305,7 +302,7 @@ Verify the receipt — bind it to a trusted signer with `--trusted-keys`:
 # trusted.json is a JSON array of base64 pubkeys you accept signatures from.
 echo '["fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE="]' > trusted.json
 
-heso receipt-verify --trusted-keys trusted.json receipt.json
+heso verify --trusted-keys trusted.json receipt.json
 # → OK fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE=
 # exit 0
 ```
@@ -317,24 +314,24 @@ Verify enforces three rejections:
 ```sh
 # 1. Tampered receipt — any byte change invalidates the signature
 sed -i 's/"seed": 0/"seed": 999/' receipt.json
-heso receipt-verify --trusted-keys trusted.json receipt.json
+heso verify --trusted-keys trusted.json receipt.json
 # → INVALID: signature verification failed       (exit 1)
 
 # 2. Wrong signer — receipt is well-formed but the pubkey isn't allowlisted
-heso receipt-verify --trusted-keys other_keys.json receipt.json
+heso verify --trusted-keys other_keys.json receipt.json
 # → INVALID: signing pubkey `...` is not in the trusted-keys allowlist   (exit 1)
 
 # 3. `mode: live` — live runs use real time + real network and aren't
 #    replay-safe, so the signature has no replay value (ADR 0008)
 heso open https://example.com/ --receipt live.json --mode live
-heso receipt-verify --trusted-keys trusted.json live.json
+heso verify --trusted-keys trusted.json live.json
 # → INVALID: receipt `mode: live` is not replay-safe — per ADR 0008 ...   (exit 1)
 ```
 
 Verify without an allowlist still works for backwards compatibility, but emits a stderr warning so the missing trust anchor isn't silent:
 
 ```sh
-heso receipt-verify receipt.json
+heso verify receipt.json
 # stderr: warning: no pubkey allowlist configured (pass --trusted-keys PATH or set HESO_TRUSTED_KEYS ...)
 # stdout: OK fdibx2...IE=
 # exit 0
@@ -389,7 +386,7 @@ The verbs are the contract (see [ADR 0017](https://github.com/blank3rs/heso/blob
 
 ## Verbs are open
 
-**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The full spec lives at [`spec/HESO-1.0.md`](spec/HESO-1.0.md). It defines a closed core set of 16 bare verb names (`open`, `read`, `click`, `fill`, `submit`, `wait`, `stamp`, `run`, `replay`, `unpack`, `identity-init`, `receipt-verify`, `plat-hash`, `plat-verify`, `plat-seal`, `plat-unseal`) — every conformant implementation MUST dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
+**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The full spec lives at [`spec/HESO-1.0.md`](spec/HESO-1.0.md). It defines the core verb set — every conformant implementation MUST dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
 
 ```json
 {"verb": "com.example.scrape-pricing", "url": "https://example.com/products"}
@@ -398,7 +395,7 @@ The verbs are the contract (see [ADR 0017](https://github.com/blank3rs/heso/blob
 
 No registration server, no central authority. **Dispatch is local-only** (spec §4.4) — receiving a plat with an unknown extension verb is a structured error, never a network fetch or a code download. The doc-under-your-domain is human documentation, not a code-delivery channel; discovering a verb (reading the doc) and dispatching it (running the code) are separate operations the spec keeps cleanly apart.
 
-DNS ownership prevents anyone but you from claiming names *under your domain* — same anti-impersonation model as Java packages, Android application IDs, Maven groups, and OCI image labels. It does NOT solve typosquatting (`com.exarnple.foo` and `com.example.foo` are distinct names that look identical to a human reader). HESO/1.0 anchors trust on signing keys, not verb names: pin receivers to trusted signers via the existing `receipt-verify --trusted-keys` allowlist (spec §3.9, §4.6).
+DNS ownership prevents anyone but you from claiming names *under your domain* — same anti-impersonation model as Java packages, Android application IDs, Maven groups, and OCI image labels. It does NOT solve typosquatting (`com.exarnple.foo` and `com.example.foo` are distinct names that look identical to a human reader). HESO/1.0 anchors trust on signing keys, not verb names: pin receivers to trusted signers via the existing `verify --trusted-keys` allowlist (spec §3.9, §4.6).
 
 Today, the reference implementation (this binary, `v0.1.2`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary; to dispatch one today you implement HESO/1.0 yourself, in any language. The spec is what makes that implementation possible.
 
