@@ -61,7 +61,7 @@ jobs:
       - name: Refuse new .md outside public allowlist
         run: |
           set -euo pipefail
-          allow='^(README\.md|npm/heso/README\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$'
+          allow='^(README\.md|CONTRIBUTING\.md|SECURITY\.md|CODE_OF_CONDUCT\.md|CHANGELOG\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$'
           added=$(git diff --name-only --diff-filter=A "${{ steps.base.outputs.base }}" HEAD -- '*.md' || true)
           if [ -z "$added" ]; then
             echo "no new .md files in this push"
@@ -225,50 +225,26 @@ jobs:
       - uses: pre-commit/action@v3.0.1
 
   # --------------------------------------------------------------------
-  # 4. The version + perf blocks in README.md and npm/heso/README.md
-  #    are wrapped in HTML-comment markers and MUST match byte-for-byte.
-  #    Install lines legitimately diverge (npm README documents
-  #    `npm install`, root documents all three managers), so we only
-  #    sync the blocks that are supposed to be shared.
+  # 4. npm/heso/README.md is gitignored and copied from the root
+  #    README.md at publish time (by scripts/deploy.ps1 and by the
+  #    npm publish step in .github/workflows/pypi.yml). The check
+  #    here is that the publish workflow actually does the copy —
+  #    if the sync step disappears, the npm registry page silently
+  #    falls back to whatever stale file (or no file) is in the
+  #    package tarball.
   # --------------------------------------------------------------------
-  readme-sync-blocks:
-    name: README sync blocks
+  readme-publish-sync:
+    name: README sync (publish-time)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compare marker blocks across READMEs
+      - name: Assert pypi.yml copies root README into npm/heso/ before publish
         run: |
           set -euo pipefail
-          extract() {
-            # $1 = file, $2 = marker name. Prints the lines strictly
-            # between <!-- heso:NAME:start --> and <!-- heso:NAME:end -->.
-            awk -v name="$2" '
-              $0 == "<!-- heso:" name ":start -->" { capture=1; next }
-              $0 == "<!-- heso:" name ":end -->"   { capture=0 }
-              capture { print }
-            ' "$1"
-          }
-          fail=0
-          for block in version perf; do
-            a=$(extract README.md "$block")
-            b=$(extract npm/heso/README.md "$block")
-            if [ -z "$a" ]; then
-              echo "::error::README.md is missing the <!-- heso:$block:start --> marker"
-              fail=1
-              continue
-            fi
-            if [ -z "$b" ]; then
-              echo "::error::npm/heso/README.md is missing the <!-- heso:$block:start --> marker"
-              fail=1
-              continue
-            fi
-            if [ "$a" != "$b" ]; then
-              echo "::error::README sync drift in block '$block'"
-              diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") || true
-              fail=1
-            else
-              echo "  ok   block '$block' matches across READMEs"
-            fi
-          done
-          exit $fail
+          if ! grep -qE 'cp[[:space:]]+README\.md[[:space:]]+npm/heso/README\.md' .github/workflows/pypi.yml; then
+            echo "::error::.github/workflows/pypi.yml is missing the README sync step."
+            echo "::error::Add 'cp README.md npm/heso/README.md' before 'npm publish'."
+            exit 1
+          fi
+          echo "  ok   pypi.yml syncs README.md -> npm/heso/README.md before publish"
         shell: bash

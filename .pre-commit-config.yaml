@@ -19,21 +19,22 @@ repos:
         entry: |
           Agent-process docs (findings, triage, regressions, research) belong in
           a gitignored directory. See AGENTS.md > "Where transient agent reports
-          go". The only .md files that ship publicly are README.md, the npm
-          package READMEs (npm/heso + npm/platforms/*), and spec/HESO-*.md.
+          go". The only .md files that ship publicly are README.md, the four
+          standard meta files (CONTRIBUTING / SECURITY / CODE_OF_CONDUCT /
+          CHANGELOG), the per-platform npm package READMEs, and spec/HESO-*.md.
         files: \.md$
-        exclude: ^(README\.md|npm/heso/README\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$
+        exclude: ^(README\.md|CONTRIBUTING\.md|SECURITY\.md|CODE_OF_CONDUCT\.md|CHANGELOG\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$
 
       - id: no-rogue-root-md
-        name: Refuse new root-level .md other than README
+        name: Refuse new root-level .md other than README + meta files
         language: fail
         entry: |
-          The repo root only carries README.md. Anything else
-          (AGENT_FINDINGS_*.md, REGRESSION_*.md, COMPATIBILITY.md, scratch
-          notes) must live in a gitignored directory. See AGENTS.md > "Where
-          transient agent reports go".
+          The repo root only carries README.md plus the four standard meta files
+          (CONTRIBUTING.md, SECURITY.md, CODE_OF_CONDUCT.md, CHANGELOG.md).
+          Anything else (AGENT_FINDINGS_*.md, REGRESSION_*.md, COMPATIBILITY.md,
+          scratch notes) must live in a gitignored directory.
         files: ^[^/]+\.md$
-        exclude: ^README\.md$
+        exclude: ^(README|CONTRIBUTING|SECURITY|CODE_OF_CONDUCT|CHANGELOG)\.md$
 
       - id: spec-and-crates-md-shape
         name: spec/ holds only HESO-*.md, crates/ ships no .md
