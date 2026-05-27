@@ -60,6 +60,7 @@ __all__ = [
     "open",
     "read",
     "wait",
+    "search",
     "click",
     "fill",
     "submit",
@@ -395,6 +396,26 @@ def wait(url: str, **kwargs: Any) -> dict:
         timeout: str — overall cap (default ``"30s"``).
     """
     return run("wait", url, *_kwargs_to_argv(kwargs))
+
+
+def search(query: str, **kwargs: Any) -> dict:
+    """``heso search <query>`` — multi-source web search.
+
+    Returns ``{query, engines_used, results, knowledge}`` as a dict.
+    ``results`` is a list of ``{rank, title, url, snippet, source}``
+    rows interleaved round-robin from the engines used; ``knowledge``
+    is a single ``{title, summary, url}`` block from Wikipedia (or
+    ``None`` if Wikipedia had no direct match / wasn't requested).
+    Pure HTTP + HTML parsing — no JS engine spin-up.
+
+    Common kwargs:
+        limit: int — cap on merged result count (default 30, max 100).
+        engines: str — comma-separated subset of ``ddg,wiki,searxng``
+            (default ``ddg,wiki``).
+        searx_url: str — base URL for a SearXNG instance. Also reads
+            ``HESO_SEARX_URL`` from the environment.
+    """
+    return run("search", query, *_kwargs_to_argv(kwargs))
 
 
 def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:

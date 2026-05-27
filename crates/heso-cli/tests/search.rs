@@ -34,12 +34,13 @@ fn heso_bin() -> PathBuf {
 }
 
 // ============================================================================
-// `heso search` CLI tests — SearXNG path (only backend whose URL is
-// configurable from outside the binary)
+// `heso search` top-level CLI tests — SearXNG path (only backend whose URL
+// is configurable from outside the binary, so the one we can wiremock end-
+// to-end without hijacking real upstream hosts).
 // ============================================================================
 
 fn run_search(args: &[&str]) -> std::process::Output {
-    let mut cmd_args = vec!["registry", "search"];
+    let mut cmd_args = vec!["search"];
     cmd_args.extend_from_slice(args);
     Command::new(heso_bin())
         .args(&cmd_args)
@@ -219,7 +220,7 @@ async fn searxng_5xx_does_not_crash_returns_empty() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unknown_engine_rejected_with_usage() {
     let out = Command::new(heso_bin())
-        .args(["registry", "search", "anything", "--engines", "google"])
+        .args(["search", "anything", "--engines", "google"])
         .output()
         .expect("spawn heso search");
     assert!(!out.status.success(), "expected non-zero exit");
@@ -233,7 +234,7 @@ async fn unknown_engine_rejected_with_usage() {
 #[tokio::test(flavor = "multi_thread")]
 async fn missing_query_rejected_with_usage() {
     let out = Command::new(heso_bin())
-        .args(["registry", "search"])
+        .args(["search"])
         .output()
         .expect("spawn heso search");
     assert!(!out.status.success(), "expected non-zero exit");
@@ -260,7 +261,7 @@ async fn searxng_via_env_var() {
         .await;
 
     let out = Command::new(heso_bin())
-        .args(["registry", "search", "any", "--engines", "searxng"])
+        .args(["search", "any", "--engines", "searxng"])
         .env("HESO_SEARX_URL", server.uri())
         .output()
         .expect("spawn heso search");

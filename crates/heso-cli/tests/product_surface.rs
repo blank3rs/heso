@@ -92,6 +92,56 @@ fn install_and_platform_claims_match_release_artifacts() {
 }
 
 #[test]
+fn readme_top_level_verbs_resolve_in_binary() {
+    // Every `heso <verb>` reference in the public README MUST resolve
+    // to a real top-level subcommand. Catches the README-vs-dispatcher
+    // drift that lets a verb get advertised without being wired up.
+    //
+    // We extract `\`heso <word>` references, filter by the curated set
+    // of top-level verbs the README documents, then call each one with
+    // a bogus marker flag and assert the binary doesn't reply
+    // "unknown subcommand". Compound flags / RPC-only methods are
+    // explicitly excluded.
+    let advertised: Vec<&str> = TOP_LEVEL_VERBS_IN_README.to_vec();
+    // Belt: also make sure the README still mentions each of these
+    // (so this list can't silently rot if the README is restructured).
+    for v in &advertised {
+        let needle = format!("`heso {v}");
+        assert!(
+            ROOT_README.contains(&needle),
+            "README no longer mentions `{needle}` — update TOP_LEVEL_VERBS_IN_README \
+             or restore the reference"
+        );
+    }
+
+    for verb in advertised {
+        let out = Command::new(heso_bin())
+            .arg(verb)
+            .arg("--definitely-not-a-real-flag-xyz")
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn `heso {verb}`: {e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stderr.contains("unknown subcommand"),
+            "README advertises `heso {verb}` but the binary reports it as unknown.\n\
+             stderr: {stderr}\nstdout: {stdout}"
+        );
+    }
+}
+
+/// Curated list of top-level verbs the public README references with
+/// backticks (`\`heso open\``, `\`heso search\``, …). New entries
+/// added to the README MUST be added here. The
+/// `readme_top_level_verbs_resolve_in_binary` test asserts the
+/// dispatcher can reach each one and that the README still mentions
+/// each one — preventing both directions of drift.
+const TOP_LEVEL_VERBS_IN_README: &[&str] = &[
+    "batch", "click", "eval-dom", "fill", "identity", "open", "read", "replay", "run", "search",
+    "serve", "stamp", "submit", "verify", "wait",
+];
+
+#[test]
 fn wrapper_readmes_match_language_idioms_and_cli_semantics() {
     assert!(NPM_README.contains("10.1 MB"));
     assert!(NPM_README.contains("~77 ms"));

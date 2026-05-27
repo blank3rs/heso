@@ -100,6 +100,16 @@ export function read(url: string, options?: ReadOptions): Promise<Record<string,
 export function wait(url: string, options?: WaitOptions): Promise<Record<string, unknown>>;
 
 /**
+ * `heso search <query>` — multi-source web search (DuckDuckGo HTML +
+ * Wikipedia REST `summary` by default; optional SearXNG via `searxUrl`).
+ * Resolves with `{ query, engines_used, results, knowledge }`.
+ */
+export function search(
+  query: string,
+  options?: SearchOptions,
+): Promise<Record<string, unknown>>;
+
+/**
  * `heso click <url>` — dispatch a real click. Pass `ref` ("@e7") OR a
  * locator option (`text`, `selector`, `ariaLabel`).
  */

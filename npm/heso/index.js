@@ -340,6 +340,20 @@ function wait(url, options) {
 }
 
 /**
+ * `heso search <query>` — multi-source web search. Resolves with
+ * `{ query, engines_used, results, knowledge }`. `results` is the
+ * round-robin merged list of `{ rank, title, url, snippet, source }`
+ * rows; `knowledge` is the Wikipedia summary block (or `null` when
+ * Wikipedia had no direct match / wasn't requested).
+ *
+ * Common options: `limit` (default 30, max 100), `engines` ("ddg,wiki",
+ * "ddg", "searxng", ...), `searxUrl` (also reads `HESO_SEARX_URL`).
+ */
+function search(query, options) {
+  return _spawnJson(["search", query, ..._optsToArgv(options)]);
+}
+
+/**
  * `heso click <url> [<@ref> | --text | --selector | --aria-label]`.
  * Pass either `ref` as the second positional (e.g. "@e7") or a locator
  * option (`text`, `selector`, `ariaLabel`).
@@ -770,6 +784,7 @@ module.exports = {
   open,
   read,
   wait,
+  search,
   click,
   fill,
   submit,
