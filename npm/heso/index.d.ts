@@ -117,8 +117,10 @@ export function read(url: string, options?: ReadOptions): Promise<Record<string,
 export function wait(url: string, options?: WaitOptions): Promise<Record<string, unknown>>;
 
 /**
- * `heso search <query>` — multi-backend web search (DDG HTML + Wikipedia,
- * optional SearXNG). Alias for `registry.search`.
+ * `heso search <query>` — multi-source web search (DuckDuckGo HTML +
+ * Wikipedia REST `summary` by default; optional SearXNG via `searxUrl`).
+ * Resolves with `{ query, engines_used, results, knowledge }`. Also
+ * available as `registry.search`.
  */
 export function search(
   query: string,
