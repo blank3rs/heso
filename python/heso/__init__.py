@@ -242,6 +242,46 @@ def _normalize_value(value: Any) -> Optional[str]:
     return str(value)
 
 
+_SPAWN_LEVEL_KEYS = frozenset({"binary"})
+
+
+def _split_spawn_opts(kwargs: Mapping[str, Any]) -> tuple[dict, dict]:
+    """Split ``kwargs`` into ``(spawn_opts, cli_kwargs)``.
+
+    ``timeout`` straddles both layers by design. The user supplies
+    seconds (the Python convention); we forward it to the CLI as
+    ``--timeout <ms>`` so the binary's in-band timeout produces the
+    structured ``{ok: false, error: {code: "timeout", ...}}`` envelope,
+    and we install ``timeout + 5`` seconds as the ``subprocess.run``
+    backstop in case the binary itself hangs. ``timeout=0`` and
+    ``timeout=None`` opt out of both layers — the CLI receives
+    ``--timeout 0`` and ``subprocess.run`` waits forever.
+
+    ``binary`` is removed entirely from the CLI-flag stream and
+    forwarded only as a spawn-level argument.
+    """
+    spawn: dict = {}
+    cli = dict(kwargs)
+    if "binary" in cli:
+        spawn["binary"] = cli.pop("binary")
+    if "timeout" in cli:
+        raw = cli.pop("timeout")
+        if raw is not None:
+            try:
+                seconds = float(raw)
+            except (TypeError, ValueError):
+                raise HesoError(f"timeout: expected a number of seconds, got {raw!r}")
+            ms = int(round(seconds * 1000))
+            # Forward to the CLI so the binary's per-request budget
+            # fires first and emits the structured envelope.
+            cli["timeout"] = f"{ms}ms"
+            # subprocess.run treats `timeout=0` as immediate kill;
+            # preserve "no timeout" by skipping the spawn-level cap.
+            if seconds > 0:
+                spawn["timeout"] = seconds + 5.0
+    return spawn, cli
+
+
 def _kwargs_to_argv(kwargs: Mapping[str, Any]) -> list[str]:
     """Convert ``**kwargs`` to a flat argv list of CLI flags.
 
@@ -253,6 +293,8 @@ def _kwargs_to_argv(kwargs: Mapping[str, Any]) -> list[str]:
     """
     argv: list[str] = []
     for key, value in kwargs.items():
+        if key in _SPAWN_LEVEL_KEYS:
+            continue
         flag = _flag_name(key)
 
         # `--field` is the lone CLI flag that legitimately repeats.
@@ -416,8 +458,15 @@ def open(url: str, **kwargs: Any) -> dict:
     ``best_effort=True`` -> ``--best-effort``,
     ``inject_script=["window.X=1"]`` -> repeat ``--inject-script`` (or
     pass once as a string).
+
+    ``timeout`` (float seconds, default 30) becomes both the CLI's
+    per-request ``--timeout`` budget and a ``subprocess.run`` kill
+    backstop. On in-band timeout the binary exits 1 with a structured
+    ``{ok: false, error: {code: "timeout", ...}}`` envelope on stdout,
+    surfaced via :class:`HesoError`'s ``stdout`` attribute.
     """
-    return run("open", url, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("open", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def read(url: str, **kwargs: Any) -> dict:
@@ -433,8 +482,10 @@ def read(url: str, **kwargs: Any) -> dict:
         js_fetch: bool — install the JS fetch() global.
         since: str — prior ``content_hash`` for diffing.
         best_effort: bool — exit 0 on partial failures.
+        timeout: float — per-request budget in seconds (default 30).
     """
-    return run("read", url, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("read", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def wait(url: str, **kwargs: Any) -> dict:
@@ -450,9 +501,10 @@ def wait(url: str, **kwargs: Any) -> dict:
         network_idle: bool — no queued fetch/timer for ``idle_window``.
         idle_window: str — duration like ``"500ms"``.
         time: str — advance virtual clock, e.g. ``"2s"``.
-        timeout: str — overall cap (default ``"30s"``).
+        timeout: float — overall cap in seconds (default 30).
     """
-    return run("wait", url, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("wait", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def search(query: str, **kwargs: Any) -> dict:
@@ -507,10 +559,11 @@ def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
     navigation walked through, empty for direct hits and for clicks
     that did not navigate.
     """
-    extra = _kwargs_to_argv(kwargs)
+    spawn, cli = _split_spawn_opts(kwargs)
+    extra = _kwargs_to_argv(cli)
     if ref is not None:
-        return run("click", url, ref, *extra)
-    return run("click", url, *extra)
+        return run("click", url, ref, *extra, **spawn)
+    return run("click", url, *extra, **spawn)
 
 
 def fill(
@@ -533,11 +586,12 @@ def fill(
     reflects the requested string so the caller can retry with a
     different locator.
     """
-    extra = _kwargs_to_argv(kwargs)
+    spawn, cli = _split_spawn_opts(kwargs)
+    extra = _kwargs_to_argv(cli)
     if value is not None:
-        return run("fill", url, ref_or_value, value, *extra)
+        return run("fill", url, ref_or_value, value, *extra, **spawn)
     # Locator via kwargs; the single positional is the value.
-    return run("fill", url, *extra, ref_or_value)
+    return run("fill", url, *extra, ref_or_value, **spawn)
 
 
 def submit(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
@@ -555,10 +609,11 @@ def submit(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
     ``fieldsApplied``, ...) lives under ``result``. ``postUrl`` is the
     response URL after redirects.
     """
-    extra = _kwargs_to_argv(kwargs)
+    spawn, cli = _split_spawn_opts(kwargs)
+    extra = _kwargs_to_argv(cli)
     if ref is not None:
-        return run("submit", url, ref, *extra)
-    return run("submit", url, *extra)
+        return run("submit", url, ref, *extra, **spawn)
+    return run("submit", url, *extra, **spawn)
 
 
 def eval_js(js: str, **kwargs: Any) -> dict:
@@ -567,7 +622,8 @@ def eval_js(js: str, **kwargs: Any) -> dict:
     Returns ``{value, console, ...}``. ``seed=N`` seeds the
     determinism shims. No DOM — use :func:`eval_dom` for that.
     """
-    return run("eval-js", *_kwargs_to_argv(kwargs), js)
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("eval-js", *_kwargs_to_argv(cli), js, **spawn)
 
 
 def eval_dom(url: str, js: str, **kwargs: Any) -> dict:
@@ -579,8 +635,10 @@ def eval_dom(url: str, js: str, **kwargs: Any) -> dict:
     Common kwargs:
         seed: int — RNG seed (default 0).
         js_fetch: bool — install the JS fetch() global.
+        timeout: float — per-request budget in seconds (default 30).
     """
-    return run("eval-dom", *_kwargs_to_argv(kwargs), url, js)
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("eval-dom", *_kwargs_to_argv(cli), url, js, **spawn)
 
 
 def batch(
@@ -596,18 +654,21 @@ def batch(
 
     Common kwargs:
         parallel: int — concurrent slots (default 8 for open, 2 for read).
-        timeout_per_url: str — per-URL cap, e.g. ``"5s"``.
+        timeout_per_url: str — per-URL cap, e.g. ``"5s"`` (alias of ``timeout``).
         fail_fast: bool — stop on first error.
         include: str — passed through to the read subverb.
         js_fetch: bool — passed through to the read subverb.
+        timeout: float — per-URL cap in seconds (alias of ``timeout_per_url``).
     """
     url_list = list(urls)
+    spawn, cli = _split_spawn_opts(kwargs)
     raw = run(
         "batch",
         subverb,
-        *_kwargs_to_argv(kwargs),
+        *_kwargs_to_argv(cli),
         *url_list,
         parse_json=False,
+        **spawn,
     )
     out: list[dict] = []
     for line in raw.splitlines():
@@ -626,18 +687,21 @@ def batch(
 def meta(url: str, **kwargs: Any) -> dict:
     """``heso meta <url>`` — extract structured metadata (JSON-LD,
     OpenGraph, SEO meta, canonical, icons, lang)."""
-    return run("meta", url, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("meta", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def ls(url: str, path: str = "/", **kwargs: Any) -> dict:
     """``heso ls <url> [path]`` — list children of a tree path."""
-    return run("ls", url, path, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("ls", url, path, *_kwargs_to_argv(cli), **spawn)
 
 
 def cat(url: str, target: str, **kwargs: Any) -> dict:
     """``heso cat <url> <path|@ref>`` — read a tree path's text or an
     element ref's full record."""
-    return run("cat", url, target, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("cat", url, target, *_kwargs_to_argv(cli), **spawn)
 
 
 def find(url: str, **kwargs: Any) -> dict:
@@ -649,12 +713,14 @@ def find(url: str, **kwargs: Any) -> dict:
         name: str — filter by name substring.
         section: str — filter by section path, e.g. ``"/pricing"``.
     """
-    return run("find", url, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("find", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def tree(url: str, **kwargs: Any) -> dict:
     """``heso tree <url>`` — full heading-derived page tree as JSON."""
-    return run("tree", url, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("tree", url, *_kwargs_to_argv(cli), **spawn)
 
 
 def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
@@ -672,11 +738,13 @@ def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
         template: str — load a v0 plan template from disk.
         values: dict — substitution map for ``{{name}}`` placeholders
             in the template.
+        timeout: float — per-network-step budget in seconds (default 30).
 
     Keyword arguments become CLI flags via the same rules as every
     other verb.
     """
-    return run("stamp", str(path), *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("stamp", str(path), *_kwargs_to_argv(cli), **spawn)
 
 
 def replay(path: Union[str, Path], **kwargs: Any) -> dict:
@@ -689,7 +757,8 @@ def replay(path: Union[str, Path], **kwargs: Any) -> dict:
     steps}``. Pass ``plan=True`` to return the plat's ``plan`` field
     instead, for editing.
     """
-    return run("replay", str(path), *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("replay", str(path), *_kwargs_to_argv(cli), **spawn)
 
 
 def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
@@ -708,7 +777,8 @@ def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
 
     Keyword arguments (e.g. ``seed=42``) become CLI flags.
     """
-    return run("run", str(path), *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("run", str(path), *_kwargs_to_argv(cli), **spawn)
 
 
 def refresh(path: Union[str, Path], **kwargs: Any) -> dict:
@@ -720,8 +790,9 @@ def refresh(path: Union[str, Path], **kwargs: Any) -> dict:
     regardless of drift status (exit 0 vs 1); raises :class:`HesoError`
     only on usage errors (exit 2 — missing plan field, unreachable site).
     """
+    spawn, cli = _split_spawn_opts(kwargs)
     try:
-        return run("refresh", str(path), *_kwargs_to_argv(kwargs))
+        return run("refresh", str(path), *_kwargs_to_argv(cli), **spawn)
     except HesoError as e:
         if e.returncode == 1 and e.stdout:
             try:
@@ -738,7 +809,8 @@ def refresh(path: Union[str, Path], **kwargs: Any) -> dict:
 
 def verify(path: Union[str, Path], **kwargs: Any) -> dict:
     """``heso verify <file>`` — verify integrity and/or signature of a plat, receipt, or sealed envelope."""
-    return run("verify", str(path), *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("verify", str(path), *_kwargs_to_argv(cli), **spawn)
 
 
 def info(
@@ -749,20 +821,23 @@ def info(
 
     Pass a single path to inspect one plat. Pass a two-element sequence to diff.
     """
+    spawn, cli = _split_spawn_opts(kwargs)
     if isinstance(path_or_paths, (str, Path)):
-        return run("info", str(path_or_paths), *_kwargs_to_argv(kwargs))
+        return run("info", str(path_or_paths), *_kwargs_to_argv(cli), **spawn)
     paths = [str(p) for p in path_or_paths]
-    return run("info", *paths, *_kwargs_to_argv(kwargs))
+    return run("info", *paths, *_kwargs_to_argv(cli), **spawn)
 
 
 def seal(path: Union[str, Path], **kwargs: Any) -> dict:
     """``heso seal <file> [--key PATH] [--tsa URL] [--no-resign]`` — Ed25519 envelope."""
-    return run("seal", str(path), *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("seal", str(path), *_kwargs_to_argv(cli), **spawn)
 
 
 def unseal(path: Union[str, Path], **kwargs: Any) -> dict:
     """``heso unseal <file> [--extract]`` — verify a sealed envelope."""
-    return run("unseal", str(path), *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("unseal", str(path), *_kwargs_to_argv(cli), **spawn)
 
 
 # ---------------------------------------------------------------------------

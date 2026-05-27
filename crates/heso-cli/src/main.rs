@@ -272,6 +272,25 @@ fn print_banner() {
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
     );
     println!();
+    println!("Global flags");
+    println!("  --timeout <DUR>             Per-request wall-clock cap on every network verb");
+    println!(
+        "                              (open / read / click / fill / submit / eval-dom / batch /"
+    );
+    println!("                              stamp / refresh / meta / find / tree / ls / cat).");
+    println!(
+        "                              Default 30s. Accepts `5s`, `200ms`, `1m`, or a bare number"
+    );
+    println!(
+        "                              (milliseconds). `--timeout 0` opts out of the cap. On"
+    );
+    println!(
+        "                              timeout the verb emits {{ok: false, error: {{code: \"timeout\","
+    );
+    println!(
+        "                              timeout_ms, elapsed_ms, url}}}} on stdout and exits 1."
+    );
+    println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See README.md for usage and the full reference at heso.ca/docs.");
 }
@@ -470,9 +489,21 @@ async fn cmd_update(args: &[String]) -> ExitCode {
     }
 }
 
-/// Open a URL with the default `FetchEngine`. Returns the loaded page or an
-/// `ExitCode` describing how to exit the process on failure.
-async fn open_or_die(url_arg: &str) -> Result<heso_engine_fetch::FetchPage, ExitCode> {
+/// Default per-network-operation timeout for verbs that don't carry
+/// an explicit `--timeout` flag. 30 seconds matches Playwright's
+/// `actionTimeout` default and is the long-standing default of
+/// `heso wait`; see [`crate::batch`]'s `DEFAULT_TIMEOUT_PER_URL` for
+/// the matching batch-level cap.
+pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
+/// Open a URL with a configurable per-request timeout. `timeout_ms` of
+/// `Some(0)` (or any explicit `None`) drops the timeout — the engine
+/// will run unbounded. Used by the verbs that wire `--timeout DUR`
+/// through to their `FetchEngine` construction.
+async fn open_or_die_with_timeout(
+    url_arg: &str,
+    timeout_ms: Option<u64>,
+) -> Result<heso_engine_fetch::FetchPage, ExitCode> {
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
         Err(e) => {
@@ -480,17 +511,120 @@ async fn open_or_die(url_arg: &str) -> Result<heso_engine_fetch::FetchPage, Exit
             return Err(ExitCode::from(2));
         }
     };
-    let engine = match FetchEngine::new() {
+    let engine = match build_fetch_engine(timeout_ms) {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to build engine: {e}");
-            return Err(ExitCode::FAILURE);
-        }
+        Err(code) => return Err(code),
     };
-    engine.open(&url).await.map_err(|e| {
-        eprintln!("fetch failed: {e}");
+    let started = std::time::Instant::now();
+    match engine.open_typed(url.as_str()).await {
+        Ok(p) => Ok(p),
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            Err(ExitCode::FAILURE)
+        }
+        Err(e) => {
+            eprintln!("fetch failed: {e}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// Build a [`FetchEngine`] honoring the caller's `--timeout` choice.
+/// `Some(ms)` with `ms > 0` activates the per-request budget; `None`
+/// or `Some(0)` leaves the engine unbounded (the historical default
+/// for callers that prefer to manage timeouts themselves).
+pub(crate) fn build_fetch_engine(timeout_ms: Option<u64>) -> Result<FetchEngine, ExitCode> {
+    let result = match timeout_ms {
+        Some(ms) if ms > 0 => FetchEngine::with_timeout(std::time::Duration::from_millis(ms)),
+        _ => FetchEngine::new(),
+    };
+    result.map_err(|e| {
+        eprintln!("failed to build engine: {e}");
         ExitCode::FAILURE
     })
+}
+
+/// Print the canonical timeout error envelope to stdout. Verbs that
+/// honor `--timeout` use this so an agent reading the output gets a
+/// stable shape for the "we ran out of time" outcome, distinct from
+/// the generic `fetch failed:` line emitted for other network errors.
+pub(crate) fn emit_timeout_envelope(url: &str, timeout_ms: u64, elapsed_ms: u64) {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "timeout",
+            "timeout_ms": timeout_ms,
+            "elapsed_ms": elapsed_ms,
+            "url": url,
+        },
+    });
+    let _ = write_json_to_stdout(&body);
+}
+
+/// Normalize a `--timeout` input for the envelope's `timeout_ms`
+/// field. `Some(0)` and `None` (caller chose "no timeout") both
+/// surface as `0`; any positive value passes through. This is only
+/// reached on the timeout-error path, so the convention is: "the
+/// budget the engine ran against" — `0` means "no budget was set"
+/// (the error came from somewhere other than the per-request cap).
+fn timeout_ms_for_envelope(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms.unwrap_or(0)
+}
+
+/// Parse an optional `--timeout <DUR>` flag at position `i`. Returns
+/// `Ok(Some((value_ms, slots_consumed)))` when the flag matched,
+/// `Ok(None)` when it didn't, and `Err(exit_code)` on malformed
+/// input (missing value or unparseable duration).
+///
+/// `0` / `0ms` / `0s` are accepted and mean "no timeout" — the verb
+/// receives `Some(0)` and threads it through to
+/// [`build_fetch_engine`] which leaves the engine unbounded. Negative
+/// or non-numeric input is rejected by [`parse_duration_ms`] and
+/// surfaces as exit code 2.
+pub(crate) fn try_consume_timeout_flag(
+    args: &[String],
+    i: usize,
+) -> Result<Option<(u64, usize)>, ExitCode> {
+    if args.get(i).map(String::as_str) != Some("--timeout") {
+        return Ok(None);
+    }
+    let Some(v) = args.get(i + 1) else {
+        eprintln!("--timeout needs a value");
+        return Err(ExitCode::from(2));
+    };
+    match parse_duration_ms(v) {
+        Ok(ms) => Ok(Some((ms, 2))),
+        Err(e) => {
+            eprintln!("--timeout: {e}");
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+/// Strip the `--timeout DUR` global flag out of `args` and return the
+/// remaining positionals plus the resolved timeout (defaulting to
+/// [`DEFAULT_TIMEOUT_MS`] when absent). Used by verbs whose own
+/// argument parser doesn't need flag introspection (`tree` / `ls` /
+/// `cat` / `meta`) — they keep their positional-only walk and let
+/// this helper handle the one extra global flag.
+pub(crate) fn strip_timeout_flag(args: &[String]) -> Result<(Vec<String>, Option<u64>), ExitCode> {
+    let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
+    let mut i = 0;
+    while i < args.len() {
+        match try_consume_timeout_flag(args, i)? {
+            Some((ms, n)) => {
+                timeout_ms = Some(ms);
+                i += n;
+            }
+            None => {
+                filtered.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok((filtered, timeout_ms))
 }
 
 pub(crate) fn print_json(value: &serde_json::Value) -> ExitCode {
@@ -520,11 +654,15 @@ pub(crate) fn write_json_to_stdout(value: &serde_json::Value) -> bool {
 }
 
 async fn cmd_tree(args: &[String]) -> ExitCode {
+    let (args, timeout_ms) = match strip_timeout_flag(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
     if args.is_empty() {
-        eprintln!("usage: heso tree <url>");
+        eprintln!("usage: heso tree <url> [--timeout DUR]");
         return ExitCode::from(2);
     }
-    let page = match open_or_die(&args[0]).await {
+    let page = match open_or_die_with_timeout(&args[0], timeout_ms).await {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -538,12 +676,16 @@ async fn cmd_tree(args: &[String]) -> ExitCode {
 }
 
 async fn cmd_ls(args: &[String]) -> ExitCode {
+    let (args, timeout_ms) = match strip_timeout_flag(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
     if args.is_empty() {
-        eprintln!("usage: heso ls <url> [path]");
+        eprintln!("usage: heso ls <url> [path] [--timeout DUR]");
         return ExitCode::from(2);
     }
     let path = args.get(1).map(String::as_str).unwrap_or("/");
-    let page = match open_or_die(&args[0]).await {
+    let page = match open_or_die_with_timeout(&args[0], timeout_ms).await {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -567,12 +709,16 @@ async fn cmd_ls(args: &[String]) -> ExitCode {
 /// The leading `@` is the discriminator. Same shell verb, two addressable
 /// vocabularies.
 async fn cmd_cat(args: &[String]) -> ExitCode {
+    let (args, timeout_ms) = match strip_timeout_flag(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
     if args.len() < 2 {
-        eprintln!("usage: heso cat <url> <path|@ref>");
+        eprintln!("usage: heso cat <url> <path|@ref> [--timeout DUR]");
         return ExitCode::from(2);
     }
     let target = &args[1];
-    let page = match open_or_die(&args[0]).await {
+    let page = match open_or_die_with_timeout(&args[0], timeout_ms).await {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -618,8 +764,12 @@ async fn cmd_cat(args: &[String]) -> ExitCode {
 /// - `--section` is a path prefix; `--section /pricing` returns
 ///   everything in `/pricing` and below (e.g. `/pricing/enterprise`).
 async fn cmd_find(args: &[String]) -> ExitCode {
+    let (args, timeout_ms) = match strip_timeout_flag(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
     if args.is_empty() {
-        eprintln!("usage: heso find <url> [--role X] [--name SUBSTR] [--section /path]");
+        eprintln!("usage: heso find <url> [--role X] [--name SUBSTR] [--section /path] [--timeout DUR]");
         return ExitCode::from(2);
     }
     let url_arg = &args[0];
@@ -659,13 +809,13 @@ async fn cmd_find(args: &[String]) -> ExitCode {
             }
             other => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso find <url> [--role X] [--name SUBSTR] [--section /path]");
+                eprintln!("usage: heso find <url> [--role X] [--name SUBSTR] [--section /path] [--timeout DUR]");
                 return ExitCode::from(2);
             }
         }
     }
 
-    let page = match open_or_die(url_arg).await {
+    let page = match open_or_die_with_timeout(url_arg, timeout_ms).await {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -696,11 +846,15 @@ async fn cmd_find(args: &[String]) -> ExitCode {
 }
 
 async fn cmd_meta(args: &[String]) -> ExitCode {
+    let (args, timeout_ms) = match strip_timeout_flag(args) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
     if args.is_empty() {
-        eprintln!("usage: heso meta <url>");
+        eprintln!("usage: heso meta <url> [--timeout DUR]");
         return ExitCode::from(2);
     }
-    let page = match open_or_die(&args[0]).await {
+    let page = match open_or_die_with_timeout(&args[0], timeout_ms).await {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -735,7 +889,7 @@ type OpenHydrationResult = (
 ///   [`DEFAULT_LINK_CAP`], hard max [`HARD_LINK_CAP`]).
 async fn cmd_open(args: &[String]) -> ExitCode {
     if args.is_empty() {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--timeout DUR] <url>");
         return ExitCode::from(2);
     }
 
@@ -748,6 +902,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let mut link_cap: usize = DEFAULT_LINK_CAP;
     let mut inject_scripts: Vec<String> = Vec::new();
     let mut sign_flags = receipts::SignFlags::default();
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut i = 0;
     while i < args.len() {
         // `--receipt PATH` / `--key PATH` / `--mode M` / `--seed N` —
@@ -758,6 +913,19 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         // the open-specific match below.
         match receipts::try_consume_sign_flag(args, i, &mut sign_flags) {
             Ok(Some(n)) => {
+                i += n;
+                continue;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
+        // `--timeout DUR` — global flag, recognized on every
+        // network-touching verb. Default 30s (Playwright parity);
+        // `--timeout 0` opts out of the per-request cap and lets the
+        // engine run unbounded.
+        match try_consume_timeout_flag(args, i) {
+            Ok(Some((ms, n))) => {
+                timeout_ms = Some(ms);
                 i += n;
                 continue;
             }
@@ -813,7 +981,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
+                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] [--timeout DUR] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -831,7 +999,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     }
 
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] [--timeout DUR] <url>");
         return ExitCode::from(2);
     };
 
@@ -840,12 +1008,9 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let engine = match FetchEngine::new() {
+    let engine = match build_fetch_engine(timeout_ms) {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to build engine: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     let opts = ExploreOptions {
@@ -853,8 +1018,14 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         link_cap,
     };
 
-    let page = match engine.open_with_explore(&url_str, opts).await {
+    let fetch_started = std::time::Instant::now();
+    let page = match engine.open_with_explore_typed(&url_str, opts).await {
         Ok(p) => p,
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(&url_str, timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             // Hard fetch failures (DNS, connection refused, HTTP error
             // before any body returned) exit non-zero — no payload was
@@ -1413,9 +1584,19 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
     // any position; positionals are `<url> <js>` in order.
     let mut seed: u64 = 0;
     let mut js_fetch = false;
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut positional: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
+        match try_consume_timeout_flag(args, i) {
+            Ok(Some((ms, n))) => {
+                timeout_ms = Some(ms);
+                i += n;
+                continue;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
         match args[i].as_str() {
             "--seed" => {
                 let Some(v) = args.get(i + 1) else {
@@ -1441,7 +1622,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
             }
             other if other.starts_with("--") && other != "-" => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] <url> <js> | heso eval-dom [--seed N] [--js-fetch] <url> -  < script.js");
+                eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> <js> | heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> -  < script.js");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1451,7 +1632,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
     }
     if positional.len() < 2 {
-        eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] <url> <js> | heso eval-dom [--seed N] [--js-fetch] <url> -  < script.js");
+        eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> <js> | heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> -  < script.js");
         return ExitCode::from(2);
     }
     let url_arg = &positional[0];
@@ -1474,15 +1655,18 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let fetch_engine = match FetchEngine::new() {
+    let fetch_engine = match build_fetch_engine(timeout_ms) {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to build fetch engine: {e}");
+        Err(code) => return code,
+    };
+    let fetch_started = std::time::Instant::now();
+    let (final_url, html) = match fetch_engine.fetch_text_typed(&url).await {
+        Ok(pair) => pair,
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
             return ExitCode::FAILURE;
         }
-    };
-    let (final_url, html) = match fetch_engine.fetch_text(&url).await {
-        Ok(pair) => pair,
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -1640,6 +1824,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let mut inject_scripts: Vec<String> = Vec::new();
     let mut complete = false;
     let mut sign_flags = receipts::SignFlags::default();
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut i = 0;
     while i < args.len() {
         // Receipt-sign flag suite — shared with `cmd_open`. The helper
@@ -1647,6 +1832,16 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         // through to the read-specific match below.
         match receipts::try_consume_sign_flag(args, i, &mut sign_flags) {
             Ok(Some(n)) => {
+                i += n;
+                continue;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
+        // `--timeout DUR` — see `cmd_open` for the contract.
+        match try_consume_timeout_flag(args, i) {
+            Ok(Some((ms, n))) => {
+                timeout_ms = Some(ms);
                 i += n;
                 continue;
             }
@@ -1696,7 +1891,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
             }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] <url>");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--timeout DUR] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1713,7 +1908,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         }
     }
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] <url>");
+        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--timeout DUR] <url>");
         return ExitCode::from(2);
     };
 
@@ -1727,18 +1922,21 @@ async fn cmd_read(args: &[String]) -> ExitCode {
 
     let include = parse_include_filter(include_csv.as_deref());
 
-    let fetch_engine = match FetchEngine::new() {
+    let fetch_engine = match build_fetch_engine(timeout_ms) {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to build fetch engine: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     // Static path: gives us url/title/meta/tree/actions/inline_data
     // plus the raw HTML for the JS-side hydration pass below.
-    let page = match fetch_engine.open(&url).await {
+    let fetch_started = std::time::Instant::now();
+    let page = match fetch_engine.open_typed(url.as_str()).await {
         Ok(p) => p,
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -3595,6 +3793,35 @@ fn format_locator(
 ///
 /// Returns `Err(ExitCode::from(2))` on flag-shape errors (missing
 /// values, duplicate flags) and prints a usage line to stderr.
+/// Like [`parse_locator_flags`] but also strips the global
+/// `--timeout DUR` flag out of the argv. Returns the timeout in
+/// milliseconds (defaulting to [`DEFAULT_TIMEOUT_MS`] when absent)
+/// alongside the extracted locator + remaining positionals. The
+/// stand-alone [`parse_locator_flags`] helper stays in place for the
+/// JSON-RPC `serve` path, which doesn't carry a CLI-level timeout.
+pub(crate) fn parse_locator_flags_with_timeout(
+    args: &[String],
+    op_name: &str,
+) -> Result<(LocatorTarget, Vec<String>, Option<u64>), ExitCode> {
+    let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
+    let mut i = 0;
+    while i < args.len() {
+        match try_consume_timeout_flag(args, i)? {
+            Some((ms, n)) => {
+                timeout_ms = Some(ms);
+                i += n;
+            }
+            None => {
+                filtered.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let (target, extra) = parse_locator_flags(&filtered, op_name)?;
+    Ok((target, extra, timeout_ms))
+}
+
 pub(crate) fn parse_locator_flags(
     args: &[String],
     op_name: &str,
@@ -3673,8 +3900,12 @@ pub(crate) fn parse_locator_flags(
 /// `written_value` is the literal string the verb wrote (`Some(s)` for
 /// `fill`, `None` for `click` / `submit` which don't take a string).
 /// It is surfaced as the response's `value` field — the canonical
-/// "what was written" answer that previously collided with the
-/// engine's selector-matched boolean.
+/// "what was written" answer, distinct from the engine's selector-match
+/// boolean.
+///
+/// `timeout_ms` caps each underlying fetch (page open + html body
+/// fetch). On timeout the verb emits a structured timeout envelope and
+/// exits non-zero. `None` uses the engine's default ceiling.
 ///
 /// Response envelope (unified across writing verbs):
 ///
@@ -3700,6 +3931,7 @@ async fn run_dispatch<F>(
     target: &LocatorTarget,
     op_name: &str,
     written_value: Option<&str>,
+    timeout_ms: Option<u64>,
     op: F,
 ) -> ExitCode
 where
@@ -3716,20 +3948,23 @@ where
             return ExitCode::from(2);
         }
     };
-    let engine = match FetchEngine::new() {
+    let engine = match build_fetch_engine(timeout_ms) {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to build fetch engine: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
     // We need BOTH the parsed action graph (to resolve @ref or locator
     // → selector) AND the raw HTML (to hand to the JS engine). `open()`
     // gives us actions + body_html in one call so the locator path
     // doesn't pay a second HTTP round-trip.
-    let page = match engine.open(&url).await {
+    let fetch_started = std::time::Instant::now();
+    let page = match engine.open_typed(url.as_str()).await {
         Ok(p) => p,
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -3756,8 +3991,14 @@ where
         }
     };
 
-    let (final_url, html) = match engine.fetch_text(&url).await {
+    let html_started = std::time::Instant::now();
+    let (final_url, html) = match engine.fetch_text_typed(&url).await {
         Ok(pair) => pair,
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = html_started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch (html) failed: {e}");
             return ExitCode::FAILURE;
@@ -4130,16 +4371,16 @@ async fn augment_click_with_destination(
 /// matches (with the candidate refs printed to stderr), or invalid
 /// CSS selector.
 async fn cmd_click(args: &[String]) -> ExitCode {
-    let (target, extra) = match parse_locator_flags(args, "click") {
+    let (target, extra, timeout_ms) = match parse_locator_flags_with_timeout(args, "click") {
         Ok(p) => p,
         Err(code) => return code,
     };
     if extra.is_empty() {
-        eprintln!("usage: heso click <url> (<@ref> | --text S | --selector CSS | --aria-label S)");
+        eprintln!("usage: heso click <url> (<@ref> | --text S | --selector CSS | --aria-label S) [--timeout DUR]");
         return ExitCode::from(2);
     }
     let url_arg = &extra[0];
-    run_dispatch(url_arg, &target, "click", None, |eng, html, sel| {
+    run_dispatch(url_arg, &target, "click", None, timeout_ms, |eng, html, sel| {
         eng.dispatch_click(html, sel)
     })
     .await
@@ -4157,13 +4398,13 @@ async fn cmd_click(args: &[String]) -> ExitCode {
 /// still reflects what the agent asked to write — the request shape
 /// is preserved so the caller can retry with a different locator.
 async fn cmd_fill(args: &[String]) -> ExitCode {
-    let (target, extra) = match parse_locator_flags(args, "fill") {
+    let (target, extra, timeout_ms) = match parse_locator_flags_with_timeout(args, "fill") {
         Ok(p) => p,
         Err(code) => return code,
     };
     if extra.len() < 2 {
         eprintln!(
-            "usage: heso fill <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value>"
+            "usage: heso fill <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value> [--timeout DUR]"
         );
         return ExitCode::from(2);
     }
@@ -4175,6 +4416,7 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
         &target,
         "fill",
         Some(&value),
+        timeout_ms,
         move |eng, html, sel| eng.set_input_value(html, sel, &value_for_op),
     )
     .await
@@ -4251,8 +4493,18 @@ async fn cmd_submit(args: &[String]) -> ExitCode {
         aria_label: None,
     };
     let mut positional: Vec<String> = Vec::with_capacity(args.len());
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut i = 0;
     while i < args.len() {
+        match try_consume_timeout_flag(args, i) {
+            Ok(Some((ms, n))) => {
+                timeout_ms = Some(ms);
+                i += n;
+                continue;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
         match args[i].as_str() {
             "--field" => {
                 let Some(v) = args.get(i + 1) else {
@@ -4321,7 +4573,7 @@ async fn cmd_submit(args: &[String]) -> ExitCode {
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
                 eprintln!(
-                    "usage: heso submit <url> (<@form-ref> | --text S | --selector CSS | --aria-label S) [--field NAME=VALUE]... [--data JSON]"
+                    "usage: heso submit <url> (<@form-ref> | --text S | --selector CSS | --aria-label S) [--field NAME=VALUE]... [--data JSON] [--timeout DUR]"
                 );
                 return ExitCode::from(2);
             }
@@ -4392,7 +4644,7 @@ async fn cmd_submit(args: &[String]) -> ExitCode {
 
     let merged = merge_submit_fields(&data_fields, &fields_cli);
 
-    cmd_submit_inner(&positional[0], &target, &merged).await
+    cmd_submit_inner(&positional[0], &target, &merged, timeout_ms).await
 }
 
 /// Merge `--data` JSON fields with `--field NAME=VALUE` CLI flags so
@@ -4433,6 +4685,7 @@ async fn cmd_submit_inner(
     url_arg: &str,
     target: &LocatorTarget,
     fields: &[(String, String)],
+    timeout_ms: Option<u64>,
 ) -> ExitCode {
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
@@ -4441,16 +4694,19 @@ async fn cmd_submit_inner(
             return ExitCode::from(2);
         }
     };
-    let engine = match FetchEngine::new() {
+    let engine = match build_fetch_engine(timeout_ms) {
         Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to build fetch engine: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(code) => return code,
     };
 
-    let page = match engine.open(&url).await {
+    let fetch_started = std::time::Instant::now();
+    let page = match engine.open_typed(url.as_str()).await {
         Ok(p) => p,
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -4477,8 +4733,14 @@ async fn cmd_submit_inner(
         }
     };
 
-    let (final_url, html) = match engine.fetch_text(&url).await {
+    let html_started = std::time::Instant::now();
+    let (final_url, html) = match engine.fetch_text_typed(&url).await {
         Ok(pair) => pair,
+        Err(e) if e.is_timeout() => {
+            let elapsed_ms = html_started.elapsed().as_millis() as u64;
+            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch (html) failed: {e}");
             return ExitCode::FAILURE;
@@ -4716,7 +4978,7 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
         return template::cmd_stamp_from_template_args(args).await;
     }
 
-    let (seed, path) = match parse_seed_and_path(args, "stamp") {
+    let (seed, timeout_ms, path) = match parse_seed_timeout_and_path(args, "stamp") {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -4738,7 +5000,7 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let body = match stamp_to_plat(&plan, seed).await {
+    let body = match stamp_to_plat(&plan, seed, timeout_ms).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{e}");
@@ -4766,16 +5028,28 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
 async fn stamp_to_plat(
     plan: &PlanInput,
     seed: Option<u64>,
+    timeout_ms: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     // Fresh shared cassette: the static `FetchEngine` and the JS-side
     // `fetch` / XHR shims (via `open_js_session_with_cassette`) both
     // append into this one log during the run. After the plan finishes
     // we move the inner `Cassette` out and embed it in the plat body
     // so `heso run <plat>` can play it back byte-identical.
+    //
+    // `timeout_ms` is the per-network-request cap applied to every
+    // `Open` step (and every JS-side fetch routed through the same
+    // client). It is a per-step budget; total plan wall-time is not
+    // bounded — long plans with many short fetches stay legal.
     let cassette: std::sync::Arc<std::sync::Mutex<heso_engine_fetch::Cassette>> =
         std::sync::Arc::new(std::sync::Mutex::new(heso_engine_fetch::Cassette::new()));
-    let fetch = FetchEngine::with_recording_cassette(cassette.clone())
-        .map_err(|e| format!("engine init failed: {e}"))?;
+    let fetch = match timeout_ms {
+        Some(ms) if ms > 0 => FetchEngine::with_recording_cassette_and_timeout(
+            cassette.clone(),
+            std::time::Duration::from_millis(ms),
+        ),
+        _ => FetchEngine::with_recording_cassette(cassette.clone()),
+    }
+    .map_err(|e| format!("engine init failed: {e}"))?;
     let outcome = run_plan(&fetch, &plan.actions, seed, plan.start_url.clone()).await;
 
     // Build a FetchPage from the post-execution DOM (live JS state).
@@ -4853,11 +5127,21 @@ async fn stamp_to_plat(
 async fn cmd_refresh(args: &[String]) -> ExitCode {
     let mut seed: Option<u64> = None;
     let mut path: Option<String> = None;
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut i = 0;
     while i < args.len() {
+        match try_consume_timeout_flag(args, i) {
+            Ok(Some((ms, n))) => {
+                timeout_ms = Some(ms);
+                i += n;
+                continue;
+            }
+            Ok(None) => {}
+            Err(code) => return code,
+        }
         match args[i].as_str() {
             "--help" | "-h" => {
-                println!("usage: heso refresh [--seed N] <plat.plat|->");
+                println!("usage: heso refresh [--seed N] [--timeout DUR] <plat.plat|->");
                 return ExitCode::SUCCESS;
             }
             "--seed" => {
@@ -4889,7 +5173,7 @@ async fn cmd_refresh(args: &[String]) -> ExitCode {
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: heso refresh [--seed N] <plat.plat|->");
+        eprintln!("usage: heso refresh [--seed N] [--timeout DUR] <plat.plat|->");
         return ExitCode::from(2);
     };
 
@@ -4919,7 +5203,7 @@ async fn cmd_refresh(args: &[String]) -> ExitCode {
         Ok(p) => p,
         Err(e) => return emit_refresh_error("no_plan", e),
     };
-    let live_body = match stamp_to_plat(&plan, seed).await {
+    let live_body = match stamp_to_plat(&plan, seed, timeout_ms).await {
         Ok(b) => b,
         Err(e) => return emit_refresh_error("stamp_failed", e),
     };
@@ -5037,10 +5321,30 @@ pub(crate) async fn read_plat_input_or_hash(input: &str, verb: &str) -> Result<(
 /// Shared `--seed N <path>` flag walker used by `stamp` and the
 /// extended `replay` variants. Mirrors `cmd_replay`'s style.
 fn parse_seed_and_path(args: &[String], verb: &str) -> Result<(Option<u64>, String), ExitCode> {
+    let (seed, _timeout_ms, path) = parse_seed_timeout_and_path(args, verb)?;
+    Ok((seed, path))
+}
+
+/// Like [`parse_seed_and_path`] but also strips the global
+/// `--timeout DUR` flag. Returns the parsed seed, the resolved
+/// timeout (defaulting to [`DEFAULT_TIMEOUT_MS`] when absent), and
+/// the positional path. Used by network-touching plan verbs (`stamp`,
+/// `refresh`) that need to thread the timeout through to their
+/// `FetchEngine`.
+fn parse_seed_timeout_and_path(
+    args: &[String],
+    verb: &str,
+) -> Result<(Option<u64>, Option<u64>, String), ExitCode> {
     let mut seed: Option<u64> = None;
+    let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut path: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
+        if let Some((ms, n)) = try_consume_timeout_flag(args, i)? {
+            timeout_ms = Some(ms);
+            i += n;
+            continue;
+        }
         match args[i].as_str() {
             "--seed" => {
                 let Some(v) = args.get(i + 1) else {
@@ -5067,10 +5371,10 @@ fn parse_seed_and_path(args: &[String], verb: &str) -> Result<(Option<u64>, Stri
         }
     }
     let Some(path) = path else {
-        eprintln!("usage: heso {verb} [--seed N] <file.json|plat-hash|->");
+        eprintln!("usage: heso {verb} [--seed N] [--timeout DUR] <file.json|plat-hash|->");
         return Err(ExitCode::from(2));
     };
-    Ok((seed, path))
+    Ok((seed, timeout_ms, path))
 }
 
 // ============================================================================

@@ -233,10 +233,18 @@ function _valueArgs(flag, value) {
   return [flag, String(value)];
 }
 
+// Option keys that are consumed by the spawn layer, not forwarded as
+// CLI flags. `binary` overrides the binary-path resolution and
+// `timeout` is split: the numeric ms value becomes a `--timeout <ms>`
+// CLI flag AND a process-kill backstop (with slack) in `_spawn`.
+const _SPAWN_LEVEL_KEYS = new Set(["binary"]);
+
 function _optsToArgv(opts) {
   if (!opts) return [];
   const argv = [];
   for (const [key, value] of Object.entries(opts)) {
+    if (_SPAWN_LEVEL_KEYS.has(key)) continue;
+
     const flag = _flagName(key);
 
     // `field` is the one flag that legitimately repeats.
@@ -259,6 +267,36 @@ function _optsToArgv(opts) {
     argv.push(..._valueArgs(flag, value));
   }
   return argv;
+}
+
+/// Extract the spawn-level options (`binary`, `timeout`) from the
+/// user-supplied options bag. Returns `{spawnOpts, cliOpts}`.
+///
+/// `timeout` straddles both layers by design: the CLI honors
+/// `--timeout <DUR>` (default 30s) and returns a structured error
+/// envelope on the in-band timeout path, while the process-kill
+/// backstop covers the rare case where the CLI itself hangs. The
+/// backstop is pinned to `timeout + 5_000ms` so the CLI's structured
+/// path always wins under normal operation. A `timeout: 0` user
+/// disables both layers — pass through `--timeout 0` and skip the
+/// process kill.
+function _splitSpawnOpts(options) {
+  if (!options) return { spawnOpts: {}, cliOpts: undefined };
+  const cliOpts = { ...options };
+  delete cliOpts.binary;
+  const spawnOpts = {};
+  if (options.binary !== undefined && options.binary !== null) {
+    spawnOpts.binary = options.binary;
+  }
+  if (options.timeout !== undefined && options.timeout !== null) {
+    const ms = Number(options.timeout);
+    if (Number.isFinite(ms) && ms > 0) {
+      // 5s slack so the CLI's in-band timeout fires first and the
+      // process-kill is only ever the safety net for a hung binary.
+      spawnOpts.timeout = ms + 5_000;
+    }
+  }
+  return { spawnOpts, cliOpts };
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +406,8 @@ async function run(args, opts = {}) {
  * summary `{ url, title, description, metadata, tree, actions, plat_hash, ... }`.
  */
 function open(url, options) {
-  return _spawnJson(["open", url, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["open", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /**
@@ -376,12 +415,14 @@ function open(url, options) {
  * `{ title, text, tree, actions, forms, cookies, console, framework, content_hash, ... }`.
  */
 function read(url, options) {
-  return _spawnJson(["read", url, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["read", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /** `heso wait <url>` — block until a page condition is satisfied. */
 function wait(url, options) {
-  return _spawnJson(["wait", url, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["wait", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /**
@@ -421,9 +462,11 @@ function search(query, options) {
 function click(url, refOrOptions, maybeOptions) {
   // Overload: click(url, "@e7") or click(url, { text: "Sign in" }).
   if (typeof refOrOptions === "string") {
-    return _spawnJson(["click", url, refOrOptions, ..._optsToArgv(maybeOptions || {})]);
+    const { spawnOpts, cliOpts } = _splitSpawnOpts(maybeOptions || {});
+    return _spawnJson(["click", url, refOrOptions, ..._optsToArgv(cliOpts)], spawnOpts);
   }
-  return _spawnJson(["click", url, ..._optsToArgv(refOrOptions || {})]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(refOrOptions || {});
+  return _spawnJson(["click", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /**
@@ -441,16 +484,15 @@ function click(url, refOrOptions, maybeOptions) {
 function fill(url, refOrValue, valueOrOptions, maybeOptions) {
   if (typeof valueOrOptions === "string") {
     // fill(url, "@e3", "hello"[, opts])
-    return _spawnJson([
-      "fill",
-      url,
-      refOrValue,
-      valueOrOptions,
-      ..._optsToArgv(maybeOptions || {}),
-    ]);
+    const { spawnOpts, cliOpts } = _splitSpawnOpts(maybeOptions || {});
+    return _spawnJson(
+      ["fill", url, refOrValue, valueOrOptions, ..._optsToArgv(cliOpts)],
+      spawnOpts,
+    );
   }
   // fill(url, "hello", { text: "Email" })
-  return _spawnJson(["fill", url, ..._optsToArgv(valueOrOptions || {}), refOrValue]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(valueOrOptions || {});
+  return _spawnJson(["fill", url, ..._optsToArgv(cliOpts), refOrValue], spawnOpts);
 }
 
 /**
@@ -465,19 +507,23 @@ function fill(url, refOrValue, valueOrOptions, maybeOptions) {
  */
 function submit(url, refOrOptions, maybeOptions) {
   if (typeof refOrOptions === "string") {
-    return _spawnJson(["submit", url, refOrOptions, ..._optsToArgv(maybeOptions || {})]);
+    const { spawnOpts, cliOpts } = _splitSpawnOpts(maybeOptions || {});
+    return _spawnJson(["submit", url, refOrOptions, ..._optsToArgv(cliOpts)], spawnOpts);
   }
-  return _spawnJson(["submit", url, ..._optsToArgv(refOrOptions || {})]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(refOrOptions || {});
+  return _spawnJson(["submit", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /** `heso eval-js <js>` — evaluate JS in a sandboxed QuickJS context (no DOM). */
 function evalJs(js, options) {
-  return _spawnJson(["eval-js", ..._optsToArgv(options), js]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["eval-js", ..._optsToArgv(cliOpts), js], spawnOpts);
 }
 
 /** `heso eval-dom <url> <js>` — fetch, run page scripts, then eval against the DOM. */
 function evalDom(url, js, options) {
-  return _spawnJson(["eval-dom", ..._optsToArgv(options), url, js]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["eval-dom", ..._optsToArgv(cliOpts), url, js], spawnOpts);
 }
 
 /**
@@ -485,8 +531,9 @@ function evalDom(url, js, options) {
  * one array of objects, completion-ordered.
  */
 async function batch(subverb, urls, options) {
-  const args = ["batch", subverb, ..._optsToArgv(options), ...urls];
-  const raw = await run(args, { parseJson: false });
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  const args = ["batch", subverb, ..._optsToArgv(cliOpts), ...urls];
+  const raw = await run(args, { parseJson: false, ...spawnOpts });
   const out = [];
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
@@ -502,19 +549,24 @@ async function batch(subverb, urls, options) {
 
 // Optional convenience verbs.
 function meta(url, options) {
-  return _spawnJson(["meta", url, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["meta", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 function ls(url, treePath = "/", options) {
-  return _spawnJson(["ls", url, treePath, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["ls", url, treePath, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 function cat(url, target, options) {
-  return _spawnJson(["cat", url, target, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["cat", url, target, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 function find(url, options) {
-  return _spawnJson(["find", url, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["find", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 function tree(url, options) {
-  return _spawnJson(["tree", url, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["tree", url, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 // Plan lifecycle: stamp / replay. `stamp` mints a plat from a plan;
@@ -522,25 +574,32 @@ function tree(url, options) {
 // (no plat output). Pass `plan: true` to `replay` to extract the plan
 // field for editing instead.
 function stamp(filePath, options) {
-  return _spawnJson(["stamp", String(filePath), ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["stamp", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
 }
 function replay(filePath, options) {
-  return _spawnJson(["replay", String(filePath), ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["replay", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 // `heso run <plat>` — cassette-backed re-execution. Named `runPlat`
 // here so it doesn't collide with the low-level `run(args, opts)`
 // escape hatch exported below.
 function runPlat(filePath, options) {
-  return _spawnJson(["run", String(filePath), ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["run", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 // `heso refresh <plat>` — drift detection. The CLI exits 1 to signal
 // drift but the stdout is still a well-formed result body, so surface
 // that as a resolved value instead of an error.
 async function refresh(filePath, options) {
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
   try {
-    return await _spawnJson(["refresh", String(filePath), ..._optsToArgv(options)]);
+    return await _spawnJson(
+      ["refresh", String(filePath), ..._optsToArgv(cliOpts)],
+      spawnOpts,
+    );
   } catch (e) {
     if (e instanceof HesoError && e.code === 1) {
       return JSON.parse(e.stdout);
@@ -555,7 +614,8 @@ async function refresh(filePath, options) {
 
 /** `heso verify <file>` — verify integrity and/or signature of a plat, receipt, or sealed envelope. */
 function verify(filePath, options) {
-  return _spawnJson(["verify", String(filePath), ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["verify", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /**
@@ -566,17 +626,20 @@ function info(filePathOrPaths, options) {
   const paths = Array.isArray(filePathOrPaths)
     ? filePathOrPaths.map(String)
     : [String(filePathOrPaths)];
-  return _spawnJson(["info", ...paths, ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["info", ...paths, ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /** `heso seal <file> [--key PATH]` — Ed25519 envelope. */
 function seal(filePath, options) {
-  return _spawnJson(["seal", String(filePath), ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["seal", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /** `heso unseal <file> [--extract]` — verify a sealed envelope. */
 function unseal(filePath, options) {
-  return _spawnJson(["unseal", String(filePath), ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["unseal", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 // ---------------------------------------------------------------------------

@@ -34,6 +34,7 @@ A 50-second real recording — an LLM agent (Gemini) drives heso to find and com
 - [Plug into agent harnesses](#plug-into-agent-harnesses)
 - [Verbs are open](#verbs-are-open)
 - [Use as an agent skill](#use-as-an-agent-skill)
+- [Global flags](#global-flags)
 - [Stats](#stats)
 - [Building from source](#building-from-source)
 - [Status](#status)
@@ -427,9 +428,29 @@ description: Use heso when an agent needs to touch the web — fetch pages, run 
 - `heso serve` — multi-step JSON-RPC session
 - `--best-effort` on open/read/wait — exit 0 on partial failures, surface what broke
 - `--inject-script "<js>" | @file` — inject a polyfill before page scripts run
+- `--timeout <DUR>` on every network verb — per-request wall-clock cap (default `30s`)
 ```
 
 The verbs are the contract. Same shape works in any harness that does tool or skill markdown.
+
+### Global flags
+
+Every network-touching verb accepts `--timeout <DUR>` — `open`, `read`, `click`, `fill`, `submit`, `eval-dom`, `batch`, `stamp`, `refresh`, `meta`, `find`, `tree`, `ls`, `cat`. Default: **30 seconds**.
+
+```
+heso open --timeout 3s https://example.com
+heso read --timeout 500ms https://news.ycombinator.com
+heso batch open --timeout 5s url1 url2 url3      # alias of --timeout-per-url
+heso stamp --timeout 10s plan.json
+```
+
+Duration syntax matches `heso wait`: bare numbers are milliseconds, suffixes are `ms` / `s` / `m`. `--timeout 0` opts out of the cap entirely. On a timeout the verb emits a structured envelope on stdout and exits 1:
+
+```json
+{"ok": false, "error": {"code": "timeout", "timeout_ms": 30000, "elapsed_ms": 30000, "url": "https://..."}}
+```
+
+The budget is per network request — it applies to the full request (TLS handshake, redirect chain, response-body stream) and does not reset across redirects. `--timeout` bounds HTTP only; JavaScript execution inside `eval-dom` / `read` / `stamp` is not interruptible from the timeout (it has its own cooperative cancel paths). The `npm/@ixla/heso` and `python/heso` wrappers also install a `timeout + 5s` process-kill backstop so a hung binary still eventually unblocks the caller.
 
 ## Stats
 

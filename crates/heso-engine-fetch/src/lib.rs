@@ -101,6 +101,7 @@ pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use heso_core::{Result as HesoResult, Url};
 use heso_engine_api::{EngineApi, Page};
@@ -140,6 +141,19 @@ pub enum Error {
 impl From<Error> for heso_core::Error {
     fn from(e: Error) -> Self {
         heso_core::Error::Io(std::io::Error::other(e.to_string()))
+    }
+}
+
+impl Error {
+    /// True when this error came from `reqwest` and represents a
+    /// client-side timeout (the `Client::timeout` budget elapsed). The
+    /// CLI uses this to surface a structured `{code: "timeout", ...}`
+    /// envelope rather than a generic `fetch failed: ...` line.
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            Error::Http(e) => e.is_timeout(),
+            _ => false,
+        }
     }
 }
 
@@ -206,8 +220,26 @@ impl FetchEngine {
     /// `heso/<version>`, and a fresh empty cookie jar wired into the
     /// `reqwest::Client` via `cookie_provider`. Cookies persist for the
     /// lifetime of this `FetchEngine` (and any clone — `Arc` semantics).
+    ///
+    /// No per-request timeout. CLI verbs prefer [`Self::with_timeout`] so
+    /// each network operation has a wall-clock budget; this constructor
+    /// is retained for callers (tests, the explore module, JSON-RPC
+    /// `serve`) that want the historical unbounded behavior.
     pub fn new() -> HesoResult<Self> {
-        Self::build(CassetteMode::Live)
+        Self::build(CassetteMode::Live, None)
+    }
+
+    /// Construct a new engine with a per-request timeout. The timeout
+    /// is enforced by the underlying `reqwest::Client` and applies to
+    /// the full request — including TLS handshake, redirect chain, and
+    /// response-body streaming. Per the `reqwest` docs, the budget does
+    /// not reset across redirects.
+    ///
+    /// CLI verbs reach for this constructor with the user-supplied
+    /// `--timeout` value (default 30s); library callers that need
+    /// the previous unbounded behavior keep using [`Self::new`].
+    pub fn with_timeout(timeout: Duration) -> HesoResult<Self> {
+        Self::build(CassetteMode::Live, Some(timeout))
     }
 
     /// Construct a `FetchEngine` whose HTTP traffic is mirrored into
@@ -218,7 +250,17 @@ impl FetchEngine {
     /// Used by `heso stamp` to produce a plat whose cassette field
     /// can later be replayed byte-identically by `heso replay`.
     pub fn with_recording_cassette(cassette: Arc<std::sync::Mutex<Cassette>>) -> HesoResult<Self> {
-        Self::build(CassetteMode::Recording(cassette))
+        Self::build(CassetteMode::Recording(cassette), None)
+    }
+
+    /// Construct a recording-mode engine with a per-request timeout.
+    /// See [`Self::with_timeout`] for the timeout semantics and
+    /// [`Self::with_recording_cassette`] for the cassette mode.
+    pub fn with_recording_cassette_and_timeout(
+        cassette: Arc<std::sync::Mutex<Cassette>>,
+        timeout: Duration,
+    ) -> HesoResult<Self> {
+        Self::build(CassetteMode::Recording(cassette), Some(timeout))
     }
 
     /// Construct a `FetchEngine` that serves every HTTP request from
@@ -232,7 +274,7 @@ impl FetchEngine {
     /// inside it and the JS engine still expects one). It's just not
     /// reached for HTTP under Replaying mode.
     pub fn with_replaying_cassette(cassette: Arc<Cassette>) -> HesoResult<Self> {
-        Self::build(CassetteMode::Replaying(cassette))
+        Self::build(CassetteMode::Replaying(cassette), None)
     }
 
     /// Internal: the constructor body shared by [`Self::new`],
@@ -240,9 +282,16 @@ impl FetchEngine {
     /// [`Self::with_replaying_cassette`]. Centralizes the client +
     /// cookie-jar build so the three entry points stay byte-identical
     /// on the live-HTTP side.
-    fn build(cassette_mode: CassetteMode) -> HesoResult<Self> {
+    ///
+    /// `request_timeout` of `Some(d)` is plumbed through to
+    /// `ClientBuilder::timeout`, which `reqwest` applies as a total
+    /// wall-clock cap on every request issued through the client
+    /// (spans the TLS handshake, the redirect chain, and the
+    /// response-body stream). `None` leaves the client unbounded —
+    /// the historical default for callers that haven't migrated.
+    fn build(cassette_mode: CassetteMode, request_timeout: Option<Duration>) -> HesoResult<Self> {
         let cookie_jar = Arc::new(CookieStoreMutex::default());
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .user_agent(concat!("heso/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::limited(20))
             // Hand the shared jar to reqwest. Per `reqwest` docs:
@@ -253,9 +302,11 @@ impl FetchEngine {
             // shared with [`Self::cookie_jar`] so any other caller
             // (e.g. `heso-engine-js`'s `document.cookie` bridge) sees
             // the exact same store.
-            .cookie_provider(cookie_jar.clone())
-            .build()
-            .map_err(Error::from)?;
+            .cookie_provider(cookie_jar.clone());
+        if let Some(d) = request_timeout {
+            builder = builder.timeout(d);
+        }
+        let client = builder.build().map_err(Error::from)?;
         Ok(Self {
             client,
             cookie_jar,
@@ -365,6 +416,144 @@ impl FetchEngine {
         let raw = self.do_http_get(url).await?;
         let html_text = String::from_utf8_lossy(&raw.body_bytes).into_owned();
         Ok((raw.final_url, html_text))
+    }
+
+    /// Typed-error variant of [`Self::fetch_text`]. Returns the local
+    /// [`Error`] enum so callers can call [`Error::is_timeout`] and
+    /// surface the structured `{code: "timeout", ...}` envelope. The
+    /// `HesoResult`-returning variant flattens errors through
+    /// `heso_core::Error::Io`, which loses the timeout discrimination
+    /// the CLI's failure envelope needs.
+    pub async fn fetch_text_typed(&self, url: &Url) -> Result<(Url, String), Error> {
+        let raw = self.live_or_replay_typed(url).await?;
+        let html_text = String::from_utf8_lossy(&raw.body_bytes).into_owned();
+        Ok((raw.final_url, html_text))
+    }
+
+    /// Typed-error variant of [`EngineApi::open`]. Same semantics as the
+    /// trait method; the difference is the return type — local [`Error`]
+    /// preserves the [`Error::is_timeout`] signal that
+    /// `heso_core::Error::Io` flattens away.
+    pub async fn open_typed(&self, input: &str) -> Result<FetchPage, Error> {
+        let parsed = Url::parse(input).map_err(Error::from)?;
+        let raw = self.live_or_replay_typed(&parsed).await?;
+        let html_text = String::from_utf8_lossy(&raw.body_bytes).into_owned();
+        Ok(FetchPage::from_html(
+            input.to_owned(),
+            raw.final_url,
+            raw.http_status,
+            raw.response_cookies,
+            html_text,
+        ))
+    }
+
+    /// Typed-error variant of [`Self::open_with_explore`]. Shape and
+    /// semantics match the public variant; the difference is the
+    /// return type — local [`Error`] preserves the
+    /// [`Error::is_timeout`] signal.
+    pub async fn open_with_explore_typed(
+        &self,
+        input: &str,
+        opts: ExploreOptions,
+    ) -> Result<FetchPage, Error> {
+        let mut page = self.open_typed(input).await?;
+        if opts.is_disabled() {
+            return Ok(page);
+        }
+        let visited = Arc::new(tokio::sync::Mutex::new({
+            let mut s = HashSet::new();
+            s.insert(canonical_self_key(&page.url));
+            s
+        }));
+        let linked = explore::explore(
+            self.clone(),
+            page.actions.clone(),
+            page.url.clone(),
+            opts,
+            visited,
+        )
+        .await;
+        page.linked_pages = linked;
+        Ok(page)
+    }
+
+    /// Internal: shared body for the typed-error fetchers. Mirrors
+    /// [`Self::do_http_get`] except the return type is the local
+    /// [`Error`] so [`Error::is_timeout`] survives the round-trip.
+    async fn live_or_replay_typed(&self, url: &Url) -> Result<HttpFetchResult, Error> {
+        match &self.cassette_mode {
+            CassetteMode::Live => self.live_get_typed(url).await,
+            CassetteMode::Recording(cassette) => {
+                let raw = self.live_get_typed(url).await?;
+                let headers: Vec<(String, String)> = raw.response_headers.to_vec();
+                cassette
+                    .lock()
+                    .expect("cassette mutex poisoned")
+                    .record(
+                        "GET",
+                        url.as_str(),
+                        raw.final_url.as_str(),
+                        &[],
+                        raw.http_status,
+                        headers,
+                        &raw.body_bytes,
+                    );
+                Ok(raw)
+            }
+            CassetteMode::Replaying(cassette) => {
+                let record = cassette.lookup("GET", url.as_str(), &[]).ok_or_else(|| {
+                    Error::CassetteMiss(cassette::CassetteMiss {
+                        method: "GET".to_owned(),
+                        url: url.as_str().to_owned(),
+                        recorded_count: cassette.len(),
+                    })
+                })?;
+                let body_bytes = Cassette::decode_response_body(record)
+                    .map_err(|e| Error::CassetteDecode(e.to_string()))?;
+                let final_url = Url::parse(&record.final_url).map_err(Error::from)?;
+                Ok(HttpFetchResult {
+                    final_url,
+                    http_status: record.status,
+                    response_cookies: Vec::new(),
+                    response_headers: record.response_headers.clone(),
+                    body_bytes,
+                })
+            }
+        }
+    }
+
+    /// Typed-error sibling of [`Self::live_get`]. Identical body; the
+    /// difference is `Result<_, Error>` instead of `HesoResult<_>` so
+    /// the underlying `reqwest::Error` survives the round-trip and
+    /// [`Error::is_timeout`] can read its `is_timeout()` flag.
+    async fn live_get_typed(&self, url: &Url) -> Result<HttpFetchResult, Error> {
+        let response = self
+            .client
+            .get(url.as_str())
+            .send()
+            .await
+            .map_err(Error::from)?;
+        let final_url_str = response.url().as_str().to_owned();
+        let final_url = Url::parse(&final_url_str).map_err(Error::from)?;
+        let http_status = response.status().as_u16();
+        let response_cookies = snapshot_response_cookies(&response);
+        let response_headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_owned(), s.to_owned()))
+            })
+            .collect();
+        let body_bytes = response.bytes().await.map_err(Error::from)?.to_vec();
+        Ok(HttpFetchResult {
+            final_url,
+            http_status,
+            response_cookies,
+            response_headers,
+            body_bytes,
+        })
     }
 
     /// Internal: the original static `open` path, factored out so
