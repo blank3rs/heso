@@ -1,9 +1,9 @@
 //! # intersection_observer
 //!
-//! A working [`IntersectionObserver`] implementation, replacing the
-//! noop that previously occupied this slot in `engine.rs`'s browser
-//! globals batch (where `MutationObserver` / `ResizeObserver` /
-//! `PerformanceObserver` still live as noop ctors).
+//! A working [`IntersectionObserver`] implementation. The sibling
+//! observer slots in `engine.rs`'s browser globals batch
+//! (`MutationObserver` / `ResizeObserver` / `PerformanceObserver`)
+//! ship as noop ctors.
 //!
 //! ## Why a real impl matters
 //!
@@ -87,8 +87,8 @@ use crate::engine::EvalError;
 
 /// Install `globalThis.IntersectionObserver` and
 /// `globalThis.IntersectionObserverEntry` as a real (microtask-firing)
-/// implementation. Replaces the noop ctor that previously occupied this
-/// slot in [`crate::engine::install_browser_apis`].
+/// implementation. Runs after [`crate::engine::install_browser_apis`]
+/// so the real ctor takes precedence over the sibling noop observers.
 ///
 /// Idempotent — the JS bootstrap returns early if both globals are
 /// already installed, matching the rest of the `install_*` family's

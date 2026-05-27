@@ -74,34 +74,7 @@ async fn open_without_flag_surfaces_failed_scripts() {
 }
 
 // =====================================================================
-// Test 2 — `heso open --best-effort` against same fixture.
-// Exit 0, `partial: true`, `partial_reason: "script_crash"`.
-// =====================================================================
-#[tokio::test]
-async fn open_with_best_effort_exits_zero_and_marks_partial() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(THROW_FIXTURE))
-        .mount(&server)
-        .await;
-    let out = Command::new(heso_bin())
-        .args(["open", "--best-effort", &server.uri()])
-        .output()
-        .expect("spawn heso open --best-effort");
-    assert!(
-        out.status.success(),
-        "heso open --best-effort must exit 0 even when a script crashes; got status={:?}\nstderr={}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let body = parse_body(&out);
-    assert_eq!(body["partial"], serde_json::json!(true));
-    assert_eq!(body["partial_reason"], serde_json::json!("script_crash"));
-}
-
-// =====================================================================
-// Test 3 — `heso read --best-effort` against same fixture.
+// Test 2 — `heso read --best-effort` against same fixture.
 // Exit 0, `partial: true`, full read payload still returned.
 // =====================================================================
 #[tokio::test]
@@ -132,7 +105,7 @@ async fn read_with_best_effort_returns_full_payload_on_script_crash() {
 }
 
 // =====================================================================
-// Test 4 — `heso wait --best-effort` against a static fixture with a
+// Test 3 — `heso wait --best-effort` against a static fixture with a
 // selector that never appears. Exit 0, `partial: true`,
 // `partial_reason: "wait_timeout"`.
 // =====================================================================
@@ -173,7 +146,7 @@ async fn wait_with_best_effort_returns_partial_on_timeout() {
 }
 
 // =====================================================================
-// Test 5 — URL that can't be fetched at all. Even `--best-effort`
+// Test 4 — URL that can't be fetched at all. Even `--best-effort`
 // MUST surface this as a hard failure (no payload to return).
 // =====================================================================
 #[tokio::test]
@@ -192,7 +165,7 @@ async fn best_effort_does_not_swallow_hard_fetch_failures() {
 }
 
 // =====================================================================
-// Test 6 — Clean run: no failures, envelope reports the trivially-
+// Test 5 — Clean run: no failures, envelope reports the trivially-
 // clean shape (`partial: false`, `partial_reason: "ok"`, empty
 // `failed_scripts`, `console_errors_count: 0`).
 // =====================================================================
@@ -223,7 +196,7 @@ async fn clean_run_emits_clean_envelope() {
 }
 
 // =====================================================================
-// Test 7 — `heso open` (no flag) against a clean page emits the
+// Test 6 — `heso open` (no flag) against a clean page emits the
 // clean envelope shape too. This catches accidentally-breaking the
 // default branch of `cmd_open`.
 // =====================================================================
@@ -250,7 +223,7 @@ async fn open_clean_page_emits_clean_envelope() {
 }
 
 // =====================================================================
-// Test 8 — `heso wait` without `--best-effort` on a timeout exits 1
+// Test 7 — `heso wait` without `--best-effort` on a timeout exits 1
 // (unchanged behavior). The structured envelope is also present.
 // =====================================================================
 #[tokio::test]

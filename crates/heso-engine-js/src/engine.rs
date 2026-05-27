@@ -6883,11 +6883,11 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
             } catch (e) {}
         }
     }
-    // Note: XHR.prototype accessors are installed by a separate
+    // XHR.prototype accessors are installed by a separate
     // XHR_PROTO_ACCESSOR_BOOTSTRAP pass AFTER install_xhr (which
-    // runs after install_browser_apis). The bootstrap-time
-    // attempt here would no-op (XMLHttpRequest is undefined at
-    // this point) and was previously recursive on read.
+    // runs after install_browser_apis). The bootstrap-time attempt
+    // here would no-op since `XMLHttpRequest` is undefined at this
+    // point in the install sequence.
 
     if (typeof globalThis.Request === 'function' && globalThis.Request.prototype) {
         // url / method / headers / body — accessors that delegate

@@ -340,10 +340,6 @@ impl JsSession {
     /// `reqwest::Client`, and replace this session's document with the
     /// response body.
     ///
-    /// Replaces the pre-PR-1 dispatch-only path that was filed as the
-    /// single biggest agent-write bug in `agent regression testing` (every
-    /// `heso submit` returned `ok=true` but issued no HTTP traffic).
-    ///
     /// Behavior summary:
     ///
     /// - **No matching form / no submitter** → returns

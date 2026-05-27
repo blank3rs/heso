@@ -421,8 +421,11 @@ fn rewrite_js_only_escapes(input: &str) -> String {
 /// source — the literal `` would otherwise be at risk of being
 /// re-processed at edit time. Same reason `IDENT_PATH` uses
 /// `[A-Za-z_$]` rather than a more compact `\w`-style class.
+#[allow(clippy::byte_char_slices)]
 const JSON_ESC_PREFIX: &[u8] = &[b'\\', b'u', b'0', b'0'];
+#[allow(clippy::byte_char_slices)]
 const JSON_ESC_VTAB: &[u8] = &[b'\\', b'u', b'0', b'0', b'0', b'b'];
+#[allow(clippy::byte_char_slices)]
 const JSON_ESC_NUL: &[u8] = &[b'\\', b'u', b'0', b'0', b'0', b'0'];
 
 #[inline]

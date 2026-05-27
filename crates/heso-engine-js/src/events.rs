@@ -217,12 +217,22 @@ impl DOMException {
 
     /// `e.toString()` — `"DOMException: <message>"` if message is non
     /// empty, else just `"DOMException"`. Matches the spec's
-    /// `Error.prototype.toString` shape.
+    /// `Error.prototype.toString` shape. Delegates to the [`Display`]
+    /// impl so Rust code and JS land print the same bytes.
+    ///
+    /// [`Display`]: std::fmt::Display
+    #[allow(clippy::inherent_to_string_shadow_display)]
     fn to_string(&self) -> String {
+        format!("{self}")
+    }
+}
+
+impl std::fmt::Display for DOMException {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.message.is_empty() {
-            "DOMException".to_owned()
+            write!(f, "DOMException")
         } else {
-            format!("DOMException: {}", self.message)
+            write!(f, "DOMException: {}", self.message)
         }
     }
 }

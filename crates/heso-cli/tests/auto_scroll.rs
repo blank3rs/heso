@@ -185,9 +185,9 @@ async fn complete_runs_loop_and_more_actions_emerge() {
     assert!(
         scroll["final_content_hash"]
             .as_str()
-            .map(|h| h.starts_with("blake3:"))
+            .map(|h| h.starts_with("snap:"))
             .unwrap_or(false),
-        "final_content_hash should be a blake3: prefixed string"
+        "final_content_hash should be a snap: prefixed string"
     );
     let complete_actions = complete_body["actions"]
         .as_array()

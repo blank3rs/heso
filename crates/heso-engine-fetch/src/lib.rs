@@ -393,11 +393,7 @@ impl FetchEngine {
             CassetteMode::Live => self.live_get(url).await,
             CassetteMode::Recording(cassette) => {
                 let raw = self.live_get(url).await?;
-                let headers: Vec<(String, String)> = raw
-                    .response_headers
-                    .iter()
-                    .cloned()
-                    .collect();
+                let headers: Vec<(String, String)> = raw.response_headers.to_vec();
                 // Lock briefly — no await held while locked.
                 cassette
                     .lock()
@@ -478,11 +474,11 @@ struct HttpFetchResult {
     final_url: Url,
     http_status: u16,
     response_cookies: Vec<ResponseCookie>,
-    /// Response headers as `(name, value)` pairs. Used by the
-    /// Recording branch to feed the cassette; not consumed by the
-    /// Live branch yet (today's callers only need `response_cookies`
-    /// for the `cookies` projection).
-    #[allow(dead_code)]
+    /// Response headers as `(name, value)` pairs. The Recording branch
+    /// feeds them into the cassette; the Replaying branch reads them
+    /// back. The Live branch carries them through unused — they're
+    /// captured in the same place to keep the struct shape uniform
+    /// across modes.
     response_headers: Vec<(String, String)>,
     body_bytes: Vec<u8>,
 }

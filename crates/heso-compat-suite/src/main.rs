@@ -929,7 +929,7 @@ fn truncate_value(v: serde_json::Value) -> serde_json::Value {
     match v {
         serde_json::Value::String(s) if s.len() > MAX => {
             let mut t = s.chars().take(MAX).collect::<String>();
-            t.push_str("…");
+            t.push('…');
             serde_json::Value::String(t)
         }
         other => other,

@@ -3,18 +3,11 @@
 //! Real HTTP form submission, per [WHATWG HTML §4.10.22 — "Form
 //! submission algorithm"][spec].
 //!
-//! The pre-PR-1 `JsSession::submit` / `JsEngine::submit_form` only
-//! dispatched a click on the form's submit button — a no-op for any
-//! page that didn't already wire a JS handler. `agent regression testing`
-//! filed this as the single biggest gap for write-shaped agent
-//! workloads: "every step returns ok=true but no HTTP POST is ever
-//! issued."
-//!
-//! This module closes the gap. It serializes the form's entry list per
-//! the requested enctype, builds a `reqwest::Request`, drives it
-//! through the engine's shared `reqwest::Client` (the same one
-//! [`crate::fetch::FetchMode::Live`] uses, so cookies / TLS /
-//! User-Agent / redirects stay coherent), and returns the post-redirect
+//! `JsSession::submit` / `JsEngine::submit_form` serialize the form's
+//! entry list per the requested enctype, build a `reqwest::Request`,
+//! drive it through the engine's shared `reqwest::Client` (the same
+//! one [`crate::fetch::FetchMode::Live`] uses, so cookies / TLS /
+//! User-Agent / redirects stay coherent), and return the post-redirect
 //! `(url, body)` so the caller can re-install the document.
 //!
 //! ## Scope and trade-offs
@@ -29,12 +22,10 @@
 //!   excluding `<button>`/`<input type="submit"|reset|image|button">`,
 //!   except the activator (the clicked submit button) is included when
 //!   present.
-//! - **File inputs in multipart**: NOT supported in PR-1. A file input
-//!   with no JS-side Blob source has nothing to send beyond the
-//!   filename; sending just the filename as a part is worse than
-//!   nothing (servers reject it). Filed as a deferred follow-up.
-//!   `FormData` is also still undefined — flagged in the
-//!   agent regression testing report.
+//! - **File inputs in multipart**: not supported. A file input with no
+//!   JS-side Blob source has nothing to send beyond the filename;
+//!   sending just the filename as a part is worse than nothing
+//!   (servers reject it). `FormData` is also unimplemented.
 //! - **`enctype` overrides on the submit button** (`formenctype`,
 //!   `formaction`, `formmethod`) are not honored yet — the form's
 //!   own attributes win. Most pages don't use these.
@@ -257,8 +248,8 @@ pub(crate) fn serialize_multipart(boundary: &str, entries: &[FormEntry]) -> Vec<
             out.extend_from_slice(b"\"\r\nContent-Type: ");
             out.extend_from_slice(content_type.as_bytes());
             out.extend_from_slice(b"\r\n\r\n");
-            // PR-1 limitation: file part body is empty until the JS-side
-            // Blob source lands (see module doc).
+            // File part body stays empty — the JS-side Blob source is
+            // unimplemented (see module doc).
             out.extend_from_slice(b"\r\n");
         } else {
             out.extend_from_slice(b"Content-Disposition: form-data; name=\"");
@@ -294,15 +285,15 @@ pub(crate) fn serialize_multipart(boundary: &str, entries: &[FormEntry]) -> Vec<
 ///      is checked. When the override is the empty string, the
 ///      input is unchecked. This makes `--field consent=on` /
 ///      `--field newsletter=` natural for boolean-shaped inputs.
-///   3. For `input[type=file]`: skipped (file upload is PR-X4 turf).
+///   3. For `input[type=file]`: skipped (file upload is unimplemented).
 ///      The `skipped` array records the name with a `"file"` reason
 ///      so the CLI can warn the user.
 ///   4. For `<select>`: sets `el.value = override`, then walks
 ///      `<option>` children and marks the one whose `value` (or
 ///      textContent fallback) matches as `selected`. Other options
 ///      are deselected. Multi-select isn't supported by the
-///      `--field` shape (you'd need repeated flag + array merging;
-///      out of scope for PR-X1).
+///      `--field` shape — it would need repeated flag + array
+///      merging.
 ///   5. For text-shaped inputs (`type=text|email|password|...`) and
 ///      `<textarea>`: sets `el.value = override` and dispatches
 ///      `input` then `change` (matching `JsSession::fill`).
@@ -349,8 +340,8 @@ pub(crate) fn build_apply_fields_js(selector: &str, fields: &[(String, String)])
             if (tag === 'input') {{
                 const type = (el.getAttribute('type') || 'text').toLowerCase();
                 if (type === 'file') {{
-                    // PR-X1 limitation: file inputs can't have their
-                    // value set from a string. Record + skip.
+                    // File inputs can't have their value set from a
+                    // string. Record + skip.
                     fileSkip = true;
                     continue;
                 }}
@@ -531,8 +522,8 @@ pub(crate) fn build_snapshot_js(selector: &str) -> String {
 
     const isDisabled = (el) => {{
         // The spec also disables controls inside a disabled
-        // <fieldset>, but <fieldset>-tracking is out of scope for
-        // PR-1. Direct `disabled` attribute is the common case.
+        // <fieldset>, but <fieldset>-tracking is unimplemented.
+        // Direct `disabled` attribute is the common case.
         if (el.hasAttribute('disabled')) return true;
         return false;
     }};

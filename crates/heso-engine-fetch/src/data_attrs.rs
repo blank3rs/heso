@@ -272,7 +272,7 @@ mod tests {
         "##;
         let data = extract(&parse(html));
         let entries = data.get("data-items").expect("data-items present");
-        assert_eq!(entries[0].value.is_array(), true);
+        assert!(entries[0].value.is_array());
         assert_eq!(entries[0].value[0]["id"], 1);
         assert_eq!(entries[0].value[1]["id"], 2);
     }

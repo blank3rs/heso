@@ -1,4 +1,4 @@
-//! Live integration tests for the PR-1 form-submit surface against
+//! Live integration tests for the form-submit surface against
 //! `httpbin.org`. Gated by `#[ignore]` because the workspace
 //! `cargo test` should not hit the public internet — run manually
 //! with `cargo test --test form_submit_live -- --ignored --nocapture`.
@@ -125,20 +125,18 @@ async fn submit_multipart_post_to_httpbin_echoes_form_field() {
 }
 
 // =====================================================================
-// PR-X1: one-shot --field path against httpbin — the canonical
-// "agent files a form" workflow that agent regression testing said was
-// the showstopper.
+// One-shot --field path against httpbin — the canonical "agent files
+// a form" workflow.
 // =====================================================================
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "hits public internet — run with --ignored"]
 async fn submit_with_fields_one_shot_against_httpbin_forms_post() {
-    // The exact agent shape agent regression testing task R2 / F2
-    // identified: fetch the form page, supply field values inline,
-    // submit, and observe the response body in one process. The
-    // httpbin pizza form has `custname` and `custemail` text inputs
-    // we override; the response JSON's `.form.custname` echoes back
-    // whatever the server received.
+    // Fetch the form page, supply field values inline, submit, and
+    // observe the response body in one process. The httpbin pizza form
+    // has `custname` and `custemail` text inputs we override; the
+    // response JSON's `.form.custname` echoes back whatever the server
+    // received.
     let html = r#"<!doctype html><html><body>
         <form id="f" method="post" action="https://httpbin.org/post">
             <input type="text" name="custname" value="">

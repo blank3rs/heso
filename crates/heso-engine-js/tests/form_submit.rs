@@ -1,7 +1,6 @@
-//! Integration tests for the PR-1 form-submit surface:
-//! `JsSession::submit` actually issues HTTP requests per WHATWG HTML
-//! §4.10.22 — the bug `agent regression testing` filed as the single biggest
-//! gap for write-shaped agent workloads.
+//! Integration tests for the form-submit surface: `JsSession::submit`
+//! issues real HTTP requests per WHATWG HTML §4.10.22 against
+//! wiremock-backed mock endpoints.
 //!
 //! These tests use `wiremock::MockServer` for localhost HTTP exchanges
 //! so the workspace `cargo test` stays hermetic. Each test:
@@ -707,11 +706,10 @@ async fn submit_unmatched_selector_reports_no_form() {
 }
 
 // =====================================================================
-// PR-X1: --field NAME=VALUE one-shot — `submit_with_fields` sets named
+// --field NAME=VALUE one-shot — `submit_with_fields` sets named
 // inputs before serializing, response body is in the outcome, parsed
 // JSON exposed when content-type is `application/json`, file inputs
-// are silently skipped. Mirrors the agent regression testing Task R2 / F2
-// failure modes.
+// are silently skipped.
 // =====================================================================
 
 /// Helper: build `(name, value)` overrides from `&[(name, value)]`
@@ -851,9 +849,9 @@ async fn submit_with_fields_skips_missing_names_silently() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_with_fields_file_input_is_skipped() {
-    // PR-X4 territory: file inputs can't have their value set via a
-    // string today. We record them in `fieldsSkipped` with reason
-    // `"file_input"` so an agent / CLI can warn the user.
+    // File inputs can't have their value set via a string; they are
+    // recorded in `fieldsSkipped` with reason `"file_input"` so an
+    // agent / CLI can warn the user.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/upload"))
@@ -890,8 +888,9 @@ async fn submit_with_fields_file_input_is_skipped() {
 
     let reqs = server.received_requests().await.unwrap();
     // The upload field is part of the multipart body but carries no
-    // bytes (PR-1's existing limit) — we just verify that the
-    // override didn't leak `/etc/passwd` into the upload value.
+    // bytes (file-input Blob source is unimplemented) — we just
+    // verify that the override didn't leak `/etc/passwd` into the
+    // upload value.
     let body = String::from_utf8_lossy(&reqs[0].body).into_owned();
     assert!(body.contains(r#"name="title""#), "{body}");
     assert!(body.contains("agent-x1"), "{body}");
