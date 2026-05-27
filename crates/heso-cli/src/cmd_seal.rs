@@ -122,7 +122,25 @@ pub(crate) fn seal_plat(body: serde_json::Value, key_path: Option<PathBuf>) -> E
             return ExitCode::FAILURE;
         }
     };
-    let sealed = heso_engine_fetch::plat_seal(&key, body);
+    let sealed = match heso_engine_fetch::plat_seal_checked(&key, body) {
+        Ok(s) => s,
+        Err(heso_engine_fetch::PlatSealError::HashMismatch {
+            embedded,
+            recomputed,
+        }) => {
+            eprintln!(
+                "seal: input plat_hash does not match its content; refusing to sign a body whose hash claim is already false"
+            );
+            eprintln!("  embedded:   {embedded}");
+            eprintln!("  recomputed: {recomputed}");
+            eprintln!("  run `heso verify` on the input to see details, or strip the stale `plat_hash` and try again");
+            return ExitCode::from(2);
+        }
+        Err(heso_engine_fetch::PlatSealError::MalformedHashField) => {
+            eprintln!("seal: input's `plat_hash` field is not a string");
+            return ExitCode::from(2);
+        }
+    };
     match serde_json::to_string(&sealed) {
         Ok(s) => {
             println!("{s}");

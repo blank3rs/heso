@@ -146,7 +146,6 @@ fn print_banner() {
     );
     println!();
     println!("Subcommands:");
-    println!("  heso fetch <url>              GET a URL via the native fetch engine, print {{url, text}} JSON");
     println!("  heso tree  <url>              Fetch + build the page tree, print the full HtmlTree as JSON");
     println!("  heso ls    <url> [path]       Fetch + list children at <path> (default `/`), JSON");
     println!("  heso cat   <url> <path|@ref>  Fetch + read intro text at <path>, or the element at <@ref>");
@@ -205,28 +204,18 @@ fn print_banner() {
     println!(
         "                                   Most public instances disable JSON output by default."
     );
-    println!("  heso plat-hash   <file>       BLAKE3 hash of a plat JSON file (content identity)");
-    println!("  heso plat-verify <file>       Verify a plat file's embedded plat_hash matches its content");
-    println!("  heso plat-info   <file>       Human summary of a plat: hash, plan/cassette/steps counts, sealed status, partial flag");
-    println!("  heso plat-diff   <a> <b>      Show what changed between two plats (plan, cassette URLs, fields)");
-    println!("  heso plat-redact <field> <file>");
-    println!("                                Strip a top-level field and emit a new plat with a recomputed plat_hash");
-    println!("  heso plat-seal   <file> [--key PATH]");
+    println!("  heso verify <file>            Polymorphic verifier: receipts, plats, sealed envelopes, action-hash");
+    println!("                                fingerprints. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
+    println!("  heso info   <file>            Polymorphic summary of any artifact (plat, receipt, sealed plat, ...)");
+    println!("  heso seal   <file> [--key PATH]");
     println!("                                Wrap a plat in an Ed25519 envelope (default key: heso-local-data/identity.key)");
-    println!("  heso plat-unseal <file> [--extract]");
+    println!("                                Refuses if the input's embedded plat_hash does not match its content.");
+    println!("  heso unseal <file> [--extract]");
     println!("                                Verify a sealed envelope. Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
-    println!("  heso publish <plat-file> -d \"description\" [-t \"tag1,tag2\"]");
-    println!("                                Upload a stamped plat to the public registry at heso.ca/ecosystem.");
-    println!("  heso pull    <plat-hash> [-o output-path]");
-    println!(
-        "                                Download a published plat by its 64-char BLAKE3 hash."
-    );
-    println!("  heso list    [-q query] [-t tag] [--sort trending|downloads|newest] [--limit N]");
-    println!("                                Browse the public plat registry.");
-    println!("  heso template-check <template.json|->");
-    println!("                                EXPERIMENTAL: validate a heso.template/v0 authoring template.");
-    println!("  heso template-stamp [--seed N] --param k=v... <template.json|->");
-    println!("                                EXPERIMENTAL: live-record a template into an ordinary HESO/1.0 plat.");
+    println!("                                With --extract, emit the inner plat body to stdout.");
+    println!("  heso registry <publish|pull|list|search> [args...]");
+    println!("                                Public plat registry. `publish <plat> -d \"…\"`, `pull <hash>`,");
+    println!("                                `list [-q …]`, `search <query>` (DDG + Wikipedia, optional SearXNG).");
     println!("  heso update [--dry-run]      Update every detected global heso install channel.");
     println!("  heso eval-js [--seed N] <js>  Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window; use eval-dom for pages.");
@@ -246,13 +235,6 @@ fn print_banner() {
     println!("                                `globalThis.X = null; fetch(URL).then(j => globalThis.X = j); globalThis.X` will NOT");
     println!("                                work — the final expression captures `null` before the .then fires. Use shape (a).");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
-    println!("  heso action-hash <url> [actions-json | -]");
-    println!("                                Keyless, deterministic fingerprint over (URL, actions). Two");
-    println!("                                strangers doing the same actions on the same site get the same");
-    println!("                                hash — no key, no server, no clock. Output is a tamper-evident");
-    println!("                                JSON with site_id / action_ids[] / trace_id (the headline hash).");
-    println!("  heso action-hash-verify <file>");
-    println!("                                Verify a saved fingerprint file (exit 0 valid, 1 invalid, 2 malformed)");
     println!("  heso stamp  [--seed N] <plan-or-plat>");
     println!("                                Execute a plan against the live web and mint a fresh plat that");
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
@@ -268,23 +250,14 @@ fn print_banner() {
     println!("                                drifted. Exit 0 no change / 1 drifted / 2 usage or input error.");
     println!("                                Emits structured JSON: {{ok, drifted, input_plat_hash, live_plat_hash,");
     println!("                                diff?}}. The plat MUST have a `plan` field.");
-    println!("  heso replay <plat.plat|plat-hash|->");
+    println!("  heso replay [--plan] <plat.plat|plat-hash|->");
     println!("                                Emit the recorded step log from a plat. Pure observation — no");
-    println!("                                engine, no network, no JS. Use `run` to re-execute.");
-    println!("  heso unpack <plat.plat|plat-hash|->");
-    println!("                                Extract the `plan` field from a plat (errors if none). Pipes into");
-    println!(
-        "                                an editor or back into `stamp` for the edit/re-mint loop."
-    );
+    println!("                                engine, no network, no JS. With --plan, emits the `plan` field");
+    println!("                                instead (pipe back into `stamp` for the edit/re-mint loop).");
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
     println!(
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
     );
-    println!("  heso receipt-verify <file>    Verify a signed receipt (exit 0 valid, 1 invalid, 2 missing/malformed)");
-    println!("    [--trusted-keys PATH]          JSON file of allowlisted base64 pubkeys (also reads HESO_TRUSTED_KEYS env).");
-    println!("                                   Receipts NOT signed by an allowlist key are rejected (exit 1).");
-    println!("                                   Empty allowlist (default) warns to stderr — no trust anchor configured.");
-    println!("                                   Receipts with `mode: live` are rejected (not replay-safe — ADR 0008).");
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See state.json + decisions/0012-fetch-only-native-engine.md (static engine) and");
@@ -4939,6 +4912,23 @@ async fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // If the input plat claims a top-level `plat_hash`, recompute it
+    // against the canonical bytes of the rest of the body and refuse
+    // to replay a body whose claim is already false. Bare plans and
+    // fingerprints have no `plat_hash` and skip the check.
+    if let Some(embedded_val) = value.get("plat_hash") {
+        if let Some(embedded) = embedded_val.as_str() {
+            let recomputed = heso_engine_fetch::plat_hash(&value);
+            if embedded != recomputed {
+                eprintln!(
+                    "plat_hash mismatch: input claims {embedded}, computed {recomputed}; run `heso verify` for details"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+
     let plan = match extract_plan(&value) {
         Ok(p) => p,
         Err(e) => {
@@ -5732,6 +5722,7 @@ async fn main() -> ExitCode {
         Some("seal") => cmd_seal::cmd_seal(&args[1..]).await,
         Some("unseal") => cmd_unseal::cmd_unseal(&args[1..]).await,
         Some("registry") => registry::cmd_registry(&args[1..]).await,
+        Some("search") => search::cmd_search(&args[1..]).await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             print_banner();

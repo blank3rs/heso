@@ -163,15 +163,21 @@ pub enum OpenOutcome {
 /// shipping form: anyone can verify it with [`open`] using nothing but
 /// the envelope.
 ///
-/// Side-effect: if `body` is a JSON object, its `plat_hash` field is
-/// overwritten with the freshly-computed BLAKE3 so the embedded hash
-/// and the signature always agree.
+/// If `body` is a JSON object that already carries a `plat_hash` field,
+/// that field is preserved verbatim — the embedded hash is treated as
+/// an input commitment, not as a slot to overwrite. Callers must hand
+/// in a body whose claimed `plat_hash` already matches its content
+/// (use [`hash`] or the [`SealError::HashMismatch`] check exposed by
+/// [`seal_checked`]).
+///
+/// Bodies that carry no `plat_hash` get one stamped on before signing
+/// so the resulting envelope is self-describing.
 pub fn seal(key: &IdentityKey, mut body: Value) -> SealedPlat {
-    if body.is_object() {
-        let h = hash(&body);
-        body.as_object_mut()
-            .expect("checked above")
-            .insert("plat_hash".to_owned(), Value::String(h));
+    if let Some(obj) = body.as_object_mut() {
+        if !obj.contains_key("plat_hash") {
+            let h = hash(&Value::Object(obj.clone()));
+            obj.insert("plat_hash".to_owned(), Value::String(h));
+        }
     }
     let mut payload = Vec::with_capacity(SIGNING_DOMAIN.len() + 256);
     payload.extend_from_slice(SIGNING_DOMAIN);
@@ -182,6 +188,46 @@ pub fn seal(key: &IdentityKey, mut body: Value) -> SealedPlat {
         content: body,
         signature,
     }
+}
+
+/// Errors from [`seal_checked`].
+#[derive(Debug, thiserror::Error)]
+pub enum SealError {
+    /// The body's embedded `plat_hash` does not match its content. The
+    /// caller is asking us to sign a body whose hash claim is already
+    /// false; refusing keeps the envelope honest.
+    #[error("plat_hash mismatch: embedded {embedded}, recomputed {recomputed}")]
+    HashMismatch {
+        /// The hash the body claimed to commit to.
+        embedded: String,
+        /// The hash the body actually canonicalizes to.
+        recomputed: String,
+    },
+    /// The body's `plat_hash` field is present but not a string.
+    #[error("plat JSON's `plat_hash` is not a string")]
+    MalformedHashField,
+}
+
+/// Like [`seal`] but refuses to sign a body whose claimed `plat_hash`
+/// doesn't match its content. Bodies without a `plat_hash` field are
+/// stamped just like [`seal`].
+pub fn seal_checked(key: &IdentityKey, body: Value) -> Result<SealedPlat, SealError> {
+    if let Some(obj) = body.as_object() {
+        if let Some(embedded_val) = obj.get("plat_hash") {
+            let embedded = embedded_val
+                .as_str()
+                .ok_or(SealError::MalformedHashField)?
+                .to_owned();
+            let recomputed = hash(&body);
+            if embedded != recomputed {
+                return Err(SealError::HashMismatch {
+                    embedded,
+                    recomputed,
+                });
+            }
+        }
+    }
+    Ok(seal(key, body))
 }
 
 /// Verify a [`SealedPlat`]. Checks, in order:
@@ -424,6 +470,40 @@ mod tests {
         let other = seal(&k2, sample());
         sealed.signature.signature = other.signature.signature.clone();
         assert!(matches!(open(&sealed), OpenOutcome::InvalidSignature(_)));
+    }
+
+    #[test]
+    fn seal_checked_refuses_stale_plat_hash() {
+        let key = IdentityKey::generate();
+        let mut body = sample();
+        body["plat_hash"] = json!("0000000000000000000000000000000000000000000000000000000000000000");
+        match seal_checked(&key, body) {
+            Err(SealError::HashMismatch { embedded, recomputed }) => {
+                assert_eq!(
+                    embedded,
+                    "0000000000000000000000000000000000000000000000000000000000000000"
+                );
+                assert_ne!(recomputed, embedded);
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seal_checked_accepts_honest_plat_hash() {
+        let key = IdentityKey::generate();
+        let mut body = sample();
+        let honest = hash(&body);
+        body["plat_hash"] = json!(honest);
+        let sealed = seal_checked(&key, body).expect("honest hash must seal");
+        assert!(matches!(open(&sealed), OpenOutcome::Valid));
+    }
+
+    #[test]
+    fn seal_checked_accepts_bare_body() {
+        let key = IdentityKey::generate();
+        let sealed = seal_checked(&key, sample()).expect("bare body must seal");
+        assert!(matches!(open(&sealed), OpenOutcome::Valid));
     }
 
     #[test]

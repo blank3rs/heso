@@ -83,8 +83,9 @@ pub use inline_data::extract as extract_inline_data;
 pub use metadata::{extract as extract_metadata, PageMetadata};
 pub use plat::{
     canonical_json as plat_canonical_json, hash as plat_hash, open as plat_open,
-    seal as plat_seal, verify as plat_verify, OpenOutcome as PlatOpenOutcome,
-    SealedPlat, VerifyError as PlatVerifyError,
+    seal as plat_seal, seal_checked as plat_seal_checked, verify as plat_verify,
+    OpenOutcome as PlatOpenOutcome, SealError as PlatSealError, SealedPlat,
+    VerifyError as PlatVerifyError,
 };
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
 // `ResponseCookie` is defined inline below alongside `FetchPage` and is
@@ -853,17 +854,47 @@ pub fn extract_actions_from_html(html: &str) -> Vec<ElementRef> {
 
 /// `true` if `html` looks like a Cloudflare / generic anti-bot
 /// interstitial page rather than the real content the agent asked for.
+///
+/// The detection is intentionally narrow. A false positive (real page
+/// flagged as a challenge) makes an agent give up on real content;
+/// that is strictly worse than a false negative (the agent retries the
+/// page with the supplied `text_len` heuristic and discovers there's
+/// no body). Two signals here, both load-bearing:
+///
+/// 1. Cloudflare's `__cf_chl_opt` / `cf_chl_jschl_tk__` JS shim names.
+///    These are uniquely Cloudflare; no real-world content page emits
+///    them by accident.
+/// 2. A `<title>` whose first 64 bytes (case-insensitive) start with
+///    one of a small set of phrases every major WAF vendor ships:
+///    Cloudflare ("just a moment"), Akamai ("access denied"),
+///    PerimeterX / HUMAN ("please verify you are a human"),
+///    AWS WAF / Imperva ("attention required"), DataDome / generic
+///    bot pages ("verify you are human"). These phrases are
+///    near-zero collision against legitimate `<title>` content.
 pub fn is_bot_challenge(html: &str) -> bool {
     if html.contains("__cf_chl_opt") || html.contains("cf_chl_jschl_tk__") {
         return true;
     }
     if let Some(idx) = html.find("<title>") {
         let after = &html[idx + "<title>".len()..];
-        let probe_end = after.len().min(64);
+        let probe_end = after.len().min(96);
         let probe = &after[..probe_end];
         let lowered: String = probe.chars().map(|c| c.to_ascii_lowercase()).collect();
-        if lowered.starts_with("just a moment") {
-            return true;
+        const TITLE_NEEDLES: &[&str] = &[
+            "just a moment",
+            "attention required",
+            "access denied",
+            "verify you are human",
+            "verify you are a human",
+            "please verify you are a human",
+            "are you a robot",
+            "checking your browser",
+            "one moment, please",
+        ];
+        for needle in TITLE_NEEDLES {
+            if lowered.starts_with(needle) {
+                return true;
+            }
         }
     }
     false

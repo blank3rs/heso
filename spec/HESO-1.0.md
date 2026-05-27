@@ -3,7 +3,7 @@
 **Status:** 1.0 (provisional)
 **Date:** 2026-05-26
 **Editor:** Akshay (blank3rs)
-**Reference implementation:** [`heso`](https://github.com/blank3rs/heso) v0.1.2
+**Reference implementation:** [`heso`](https://github.com/blank3rs/heso) v0.1.4
 **License:** CC0 1.0 (spec text) · MIT or Apache-2.0 (reference implementation)
 
 ---
@@ -649,7 +649,7 @@ Implementations MAY refine these (for example: distinct codes for "hash mismatch
 
 ### §4.8 Reference-implementation extras
 
-The reference implementation (`heso` v0.1.2) ships additional verbs not part of HESO/1.0: `tree`, `ls`, `cat`, `find`, `meta`, `batch`, `eval-js`, `eval-dom`, `search`, `serve`, `fetch`, `action-hash`, `action-hash-verify`, `refresh`, `plat-info`, `plat-diff`, `plat-redact`. These are reference-impl conveniences for agents and operators; they are not required for HESO/1.0 conformance and a second implementation MAY omit them.
+The reference implementation (`heso` v0.1.4) ships additional verbs not part of HESO/1.0: `tree`, `ls`, `cat`, `find`, `meta`, `batch`, `eval-js`, `eval-dom`, `search`, `serve`, `registry`, `refresh`. These are reference-impl conveniences for agents and operators; they are not required for HESO/1.0 conformance and a second implementation MAY omit them.
 
 Future revisions of this specification MAY promote individual extras into the core catalog via the §4.5 process.
 

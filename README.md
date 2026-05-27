@@ -133,12 +133,13 @@ heso unseal sealed.plat --extract          # verify, then print the inner plat b
 curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json \
   | heso run - \
   | jq -r .plat_hash
-# → d93c08ba32b762dd6e47091a1d4bd4aa4d8308dbdbf44869f81146a3f5b8033a
+# → d93c08ba32b762dd6e47091a1d4bd4aa4d8308dbdbf44869f81146a3f5b8033a   (under heso 0.0.10)
 ```
 
-That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia article. No network is involved in `heso run` itself.
+That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash, given the same binary. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia article. No network is involved in `heso run` itself.
 
-Three sample plats live as release assets on v0.0.10:
+The three demo plats below were stamped by `heso 0.0.10` and reproduce only under that binary — the canonical-JSON shape and extractor surface have evolved since (HESO/1.0 §5 nails them down for v0.2 onward). To reproduce the published hashes, install the matching pinned version: `pipx install 'heso==0.0.10'` or `npm install -g @ixla/heso@0.0.10`.
+
 - [`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json) — Wikipedia `Goldfinger_(film)` (1 MB plat, hash `d93c08ba…`)
 - [`replay-demo-2-torvalds-bio.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-2-torvalds-bio.plat.json) — Wikipedia `Linus_Torvalds` (1 MB plat, hash `27e66b0d…`)
 - [`replay-demo-3-rust-lang-rust.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-3-rust-lang-rust.plat.json) — `github.com/rust-lang/rust` (640 KB plat, hash `201e9410…`)
@@ -154,7 +155,7 @@ Three sample plats live as release assets on v0.0.10:
 
 **Honest about failure.**
 
-- Every `open` / `read` / `fetch` response carries `http_status` (200, 403, 503, ...) — captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Cloudflare-style "Just a moment..." interstitials are detected via `__cf_chl_opt` / challenge-token markers and surfaced as `partial_reason: "bot_challenge"`. No more silent "I got something" when the server returned an error page.
+- Every `open` / `read` / `fetch` response carries `http_status` (200, 403, 503, ...) — captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Cloudflare's `__cf_chl_opt` shim and a handful of well-known WAF `<title>` phrases ("Just a moment…", "Attention Required", "Access Denied", "Verify you are human", "Checking your browser") are detected and surfaced as `partial_reason: "bot_challenge"`. The list is deliberately narrow — false positives are worse than misses — so harder pages (Reddit / Twitter / Amazon variants) may still come back without a challenge flag; check `text_len` or pass `--best-effort` and look at `failed_scripts` when in doubt.
 - `heso click @e7` on an `<a href="...">` actually follows the link — the response carries the destination page's `title`, `tree`, `actions`, and `http_status`, not the source page.
 
 **Web platform coverage.**
@@ -169,7 +170,7 @@ Three sample plats live as release assets on v0.0.10:
 ## What it can't do
 
 - **No rendering.** No canvas, WebGL, CSS layout, or video. If the meaning is in pixels, use a real browser.
-- **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `heso/<version>` so anything fingerprinting will see us coming. We detect Cloudflare interstitials and surface them as `partial_reason: "bot_challenge"` rather than pretending the page loaded.
+- **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `heso/<version>` so anything fingerprinting will see us coming. We detect the Cloudflare shim and a handful of WAF interstitial titles and surface them as `partial_reason: "bot_challenge"` — but the detection is intentionally narrow, so harder bot walls (Reddit / Twitter / Amazon variants) can still come back as apparent success. Treat low `text_len` or `failed_scripts: [...]` on a known-rich URL as the secondary signal.
 - **Service Workers, WebRTC, WebUSB, WebBluetooth.** Not implemented. The JS engine itself runs modern Next.js / React / Vue / Svelte / SSR sites cleanly; the gaps are in browser features above ECMAScript.
 - **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
 
@@ -433,13 +434,14 @@ The verbs are the contract. Same shape works in any harness that does tool or sk
 
 ## Stats
 
-Measured on Windows 11, AMD x86_64, with the release binary:
+Measured on Windows 11, AMD x86_64, with the release binary. Cold-start and JS-engine-init numbers come from `scripts/bench.ps1` (average of 10 runs after three warm-ups); the others are real wall-clock against the live network so they vary with the route to GitHub / DDG.
 
 | Thing | Number |
 |---|---|
 | Binary size | 10.11 MB |
-| Cold start (`open https://example.com`, network included) | ~77 ms |
-| Engine-only (no network, local fixture) | ~28 ms |
+| Cold start (help banner, no engine) | ~10 ms |
+| JS engine init (`eval-js null`) | ~21 ms |
+| `open https://example.com` (network included) | ~80 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
 | Search (DDG, 5 results) | ~1 s |
 
@@ -458,7 +460,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-`v0.1.4` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the 259-test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
+`v0.1.4` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the `heso-engine-js` lib-test suite (265 tests, the bulk of the determinism + DOM + scripts coverage) is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
 
 ## License
 
