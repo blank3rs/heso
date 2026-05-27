@@ -1,6 +1,6 @@
 {
   "name": "@ixla/heso-darwin-arm64",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "macOS ARM64 (Apple Silicon) binary for @ixla/heso. Do not install directly.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
