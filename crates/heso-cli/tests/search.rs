@@ -207,14 +207,23 @@ async fn searxng_5xx_does_not_crash_returns_empty() {
         "--searx-url",
         &server.uri(),
     ]);
-    // CLI should still exit success — the search-backend error went
-    // to stderr, the JSON envelope is still emitted.
-    let v = parse_stdout(&out);
+    // The search-backend error surfaces via non-zero exit and an
+    // errors[] entry; the JSON envelope is still emitted on stdout
+    // with empty results and engines_used.
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert!(v["results"].as_array().unwrap().is_empty());
     assert!(
         v["engines_used"].as_array().unwrap().is_empty(),
         "engines_used must NOT include searxng on hard error: {v}"
     );
+    let errors = v["errors"].as_array().expect("errors array");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["engine"], serde_json::json!("searxng"));
+    assert!(errors[0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("HTTP 500"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
