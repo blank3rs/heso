@@ -18,10 +18,9 @@ to land right now:
   a flaky test. Open a PR; we'll review.
 
 For anything larger — a new verb, a new plat field, a new engine
-behavior, a new dependency — open an issue first so we can agree on the
-shape before you write the code. Decisions of that kind end up in an
-ADR in [`decisions/`](decisions/); we'd rather discuss the design than
-review a PR that fights the existing architecture.
+behavior, a new dependency — open an issue first so we can agree on
+the shape before you write the code. We'd rather discuss the design
+than review a PR that fights the existing architecture.
 
 ## Building
 
@@ -75,7 +74,6 @@ cargo test --release -p heso-compat-tests
   conformance corpus.
 - [`spec/HESO-1.0.md`](spec/HESO-1.0.md) — a pointer; the canonical
   spec lives at <https://heso.ca/spec>.
-- [`decisions/`](decisions/) — Architecture Decision Records.
 
 ## Style
 
@@ -85,8 +83,8 @@ cargo test --release -p heso-compat-tests
   as if the current shape was always intended. Don't apologize for
   past behavior in comments — they should read clean to someone who
   arrives without history.
-- Verb names, plat field names, error variants, exit codes — these are
-  load-bearing. Don't rename one without an ADR.
+- Verb names, plat field names, error variants, exit codes — these
+  are load-bearing. Don't rename one without an issue discussion first.
 
 ## Opening a pull request
 

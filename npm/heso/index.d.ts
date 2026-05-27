@@ -320,10 +320,10 @@ export function replay(
  * `heso run <plat.plat>` — re-execute a stamped plat's plan against
  * its embedded cassette. No network: cassette misses error out with
  * structured details. Returns the new plat body whose `plat_hash` must
- * match the input plat byte-for-byte if the cassette was unmodified
- * (ADR 0008). Use {@link replay} for the no-engine inspector that just
- * emits the recorded step log, and {@link stamp} to mint a fresh plat
- * against the live web.
+ * match the input plat byte-for-byte if the cassette was unmodified.
+ * Use {@link replay} for the no-engine inspector that just emits the
+ * recorded step log, and {@link stamp} to mint a fresh plat against
+ * the live web.
  *
  * Named `runPlat` to avoid collision with the low-level {@link run}
  * escape hatch.

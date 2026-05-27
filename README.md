@@ -95,7 +95,7 @@ You get JSON: title, description, a heading tree, and a list of clickable elemen
 A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`). A *plat* is an observation, plus an embedded network *cassette* — every (method, URL, request-body) → (status, headers, response-body) tuple the engine touched during the run. Four verbs close the loop:
 
 - `heso stamp <plan.json>` — executes the plan against the live web and mints a fresh plat that embeds the plan, the recorded cassette, and a per-step log. Each entry in `steps` carries a three-way `status` (`ok` / `partial` / `error`), the verb-specific `observed` payload (the JSON shape the live verb would emit), a `partial_reason` token on degraded steps (`http_404`, `bot_challenge`, `selector_not_matched`, …), and deterministic logical `started_at` / `finished_at` timestamps. Accepts a bare `Action[]` array, a plat with a `"plan"` field, or a `TraceFingerprint`. Exit 0 on a clean run; 1 if any step's `status` is `error` (still prints the partial plat with `error` + `steps`).
-- `heso run <plat.plat>` — re-executes the plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay (ADR 0008). Also walks the recorded `steps` array and asserts each re-executed step's `status` and `observed` match what was recorded; a divergence (cassette mutated to make a previously-partial step succeed, or vice versa) surfaces on stderr with the step index and the diverging field, and `run` exits 1. If the cassette has drifted (page changed since stamping), the failing step carries a structured `cassette miss: METHOD URL not recorded` error and `run` exits 1 — graceful, never silent.
+- `heso run <plat.plat>` — re-executes the plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay. Also walks the recorded `steps` array and asserts each re-executed step's `status` and `observed` match what was recorded; a divergence (cassette mutated to make a previously-partial step succeed, or vice versa) surfaces on stderr with the step index and the diverging field, and `run` exits 1. If the cassette has drifted (page changed since stamping), the failing step carries a structured `cassette miss: METHOD URL not recorded` error and `run` exits 1 — graceful, never silent.
 - `heso replay <plat.plat>` — pure observation. Reads the recorded step log from the plat and prints it. No engine, no JS, no cassette lookup, no network. Use `run` if you want to re-execute.
 - `heso replay --plan <plat.plat>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint a fresh plat (with a fresh cassette since the requests changed).
 
@@ -327,10 +327,10 @@ heso verify --trusted-keys other_keys.json receipt.json
 # → INVALID: signing pubkey `...` is not in the trusted-keys allowlist   (exit 1)
 
 # 3. `mode: live` — live runs use real time + real network and aren't
-#    replay-safe, so the signature has no replay value (ADR 0008)
+#    replay-safe, so the signature has no replay value
 heso open https://example.com/ --receipt live.json --mode live
 heso verify --trusted-keys trusted.json live.json
-# → INVALID: receipt `mode: live` is not replay-safe — per ADR 0008 ...   (exit 1)
+# → INVALID: receipt `mode: live` is not replay-safe ...   (exit 1)
 ```
 
 Verify without an allowlist still works for backwards compatibility, but emits a stderr warning so the missing trust anchor isn't silent:

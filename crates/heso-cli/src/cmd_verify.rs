@@ -249,7 +249,7 @@ fn verify_receipt_inner(
     if matches!(receipt.mode, heso_trace::Mode::Live) {
         println!("FAIL receipt");
         eprintln!(
-            "INVALID: receipt `mode: live` is not replay-safe — per ADR 0008, only \
+            "INVALID: receipt `mode: live` is not replay-safe — only \
              `deterministic` and `recording` receipts can be verified (live runs use \
              wall-clock time and real network, so the signature has no replay value)"
         );

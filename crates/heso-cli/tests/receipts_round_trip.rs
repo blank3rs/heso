@@ -297,7 +297,7 @@ async fn round_trip_mode_live_receipt_is_rejected() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("live") || stderr.contains("ADR 0008"),
+        stderr.contains("live"),
         "expected live-mode rejection message, got stderr: {stderr}"
     );
 }

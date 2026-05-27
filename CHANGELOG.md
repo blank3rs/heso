@@ -4,6 +4,31 @@ All notable changes to heso are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-05-27
+
+### Changed
+
+- Removed internal project-document references from public surfaces.
+  The verify-side stderr ("`mode: live` is not replay-safe ..."), the
+  cassette-miss errors emitted by the JS `fetch()` and `XMLHttpRequest`
+  shims, the Python wrapper docstrings, the TypeScript declarations,
+  the README, and the CONTRIBUTING notes no longer cite internal
+  project documents. User-facing prose now describes the behavior
+  directly.
+- README's `heso run` description drops the parenthetical project-doc
+  citation; receipts example no longer trails "per <internal-doc>" on
+  the live-mode rejection.
+- Hygiene: `.pre-commit-config.yaml` and the hygiene workflow's `.md`
+  allowlist now admit the four standard meta files
+  (`CONTRIBUTING.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`,
+  `CHANGELOG.md`). The old `readme-sync-blocks` job (which assumed
+  `npm/heso/README.md` lived in the git tree) is replaced with a
+  positive assertion that `.github/workflows/pypi.yml` carries the
+  publish-time `cp README.md npm/heso/README.md` step. Drift between
+  the GitHub-displayed README and the npm-displayed README is now
+  structurally impossible — the file is generated at publish time
+  from the same root README.
+
 ## [0.1.5] - 2026-05-27
 
 ### Added
@@ -48,7 +73,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `heso --help` banner rewritten to match the current dispatch —
   removed stale entries for verbs that were collapsed into the
   polymorphic surface or moved under `heso registry`, and removed
-  footer links to internal-only ADR files.
+  footer links to internal project documents that aren't part of the
+  public repo.
 - Engine: response bodies are capped before DOM parsing
   (`engine-js`), and registry / Wikipedia / SearXNG responses are
   capped at 4–16 MiB each.
@@ -68,8 +94,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Module docstring and `cmd_replay` stderr in
   `crates/heso-cli/src/main.rs` no longer reference removed verbs or
   internal-only docs.
-- README no longer links to ADR files under `decisions/`, which is
-  gitignored in the public repo.
+- README no longer links to internal project files that aren't
+  checked in publicly.
 - `SealOptions.tsa` and `SealOptions.noResign` removed from the npm
   TypeScript types (they were declared but never wired through the
   CLI). The Python `seal` docstring drops the same unimplemented

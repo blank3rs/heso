@@ -212,7 +212,7 @@ pub(crate) fn install_xhr(
                             &ctx,
                             &this.0,
                             format!(
-                                "xhr to {url2} not in cassette - heso run with --record first (ADR 0008 deterministic-mode gate)"
+                                "xhr to {url2} not in cassette - heso run with --record first"
                             ),
                         )?;
                         return Ok(());

@@ -316,7 +316,7 @@ fn make_fetch_deterministic<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Function<'j
                 .unwrap_or_else(|| "<unknown>".to_owned());
             let (promise, _resolve, reject) = Promise::new(&ctx)?;
             let msg = format!(
-                "fetch to {url} not in cassette - heso run with --record first (ADR 0008 deterministic-mode gate; full record/replay is item M)"
+                "fetch to {url} not in cassette - heso run with --record first"
             );
             let err = ctx.eval::<Value, _>(format!(
                 "new Error({})",

@@ -780,8 +780,8 @@ def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
     as structured errors per HESO/1.0 §5.5.
 
     Returns a fresh plat dict over the post-run state. For an unmodified
-    cassette the returned ``plat_hash`` is byte-identical to the input's
-    (ADR 0008). Use :func:`replay` for the no-engine inspector that just
+    cassette the returned ``plat_hash`` is byte-identical to the
+    input's. Use :func:`replay` for the no-engine inspector that just
     emits the recorded step log, and :func:`stamp` to mint a plat
     against the live web.
 
