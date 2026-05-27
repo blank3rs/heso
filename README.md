@@ -1,12 +1,10 @@
-# heso — the auditable layer for the agent web.
+# heso
 
 **Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
 
-A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of what happened.
+A Rust runtime that lets an agent touch the web — fetch a page, run its JavaScript, query the resulting DOM, click, fill, submit, hold a session — and return JSON. Every run can be stamped into a signed file (a *plat*) that replays byte-identically off-network.
 
-Every run can be **stamped** into a *plat* — a signed replay file holding the plan that ran, the page observation, and the recorded network cassette, all hashed together. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. Tamper one byte and the hash flags it. Hand the artifact to an auditor.
-
-Capabilities return JSON. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss), not opaque browser crashes. One Rust binary; no Chromium, no Node.
+One binary. No Chromium, no Node.
 
 <!-- heso:perf:start -->
 ```
@@ -19,20 +17,20 @@ batch        ~1.1 s   for 8 URLs in parallel
 
 [![heso agent demo — 50 second screen recording](https://raw.githubusercontent.com/blank3rs/heso/main/demo/poster.jpg)](https://www.heso.ca/#demo)
 
-A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no rendering pipeline, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
+A 50-second recording: an LLM agent drives heso to compare two GitHub repositories by star count and README description, then stamps the run into a plat (tamper one byte and the hash flags it). [▶ Watch on heso.ca](https://www.heso.ca/#demo)
 
 ## Contents
 
 - [Install](#install)
-- [What it can do](#what-it-can-do)
-- [What it can't do](#what-it-cant-do)
+- [The 60-second tour](#the-60-second-tour)
+- [What works today](#what-works-today)
+- [What doesn't](#what-doesnt)
 - [Why not just use X?](#why-not-just-use-x)
 - [Use as a library](#use-as-a-library)
-- [Examples](#examples)
+- [Plats: stamp, run, verify](#plats-stamp-run-verify)
 - [Signed receipts](#signed-receipts)
 - [Error handling](#error-handling)
 - [Plug into agent harnesses](#plug-into-agent-harnesses)
-- [Verbs are open](#verbs-are-open)
 - [Use as an agent skill](#use-as-an-agent-skill)
 - [Stats](#stats)
 - [Building from source](#building-from-source)
@@ -42,7 +40,7 @@ A 50-second real recording — an LLM agent (Gemini) drives heso to find and com
 ## Install
 
 ```sh
-# Python (uv, pipx, or pip — any of them)
+# Python (uv, pipx, or pip)
 uv tool install heso          # or: pipx install heso  /  pip install heso
 
 # Node
@@ -60,148 +58,99 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/blank3rs/heso/rele
 > Shipping `v0.1.4` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
 <!-- heso:version:end -->
 
-After install, `heso` is on `$PATH`:
+## The 60-second tour
+
+The shortest path to structured data on a page is `eval-dom`: fetch the URL, run its `<script>` tags against a DOM, then evaluate your own JS against the result and get JSON back.
 
 ```sh
-heso open https://example.com
-# → { url, title, description, tree, actions, plat_hash, ... }
+heso eval-dom https://news.ycombinator.com '
+  Array.from(document.querySelectorAll(".athing")).slice(0, 5).map(row => ({
+    rank: row.querySelector(".rank")?.innerText,
+    title: row.querySelector(".titleline > a")?.innerText,
+    href: row.querySelector(".titleline > a")?.href,
+  }))
+'
+# → JSON array of the top 5 stories.
 ```
 
-You get JSON: title, description, a heading tree, and a list of clickable elements numbered `@e0`, `@e1`, and so on.
-
-## What it can do
-
-**Find and read things.**
-
-- `heso search "<query>"` — searches the web (DuckDuckGo + Wikipedia, optional SearXNG). No API key.
-- `heso open <url>` — fetches and returns a page summary: title, headings, actionable elements.
-- `heso read <url>` — fetches, runs JS, returns the full picture: title, visible text, actions, forms, cookies, console output, framework detection. One call.
-- `heso read <url> --complete` — same, but heso loops "fire pending observers + click load-more + wait for DOM to settle" until the page stops changing. For lazy-loaded sites.
-- `heso batch [open|read] <urls...>` — runs many URLs in parallel. Shared cookie jar, JSON-Lines out.
-- `heso wait <url> --selector-exists ".foo"` (also `--text-contains`, `--url-matches`, `--network-idle`, `--time`) — blocks until a condition is true. No polling loop.
-
-**Interact with sites.**
-
-- `heso click <url> @e7` — click by element ref.
-- `heso click <url> --text "Sign in"` — or by visible text, CSS selector, or aria-label.
-- `heso fill <url> @e3 "hello"` — type into an input.
-- `heso submit <url> @e9` — submit a form.
-- `heso serve` exposes a JSON-RPC `navigate` method for changing URL inside a stateful session.
-- `heso eval-dom <url> "<js>"` — fetch, run scripts, then run your JS against the resulting DOM.
-
-**Bundle, edit, replay, and re-execute action sequences.**
-
-A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`). A *plat* is an observation, plus an embedded network *cassette* — every (method, URL, request-body) → (status, headers, response-body) tuple the engine touched during the run. Four verbs close the loop:
-
-- `heso stamp <plan.json>` — executes the plan against the live web and mints a fresh plat that embeds the plan, the recorded cassette, and a per-step log. Accepts a bare `Action[]` array, a plat with a `"plan"` field, or a `TraceFingerprint`. Exit 0 on a clean run; 1 if any step failed (still prints the partial plat with `error` + `steps`).
-- `heso run <plat.plat>` — re-executes the plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay (ADR 0008). If the cassette has drifted (page changed since stamping), the failing step carries a structured `cassette miss: METHOD URL not recorded` error and `run` exits 1 — graceful, never silent.
-- `heso replay <plat.plat>` — pure observation. Reads the recorded step log from the plat and prints it. No engine, no JS, no cassette lookup, no network. Use `run` if you want to re-execute.
-- `heso replay --plan <plat.plat>` — extracts just the `plan` field. Edit it standalone and pipe back into `stamp` to re-mint a fresh plat (with a fresh cassette since the requests changed).
+For the broader "give me everything" view there's `read`:
 
 ```sh
-cat > plan.json <<EOF
-[
-  {"verb": "open",   "url": "https://news.ycombinator.com/"},
-  {"verb": "click",  "ref": "@e3"},
-  {"verb": "fill",   "ref": "@e7", "value": "claude"},
-  {"verb": "submit", "ref": "@form1"}
-]
-EOF
-heso stamp plan.json > out.plat           # plan → plat (records cassette)
-heso run out.plat > replay.plat           # plat → plat (off-network, byte-identical)
-heso replay out.plat                      # plat → step log (pure read, no execution)
-heso replay --plan out.plat > plan-again.json    # plat → plan (edit, restamp)
+heso read https://nextjs.org/
+# → { title, text, actions, forms, cookies, console, framework,
+#     content_hash, partial, partial_reason, http_status, ... }
 ```
 
-The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
-
-**Inspect a plat.** Text dev tools, all baked into the main binary:
+`actions` is the list of clickable / fillable elements, numbered `@e0`, `@e1`, ... You point `click` / `fill` / `submit` at those refs:
 
 ```sh
-heso info   out.plat                       # human summary: hash, plan / cassette / steps counts, sealed status
-heso info   before.plat after.plat         # what changed (plan, cassette URLs, fields, url / title / description)
-heso seal   my.plat > sealed.plat          # wrap in Ed25519 envelope (default key: heso-local-data/identity.key)
-heso unseal sealed.plat                    # verify; exit 0 valid / 1 invalid / 2 wrong-alg or malformed
-heso unseal sealed.plat --extract          # verify, then print the inner plat body for piping
+heso click  https://news.ycombinator.com --text "more"
+heso fill   https://example.com/search @e0 "rust"
+heso submit https://example.com/search @form1 --field q=rust
 ```
 
-`seal` produces a `SealedPlat` JSON envelope (`{alg, content, signature}`) that any holder of the envelope + the `heso` binary can verify offline — no key material, no network, no clock. Mint a key once with `heso identity init`; from then on the same key signs every plat. `unseal` checks the algorithm tag, the embedded `plat_hash`, and the Ed25519 signature in order, and refuses to silently treat an unknown `alg` as Ed25519.
-
-**Replay a published plat in one command.** Install `heso` (`uv tool install heso` / `pipx install heso` / `npm install -g @ixla/heso`), then:
+Search the web (DuckDuckGo HTML + Wikipedia, no API key) and fan out:
 
 ```sh
-curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json \
-  | heso run - \
-  | jq -r .plat_hash
-# → d93c08ba32b762dd6e47091a1d4bd4aa4d8308dbdbf44869f81146a3f5b8033a   (under heso 0.0.10)
+heso search "rust web scraping" --limit 5
+heso batch  read url1 url2 url3 --parallel 2
 ```
 
-That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash, given the same binary. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia article. No network is involved in `heso run` itself.
+## What works today
 
-The three demo plats below were stamped by `heso 0.0.10` and reproduce only under that binary — the canonical-JSON shape and extractor surface have evolved since (HESO/1.0 §5 nails them down for v0.2 onward). To reproduce the published hashes, install the matching pinned version: `pipx install 'heso==0.0.10'` or `npm install -g @ixla/heso@0.0.10`.
+**Most second-tier sites Just Work.** Default UA is `heso/<version>` — honest about what it is, no fingerprint impersonation, no residential-proxy farm. That happens to slip past a lot of WAF heuristics tuned for Playwright, Puppeteer, curl-impersonate, and headless-Chrome traffic. In practice, sites that go through cleanly on a vanilla call include Zillow (DataDome), Walmart (PerimeterX), CoinGecko (Cloudflare), LinkedIn anonymous pages, TripAdvisor, Yahoo Finance, and Reddit via `old.reddit.com`.
 
-- [`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json) — Wikipedia `Goldfinger_(film)` (1 MB plat, hash `d93c08ba…`)
-- [`replay-demo-2-torvalds-bio.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-2-torvalds-bio.plat.json) — Wikipedia `Linus_Torvalds` (1 MB plat, hash `27e66b0d…`)
-- [`replay-demo-3-rust-lang-rust.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-3-rust-lang-rust.plat.json) — `github.com/rust-lang/rust` (640 KB plat, hash `201e9410…`)
+**eval-dom is the structured-extraction primary.** Fetch + run page scripts + run your JS against the DOM + return JSON. One round trip closes most "scrape this list" tasks without click choreography. `--seed N` makes `Math.random` / `crypto.getRandomValues` / `crypto.randomUUID` deterministic. `--js-fetch` lets the page's own `fetch()` and `<script src=...>` run through the same `reqwest::Client`, so cookies and recorded requests stay coherent.
 
-**Recover from broken sites.**
+**Fetch, navigate, observe.** `open` returns a summary (title, headings, action graph). `read` adds post-hydration text, grouped forms, cookies, console, framework detection, scripts. `read --complete` keeps firing observers and clicking load-more buttons until the DOM stops changing — for lazy-loaded sites. `batch [open|read] <urls...>` runs many URLs in one process with a shared cookie jar and connection pool.
 
-- `--best-effort` on `open` / `read` / `wait` — exit 0 even when scripts crash. Output includes `partial: true`, `partial_reason: "script_crash" | "wait_timeout" | "fetch_failed" | "parse_error"`, and `failed_scripts: [...]`. The agent sees what broke and decides what to try next.
-- `--inject-script "<inline-js>"` or `--inject-script @file.js` — run JS before the page's own scripts. Use it to shim a missing global (the canonical `window.lunr` cascade kind of thing).
+**Wait for SPA conditions.** `heso wait <url>` with `--selector-exists`, `--text-contains`, `--url-matches`, `--network-idle`, or `--time` (advances the deterministic virtual clock). No polling loop in your code.
 
-**Detect cross-call state changes.**
+**Interact.** `click` / `fill` / `submit` accept either `@eN` refs or locator flags (`--text`, `--selector`, `--aria-label`). A click on an `<a href>` follows the link — the response carries the destination page's `title`, `tree`, `actions`, and `http_status`, not the source page.
 
-- `heso read` always returns a `content_hash`. Pass `--since <prev_hash>` to get a `delta` describing what changed (`actions_added`, `actions_removed`, `forms_changed`, `text_changed`, `title_changed`).
+**Stateful sessions.** `heso serve` is JSON-RPC 2.0 over stdio. Cookies, DOM mutations, listeners, and history persist across calls.
 
-**Honest about failure.**
+**Recover from broken sites.** `--best-effort` on `open`, `read`, and `wait` exits 0 with a `partial: true` envelope (`partial_reason`, `failed_scripts: [...]`, `console_errors_count`) when scripts crash. `--inject-script "<js>"` or `--inject-script @file.js` runs your code before the page's, useful for shimming a missing global.
 
-- Every `open` / `read` / `fetch` response carries `http_status` (200, 403, 503, ...) — captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Cloudflare's `__cf_chl_opt` shim and a handful of well-known WAF `<title>` phrases ("Just a moment…", "Attention Required", "Access Denied", "Verify you are human", "Checking your browser") are detected and surfaced as `partial_reason: "bot_challenge"`. The list is deliberately narrow — false positives are worse than misses — so harder pages (Reddit / Twitter / Amazon variants) may still come back without a challenge flag; check `text_len` or pass `--best-effort` and look at `failed_scripts` when in doubt.
-- `heso click @e7` on an `<a href="...">` actually follows the link — the response carries the destination page's `title`, `tree`, `actions`, and `http_status`, not the source page.
+**Cross-call deltas.** `read` returns a `content_hash`. Pass `--since <prev_hash>` and you get a `delta` describing what changed (`actions_added`, `actions_removed`, `forms_changed`, `text_changed`, `title_changed`).
 
-**Web platform coverage.**
+**Honest about HTTP and bot walls.** Every response carries `http_status`, captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Bodies that contain Cloudflare's `__cf_chl_opt` JS shim or a `<title>` starting with one of nine well-known WAF phrases ("Just a moment…", "Attention Required", "Access Denied", "Verify you are human", "Checking your browser", "One moment, please", and a few variants) surface as `partial_reason: "bot_challenge"` regardless of wrapper status. The detection is intentionally narrow — false positives are worse than misses — so many bot walls come back as `http_403` or `http_429` and you should treat those as bot-walled by default rather than retrying the same request.
 
-- `XMLHttpRequest` (sync + async, backed by the same `reqwest` client as `fetch`), `performance.mark` / `performance.measure`, `document.getElementsByClassName` / `getElementsByName` / `getElementsByTagName`, 60+ `HTMLElement` subclass constructors (`new HTMLDivElement()` works, `instanceof HTMLScriptElement` works), `element.style = "color: red"` string-coercion setter, `data:` URL fast path in `<script src>`.
-- `MutationObserver` + `IntersectionObserver` fire on real DOM mutations and viewport intersections; `setTimeout` / `setInterval` accept the 1-arg form per WHATWG HTML; classic `<script>` runs sloppy-mode per spec (so sites like Apple and Wikipedia that use `var = ...` at the top level work); ES modules (`<script type="module">`) stay strict per ECMA-262.
+**Web platform coverage.** `XMLHttpRequest` (sync + async, same client as `fetch`), `performance.mark` / `performance.measure`, `document.getElementsByClassName` / `getElementsByName` / `getElementsByTagName`, 60+ `HTMLElement` subclass constructors (`new HTMLDivElement()` works, `instanceof HTMLScriptElement` works), `element.style = "color: red"` string-coercion setter, `data:` URL fast path in `<script src>`. `MutationObserver` and `IntersectionObserver` fire on real DOM mutations and viewport intersections. `setTimeout` and `setInterval` accept the 1-arg form per WHATWG HTML. Classic `<script>` runs sloppy-mode (so sites that use top-level `var` work); ES modules (`<script type="module">`) stay strict per ECMA-262.
 
-**Stateful sessions.**
+## What doesn't
 
-- `heso serve` — JSON-RPC over stdin/stdout. Cookies, DOM mutations, listeners, and history persist across calls. Useful for login → navigate → scrape flows.
-
-## What it can't do
-
-- **No rendering.** No canvas, WebGL, CSS layout, or video. If the meaning is in pixels, use a real browser.
-- **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `heso/<version>` so anything fingerprinting will see us coming. We detect the Cloudflare shim and a handful of WAF interstitial titles and surface them as `partial_reason: "bot_challenge"` — but the detection is intentionally narrow, so harder bot walls (Reddit / Twitter / Amazon variants) can still come back as apparent success. Treat low `text_len` or `failed_scripts: [...]` on a known-rich URL as the secondary signal.
-- **Service Workers, WebRTC, WebUSB, WebBluetooth.** Not implemented. The JS engine itself runs modern Next.js / React / Vue / Svelte / SSR sites cleanly; the gaps are in browser features above ECMAScript.
-- **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
+- **No rendering.** No canvas, WebGL, CSS layout, video. If the meaning is in pixels, use a real browser.
+- **Full Cloudflare Challenge Mode and Imperva interstitials still block.** The narrow bot-challenge detection catches them — exit data is honest, exit content is empty. No CAPTCHA solver.
+- **Service Workers, WebRTC, WebUSB, WebBluetooth.** Not implemented.
+- **QuickJS, not V8.** Modern Next.js / React / Vue / Svelte / SSR sites generally run; some JS that depends on V8-specific behavior won't.
+- **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it on first load, the crash is surfaced. Use `--inject-script` for the polyfill.
 
 ## Why not just use X?
 
-Partial overlap everywhere; no exact shelf neighbor. The win is not "smaller browser" — it is **smaller failure surface** when the task is structured data, not pixels.
+Partial overlap everywhere; no exact shelf neighbor. The win is not "smaller browser" — it is a smaller failure surface when the task is structured data, not pixels.
 
 | Layer | Examples | What they ship | Gap vs heso |
 |---|---|---|---|
 | **Full Chromium stack** | [Playwright](https://playwright.dev/), [Puppeteer](https://pptr.dev/), [Browser Use](https://github.com/browser-use/browser-use), [Stagehand](https://www.browserbase.com/stagehand), [Skyvern](https://github.com/Skyvern-AI/skyvern) | V8 + full browser; often an AI planner on top | Heavy deps, opaque failures, no native JSON verb surface, no plat replay |
-| **Smaller browser engine** | [Lightpanda](https://lightpanda.io/) | Zig engine, V8, CDP — drop-in for Playwright/Puppeteer | Still a *browser* mental model; agents drive it through CDP/wrappers, not verbs; no plat/cassette/receipt story |
+| **Smaller browser engine** | [Lightpanda](https://lightpanda.io/) | Zig engine, V8, CDP — drop-in for Playwright/Puppeteer | Still a browser mental model; agents drive it via CDP/wrappers, not verbs; no plat/cassette/receipt story |
 | **Scraper APIs** | Firecrawl, Jina Reader, Crawl4AI | Fetch + extract markdown/JSON | Weak or no real click/fill/submit; often no honest partial-failure envelope |
-| **DOM simulators (Node)** | [jsdom](https://github.com/jsdom/jsdom), [happy-dom](https://github.com/capricorn86/happy-dom) | Minimal DOM + JS in JS | Proven lane for the agent-relevant half; test harnesses, not shipped agent products |
-| **Built-in fetch tools** | WebFetch (Claude), curl | Static HTML / no JS hydration | No DOM events, no forms, no session |
-| **heso** | this repo | QuickJS + agent-shaped DOM + verbs + plats | QuickJS ≠ V8 (honest limit); CAPTCHAs/hard bot-detect still stop you |
-
-**What heso adds on top of the capability list:** explicit in/out scope, verb-native JSON (no Playwright/CDP/Node required), structured partial failures, and byte-identical off-network replay via stamp/run.
+| **DOM simulators (Node)** | [jsdom](https://github.com/jsdom/jsdom), [happy-dom](https://github.com/capricorn86/happy-dom) | Minimal DOM + JS in JS | Test harnesses, not agent products; no CLI, no plat, no session |
+| **Built-in fetch tools** | WebFetch (Claude), curl | Static HTML, no JS hydration | No DOM events, no forms, no session |
+| **heso** | this repo | QuickJS + agent-shaped DOM + verbs + plats | QuickJS ≠ V8; CAPTCHAs and Challenge Mode still stop you |
 
 ## Use as a library
 
-The Python (`heso`) and Node (`@ixla/heso`) packages each ship two faces of the same bundled binary: a CLI on `$PATH` and a programmatic API that spawns that binary under the hood and gives you back parsed JSON as native objects. No FFI, no Python extension module, no N-API addon — subprocess + JSON is the contract.
+The Python (`heso`) and Node (`@ixla/heso`) packages ship the same bundled binary with two faces: a CLI on `$PATH` and a programmatic API that spawns the binary under the hood and returns parsed JSON as native objects. No FFI, no Python extension module, no N-API addon — subprocess + JSON is the contract.
 
 ```python
-# Python
 import heso
 
-page    = heso.open("https://example.com")              # -> dict
-results = heso.search("rust web scraping", limit=5)     # -> dict
+page    = heso.open("https://example.com")
+results = heso.search("rust web scraping", limit=5)
 content = heso.read("https://example.com", complete=True)
+data    = heso.eval_dom("https://news.ycombinator.com", "document.title")
 
-# Stateful flow over one long-lived `heso serve` process:
 with heso.session() as s:
     s.open("https://example.com")
     s.click(text="More information...")
@@ -209,12 +158,12 @@ with heso.session() as s:
 ```
 
 ```js
-// Node
-import { open, search, read, session } from "@ixla/heso";
+import { open, search, read, evalDom, session } from "@ixla/heso";
 
 const page    = await open("https://example.com");
 const results = await search("rust web scraping", { limit: 5 });
 const content = await read("https://example.com", { complete: true });
+const data    = await evalDom("https://news.ycombinator.com", "document.title");
 
 await session(async (s) => {
   await s.open("https://example.com");
@@ -225,55 +174,60 @@ await session(async (s) => {
 
 Per-language idioms: Python is `snake_case` + sync, Node is `camelCase` + Promises. Full API at **[heso.ca/docs](https://www.heso.ca/docs)**.
 
-## Examples
+## Plats: stamp, run, verify
 
-Search the web, then read the top hits in parallel:
+A *plan* is a JSON array of canonical actions (`open`, `click`, `fill`, `submit`). A *plat* is the observation produced by running that plan, plus an embedded network *cassette* — every (method, URL, request-body) → (status, headers, response-body) tuple the engine touched. Four verbs close the loop:
 
-```sh
-heso search "rust web scraping" --limit 5
-heso batch read url1 url2 url3 --parallel 2
-```
-
-Read everything from one page in one call:
+- `heso stamp <plan.json>` executes the plan against the live web and mints a plat that embeds the plan, the cassette, and a per-step log. Exit 0 on a clean run, 1 if any step failed (prints the partial plat with `error` + `steps`).
+- `heso run <plat>` re-executes the embedded plan against the embedded cassette. **No network.** For an unchanged cassette the output `plat_hash` equals the input's — byte-identical replay ([ADR 0008](decisions/0008-deterministic-execution.md)). Cassette miss (page drifted since stamp) surfaces as `cassette miss: METHOD URL not recorded` and exits 1 — graceful, never silent.
+- `heso replay <plat>` reads the recorded step log. Pure observation; no engine, no JS, no network. With `--plan`, it emits just the `plan` field so you can edit it and pipe back into `stamp`.
+- `heso refresh <plat>` re-stamps against the live web and reports drift. Emits `{ok, drifted, input_plat_hash, live_plat_hash, diff?}`. Exit 0 unchanged / 1 drifted / 2 usage error.
 
 ```sh
-heso read https://nextjs.org/
-# → { title, text, actions, forms, cookies, console, framework,
-#     content_hash, lazy_hints, partial: false, ... }
+cat > plan.json <<'EOF'
+[
+  {"verb": "open",   "url": "https://news.ycombinator.com/"},
+  {"verb": "click",  "ref": "@e3"},
+  {"verb": "fill",   "ref": "@e7", "value": "claude"},
+  {"verb": "submit", "ref": "@form1"}
+]
+EOF
+heso stamp plan.json > out.plat                     # plan → plat (records cassette)
+heso run out.plat > replay.plat                     # plat → plat (off-network, byte-identical)
+heso replay out.plat                                # plat → step log (pure read)
+heso replay --plan out.plat > plan-again.json       # plat → plan (edit, restamp)
 ```
 
-Find by visible text, click, follow:
+The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observation, AND the cassette. Tamper any of them and the hash no longer matches; `heso verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
+
+**Inspect a plat:**
 
 ```sh
-heso click https://news.ycombinator.com --text "More"
+heso info   out.plat                       # summary: hash, plan / cassette / steps counts, sealed status
+heso info   before.plat after.plat         # diff (plan, cassette URLs, fields, url / title / description)
+heso seal   my.plat > sealed.plat          # wrap in Ed25519 envelope
+heso unseal sealed.plat                    # verify; exit 0 valid / 1 invalid / 2 wrong-alg or malformed
+heso unseal sealed.plat --extract          # verify, then print the inner plat body
 ```
 
-Wait for an SPA condition:
+`seal` produces a `SealedPlat` JSON envelope (`{alg, content, signature}`) that any holder of the envelope + the `heso` binary can verify offline — no key material, no network, no clock. Mint a key once with `heso identity init`; the same key signs every plat from then on. `unseal` checks the algorithm tag, the embedded `plat_hash`, and the Ed25519 signature in order, and refuses to silently treat an unknown `alg` as Ed25519.
+
+**Replay a published plat in one command.** Install `heso`, then:
 
 ```sh
-heso wait https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
+curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json \
+  | heso run - \
+  | jq -r .plat_hash
+# → d93c08ba32b762dd6e47091a1d4bd4aa4d8308dbdbf44869f81146a3f5b8033a   (under heso 0.0.10)
 ```
 
-Rescue a broken site with a polyfill:
+That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash, given the same binary. The cassette inside the plat carries every HTTP response the engine touched at stamp time. No network is involved in `heso run` itself.
 
-```sh
-heso open https://shoelace.style --best-effort \
-  --inject-script "window.lunr = (() => ({ Index: { load: () => ({}) } }))()"
-```
+The three demo plats below were stamped by `heso 0.0.10` and reproduce only under that binary — the canonical-JSON shape has evolved since (HESO/1.0 §5 nails the v0.2+ shape down). To reproduce the published hashes, pin the matching version: `pipx install 'heso==0.0.10'` or `npm install -g @ixla/heso@0.0.10`.
 
-Multi-step session over stdio:
-
-```sh
-heso serve
-# → JSON-RPC. Page state, cookies, DOM all persist across requests.
-```
-
-Reproducibility (same seed → same output across machines):
-
-```sh
-heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
-heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
-```
+- [`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json) — Wikipedia `Goldfinger_(film)` (1 MB plat, hash `d93c08ba…`)
+- [`replay-demo-2-torvalds-bio.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-2-torvalds-bio.plat.json) — Wikipedia `Linus_Torvalds` (1 MB plat, hash `27e66b0d…`)
+- [`replay-demo-3-rust-lang-rust.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-3-rust-lang-rust.plat.json) — `github.com/rust-lang/rust` (640 KB plat, hash `201e9410…`)
 
 ## Signed receipts
 
@@ -301,10 +255,9 @@ heso open https://example.com/ --receipt receipt.json
 # }
 ```
 
-Verify the receipt — bind it to a trusted signer with `--trusted-keys`:
+Verify the receipt and bind it to a trusted signer with `--trusted-keys`:
 
 ```sh
-# trusted.json is a JSON array of base64 pubkeys you accept signatures from.
 echo '["fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE="]' > trusted.json
 
 heso verify --trusted-keys trusted.json receipt.json
@@ -312,37 +265,30 @@ heso verify --trusted-keys trusted.json receipt.json
 # exit 0
 ```
 
-Or via the `HESO_TRUSTED_KEYS=<path>` env var if you'd rather not pass the flag every call.
+`HESO_TRUSTED_KEYS=<path>` works as an env-var alternative.
 
-Verify enforces three rejections:
+Verify rejects three classes of receipt:
 
 ```sh
-# 1. Tampered receipt — any byte change invalidates the signature
+# 1. Tampered — any byte change invalidates the signature
 sed -i 's/"seed": 0/"seed": 999/' receipt.json
 heso verify --trusted-keys trusted.json receipt.json
 # → INVALID: signature verification failed       (exit 1)
 
-# 2. Wrong signer — receipt is well-formed but the pubkey isn't allowlisted
+# 2. Wrong signer — well-formed but the pubkey isn't allowlisted
 heso verify --trusted-keys other_keys.json receipt.json
 # → INVALID: signing pubkey `...` is not in the trusted-keys allowlist   (exit 1)
 
-# 3. `mode: live` — live runs use real time + real network and aren't
+# 3. mode: live — live runs use real time + real network and aren't
 #    replay-safe, so the signature has no replay value (ADR 0008)
 heso open https://example.com/ --receipt live.json --mode live
 heso verify --trusted-keys trusted.json live.json
 # → INVALID: receipt `mode: live` is not replay-safe — per ADR 0008 ...   (exit 1)
 ```
 
-Verify without an allowlist still works for backwards compatibility, but emits a stderr warning so the missing trust anchor isn't silent:
+Verify without an allowlist still works for backwards compatibility but emits a stderr warning so the missing trust anchor isn't silent.
 
-```sh
-heso verify receipt.json
-# stderr: warning: no pubkey allowlist configured (pass --trusted-keys PATH or set HESO_TRUSTED_KEYS ...)
-# stdout: OK fdibx2...IE=
-# exit 0
-```
-
-Exit codes: `0` valid + (allowlist empty OR pubkey allowlisted), `1` invalid (tampered, wrong signer, or `mode: live`), `2` missing/malformed receipt or `--trusted-keys` load failure.
+Exit codes: `0` valid + (allowlist empty OR pubkey allowlisted), `1` invalid (tampered, wrong signer, `mode: live`), `2` missing/malformed receipt or `--trusted-keys` load failure.
 
 ## Error handling
 
@@ -353,7 +299,7 @@ import heso
 try:
     page = heso.read("https://shoelace.style")
 except heso.HesoError as e:
-    print(e.returncode, e.stderr[:200])  # exit code + first 200 chars of stderr
+    print(e.returncode, e.stderr[:200])
 ```
 
 ```js
@@ -382,31 +328,27 @@ heso is harness-agnostic. The same package serves five integration patterns:
 | Harness style | How heso fits |
 |---|---|
 | **Python frameworks** (LangChain, Pydantic AI, LangGraph, smolagents, AgentScope) | `import heso`. Each function returns a `dict`. Wrap with `@tool` / `Tool(...)` / a function schema. |
-| **Node / TS frameworks** (Mastra, Vercel AI SDK, LangGraph.js, Stagehand, Browser Use TS) | `import { open, search } from "@ixla/heso"`. All async; TypeScript types ship in `index.d.ts`. |
-| **Skill-markdown harnesses** (Claude Code, Cursor, Aider, Cline, Continue, Windsurf) | Drop the manifest in the "Use as an agent skill" block below into `~/.claude/skills/heso/SKILL.md` (or the harness's skills dir). The harness auto-discovers; `heso` on PATH does the rest. |
-| **CLI-spawning harnesses** (Aider, shell-script agents, homegrown loops) | Same `heso <verb> ...` CLI used by both libraries. JSON on stdout. No special integration. |
-| **Long-running JSON-RPC harnesses** | `heso serve` is a JSON-RPC 2.0 server over stdin/stdout. Cookies + DOM state persist across calls. |
+| **Node / TS frameworks** (Mastra, Vercel AI SDK, LangGraph.js, Stagehand, Browser Use TS) | `import { open, search } from "@ixla/heso"`. All async; types in `index.d.ts`. |
+| **Skill-markdown harnesses** (Claude Code, Cursor, Aider, Cline, Continue, Windsurf) | Drop the manifest in [Use as an agent skill](#use-as-an-agent-skill) into the harness's skills directory. `heso` on PATH does the rest. |
+| **CLI-spawning harnesses** | `heso <verb> ...` outputs JSON on stdout. Standard subprocess; no special integration. |
+| **Long-running JSON-RPC harnesses** | `heso serve` is JSON-RPC 2.0 over stdin/stdout. Cookies + DOM state persist across calls. |
 
 The verbs are the contract (see [ADR 0017](https://github.com/blank3rs/heso/blob/main/decisions/0017-verbs-as-agent-surface.md)) — no heso-specific framework dependency, no adapter layer.
 
-## Verbs are open
-
-**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The full spec lives at [`spec/HESO-1.0.md`](spec/HESO-1.0.md). It defines the core verb set — every conformant implementation MUST dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
+**HESO/1.0** is an open protocol; the `heso` binary is one implementation. Spec lives at [`spec/HESO-1.0.md`](spec/HESO-1.0.md). It defines the core verb set every conformant implementation must dispatch. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
 
 ```json
 {"verb": "com.example.scrape-pricing", "url": "https://example.com/products"}
 {"verb": "org.archive.warc-import",    "path": "./snapshot.warc"}
 ```
 
-No registration server, no central authority. **Dispatch is local-only** (spec §4.4) — receiving a plat with an unknown extension verb is a structured error, never a network fetch or a code download. The doc-under-your-domain is human documentation, not a code-delivery channel; discovering a verb (reading the doc) and dispatching it (running the code) are separate operations the spec keeps cleanly apart.
+Dispatch is local-only (spec §4.4) — receiving a plat with an unknown extension verb is a structured error, never a network fetch or a code download. Today the reference binary ships only the core verbs; typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary.
 
-DNS ownership prevents anyone but you from claiming names *under your domain* — same anti-impersonation model as Java packages, Android application IDs, Maven groups, and OCI image labels. It does NOT solve typosquatting (`com.exarnple.foo` and `com.example.foo` are distinct names that look identical to a human reader). HESO/1.0 anchors trust on signing keys, not verb names: pin receivers to trusted signers via the existing `verify --trusted-keys` allowlist (spec §3.9, §4.6).
-
-Today, the reference implementation (this binary, `v0.1.4`) ships only the core verbs — typing `heso com.example.foo ...` exits with `unknown subcommand`. Extension verbs are a namespace, not yet a registered-impl surface in this binary; to dispatch one today you implement HESO/1.0 yourself, in any language. The spec is what makes that implementation possible.
+DNS ownership prevents anyone but you from claiming names under your domain — same anti-impersonation model as Java packages, Android application IDs, Maven groups, OCI image labels. It does not solve typosquatting. HESO/1.0 anchors trust on signing keys, not verb names: pin receivers to trusted signers via the existing `verify --trusted-keys` allowlist (spec §3.9, §4.6).
 
 ## Use as an agent skill
 
-heso is built to be a tool an agent calls, not a library a human drives. The cleanest integration is the skill markdown pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses use:
+heso is built to be a tool an agent calls, not a library a human drives. The cleanest integration is the skill-markdown pattern that Claude Code, Cursor, Aider, Cline, and similar harnesses use:
 
 ```markdown
 ---
@@ -418,19 +360,19 @@ description: Use heso when an agent needs to touch the web — fetch pages, run 
 
 - `heso search "<query>" [--limit N]` — web search via DDG + Wikipedia
 - `heso open <url>` — page summary
-- `heso read <url> [--complete]` — full content + actions + forms (use --complete for lazy-loaded sites)
+- `heso read <url> [--complete]` — full content + actions + forms
+- `heso eval-dom <url> "<js>"` — run JS against the post-hydration DOM, get JSON
 - `heso wait <url> --selector-exists ".x"` — block until a condition is true
 - `heso batch [open|read] <urls...> [--parallel N]` — parallel scrape
 - `heso click <url> --text "..." | --selector "..." | @eN` — click
 - `heso fill <url> @eN "value"` — type into input
 - `heso submit <url> @eN` — submit form
-- `heso eval-dom <url> "<js>"` — run JS against the page
 - `heso serve` — multi-step JSON-RPC session
 - `--best-effort` on open/read/wait — exit 0 on partial failures, surface what broke
 - `--inject-script "<js>" | @file` — inject a polyfill before page scripts run
 ```
 
-The verbs are the contract. Same shape works in any harness that does tool or skill markdown.
+Same shape works in any harness that does tool or skill markdown.
 
 ## Stats
 
@@ -447,7 +389,7 @@ Measured on Windows 11, AMD x86_64, with the release binary. Cold-start and JS-e
 
 ## Building from source
 
-If you want to hack on heso itself (prebuilt binaries for Windows x64, Linux x64+arm64, macOS x64+arm64 ship from each release tag — see Install above):
+Prebuilt binaries for Windows x64, Linux x64+arm64, macOS x64+arm64 ship from each release tag. To hack on heso itself:
 
 ```sh
 git clone https://github.com/blank3rs/heso
@@ -460,7 +402,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-`v0.1.4` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the `heso-engine-js` lib-test suite (265 tests, the bulk of the determinism + DOM + scripts coverage) is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
+`v0.1.4` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — spot checks across the second-tier sites listed above come back clean, and the `heso-engine-js` lib-test suite (265 tests) is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
 
 ## License
 

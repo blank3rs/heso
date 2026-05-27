@@ -1,8 +1,8 @@
 # @ixla/heso
 
-**The auditable layer for the agent web.** A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of what happened.
+A Rust runtime that lets an agent touch the web — fetch a page, run its JavaScript, query the resulting DOM, click, fill, submit, hold a session — and return JSON. Every run can be stamped into a signed file (a *plat*) that replays byte-identically off-network.
 
-Every run can be **stamped** into a *plat* with an embedded network cassette. `heso run` re-executes it off-network and the resulting `plat_hash` is byte-identical to the original. Hand the artifact to an auditor. Failures come back as structured data, not opaque browser crashes. One Rust binary; no Chromium, no Node.
+One binary. No Chromium, no Node.
 
 <!-- heso:perf:start -->
 ```
@@ -24,7 +24,7 @@ npm install @ixla/heso            # library (also gives you the CLI shim)
 npx @ixla/heso open https://example.com   # one-shot
 ```
 
-> Ships prebuilt binaries for Windows x64, Linux x64 + arm64, and macOS x64 + arm64. `npm` picks the right `@ixla/heso-<platform>-<arch>` via `optionalDependencies` — no native build step.
+> Ships prebuilt binaries for Windows x64, Linux x64 + arm64, macOS x64 + arm64. `npm` picks the right `@ixla/heso-<platform>-<arch>` via `optionalDependencies` — no native build step.
 
 <!-- heso:version:start -->
 > Shipping `v0.1.4` for Windows-x64, Linux x64 + arm64, macOS x64 + arm64. `cargo-dist` builds every target on tag; npm/PyPI publish through the same workflow.
@@ -32,27 +32,45 @@ npx @ixla/heso open https://example.com   # one-shot
 
 ## Use as a CLI
 
+The shortest path to structured data on a page is `eval-dom`: fetch + run page scripts + run your JS against the DOM + return JSON.
+
 ```sh
-heso open https://example.com
-# → { url, title, description, tree, actions, plat_hash, ... }
+heso eval-dom https://news.ycombinator.com '
+  Array.from(document.querySelectorAll(".athing")).slice(0, 5).map(row => ({
+    title: row.querySelector(".titleline > a")?.innerText,
+    href:  row.querySelector(".titleline > a")?.href,
+  }))
+'
+```
+
+For the broader view there's `read` (or `open` for just title + actions + tree):
+
+```sh
+heso open  https://example.com
+heso read  https://nextjs.org/ --complete
+heso batch read url1 url2 url3 --parallel 2
 
 heso search "rust web scraping" --limit 5
-heso read https://nextjs.org/ --complete
-heso batch read url1 url2 url3 --parallel 2
-heso click https://news.ycombinator.com --text "More"
-heso wait https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
-heso open https://x.com --best-effort --inject-script "window.lunr = (() => ({}))()"
-heso serve     # JSON-RPC over stdio for multi-step sessions
+heso click  https://news.ycombinator.com --text "more"
+heso fill   https://example.com/search @e0 "rust"
+heso submit https://example.com/search @form1 --field q=rust
+heso wait   https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
+heso serve  # JSON-RPC over stdio for multi-step sessions
+```
 
-heso stamp  plan.json > out.plat    # plan → plat (executes + mints)
-heso replay out.plat                # plat → per-step log (no artifact)
-heso unpack out.plat > plan.json    # plat → plan (edit, restamp)
+Plat tools (signed, replayable artifacts):
 
-heso plat-info   out.plat           # human summary of a plat (hash, plan/cassette/steps counts, sealed status)
-heso plat-diff   a.plat b.plat      # what changed (plan, cassette URLs, fields)
-heso plat-redact cookies my.plat    # strip a top-level field, recompute plat_hash
-heso plat-seal   my.plat            # wrap in Ed25519 envelope (default key: heso-local-data/identity.key)
-heso plat-unseal sealed.plat        # verify; exit 0 valid / 1 invalid / 2 wrong-alg
+```sh
+heso stamp  plan.json > out.plat       # plan → plat (executes + records cassette)
+heso run    out.plat > replay.plat     # plat → plat (off-network, byte-identical hash)
+heso replay out.plat                   # plat → step log (pure read, no engine)
+heso replay --plan out.plat > plan.json  # plat → plan (edit, restamp)
+
+heso info   out.plat                   # summary: hash, plan / cassette / steps counts
+heso info   before.plat after.plat     # diff (plan, cassette URLs, fields)
+heso seal   my.plat > sealed.plat      # wrap in Ed25519 envelope
+heso unseal sealed.plat                # verify; exit 0 valid / 1 invalid / 2 wrong-alg or malformed
+heso verify receipt.json --trusted-keys trusted.json
 ```
 
 Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.
@@ -62,7 +80,7 @@ Full verb reference at **[heso.ca/docs](https://www.heso.ca/docs)**.
 ```js
 import {
   open, read, evalDom, session, wait,
-  stamp, replay,
+  stamp, run, replay,
   verify, info, seal, unseal,
   registry,
   HesoError,
@@ -89,11 +107,11 @@ await session(async (s) => {
 });
 
 // Polymorphic plat / receipt tools
-const info_out = await info("out.plat");                       // summary of any artifact
-const verdict  = await verify("out.plat");                     // { status: "valid", ... }
-const sealed   = await seal("out.plat");                       // SealedPlat envelope
-const status   = await unseal("sealed.plat");                  // { status: "valid", ... }
-const body     = await unseal("sealed.plat", { extract: true }); // inner plat
+const summary = await info("out.plat");                        // summary of any artifact
+const verdict = await verify("out.plat");                      // { status: "valid", ... }
+const sealed  = await seal("out.plat");                        // SealedPlat envelope
+const status  = await unseal("sealed.plat");                   // { status: "valid", ... }
+const body    = await unseal("sealed.plat", { extract: true }); // inner plat
 ```
 
 All functions return `Promise<object>`. TypeScript declarations ship in `index.d.ts`.
@@ -114,7 +132,7 @@ try {
 }
 ```
 
-For sites that crash some scripts, opt into the partial-success envelope instead:
+For sites that crash some scripts, opt into the partial-success envelope instead — heso exits 0 with `partial: true`:
 
 ```js
 const page = await read("https://shoelace.style", { bestEffort: true });
@@ -123,20 +141,26 @@ if (page.partial) {
 }
 ```
 
-## What it can do
+## What works today
 
-- **Find and read**: `search`, `open`, `read --complete`, `batch`, `wait`
-- **Interact**: `click` by ref/text/selector/aria, `fill`, `submit`; sessions also expose `navigate`
-- **Recover from broken sites**: `--best-effort` returns `partial: true` + structured failure envelope; `--inject-script` shims missing globals
-- **Detect state changes**: `read` returns `content_hash`; pass `--since <hash>` for a `delta` describing what changed
-- **Stateful sessions**: `session()` wraps a long-lived `heso serve` for login → navigate → scrape flows
+- **eval-dom is the structured-extraction primary** — fetch + run page scripts + run your JS against the DOM, one round trip.
+- **Most second-tier sites Just Work.** Default UA is `heso/<version>` — honest, no impersonation, no residential-proxy farm — and that slips past a lot of WAF heuristics tuned for Playwright, Puppeteer, curl-impersonate, and headless-Chrome traffic. Sites that go through cleanly on a vanilla call include Zillow, Walmart, CoinGecko, LinkedIn anonymous pages, TripAdvisor, Yahoo Finance, and Reddit via `old.reddit.com`.
+- **Find and read** — `search`, `open`, `read --complete`, `batch`, `wait`.
+- **Interact** — `click` by ref/text/selector/aria, `fill`, `submit`; sessions also expose `navigate`.
+- **Recover from broken sites** — `--best-effort` returns `partial: true` + structured failure envelope; `--inject-script` shims missing globals.
+- **Detect state changes** — `read` returns `content_hash`; pass `--since <hash>` for a `delta` describing what changed.
+- **Stateful sessions** — `session()` wraps a long-lived `heso serve` for login → navigate → scrape flows.
 
-## What it can't do
+## What doesn't
 
 - **No rendering** — no canvas, WebGL, CSS layout, or video. If the meaning is in pixels, use a real browser.
-- **CAPTCHAs and hard bot-detect** — hits one, stops.
-- **Pages built on tech we don't simulate** — Service Workers, WebRTC, WebUSB, WebBluetooth.
-- **Sites whose JS we can't run** — QuickJS isn't V8. Most works; some doesn't.
+- **Full Cloudflare Challenge Mode and Imperva interstitials still block.** The narrow bot-challenge detection catches them — exit data is honest, exit content is empty. No CAPTCHA solver.
+- **No Service Workers, WebRTC, WebUSB, WebBluetooth.**
+- **QuickJS, not V8.** Most modern frameworks (Next.js, React, Vue, Svelte, SSR) run cleanly; some V8-specific JS doesn't.
+
+## Honest about HTTP and bot walls
+
+Every response carries `http_status`. Bodies containing Cloudflare's `__cf_chl_opt` JS shim or a `<title>` starting with one of nine well-known WAF phrases ("Just a moment…", "Attention Required", "Access Denied", "Verify you are human", and a few variants) surface as `partial_reason: "bot_challenge"` regardless of wrapper status. The detection is intentionally narrow — false positives are worse than misses — so many bot walls come back as `http_403` or `http_429` and you should treat those as bot-walled by default rather than retrying the same request.
 
 ## Plug into agent harnesses
 

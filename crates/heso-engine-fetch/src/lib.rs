@@ -903,11 +903,16 @@ pub fn is_bot_challenge(html: &str) -> bool {
 /// Map an HTTP status + body to an optional `partial_reason` token.
 /// `None` means "clean 2xx"; `Some(...)` is the failure-envelope token
 /// the agent surface uses: `http_403`, `http_5xx`, `bot_challenge`, ...
+///
+/// Bot-challenge content is checked first and takes precedence over the
+/// HTTP label, since WAFs serve their interstitials under a mix of
+/// statuses (200, 403, 429, 503). The agent-relevant signal is "this is
+/// a challenge page", not the wrapper status code.
 pub fn partial_reason_for_status(http_status: u16, body_html: &str) -> Option<String> {
+    if is_bot_challenge(body_html) {
+        return Some("bot_challenge".to_owned());
+    }
     if (200..300).contains(&http_status) {
-        if is_bot_challenge(body_html) {
-            return Some("bot_challenge".to_owned());
-        }
         return None;
     }
     if (400..500).contains(&http_status) {
