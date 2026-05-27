@@ -817,7 +817,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "heso-cli"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "heso-core",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "heso-compat-suite"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "heso-engine-fetch",
  "heso-engine-js",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "heso-compat-tests"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "heso-core",
  "heso-engine-api",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "heso-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "heso-engine-api"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "heso-core",
  "thiserror",
@@ -893,7 +893,7 @@ dependencies = [
 
 [[package]]
 name = "heso-engine-fetch"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "blake3",
@@ -916,7 +916,7 @@ dependencies = [
 
 [[package]]
 name = "heso-engine-js"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "cookie_store 0.21.1",
@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "heso-primitives"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "heso-core",
@@ -951,7 +951,7 @@ dependencies = [
 
 [[package]]
 name = "heso-trace"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "heso-core",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "heso-trace-exec"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "blake3",
  "heso-core",
