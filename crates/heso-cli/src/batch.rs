@@ -495,12 +495,23 @@ async fn run_one(
     };
 
     match tokio::time::timeout(timeout_per_url, task).await {
-        Ok(Ok(payload)) => BatchRow {
-            url: url.to_string(),
-            ok: true,
-            payload: Some(payload),
-            error: None,
-        },
+        Ok(Ok(payload)) => {
+            // `ok` reflects whether the verb's primary objective
+            // succeeded — i.e. a usable page came back. A 5xx or
+            // `partial: true` shape is not "ok" even though the fetch
+            // wire didn't panic. Mirrors single-URL `heso open` semantics.
+            let payload_ok = payload
+                .get("partial")
+                .and_then(|v| v.as_bool())
+                .map(|p| !p)
+                .unwrap_or(true);
+            BatchRow {
+                url: url.to_string(),
+                ok: payload_ok,
+                payload: Some(payload),
+                error: None,
+            }
+        }
         Ok(Err(err)) => BatchRow {
             url: url.to_string(),
             ok: false,
@@ -530,7 +541,7 @@ async fn run_open_for_url(
         .open(url)
         .await
         .map_err(|e| classify_fetch_error(&e.to_string()))?;
-    Ok(build_open_payload(&page))
+    Ok(build_open_payload_with_envelope(&page))
 }
 
 /// `heso read` for one URL — fetch + JS hydration. One [`heso_engine_js::JsEngine`]
@@ -542,7 +553,7 @@ async fn run_read_for_url(
     engine: &Arc<FetchEngine>,
     url: &Url,
     include: IncludeFilter,
-    _js_fetch: bool,
+    js_fetch: bool,
 ) -> Result<serde_json::Value, String> {
     let page = engine
         .open(url)
@@ -552,17 +563,30 @@ async fn run_read_for_url(
     let client = engine.client();
     let cookie_jar = engine.cookie_jar();
     let rt_handle = tokio::runtime::Handle::current();
-    let js_engine =
+    let js_engine = if js_fetch {
         heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar)
-            .map_err(|e| format!("engine: {e}"))?;
+            .map_err(|e| format!("engine: {e}"))?
+    } else {
+        heso_engine_js::JsEngine::new().map_err(|e| format!("engine: {e}"))?
+    };
+    let script_policy = if js_fetch {
+        heso_engine_js::ScriptFetchPolicy::Fetch
+    } else {
+        heso_engine_js::ScriptFetchPolicy::Skip
+    };
     let (session, script_outcome) = heso_engine_js::JsSession::open_on_engine(
         js_engine,
         &page.body_html,
         page.url().clone(),
-        heso_engine_js::ScriptFetchPolicy::Fetch,
+        script_policy,
     )
     .map_err(|e| format!("js_hydrate: {e}"))?;
     let console = session.engine().drain_console();
+    let failed_scripts = session.engine().drain_script_failures();
+    let console_errors_count = console
+        .iter()
+        .filter(|e| matches!(e.level, heso_engine_js::ConsoleLevel::Error))
+        .count();
     let post_html = session.document_html();
 
     let mut body = build_open_payload_without_hash(&page);
@@ -590,6 +614,28 @@ async fn run_read_for_url(
             "skipped_non_script_type": script_outcome.skipped_non_script_type,
         });
     }
+    let (js_partial, js_reason) = crate::classify_failure_envelope(&failed_scripts);
+    let (partial, partial_reason) = crate::apply_http_truthfulness(
+        js_partial,
+        js_reason,
+        page.http_status,
+        &page.body_html,
+    );
+    let (partial, partial_reason) = crate::apply_extraction_truthfulness(
+        partial,
+        partial_reason,
+        &page.tree.title,
+        page.actions.len(),
+        page.tree.root.children.len(),
+        &failed_scripts,
+    );
+    crate::attach_failure_envelope(
+        &mut body,
+        partial,
+        &partial_reason,
+        &failed_scripts,
+        console_errors_count,
+    );
     // plat_hash last — over the same canonical form `heso read` uses.
     let hash = heso_engine_fetch::plat_hash(&body);
     if let Some(obj) = body.as_object_mut() {
@@ -598,11 +644,24 @@ async fn run_read_for_url(
     Ok(body)
 }
 
-/// Build the `heso open` JSON payload (with `plat_hash`) for a fetched
-/// page. Identical shape to the single-URL `cmd_open` output, minus
-/// the top-level `url` field which the batch row carries.
-fn build_open_payload(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
-    let mut body = build_open_payload_without_hash(page);
+/// Build the `heso open` JSON payload (with `plat_hash` AND the
+/// structured-failure envelope) for a fetched page. Mirrors the
+/// single-URL `cmd_open` output minus the top-level `url` field
+/// (which the batch row carries). HTTP-side classification only —
+/// `batch open` skips the JS hydration pass that single `open` does
+/// for `failed_scripts`/`console_errors_count` because that would
+/// rebuild a QuickJS context per URL.
+fn build_open_payload_with_envelope(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
+    let mut body = page.plat_body_base();
+    let partial_reason = heso_engine_fetch::partial_reason_for_status(
+        page.http_status,
+        &page.body_html,
+    );
+    let (partial, reason): (bool, String) = match partial_reason {
+        Some(r) => (true, r),
+        None => (false, "ok".to_owned()),
+    };
+    crate::attach_failure_envelope(&mut body, partial, &reason, &[], 0);
     let hash = heso_engine_fetch::plat_hash(&body);
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
@@ -610,9 +669,8 @@ fn build_open_payload(page: &heso_engine_fetch::FetchPage) -> serde_json::Value 
     body
 }
 
-/// Same as [`build_open_payload`] but skips the final `plat_hash`
-/// stamp — the `read` path needs to layer extra fields on first, then
-/// compute the hash over the full result.
+/// Skips the final `plat_hash` stamp — the `read` path needs to layer
+/// extra fields on first, then compute the hash over the full result.
 fn build_open_payload_without_hash(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
     page.plat_body_base()
 }
