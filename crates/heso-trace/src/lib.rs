@@ -89,6 +89,23 @@ pub struct Cost {
     pub planner_tokens: u64,
 }
 
+/// RFC 3161 trusted-timestamp anchor. Conditionally present on a
+/// [`Receipt`] after notarization. When present, participates in
+/// [`canonical_receipt_bytes`] under [`SignatureScope::PostAnchor`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TsaAnchor {
+    /// URL of the TSA that issued the token.
+    pub tsa_url: String,
+    /// Hash algorithm used for `message_imprint_hex`. Canonical value: `"SHA-256"`.
+    pub hash_alg: String,
+    /// Hex-encoded hash over `canonical_receipt_bytes(R, PreAnchor)`.
+    pub message_imprint_hex: String,
+    /// Base64-encoded RFC 3161 `TimeStampToken` (DER-encoded ASN.1).
+    pub token_b64: String,
+    /// `genTime` from the TSA response, ISO 8601 string.
+    pub gen_time: String,
+}
+
 /// Receipt of one trace run.
 ///
 /// Per [ADR 0009], every `heso.run` call returns a receipt. The receipt
@@ -103,7 +120,7 @@ pub struct Cost {
 ///
 /// [ADR 0005]: ../../decisions/0005-ed25519-identity.md
 /// [ADR 0009]: ../../decisions/0009-heso-run-single-tool.md
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
     /// The full trace as planned.
     pub trace: Trace,
@@ -140,6 +157,14 @@ pub struct Receipt {
     /// [ADR 0005]: ../../decisions/0005-ed25519-identity.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    /// Conditionally-present RFC 3161 timestamp anchor. See [`TsaAnchor`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsa_anchor: Option<TsaAnchor>,
+    /// 64-character lowercase hex BLAKE3 hash of the plat produced by the
+    /// trace run that generated this receipt. Populated by stamp/run flows
+    /// when a plat is emitted alongside the receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub produced_plat_hash: Option<String>,
 }
 
 impl Receipt {
@@ -152,8 +177,16 @@ impl Receipt {
 impl SignaturePayload for Receipt {
     /// Canonical-JSON of the receipt with `signature` cleared, encoded as
     /// UTF-8 bytes. The same shape verifiers use to recompute the digest.
+    /// Dispatches the signature scope on `tsa_anchor` presence so the
+    /// trait impl matches what [`sign_receipt`] and [`verify_receipt`]
+    /// produce.
     fn signing_payload(&self) -> Vec<u8> {
-        canonical_receipt_json(self).into_bytes()
+        let scope = if self.tsa_anchor.is_some() {
+            SignatureScope::PostAnchor
+        } else {
+            SignatureScope::PreAnchor
+        };
+        canonical_receipt_bytes(self, scope)
     }
 }
 
@@ -608,8 +641,26 @@ pub fn normalize_url_for_hash(url: &Url) -> String {
 // Canonical-JSON for signing
 // ============================================================================
 
-/// Canonical-JSON form of a receipt with `signature` cleared, suitable as
-/// the byte input to Ed25519 signing/verifying.
+/// Which canonical-byte view of a [`Receipt`] is being requested.
+///
+/// `PreAnchor` clears both `signature` AND `tsa_anchor` to JSON null —
+/// used for the TSA `messageImprint` input and for the initial signature
+/// in the default (re-sign) notarize flow.
+///
+/// `PostAnchor` clears only `signature` to JSON null; `tsa_anchor` is
+/// preserved. Used for the re-signed signature after notarize attaches
+/// the anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureScope {
+    /// Both `signature` and `tsa_anchor` cleared.
+    PreAnchor,
+    /// Only `signature` cleared; `tsa_anchor` preserved.
+    PostAnchor,
+}
+
+/// Canonical bytes of a [`Receipt`] under the requested signature scope.
+/// The signature field is always cleared to JSON null; the anchor field
+/// is cleared only under [`SignatureScope::PreAnchor`].
 ///
 /// Canonicalization rules (same as the [`plat`] module — chosen so two
 /// implementations produce identical bytes):
@@ -620,29 +671,34 @@ pub fn normalize_url_for_hash(url: &Url) -> String {
 ///   subset (handles `\"`, `\\`, `\n`, `\t`, `\uXXXX`, etc.).
 /// - Numbers via `serde_json::Number`'s `Display`, which preserves the
 ///   integer-vs-float distinction.
-/// - The `signature` field is forced to `null` on the receipt object
-///   itself before canonicalizing. The "sign it and stamp it" pattern:
-///   sign over the receipt-without-signature, then write the signature
-///   back into the same struct.
 ///
 /// This is a subset of RFC 8785 (JSON Canonicalization Scheme) sufficient
-/// for the value shapes a receipt emits. If we ever need full RFC 8785
-/// conformance for cross-vendor interop we can swap in a JCS crate; for
-/// v1 the in-tree implementation is small, dependency-free, and explicit
-/// about its constraints.
+/// for the value shapes a receipt emits.
 ///
 /// [`plat`]: ../heso_engine_fetch/plat/index.html
-pub fn canonical_receipt_json(receipt: &Receipt) -> String {
+pub fn canonical_receipt_bytes(receipt: &Receipt, scope: SignatureScope) -> Vec<u8> {
     let mut v = serde_json::to_value(receipt).expect("receipt serializes");
-    // Force `signature` to JSON `null` on the top-level object. That gives
-    // a single canonical "unsigned" shape regardless of whether the input
-    // is a fresh (no field) or already-signed (Some(...)) receipt.
     if let Some(obj) = v.as_object_mut() {
         obj.insert("signature".to_owned(), Value::Null);
+        if scope == SignatureScope::PreAnchor {
+            obj.insert("tsa_anchor".to_owned(), Value::Null);
+        }
     }
     let mut out = String::new();
     write_canonical(&v, &mut out);
-    out
+    out.into_bytes()
+}
+
+/// Canonical-JSON form of a receipt with `signature` cleared, suitable as
+/// the byte input to Ed25519 signing/verifying.
+///
+/// Thin wrapper over [`canonical_receipt_bytes`] under
+/// [`SignatureScope::PreAnchor`] — receipts without a `tsa_anchor` produce
+/// the same bytes either way, preserving back-compat with pre-anchor
+/// receipts.
+pub fn canonical_receipt_json(receipt: &Receipt) -> String {
+    String::from_utf8(canonical_receipt_bytes(receipt, SignatureScope::PreAnchor))
+        .expect("canonical JSON is valid UTF-8")
 }
 
 fn write_canonical<W: std::fmt::Write>(v: &Value, out: &mut W) {
@@ -737,25 +793,22 @@ fn write_json_string<W: std::fmt::Write>(out: &mut W, s: &str) {
 /// Any pre-existing signature is discarded before the new one is
 /// computed (the canonical form clears it anyway, so this just keeps the
 /// in-memory struct consistent with what was signed).
+///
+/// The signature scope tracks `tsa_anchor` presence — receipts with an
+/// attached anchor sign under [`SignatureScope::PostAnchor`] so the
+/// anchor itself is covered; receipts without sign under
+/// [`SignatureScope::PreAnchor`]. [`verify_receipt`] mirrors this
+/// dispatch so the bytes match on both sides.
 pub fn sign_receipt(key: &IdentityKey, receipt: &mut Receipt) {
     receipt.signature = None;
-    let payload = canonical_receipt_json(receipt).into_bytes();
+    let scope = if receipt.tsa_anchor.is_some() {
+        SignatureScope::PostAnchor
+    } else {
+        SignatureScope::PreAnchor
+    };
+    let payload = canonical_receipt_bytes(receipt, scope);
     let sig = key.sign(&payload);
     receipt.signature = Some(sig);
-}
-
-/// Compute the canonical-JSON bytes of a receipt **as if its
-/// `signature` field were `null`**, without mutating or cloning the
-/// caller's receipt. Used by [`verify_receipt`] to skip the `Receipt`
-/// clone that the previous implementation paid on every verify.
-fn canonical_receipt_unsigned_bytes(receipt: &Receipt) -> Vec<u8> {
-    let mut v = serde_json::to_value(receipt).expect("receipt serializes");
-    if let Some(obj) = v.as_object_mut() {
-        obj.insert("signature".to_owned(), Value::Null);
-    }
-    let mut out = String::new();
-    write_canonical(&v, &mut out);
-    out.into_bytes()
 }
 
 /// Verify a receipt's embedded signature against its canonical form.
@@ -771,11 +824,12 @@ pub fn verify_receipt(receipt: &Receipt) -> VerifyOutcome {
     let Some(sig) = receipt.signature.as_ref() else {
         return VerifyOutcome::Missing;
     };
-    // Recompute canonical form with `signature` cleared. Previously
-    // this `.clone()`d the whole receipt (every PrimitiveResult, every
-    // pages_seen entry, every String) just to set signature=None; the
-    // helper writes the canonical bytes from a borrow.
-    let payload = canonical_receipt_unsigned_bytes(receipt);
+    let scope = if receipt.tsa_anchor.is_some() {
+        SignatureScope::PostAnchor
+    } else {
+        SignatureScope::PreAnchor
+    };
+    let payload = canonical_receipt_bytes(receipt, scope);
     match sig.verify(&payload) {
         Ok(()) => VerifyOutcome::Valid,
         Err(e) => VerifyOutcome::Invalid(e),
@@ -819,21 +873,17 @@ mod tests {
         let trace = url("https://example.com/");
         Receipt {
             trace: trace.clone(),
-            results: vec![],
             pages_seen: vec![ContentHash::of(b"page")],
             trace_hash: trace_hash(&trace),
             planner_id: "planner-v0".into(),
             seed: 42,
-            mode: Mode::Deterministic,
             cost: Cost {
                 bytes: 1024,
                 cpu_ms: 5,
                 wall_ms: 200,
                 planner_tokens: 0,
             },
-            failed_at: None,
-            error: None,
-            signature: None,
+            ..Default::default()
         }
     }
 
@@ -1284,10 +1334,7 @@ mod tests {
     #[test]
     fn canonical_form_sorts_keys_at_top_level() {
         // The serialized receipt has many fields; canonical form must list
-        // them in lexicographic order. Quick check: `cost` precedes
-        // `error` precedes `failed_at` precedes `mode` precedes `pages_seen`
-        // precedes `planner_id` precedes `results` precedes `seed`
-        // precedes `signature` precedes `trace` precedes `trace_hash`.
+        // them in lexicographic order.
         let mut r = sample_receipt();
         r.error = Some("e".into());
         r.failed_at = Some(1);
@@ -1304,6 +1351,7 @@ mod tests {
             "\"signature\"",
             "\"trace\"",
             "\"trace_hash\"",
+            "\"tsa_anchor\"",
         ];
         let mut prev = 0usize;
         for needle in positions {
@@ -1448,6 +1496,121 @@ mod tests {
                 Value::Object(out)
             }
             other => other,
+        }
+    }
+
+    // ------- tsa_anchor + produced_plat_hash -------
+
+    fn sample_anchor() -> TsaAnchor {
+        TsaAnchor {
+            tsa_url: "https://tsa.example/timestamp".into(),
+            hash_alg: "SHA-256".into(),
+            message_imprint_hex: "a".repeat(64),
+            token_b64: "AAAA".into(),
+            gen_time: "2026-05-27T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn tsa_anchor_serde_roundtrip() {
+        let a = sample_anchor();
+        let json = serde_json::to_string(&a).unwrap();
+        let back: TsaAnchor = serde_json::from_str(&json).unwrap();
+        assert_eq!(a, back);
+    }
+
+    #[test]
+    fn receipt_with_tsa_anchor_serde_roundtrip() {
+        let mut r = sample_receipt();
+        r.tsa_anchor = Some(sample_anchor());
+        let json = serde_json::to_string(&r).unwrap();
+        let back: Receipt = serde_json::from_str(&json).unwrap();
+        assert_eq!(r, back);
+    }
+
+    #[test]
+    fn receipt_omits_tsa_anchor_when_none() {
+        let r = sample_receipt();
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(
+            !s.contains("\"tsa_anchor\""),
+            "unanchored receipt JSON must omit tsa_anchor: {s}"
+        );
+    }
+
+    #[test]
+    fn receipt_omits_produced_plat_hash_when_none() {
+        let r = sample_receipt();
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(
+            !s.contains("\"produced_plat_hash\""),
+            "receipt JSON without plat must omit produced_plat_hash: {s}"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_preanchor_clears_anchor() {
+        let mut r = sample_receipt();
+        r.tsa_anchor = Some(sample_anchor());
+        let bytes = canonical_receipt_bytes(&r, SignatureScope::PreAnchor);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.contains("\"tsa_anchor\":null"),
+            "PreAnchor must null out tsa_anchor: {s}"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_postanchor_preserves_anchor() {
+        let mut r = sample_receipt();
+        r.tsa_anchor = Some(sample_anchor());
+        let bytes = canonical_receipt_bytes(&r, SignatureScope::PostAnchor);
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            s.contains("\"tsa_url\":\"https://tsa.example/timestamp\""),
+            "PostAnchor must keep the populated anchor: {s}"
+        );
+        assert!(
+            s.contains("\"message_imprint_hex\""),
+            "PostAnchor must keep anchor inner fields: {s}"
+        );
+        assert!(
+            !s.contains("\"tsa_anchor\":null"),
+            "PostAnchor must not null out tsa_anchor: {s}"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_both_scopes_clear_signature() {
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        r.tsa_anchor = Some(sample_anchor());
+        sign_receipt(&key, &mut r);
+        assert!(r.signature.is_some());
+        for scope in [SignatureScope::PreAnchor, SignatureScope::PostAnchor] {
+            let bytes = canonical_receipt_bytes(&r, scope);
+            let s = std::str::from_utf8(&bytes).unwrap();
+            assert!(
+                s.contains("\"signature\":null"),
+                "scope {scope:?} must null out signature: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn produced_plat_hash_participates_in_signing() {
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        r.produced_plat_hash = Some("a".repeat(64));
+        sign_receipt(&key, &mut r);
+        match verify_receipt(&r) {
+            VerifyOutcome::Valid => {}
+            other => panic!("expected Valid pre-mutation, got {other:?}"),
+        }
+        r.produced_plat_hash = Some("b".repeat(64));
+        match verify_receipt(&r) {
+            VerifyOutcome::Invalid(_) => {}
+            other => panic!("expected Invalid after mutating plat hash, got {other:?}"),
         }
     }
 }

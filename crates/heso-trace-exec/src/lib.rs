@@ -120,6 +120,8 @@ pub async fn run<E: EngineApi>(engine: &E, trace: &Trace, config: &SessionConfig
         failed_at,
         error,
         signature: None,
+        tsa_anchor: None,
+        produced_plat_hash: None,
     }
 }
 
