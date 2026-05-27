@@ -61,7 +61,7 @@ jobs:
       - name: Refuse new .md outside public allowlist
         run: |
           set -euo pipefail
-          allow='^(README\.md|SECURITY\.md|crates/[^/]+/README\.md|npm/heso/README\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$'
+          allow='^(README\.md|npm/heso/README\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$'
           added=$(git diff --name-only --diff-filter=A "${{ steps.base.outputs.base }}" HEAD -- '*.md' || true)
           if [ -z "$added" ]; then
             echo "no new .md files in this push"

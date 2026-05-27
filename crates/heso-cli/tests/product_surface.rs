@@ -10,7 +10,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ROOT_README: &str = include_str!("../../../README.md");
 const PYPROJECT: &str = include_str!("../../../pyproject.toml");
 const PY_INIT: &str = include_str!("../../../python/heso/__init__.py");
-const SECURITY: &str = include_str!("../../../SECURITY.md");
 const NPM_PACKAGE: &str = include_str!("../../../npm/heso/package.json");
 const NPM_README: &str = include_str!("../../../npm/heso/README.md");
 const NPM_TYPES: &str = include_str!("../../../npm/heso/index.d.ts");
@@ -90,8 +89,6 @@ fn install_and_platform_claims_match_release_artifacts() {
     assert!(PYPROJECT.contains("Operating System :: MacOS"));
     assert!(PYPROJECT.contains("Operating System :: POSIX :: Linux"));
     assert!(PYPROJECT.contains("Operating System :: Microsoft :: Windows"));
-    assert!(SECURITY.contains("Supported Versions"));
-    assert!(SECURITY.contains("Reporting a Vulnerability"));
 }
 
 #[test]

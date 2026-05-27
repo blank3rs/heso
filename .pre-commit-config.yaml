@@ -1,11 +1,11 @@
 # Pre-commit hooks for the public heso repo.
 #
-# The only `.md` files that ship publicly are README.md, SECURITY.md, the
-# per-crate / per-package READMEs, and the HESO spec. Everything else
-# (agent findings, triage, research, regression dumps) stays gitignored.
-# See AGENTS.md > "Where transient agent reports go" for the canonical
-# homes. These hooks back that rule with a machine check so it can't
-# drift on a busy commit.
+# The only `.md` files that ship publicly are README.md, the npm package
+# READMEs (npm/heso + npm/platforms/*), and the HESO spec. Everything
+# else (agent findings, triage, research, regression dumps, internal
+# per-crate notes) stays gitignored. See AGENTS.md > "Where transient
+# agent reports go" for the canonical homes. These hooks back that rule
+# with a machine check so it can't drift on a busy commit.
 #
 # To enable locally: `pre-commit install` (writes a hook into .git/hooks/).
 # CI runs the same config via .github/workflows/hygiene.yml.
@@ -19,29 +19,30 @@ repos:
         entry: |
           Agent-process docs (findings, triage, regressions, research) belong in
           a gitignored directory. See AGENTS.md > "Where transient agent reports
-          go". The only .md files that ship publicly are README.md, SECURITY.md,
-          per-crate/per-package READMEs, and spec/HESO-*.md.
+          go". The only .md files that ship publicly are README.md, the npm
+          package READMEs (npm/heso + npm/platforms/*), and spec/HESO-*.md.
         files: \.md$
-        exclude: ^(README\.md|SECURITY\.md|crates/[^/]+/README\.md|npm/heso/README\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$
+        exclude: ^(README\.md|npm/heso/README\.md|npm/platforms/[^/]+/README\.md|spec/HESO-[0-9.]+\.md)$
 
       - id: no-rogue-root-md
-        name: Refuse new root-level .md other than README / SECURITY
+        name: Refuse new root-level .md other than README
         language: fail
         entry: |
-          The repo root only carries README.md and SECURITY.md. Anything else
+          The repo root only carries README.md. Anything else
           (AGENT_FINDINGS_*.md, REGRESSION_*.md, COMPATIBILITY.md, scratch
           notes) must live in a gitignored directory. See AGENTS.md > "Where
           transient agent reports go".
         files: ^[^/]+\.md$
-        exclude: ^(README\.md|SECURITY\.md)$
+        exclude: ^README\.md$
 
       - id: spec-and-crates-md-shape
-        name: spec/ holds only HESO-*.md, crates/* hold only README.md
+        name: spec/ holds only HESO-*.md, crates/ ships no .md
         language: fail
         entry: |
-          spec/ may only contain HESO-<version>.md files; crates/<name>/ may
-          only contain README.md as its tracked .md surface. Move design notes
-          to a gitignored directory and link from the spec / crate README if
-          needed.
+          spec/ may only contain HESO-<version>.md files; crates/<name>/ does
+          not ship any .md surface (the workspace README + the HESO spec are
+          the documentation surfaces). Move design notes and contributor docs
+          to a gitignored directory and link from the spec or top-level README
+          if needed.
         files: ^(spec/.*\.md|crates/[^/]+/.*\.md)$
-        exclude: ^(spec/HESO-[0-9.]+\.md|crates/[^/]+/README\.md)$
+        exclude: ^spec/HESO-[0-9.]+\.md$
