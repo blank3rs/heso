@@ -5738,6 +5738,39 @@ fn cmd_identity_show(args: &[String]) -> ExitCode {
     }
 }
 
+/// Wall-clock cap applied around `open` and `read` — matches `batch
+/// --timeout-per-url`'s 30s default (Playwright's `actionTimeout`),
+/// so single and batch verbs share the same per-URL budget. A slow
+/// or hung server cannot tie up an agent's subprocess indefinitely.
+const SINGLE_VERB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Wrap a verb future in a wall-clock timeout. On timeout, emit a
+/// one-line JSON envelope with the same `partial` / `partial_reason`
+/// shape `cmd_open` / `cmd_read` use for soft failures, and exit
+/// non-zero. The envelope is stable enough for agents to branch on
+/// without parsing English.
+async fn run_with_single_verb_timeout<F>(verb: &str, fut: F) -> ExitCode
+where
+    F: std::future::Future<Output = ExitCode>,
+{
+    match tokio::time::timeout(SINGLE_VERB_TIMEOUT, fut).await {
+        Ok(code) => code,
+        Err(_) => {
+            let envelope = serde_json::json!({
+                "ok": false,
+                "partial": true,
+                "partial_reason": "timeout",
+                "verb": verb,
+                "timeout_ms": SINGLE_VERB_TIMEOUT.as_millis() as u64,
+            });
+            if let Ok(s) = serde_json::to_string(&envelope) {
+                println!("{s}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -5755,8 +5788,8 @@ async fn main() -> ExitCode {
         Some("cat") => cmd_cat(&args[1..]).await,
         Some("find") => cmd_find(&args[1..]).await,
         Some("meta") => cmd_meta(&args[1..]).await,
-        Some("open") => cmd_open(&args[1..]).await,
-        Some("read") => cmd_read(&args[1..]).await,
+        Some("open") => run_with_single_verb_timeout("open", cmd_open(&args[1..])).await,
+        Some("read") => run_with_single_verb_timeout("read", cmd_read(&args[1..])).await,
         Some("batch") => batch::cmd_batch(&args[1..]).await,
         Some("wait") => cmd_wait(&args[1..]).await,
         Some("eval-js") => cmd_eval_js(&args[1..]).await,
