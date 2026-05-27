@@ -116,6 +116,45 @@ export function read(url: string, options?: ReadOptions): Promise<Record<string,
 /** `heso wait <url>` — block until a page condition is satisfied. */
 export function wait(url: string, options?: WaitOptions): Promise<Record<string, unknown>>;
 
+/** Error envelope on `ok: false` writing-verb responses. */
+export interface WriteVerbError {
+  /**
+   * Stable machine-readable code. `"selector_not_matched"` when the
+   * resolved CSS selector found no element in the loaded DOM;
+   * `"engine_exception"` / `"engine_thrown_value"` / `"engine_failure"`
+   * for JS-side failures.
+   */
+  code: string;
+  message: string;
+  [extra: string]: unknown;
+}
+
+/**
+ * Unified envelope returned by `click` / `fill` / `submit`. `value`
+ * carries the literal string the verb wrote (`fill` only) or `null`
+ * for the verbs that don't take a string. The "did the selector
+ * match an element?" answer is folded into `ok` — a miss returns
+ * `ok: false` with `error.code: "selector_not_matched"`.
+ */
+export interface WriteVerbResult {
+  ok: boolean;
+  op: "click" | "fill" | "submit";
+  url: string;
+  ref: string;
+  selector: string;
+  /** The `id` attribute on the matched element, or `null` when absent. */
+  element_id: string | null;
+  /** Exact string written. `null` for `click` / `submit`. */
+  value: string | null;
+  /** Engine-specific structured payload (e.g. submit's `{matched, submitted, ...}`). */
+  result?: unknown;
+  /** Captured `console.*` output from the dispatched events. */
+  console?: unknown[];
+  /** Present only on `ok: false`. */
+  error?: WriteVerbError;
+  [extra: string]: unknown;
+}
+
 /**
  * `heso search <query>` — multi-source web search (DuckDuckGo HTML +
  * Wikipedia REST `summary` by default; optional SearXNG via `searxUrl`).
@@ -131,23 +170,30 @@ export function search(
  * `heso click <url>` — dispatch a real click. Pass `ref` ("@e7") OR a
  * locator option (`text`, `selector`, `ariaLabel`).
  *
- * The resolved JSON carries `url` (the page where the click happened,
- * post any redirects on that page's own fetch), `final_url` (where
+ * Resolves with the unified writing-verb envelope: `{ok, op: "click",
+ * url, ref, selector, element_id, value, result, console, ...}`. `value`
+ * is always `null` for click — the verb doesn't take a string to write.
+ * A selector miss surfaces as `ok: false` with `error.code:
+ * "selector_not_matched"`.
+ *
+ * Navigation fields: `url` is the page where the click happened (post
+ * any redirects on that page's own fetch); `final_url` is where
  * navigation actually landed after following `<a href>` plus its own
- * redirect chain — equals `url` for non-navigating clicks), and
- * `redirects` (the `{from, to, status}` hops the navigation walked
- * through, empty for direct hits and for clicks that did not
- * navigate).
+ * redirect chain (equals `url` for non-navigating clicks); `redirects`
+ * is the `{from, to, status}` hops the navigation walked through, empty
+ * for direct hits and for clicks that did not navigate.
  */
 export function click(
   url: string,
   ref: string,
   options?: LocatorOptions,
-): Promise<Record<string, unknown>>;
-export function click(url: string, options: LocatorOptions): Promise<Record<string, unknown>>;
+): Promise<WriteVerbResult>;
+export function click(url: string, options: LocatorOptions): Promise<WriteVerbResult>;
 
 /**
- * `heso fill <url> <ref> <value>` — type into an input.
+ * `heso fill <url> <ref> <value>` — type into an input. The response
+ * `value` is the literal string the verb wrote (the bytes you passed),
+ * not a success flag.
  *
  *   fill(url, "@e3", "hello")           // positional ref
  *   fill(url, "hello", { text: "..." }) // locator option, value second-positional
@@ -157,20 +203,25 @@ export function fill(
   ref: string,
   value: string,
   options?: LocatorOptions,
-): Promise<Record<string, unknown>>;
+): Promise<WriteVerbResult>;
 export function fill(
   url: string,
   value: string,
   options: LocatorOptions,
-): Promise<Record<string, unknown>>;
+): Promise<WriteVerbResult>;
 
-/** `heso submit <url>` — submit a form. Accepts a ref or a locator. */
+/**
+ * `heso submit <url>` — submit a form. Accepts a ref or a locator.
+ * Response `value` is `null`; the structured form-submission outcome
+ * (`matched`, `submitted`, `responseStatus`, `responseJson`,
+ * `fieldsApplied`, ...) lives on `result`.
+ */
 export function submit(
   url: string,
   ref: string,
   options?: SubmitOptions,
-): Promise<Record<string, unknown>>;
-export function submit(url: string, options: SubmitOptions): Promise<Record<string, unknown>>;
+): Promise<WriteVerbResult>;
+export function submit(url: string, options: SubmitOptions): Promise<WriteVerbResult>;
 
 /** `heso eval-js <js>` — evaluate JS in a sandboxed QuickJS context (no DOM). */
 export function evalJs(js: string, options?: CommonOptions): Promise<Record<string, unknown>>;

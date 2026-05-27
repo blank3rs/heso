@@ -91,10 +91,12 @@ async fn click_anchor_follows_href_and_reports_destination() {
     );
     let body = parse_body(&out);
 
-    // The original click contract still holds — value: true, op: click.
+    // Click's `value` is null in the unified envelope; the engine's
+    // matched-flag rides on `result` and is folded into `ok`.
     assert_eq!(body["ok"], serde_json::json!(true));
     assert_eq!(body["op"], serde_json::json!("click"));
-    assert_eq!(body["value"], serde_json::json!(true));
+    assert_eq!(body["value"], serde_json::Value::Null);
+    assert_eq!(body["result"], serde_json::json!(true));
 
     // Bug A fix: navigation actually happened.
     assert_eq!(body["navigated"], serde_json::json!(true), "body={body}");
@@ -196,7 +198,8 @@ async fn click_non_anchor_does_not_navigate() {
     assert!(out.status.success());
     let body = parse_body(&out);
     assert_eq!(body["ok"], serde_json::json!(true));
-    assert_eq!(body["value"], serde_json::json!(true));
+    assert_eq!(body["value"], serde_json::Value::Null);
+    assert_eq!(body["result"], serde_json::json!(true));
     // The augmented destination fields should NOT be present.
     assert!(
         body.get("navigated").is_none(),

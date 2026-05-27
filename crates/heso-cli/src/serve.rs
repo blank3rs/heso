@@ -45,9 +45,9 @@
 //! | `find`     | `{page_id, role?, name_substr?, section?}` | `{count, matches: [ElementRef, ...]}` |
 //! | `close`    | `{page_id}` | `{closed: bool}` |
 //! | `ping`     | none | `"pong"` |
-//! | `fill`     | `{ref, value, page_id?}` | `{ok, op, url, ref, selector, value, console}` |
-//! | `click`    | `{ref, page_id?}` | `{ok, op, url, ref, selector, value, console}` |
-//! | `submit`   | `{ref, field?: {name: value}, data?: {name: value}, page_id?}` | `{ok, op, url, ref, selector, value, console, postUrl}` |
+//! | `fill`     | `{ref, value, page_id?}` | `{ok, op, url, ref, selector, element_id, value, result, console}` |
+//! | `click`    | `{ref, page_id?}` | `{ok, op, url, ref, selector, element_id, value: null, result, console}` |
+//! | `submit`   | `{ref, field?: {name: value}, data?: {name: value}, page_id?}` | `{ok, op, url, ref, selector, element_id, value: null, result, console, postUrl}` |
 //! | `eval`     | `{js, page_id?}` | `{ok, url, value, console}` |
 //! | `navigate` | `{url, page_id?}` | `{ok, url, page_id, scripts}` |
 //! | `read`     | `{page_id?, include?, inject_scripts?: [string]}` | `{url, title, text, tree, actions, forms, cookies, console, framework, scripts, plat_hash}` |
@@ -107,8 +107,9 @@ use tokio::sync::Mutex;
 
 use crate::{
     attach_failure_envelope, classify_failure_envelope, collect_cookies, compute_delta,
-    compute_lazy_hints, delta_no_prior, detect_framework, group_forms, merge_submit_fields,
-    parse_include_filter, run_auto_scroll_loop, selector_for_action, ReadSnapshot,
+    compute_lazy_hints, delta_no_prior, detect_framework, engine_matched, group_forms,
+    merge_submit_fields, parse_include_filter, run_auto_scroll_loop, selector_for_action,
+    ReadSnapshot,
 };
 
 /// Cap on the per-session `read` snapshot store. After the 8th distinct
@@ -837,13 +838,20 @@ async fn dispatch_fill(
     let outcome = session
         .fill(&selector, &p.value)
         .map_err(|e| format!("js fill failed: {e}"))?;
+    let element_id = elem
+        .attrs
+        .get("id")
+        .filter(|s| !s.is_empty())
+        .cloned();
     Ok(serde_json::json!({
-        "ok": true,
+        "ok": engine_matched(&outcome.value),
         "op": "fill",
         "url": session.url().to_string(),
         "ref": want,
         "selector": selector,
-        "value": outcome.value,
+        "element_id": element_id,
+        "value": p.value,
+        "result": outcome.value,
         "console": outcome.console,
     }))
 }
@@ -883,13 +891,20 @@ async fn dispatch_click(
     let outcome = session
         .click(&selector)
         .map_err(|e| format!("js click failed: {e}"))?;
+    let element_id = elem
+        .attrs
+        .get("id")
+        .filter(|s| !s.is_empty())
+        .cloned();
     Ok(serde_json::json!({
-        "ok": true,
+        "ok": engine_matched(&outcome.value),
         "op": "click",
         "url": session.url().to_string(),
         "ref": want,
         "selector": selector,
-        "value": outcome.value,
+        "element_id": element_id,
+        "value": serde_json::Value::Null,
+        "result": outcome.value,
         "console": outcome.console,
     }))
 }
@@ -950,6 +965,11 @@ async fn dispatch_submit(
         .submit_with_fields(&selector, &merged)
         .map_err(|e| format!("js submit failed: {e}"))?;
     let post_url = session.url().to_string();
+    let element_id = elem
+        .attrs
+        .get("id")
+        .filter(|s| !s.is_empty())
+        .cloned();
     // The post-submit URL may differ from the page record's URL because
     // navigate-on-success swaps the session's document; the static
     // FetchPage cached for ls/cat/find stays as-is (those still read
@@ -962,12 +982,14 @@ async fn dispatch_submit(
     // The proper refresh path is `navigate` (which re-fetches the
     // action graph via FetchEngine::open).
     Ok(serde_json::json!({
-        "ok": true,
+        "ok": engine_matched(&outcome.value),
         "op": "submit",
         "url": post_url.clone(),
         "ref": want,
         "selector": selector,
-        "value": outcome.value,
+        "element_id": element_id,
+        "value": serde_json::Value::Null,
+        "result": outcome.value,
         "console": outcome.console,
         "postUrl": post_url,
     }))

@@ -405,12 +405,18 @@ function search(query, options) {
  * Pass either `ref` as the second positional (e.g. "@e7") or a locator
  * option (`text`, `selector`, `ariaLabel`).
  *
- * The resolved JSON carries `url` (the page where the click happened,
- * post any redirects on that page's own fetch), `final_url` (where
+ * Resolves with the unified writing-verb envelope: `{ok, op: "click",
+ * url, ref, selector, element_id, value: null, result, console, ...}`.
+ * `value` is always `null` for click — the verb doesn't take a string
+ * to write. A selector miss surfaces as `ok: false` with `error.code:
+ * "selector_not_matched"`.
+ *
+ * Navigation fields: `url` is the page where the click happened (post
+ * any redirects on that page's own fetch); `final_url` is where
  * navigation actually landed after following `<a href>` plus its own
- * redirect chain — equals `url` for non-navigating clicks), and
- * `redirects` (the `{from, to, status}` hops the navigation walked
- * through, empty for direct hits and for clicks that did not navigate).
+ * redirect chain (equals `url` for non-navigating clicks); `redirects`
+ * is the `{from, to, status}` hops the navigation walked through, empty
+ * for direct hits and for clicks that did not navigate.
  */
 function click(url, refOrOptions, maybeOptions) {
   // Overload: click(url, "@e7") or click(url, { text: "Sign in" }).
@@ -425,6 +431,12 @@ function click(url, refOrOptions, maybeOptions) {
  * Two shapes:
  *   fill(url, "@e3", "hello")
  *   fill(url, "hello", { text: "Email" })
+ *
+ * Resolves with `{ok, op: "fill", url, ref, selector, element_id,
+ *   value, result, console, ...}`. `value` is the exact string passed
+ *   to the verb (the typed bytes). When the selector misses, `ok` is
+ *   `false` with `error.code: "selector_not_matched"` and `value` still
+ *   reflects the requested string.
  */
 function fill(url, refOrValue, valueOrOptions, maybeOptions) {
   if (typeof valueOrOptions === "string") {
@@ -443,6 +455,13 @@ function fill(url, refOrValue, valueOrOptions, maybeOptions) {
 
 /**
  * `heso submit <url> (<@form-ref> | locator-opts) [--field n=v]... [--data JSON]`.
+ *
+ * Resolves with `{ok, op: "submit", url, ref, selector, element_id,
+ *   value: null, result, console, postUrl}`. `value` is always `null`
+ *   for submit; the structured form-submission outcome (`matched`,
+ *   `submitted`, `responseStatus`, `responseJson`, `fieldsApplied`,
+ *   ...) lives under `result`. `postUrl` is the response URL after
+ *   redirects.
  */
 function submit(url, refOrOptions, maybeOptions) {
   if (typeof refOrOptions === "string") {

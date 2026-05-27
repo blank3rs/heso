@@ -65,8 +65,12 @@ async fn click_by_text_finds_submit_button() {
     // First interactive element is @e0 (the Submit button).
     assert_eq!(body["ref"], serde_json::json!("@e0"));
     assert_eq!(body["selector"], serde_json::json!("#b"));
-    // `dispatch_click` returns the boolean "found and clicked?".
-    assert_eq!(body["value"], serde_json::json!(true));
+    // Click doesn't take a string to write; `value` is null. The
+    // engine's "selector matched?" boolean is folded into `ok`, and
+    // the structured engine payload lives under `result`.
+    assert_eq!(body["value"], serde_json::Value::Null);
+    assert_eq!(body["element_id"], serde_json::json!("b"));
+    assert_eq!(body["result"], serde_json::json!(true));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -226,8 +230,11 @@ async fn fill_by_selector_sets_input_value() {
     let body = assert_ok(&out);
     assert_eq!(body["ok"], serde_json::json!(true));
     assert_eq!(body["op"], serde_json::json!("fill"));
-    // `set_input_value` returns a bare `true` when the selector matched.
-    assert_eq!(body["value"], serde_json::json!(true));
+    // `value` is the literal string the verb wrote (the bytes you
+    // passed), not a success boolean. The engine's selector-matched
+    // flag rides on `result`.
+    assert_eq!(body["value"], serde_json::json!("rust"));
+    assert_eq!(body["result"], serde_json::json!(true));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -249,8 +256,10 @@ async fn fill_by_text_matches_placeholder() {
     let out = run("fill", &[&server.uri(), "--text", "search", "rust"]);
     let body = assert_ok(&out);
     assert_eq!(body["ok"], serde_json::json!(true));
-    // `set_input_value` returns true on a successful selector match.
-    assert_eq!(body["value"], serde_json::json!(true));
+    // `value` carries the literal written string under the new
+    // envelope; the engine's matched-flag now lives on `result`.
+    assert_eq!(body["value"], serde_json::json!("rust"));
+    assert_eq!(body["result"], serde_json::json!(true));
     assert_eq!(body["ref"], serde_json::json!("@e0"));
 }
 
@@ -283,6 +292,10 @@ async fn submit_by_selector_posts_form() {
     let body = assert_ok(&out);
     assert_eq!(body["ok"], serde_json::json!(true));
     assert_eq!(body["op"], serde_json::json!("submit"));
-    assert_eq!(body["value"]["submitted"], serde_json::json!(true));
-    assert_eq!(body["value"]["responseJson"]["got"], serde_json::json!("alice"));
+    // `value` is null for submit; the structured form-submission
+    // outcome lives under `result`.
+    assert_eq!(body["value"], serde_json::Value::Null);
+    assert_eq!(body["result"]["submitted"], serde_json::json!(true));
+    assert_eq!(body["result"]["responseJson"]["got"], serde_json::json!("alice"));
+    assert_eq!(body["element_id"], serde_json::json!("login"));
 }
