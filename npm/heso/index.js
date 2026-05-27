@@ -536,7 +536,7 @@ function info(filePathOrPaths, options) {
   return _spawnJson(["info", ...paths, ..._optsToArgv(options)]);
 }
 
-/** `heso seal <file> [--key PATH] [--tsa URL] [--no-resign]` — Ed25519 envelope. */
+/** `heso seal <file> [--key PATH]` — Ed25519 envelope. */
 function seal(filePath, options) {
   return _spawnJson(["seal", String(filePath), ..._optsToArgv(options)]);
 }

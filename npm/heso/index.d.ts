@@ -304,10 +304,6 @@ export interface InfoOptions extends CommonOptions {
 export interface SealOptions extends CommonOptions {
   /** Identity-key path. Default: `heso-local-data/identity.key`. */
   key?: string;
-  /** Time-Stamping Authority URL to countersign the envelope. */
-  tsa?: string;
-  /** Skip the resign step when re-sealing an already-sealed plat. */
-  noResign?: boolean;
 }
 
 /** Options for {@link unseal}. */
