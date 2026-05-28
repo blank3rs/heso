@@ -1,19 +1,15 @@
-"""CLI entry point for the ``heso`` console script.
+"""``python -m heso`` entry point.
 
-``pip install heso`` installs a Windows ``heso.exe`` (or POSIX
-``heso``) generated from this module's :func:`main` via the
-``[project.scripts]`` entry in :file:`pyproject.toml`. When invoked,
+``pip install heso`` puts the native ``heso`` binary on ``PATH``
+directly (shipped via the wheel's ``*.data/scripts/`` directory), so
+``heso open URL`` from a shell runs the binary with no Python
+interpreter in the way.
+
+This module provides the ``python -m heso open URL`` spelling for
+callers who want to drive the binary through the interpreter.
 :func:`main` locates the bundled Rust binary in ``heso/bin/`` and
 re-execs into it, passing the user's ``sys.argv[1:]`` through
 unchanged.
-
-This indirection is what lets the same wheel ship both a library
-(``import heso; heso.open(...)``) and a working CLI (``heso open
-URL``) — the binary is the source of truth either way; this is just
-how Python users get it on ``PATH``.
-
-``python -m heso open URL`` also works via the ``__main__`` module
-hook.
 """
 
 from __future__ import annotations

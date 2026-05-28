@@ -8,9 +8,11 @@
 # Now: setuptools assembles a *normal* Python package at `python/heso/`
 # that bundles the prebuilt `heso(.exe)` binary as package data under
 # `heso/bin/`. The library (`heso.open`, `heso.read`, etc.) shells out
-# to that bundled binary; the CLI entry point (`[project.scripts]
-# heso`) generates a tiny wrapper that exec's the same binary. Same
-# binary, two faces.
+# to that bundled binary. The same binary is also handed to setuptools
+# as a `scripts` entry (see setup.py), so it lands in the wheel's
+# `*.data/scripts/` directory and pip installs it directly onto PATH as
+# `heso`/`heso.exe` — the native binary, with no Python interpreter in
+# the hot path. Same binary, two faces.
 #
 # Build flow:
 #   1. `scripts/release.ps1` builds `target/release/heso.exe` first.
@@ -59,12 +61,11 @@ Documentation = "https://www.heso.ca/docs"
 Repository = "https://github.com/blank3rs/heso"
 Issues = "https://github.com/blank3rs/heso/issues"
 
-[project.scripts]
-# `pip install heso` generates a launcher (`heso.exe` on Windows, a
-# shebanged shim on POSIX) that imports this module and calls main().
-# main() exec's into the bundled binary. Net: `heso open URL` works
-# on PATH after install, matching the direct binary UX.
-heso = "heso.__main__:main"
+# The `heso` command on PATH is the native binary itself, shipped via
+# setup.py's `scripts` entry into the wheel's `*.data/scripts/`
+# directory. `python -m heso ...` remains available through
+# `heso/__main__.py` for callers who want to drive it through the
+# interpreter.
 
 # ----------------------------------------------------------------------
 # setuptools section — package layout

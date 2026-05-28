@@ -37,8 +37,8 @@ long-running ``heso serve`` JSON-RPC subprocess::
         page = s.read()
 
 The CLI is unchanged: after ``pip install heso``, ``heso open URL``
-still works on ``PATH`` (the setuptools console script delegates to
-:mod:`heso.__main__`, which in turn exec's the bundled binary).
+still works on ``PATH`` — the native binary is installed there
+directly, so it runs without a Python interpreter in the hot path.
 """
 
 from __future__ import annotations
