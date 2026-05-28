@@ -990,6 +990,30 @@ impl JsEngine {
         self.base_url.lock().expect("base_url poisoned").clone()
     }
 
+    /// Install a QuickJS interrupt handler. Each time QuickJS checks
+    /// for cooperative cancellation (between bytecode chunks, between
+    /// microtasks, etc.) the handler runs; if it returns `true` the
+    /// runtime aborts the in-flight script and surfaces the abort to
+    /// the caller as an [`EvalError::Engine`] / [`EvalError::Exception`]
+    /// at the next reachable boundary.
+    ///
+    /// Use it to enforce a wallclock budget on `eval` / `eval_with_html`
+    /// from another thread — wrap an `Arc<AtomicBool>` in the closure,
+    /// spawn a watchdog that flips the bool when the deadline expires,
+    /// and the next QuickJS check tears the script down. The handler
+    /// is not `Send` (the underlying `InterruptHandler` type in the
+    /// default rquickjs feature set is single-threaded), so the
+    /// closure runs on the same thread that owns the engine — which
+    /// is also the only thread that runs JS.
+    ///
+    /// Pass `None` to remove a previously-installed handler.
+    pub fn set_interrupt_handler(
+        &self,
+        handler: Option<Box<dyn FnMut() -> bool + 'static>>,
+    ) {
+        self._runtime.set_interrupt_handler(handler);
+    }
+
     /// Install (or replace) the module resolver used by the
     /// `globalThis.import(...)` shim.
     ///
@@ -1297,7 +1321,8 @@ impl JsEngine {
             }
         }
         Err(EvalError::Engine(format!(
-            "microtask pump exceeded {MAX_PUMP} iterations - possible infinite loop"
+            "microtask queue did not settle after {MAX_PUMP} jobs; the script may have an \
+             infinite loop or produce a very large value"
         )))
     }
 
@@ -7440,6 +7465,28 @@ fn js_value_to_json<'js>(ctx: &Ctx<'js>, val: Value<'js>) -> Result<serde_json::
         }
     }
 
+    // DOM element nodes also serialize to `{}` through bare
+    // `JSON.stringify` because their interesting properties
+    // (`tagName`, `attributes`, `outerHTML`, child nodes) live on
+    // the prototype, not as enumerable own props. Detect them by
+    // probing for a string-typed `outerHTML` and surface the three
+    // fields an agent typically wants from a DOM node:
+    // `{ tag, outerHTML, attrs }`.
+    if let Some(obj) = val.as_object() {
+        if let Ok(outer_html) = obj.get::<_, String>("outerHTML") {
+            let tag: String = obj
+                .get::<_, String>("tagName")
+                .map(|t| t.to_ascii_lowercase())
+                .unwrap_or_else(|_| "unknown".to_owned());
+            let attrs = collect_dom_attrs(obj)?;
+            return Ok(serde_json::json!({
+                "tag": tag,
+                "outerHTML": outer_html,
+                "attrs": attrs,
+            }));
+        }
+    }
+
     // Objects and arrays: hand to JS's own JSON.stringify, then parse.
     let globals = ctx.globals();
     let json_obj: Object = globals
@@ -7462,7 +7509,58 @@ fn js_value_to_json<'js>(ctx: &Ctx<'js>, val: Value<'js>) -> Result<serde_json::
         .ok_or_else(|| EvalError::Engine("JSON.stringify did not return a string".to_owned()))?
         .to_string()
         .map_err(|e| EvalError::Engine(format!("decode stringified JSON: {e}")))?;
+    // Cap the serialized JSON at 10 MB to keep one runaway value from
+    // pinning the host. Anything beyond this is almost always a script
+    // bug — accidentally returning the whole DOM, or an array sized
+    // off a quadratic loop. Surface it as a structured engine error so
+    // the caller sees the boundary instead of an opaque allocation
+    // failure further down.
+    const MAX_SERIALIZED_BYTES: usize = 10 * 1024 * 1024;
+    if s.len() > MAX_SERIALIZED_BYTES {
+        return Err(EvalError::Engine(format!(
+            "result too large to serialize ({} bytes; cap is {} bytes)",
+            s.len(),
+            MAX_SERIALIZED_BYTES,
+        )));
+    }
     serde_json::from_str(&s).map_err(|e| EvalError::Engine(format!("parse stringified JSON: {e}")))
+}
+
+/// Walk a DOM element's `attributes` `NamedNodeMap`-shaped list and
+/// return a `{name -> value}` JSON object. Used by [`js_value_to_json`]
+/// so DOM nodes serialize as something other than `{}`.
+///
+/// The `attributes` property is exposed as a live array-like with
+/// `length` + indexed `Attr` entries, each carrying `name` and
+/// `value` strings. We walk it once and produce a plain JSON map; on
+/// any individual attribute that can't be read we skip it rather
+/// than failing the whole serialization (best-effort: surfacing a
+/// partial attrs map beats blocking the whole eval output).
+fn collect_dom_attrs<'js>(
+    obj: &Object<'js>,
+) -> Result<serde_json::Map<String, serde_json::Value>, EvalError> {
+    let mut out = serde_json::Map::new();
+    let Ok(attrs_val) = obj.get::<_, Value<'js>>("attributes") else {
+        return Ok(out);
+    };
+    let Some(attrs_obj) = attrs_val.as_object() else {
+        return Ok(out);
+    };
+    let len: u32 = attrs_obj.get("length").unwrap_or(0);
+    for i in 0..len {
+        let Ok(attr_val) = attrs_obj.get::<_, Value<'js>>(i) else {
+            continue;
+        };
+        let Some(attr_obj) = attr_val.as_object() else {
+            continue;
+        };
+        let Ok(name) = attr_obj.get::<_, String>("name") else {
+            continue;
+        };
+        let value: String = attr_obj.get("value").unwrap_or_default();
+        out.insert(name, serde_json::Value::String(value));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -7733,6 +7831,62 @@ mod tests {
             .eval_with_html(html, "document.getElementById('main').textContent")
             .expect("eval_with_html ok");
         assert_eq!(out.value, serde_json::json!("inside"));
+    }
+
+    #[test]
+    fn returning_dom_element_serializes_as_tag_outer_html_attrs() {
+        // A bare DOM element has no enumerable own properties, so plain
+        // JSON.stringify yields `{}`. The serializer detects the node
+        // via `outerHTML` and emits `{tag, outerHTML, attrs}` instead.
+        let html =
+            r#"<html><body><a href="https://example.com" class="cta">go</a></body></html>"#;
+        let out = engine()
+            .eval_with_html(html, "document.querySelector('a')")
+            .expect("eval_with_html ok");
+        assert_eq!(out.value["tag"], serde_json::json!("a"));
+        assert_eq!(
+            out.value["outerHTML"],
+            serde_json::json!(r#"<a href="https://example.com" class="cta">go</a>"#)
+        );
+        assert_eq!(out.value["attrs"]["href"], serde_json::json!("https://example.com"));
+        assert_eq!(out.value["attrs"]["class"], serde_json::json!("cta"));
+    }
+
+    #[test]
+    fn element_without_attributes_serializes_with_empty_attrs() {
+        let html = "<html><body><h1>title</h1></body></html>";
+        let out = engine()
+            .eval_with_html(html, "document.querySelector('h1')")
+            .expect("eval_with_html ok");
+        assert_eq!(out.value["tag"], serde_json::json!("h1"));
+        assert_eq!(out.value["outerHTML"], serde_json::json!("<h1>title</h1>"));
+        assert_eq!(out.value["attrs"], serde_json::json!({}));
+    }
+
+    #[test]
+    fn oversized_result_returns_engine_error() {
+        // The size guard sits on the JSON.stringify path inside
+        // `js_value_to_json`. Exercise it directly with a composite
+        // value (an object whose single string value serializes past
+        // 10 MB) so the test pins the guard itself rather than the
+        // upstream deep-resolve / microtask pump, which catch the most
+        // egregious shapes first.
+        let e = engine();
+        let result = e.context.with(|ctx| {
+            let big: Value = ctx
+                .eval(r#"({ big: "x".repeat(11 * 1024 * 1024) })"#)
+                .expect("build oversize value");
+            js_value_to_json(&ctx, big)
+        });
+        match result {
+            Err(EvalError::Engine(msg)) => {
+                assert!(
+                    msg.contains("too large to serialize"),
+                    "unexpected engine error: {msg}"
+                );
+            }
+            other => panic!("expected EvalError::Engine(too large), got {other:?}"),
+        }
     }
 
     #[test]
