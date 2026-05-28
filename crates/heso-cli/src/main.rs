@@ -6784,25 +6784,25 @@ where
 /// `thread 'main' has overflowed`-style backtrace on stderr — noisy
 /// and surprising for what is a normal shell idiom.
 ///
-/// The hook inspects the panic payload for a broken-pipe signature
-/// (the `io::Error` Display contains "Broken pipe"; on Windows the
-/// underlying error is also `ErrorKind::BrokenPipe`). On a match it
-/// exits 0 silently — the consumer got what it wanted and tore the
-/// pipe down on purpose. Any other panic flows to the default hook
-/// (full backtrace, abort) so real bugs stay loud.
+/// The hook inspects the panic payload for a pipe-closed signature. The
+/// human-readable text differs per platform and locale ("Broken pipe" on
+/// Unix, "The pipe has been ended" on Windows), so we match the
+/// locale-independent OS error numbers instead. On a match it exits 0
+/// silently — the consumer got what it wanted and tore the pipe down on
+/// purpose. Any other panic flows to the default hook (full backtrace,
+/// abort) so real bugs stay loud.
 fn install_broken_pipe_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let is_broken_pipe = info
-            .payload()
+        let payload = info.payload();
+        let message = payload
             .downcast_ref::<String>()
-            .map(|s| s.contains("Broken pipe"))
-            .or_else(|| {
-                info.payload()
-                    .downcast_ref::<&str>()
-                    .map(|s| s.contains("Broken pipe"))
-            })
-            .unwrap_or(false);
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        let is_broken_pipe = message.contains("Broken pipe") // Unix EPIPE
+            || message.contains("os error 109") // Windows ERROR_BROKEN_PIPE
+            || message.contains("os error 232"); // Windows ERROR_NO_DATA, pipe closing
         if is_broken_pipe {
             std::process::exit(0);
         }
