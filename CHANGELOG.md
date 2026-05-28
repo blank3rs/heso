@@ -4,6 +4,40 @@ All notable changes to heso are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-05-28
+
+### Added
+
+- A plat body now records the `seed` it ran under (`FetchPage.seed`,
+  default 0), an ordinary field covered by `plat_hash`, so a run is
+  self-describingly reproducible (HESO/1.0 §4).
+- `heso-verify`: a standalone HESO/1.0 Grade-0 verifier crate that owns
+  the canonicalization, `plat_hash`, and sealed-envelope open/verify
+  logic with a minimal dependency set (serde, serde_json, serde_jcs,
+  blake3, ed25519-dalek verify-only, base64) — no engine, DOM, or
+  network crate. The engine's verify path now delegates to it, so the
+  open/verify logic lives in exactly one place. The verb surface
+  (`heso unseal` / `heso verify`) is unchanged.
+
+### Changed
+
+- `heso run` replays under the seed recorded in the input plat rather
+  than a hardcoded 0, so a deterministic replay reproduces the same DOM
+  an independent verifier would. An explicit `--seed` still overrides;
+  legacy plats with no recorded seed fall back to 0. Replaying an
+  unmodified plat stays byte-identical (the stamp → run `plat_hash`
+  contract holds).
+
+### Fixed
+
+- The PyPI wheel builds again. setup.py hands the native `heso` binary
+  to setuptools as a `scripts` entry; setuptools' `build_scripts`
+  command tried to tokenize it as Python and failed the wheel build
+  (`source code cannot contain null bytes` on Linux, `invalid or
+  missing encoding declaration` on Windows). The binary is now copied
+  into the wheel's `*.data/scripts/` directory verbatim. 0.1.8 shipped
+  to npm but not PyPI for this reason; 0.1.9 restores PyPI.
+
 ## [0.1.8] - 2026-05-28
 
 ### Added
