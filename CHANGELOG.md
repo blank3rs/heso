@@ -4,6 +4,61 @@ All notable changes to heso are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] - 2026-05-28
+
+### Added
+
+- `--no-private-networks` flag (and the `HESO_BLOCK_PRIVATE_NETWORKS`
+  environment variable) opt into SSRF protection. heso resolves each
+  target and refuses the request if any resolved IP is loopback,
+  RFC1918 private, link-local (including the `169.254.169.254`
+  cloud-metadata address), unspecified, CGNAT (`100.64.0.0/10`), IPv6
+  unique-local, or an IPv4-mapped form of any of those. The check runs
+  on the resolved address, so an inward-pointing hostname is caught as
+  well as a literal IP, and a redirect to a literal private IP is
+  refused mid-chain. Off by default so `localhost` stays reachable;
+  enable it per call with the flag or process-wide with the env var. A
+  blocked request emits `{ok: false, error: {code:
+  "private_network_blocked", url}}` and exits 1.
+- `--js-timeout <duration>` on `eval-js` and `eval-dom` caps script
+  wall-clock time via an interrupt-handler watchdog and returns a
+  structured `timeout` error on expiry. Default: no cap.
+- `eval-js` / `eval-dom` serialize a DOM-element result as
+  `{tag, outerHTML, attrs}` instead of an empty object.
+
+### Changed
+
+- `--best-effort` `partial_reason` gains three values: `bot_challenge`
+  now also covers Reddit-style "please wait for verification"
+  interstitials; `non_html_content_type` flags a `200 OK` carrying a
+  non-HTML body (PDF, JSON, octet-stream, images) instead of treating
+  an empty extraction as a clean page; and `http_<code>` reports a
+  non-2xx status.
+- `eval-js` / `eval-dom` run on a dedicated 8 MB-stack thread, so deep
+  recursion trips QuickJS's own guard and returns a structured engine
+  error instead of overflowing the OS stack. Serialized eval results
+  are capped at 10 MB with a structured error.
+
+### Fixed
+
+- The broken-pipe hook recognizes Windows pipe-closed errors (OS error
+  109 / 232) alongside the Unix "Broken pipe" string, so piping a
+  verb's output into a reader that closes early (`heso ... | head`)
+  exits cleanly on every platform instead of aborting with a panic.
+- `verify --trusted-keys` (and `HESO_TRUSTED_KEYS`) fail closed on an
+  empty allowlist: zero entries is an error (exit 1), not a
+  trust-anyone wildcard.
+- Argument errors on the eval and read paths (malformed URL, ASCII
+  control characters in a URL, unknown `--include` key, empty search
+  query, ref/locator misses) emit a structured `{ok: false, error:
+  {code, message}}` envelope on stdout alongside the stderr line. URLs
+  containing control characters are rejected rather than silently
+  rewritten.
+- `stamp` / `run` report an actionable error when a plan action carries
+  a CLI-only `--text` / `--selector` / `--aria-label` locator instead
+  of a stable `ref`, pointing at `heso find` / `heso read` rather than
+  a terse "unknown field" message.
+
 ## [0.1.6] - 2026-05-27
 
 ### Changed

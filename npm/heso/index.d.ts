@@ -49,6 +49,14 @@ export interface CommonOptions {
   timeout?: number;
   /** Override the `heso` binary path. Mainly for tests. */
   binary?: string;
+  /**
+   * Refuse the request when the target resolves to a private,
+   * loopback, link-local (incl. the `169.254.169.254` cloud-metadata
+   * address), or CGNAT IP. Forwarded as the global
+   * `--no-private-networks` flag; applies to every network verb. Off
+   * by default.
+   */
+  noPrivateNetworks?: boolean;
   /** Any other CLI flag (`--my-flag value`); camelCase here -> dashed CLI. */
   [key: string]: unknown;
 }
@@ -235,13 +243,24 @@ export function submit(
 export function submit(url: string, options: SubmitOptions): Promise<WriteVerbResult>;
 
 /** `heso eval-js <js>` — evaluate JS in a sandboxed QuickJS context (no DOM). */
-export function evalJs(js: string, options?: CommonOptions): Promise<Record<string, unknown>>;
+export function evalJs(
+  js: string,
+  options?: CommonOptions & {
+    /** Cap JS wall-clock; forwarded as `--js-timeout`. Default: no cap. */
+    jsTimeout?: string | number;
+  },
+): Promise<Record<string, unknown>>;
 
 /** `heso eval-dom <url> <js>` — fetch, run page scripts, then eval against the DOM. */
 export function evalDom(
   url: string,
   js: string,
-  options?: CommonOptions & { seed?: number; jsFetch?: boolean },
+  options?: CommonOptions & {
+    seed?: number;
+    jsFetch?: boolean;
+    /** Cap JS wall-clock; forwarded as `--js-timeout`. Default: no cap. */
+    jsTimeout?: string | number;
+  },
 ): Promise<Record<string, unknown>>;
 
 /**

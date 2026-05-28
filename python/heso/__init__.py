@@ -464,6 +464,10 @@ def open(url: str, **kwargs: Any) -> dict:
     backstop. On in-band timeout the binary exits 1 with a structured
     ``{ok: false, error: {code: "timeout", ...}}`` envelope on stdout,
     surfaced via :class:`HesoError`'s ``stdout`` attribute.
+
+    ``no_private_networks=True`` refuses the request when the target
+    resolves to a private / loopback / link-local / metadata IP (SSRF
+    protection; off by default, global across every network verb).
     """
     spawn, cli = _split_spawn_opts(kwargs)
     return run("open", url, *_kwargs_to_argv(cli), **spawn)
@@ -482,6 +486,8 @@ def read(url: str, **kwargs: Any) -> dict:
         js_fetch: bool — install the JS fetch() global.
         since: str — prior ``content_hash`` for diffing.
         best_effort: bool — exit 0 on partial failures.
+        no_private_networks: bool — refuse private/loopback/metadata
+            IPs (SSRF protection; off by default, global).
         timeout: float — per-request budget in seconds (default 30).
     """
     spawn, cli = _split_spawn_opts(kwargs)
@@ -627,7 +633,9 @@ def eval_js(js: str, **kwargs: Any) -> dict:
     """``heso eval-js <js>`` — evaluate JS in a sandboxed QuickJS context.
 
     Returns ``{value, console, ...}``. ``seed=N`` seeds the
-    determinism shims. No DOM — use :func:`eval_dom` for that.
+    determinism shims. ``js_timeout="5s"`` caps script wall-clock and
+    returns a structured ``timeout`` error on expiry (default: no cap).
+    No DOM — use :func:`eval_dom` for that.
     """
     spawn, cli = _split_spawn_opts(kwargs)
     return run("eval-js", *_kwargs_to_argv(cli), js, **spawn)
@@ -642,6 +650,8 @@ def eval_dom(url: str, js: str, **kwargs: Any) -> dict:
     Common kwargs:
         seed: int — RNG seed (default 0).
         js_fetch: bool — install the JS fetch() global.
+        js_timeout: str — cap script wall-clock (e.g. "5s"); returns a
+            structured timeout error on expiry (default: no cap).
         timeout: float — per-request budget in seconds (default 30).
     """
     spawn, cli = _split_spawn_opts(kwargs)

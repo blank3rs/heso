@@ -429,6 +429,7 @@ description: Use heso when an agent needs to touch the web — fetch pages, run 
 - `--best-effort` on open/read/wait — exit 0 on partial failures, surface what broke
 - `--inject-script "<js>" | @file` — inject a polyfill before page scripts run
 - `--timeout <DUR>` on every network verb — per-request wall-clock cap (default `30s`)
+- `--js-timeout <DUR>` on `eval-js` / `eval-dom` — cap JS execution wall-clock (default: no cap)
 - `--no-private-networks` — refuse URLs resolving to private/loopback/metadata IPs (SSRF protection; off by default)
 ```
 
@@ -486,7 +487,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-`v0.1.6` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the 259-test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
+`v0.1.6` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the 271-test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
 
 ## License
 
