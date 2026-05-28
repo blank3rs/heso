@@ -429,6 +429,7 @@ description: Use heso when an agent needs to touch the web — fetch pages, run 
 - `--best-effort` on open/read/wait — exit 0 on partial failures, surface what broke
 - `--inject-script "<js>" | @file` — inject a polyfill before page scripts run
 - `--timeout <DUR>` on every network verb — per-request wall-clock cap (default `30s`)
+- `--no-private-networks` — refuse URLs resolving to private/loopback/metadata IPs (SSRF protection; off by default)
 ```
 
 The verbs are the contract. Same shape works in any harness that does tool or skill markdown.
@@ -451,6 +452,12 @@ Duration syntax matches `heso wait`: bare numbers are milliseconds, suffixes are
 ```
 
 The budget is per network request — it applies to the full request (TLS handshake, redirect chain, response-body stream) and does not reset across redirects. `--timeout` bounds HTTP only. To bound JavaScript execution itself, `eval-js` and `eval-dom` accept a separate `--js-timeout <DUR>` that caps script wallclock and returns a structured `timeout` error on expiry (default: no cap). The `npm/@ixla/heso` and `python/heso` wrappers also install a `timeout + 5s` process-kill backstop so a hung binary still eventually unblocks the caller.
+
+`--no-private-networks` opts into SSRF protection: heso resolves each target and refuses to connect if any resolved IP is loopback, RFC1918 private, link-local (including the `169.254.169.254` cloud-metadata address), unspecified, or CGNAT. The check runs on the resolved IP, so a hostname like `localhost` — or any domain whose DNS points inward — is caught, not just literal IPs. It is **off by default** so local testing against `localhost` keeps working; set it per invocation with the flag, or once for a hosted deployment with `HESO_BLOCK_PRIVATE_NETWORKS=1` in the environment (which protects every verb). On a refusal the verb emits a structured envelope on stdout and exits 1:
+
+```json
+{"ok": false, "error": {"code": "private_network_blocked", "url": "https://..."}}
+```
 
 ## Stats
 
