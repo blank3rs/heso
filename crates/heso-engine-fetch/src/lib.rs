@@ -348,9 +348,9 @@ impl FetchEngine {
     /// the historical default for callers that haven't migrated.
     fn build(cassette_mode: CassetteMode, request_timeout: Option<Duration>) -> HesoResult<Self> {
         let cookie_jar = Arc::new(CookieStoreMutex::default());
+        let blocking = private_network::blocking_env_enabled();
         let mut builder = Client::builder()
             .user_agent(concat!("heso/", env!("CARGO_PKG_VERSION")))
-            .redirect(reqwest::redirect::Policy::limited(20))
             // Hand the shared jar to reqwest. Per `reqwest` docs:
             // calling `cookie_provider(my_store)` is the spec-compliant
             // alternative to `cookie_store(true)` — Set-Cookie response
@@ -360,6 +360,27 @@ impl FetchEngine {
             // (e.g. `heso-engine-js`'s `document.cookie` bridge) sees
             // the exact same store.
             .cookie_provider(cookie_jar.clone());
+        // Redirect policy caps the chain at 20 hops. With SSRF blocking
+        // on, a custom policy also refuses any hop whose target host is a
+        // literal IP in a blocked range: reqwest skips the custom DNS
+        // resolver for literal-IP hosts, so a 3xx to `http://127.0.0.1/`
+        // would otherwise slip past `PrivateNetworkGuard`. Hostname hops
+        // stay covered by the resolver; this mirrors the per-hop
+        // `guard_literal_host` check the manual redirect path already runs.
+        builder = if blocking {
+            builder.redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() > 20 {
+                    return attempt.error("too many redirects");
+                }
+                if let Some(ip) = private_network::blocked_literal_host_ip(attempt.url()) {
+                    let host = attempt.url().host_str().unwrap_or_default().to_owned();
+                    return attempt.error(private_network::BlockedAddr::new(host, ip));
+                }
+                attempt.follow()
+            }))
+        } else {
+            builder.redirect(reqwest::redirect::Policy::limited(20))
+        };
         if let Some(d) = request_timeout {
             builder = builder.timeout(d);
         }
@@ -370,7 +391,7 @@ impl FetchEngine {
         // var (or the `--no-private-networks` flag, which sets it
         // in-process) protects every network verb with no per-verb
         // wiring. Default off keeps `localhost` reachable for local use.
-        if private_network::blocking_env_enabled() {
+        if blocking {
             builder = builder.dns_resolver(Arc::new(private_network::PrivateNetworkGuard));
         }
         let client = builder.build().map_err(Error::from)?;
