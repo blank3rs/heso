@@ -68,6 +68,7 @@ pub mod explore;
 pub mod inline_data;
 pub mod metadata;
 pub mod plat;
+pub mod private_network;
 pub mod step;
 pub mod tree;
 
@@ -136,6 +137,15 @@ pub enum Error {
     /// a live fetch, per ADR 0008.
     #[error("cassette decode error: {0}")]
     CassetteDecode(String),
+
+    /// A URL whose host is a literal IP in a blocked range was refused
+    /// by the opt-in SSRF guard before any connection was attempted.
+    /// (Hostname targets are caught one layer down by
+    /// [`private_network::PrivateNetworkGuard`] and surface as
+    /// [`Error::Http`].) The inner `Display` carries
+    /// [`private_network::BLOCK_ERROR_MARKER`].
+    #[error("{0}")]
+    PrivateNetworkBlocked(private_network::BlockedAddr),
 }
 
 impl From<Error> for heso_core::Error {
@@ -155,6 +165,53 @@ impl Error {
             _ => false,
         }
     }
+
+    /// True when the opt-in SSRF guard refused this request's target
+    /// for resolving to a private/loopback/metadata IP. Covers both the
+    /// literal-IP pre-flight ([`Error::PrivateNetworkBlocked`]) and the
+    /// hostname case, where the block originates inside reqwest's
+    /// connect path and is recognized by walking the source chain for
+    /// [`private_network::BLOCK_ERROR_MARKER`]. The CLI uses this to
+    /// emit a structured `{code: "private_network_blocked", ...}`
+    /// envelope instead of a generic `fetch failed:` line.
+    pub fn is_private_network_blocked(&self) -> bool {
+        match self {
+            // Literal-IP host refused by the engine's pre-flight check.
+            Error::PrivateNetworkBlocked(_) => true,
+            // Hostname refused by the DNS resolver — the block is buried
+            // in reqwest's connect-error source chain.
+            Error::Http(e) => {
+                let mut source: Option<&dyn std::error::Error> = Some(e);
+                while let Some(err) = source {
+                    if err
+                        .to_string()
+                        .contains(private_network::BLOCK_ERROR_MARKER)
+                    {
+                        return true;
+                    }
+                    source = err.source();
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Refuse a request whose URL host is a literal IP in a blocked range,
+/// when opt-in SSRF protection is enabled. A no-op when blocking is off
+/// or the host is a name (names are checked post-resolution by
+/// [`private_network::PrivateNetworkGuard`]) or a public IP.
+fn guard_literal_host(url: &Url) -> Result<(), Error> {
+    if !private_network::blocking_env_enabled() {
+        return Ok(());
+    }
+    if let Some(ip) = private_network::blocked_literal_host_ip(url) {
+        return Err(Error::PrivateNetworkBlocked(
+            private_network::BlockedAddr::new(url.host_str().unwrap_or_default(), ip),
+        ));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -305,6 +362,16 @@ impl FetchEngine {
             .cookie_provider(cookie_jar.clone());
         if let Some(d) = request_timeout {
             builder = builder.timeout(d);
+        }
+        // Opt-in SSRF protection. When enabled, swap reqwest's default
+        // resolver for one that refuses any name resolving to a
+        // private/loopback/metadata IP. Checked here — the single point
+        // every engine is constructed — so an operator setting the env
+        // var (or the `--no-private-networks` flag, which sets it
+        // in-process) protects every network verb with no per-verb
+        // wiring. Default off keeps `localhost` reachable for local use.
+        if private_network::blocking_env_enabled() {
+            builder = builder.dns_resolver(Arc::new(private_network::PrivateNetworkGuard));
         }
         let client = builder.build().map_err(Error::from)?;
         Ok(Self {
@@ -530,6 +597,7 @@ impl FetchEngine {
     /// the underlying `reqwest::Error` survives the round-trip and
     /// [`Error::is_timeout`] can read its `is_timeout()` flag.
     async fn live_get_typed(&self, url: &Url) -> Result<HttpFetchResult, Error> {
+        guard_literal_host(url)?;
         let response = self
             .client
             .get(url.as_str())
@@ -636,6 +704,7 @@ impl FetchEngine {
     /// Hit the wire via reqwest. Used by [`Self::do_http_get`]'s Live
     /// and Recording branches; never reached under Replaying.
     async fn live_get(&self, url: &Url) -> HesoResult<HttpFetchResult> {
+        guard_literal_host(url)?;
         let response = self
             .client
             .get(url.as_str())
@@ -698,12 +767,15 @@ impl FetchEngine {
         // intermediate status codes the caller wants on
         // `redirects[].status`. Build a sibling client with the same
         // cookie jar but no auto-follow so each 3xx surfaces here.
-        let manual_client = Client::builder()
+        let mut manual_builder = Client::builder()
             .user_agent(concat!("heso/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
-            .cookie_provider(self.cookie_jar.clone())
-            .build()
-            .map_err(Error::from)?;
+            .cookie_provider(self.cookie_jar.clone());
+        if private_network::blocking_env_enabled() {
+            manual_builder =
+                manual_builder.dns_resolver(Arc::new(private_network::PrivateNetworkGuard));
+        }
+        let manual_client = manual_builder.build().map_err(Error::from)?;
 
         let mut current = url.clone();
         let mut hops: Vec<RedirectHop> = Vec::new();
@@ -712,6 +784,7 @@ impl FetchEngine {
         // and hitting it on a default fetch produce the same outcome.
         const MAX_REDIRECTS: usize = 20;
         for _ in 0..=MAX_REDIRECTS {
+            guard_literal_host(&current)?;
             let response = manual_client
                 .get(current.as_str())
                 .send()
