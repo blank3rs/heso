@@ -4,6 +4,47 @@ All notable changes to heso are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-05-28
+
+### Added
+
+- `click` on a non-navigating element (an in-page handler that mutates
+  the DOM or calls `history.pushState`) now returns the post-click
+  `text`, `tree`, and `content_hash`, so an agent can see what changed.
+  The `<a href>` navigation path (which already returned the
+  destination's fields) is unchanged.
+- `run` gains `--no-verify-input` to skip the input-integrity check
+  introduced below.
+
+### Changed
+
+- The `heso` command installed by `pip install heso` is now the native
+  Rust binary itself (shipped via the wheel's `*.data/scripts/`
+  directory) instead of a Python console-script that booted the
+  interpreter before exec'ing the binary. `import heso` and
+  `python -m heso` are unchanged.
+- `read` no longer fetches external `<script src=...>` by default; pass
+  `--js-fetch` to opt in (matching `read --help` and `eval-dom`). Inline
+  scripts are unaffected.
+- `run` now verifies the input plat's integrity before replaying and
+  refuses on a `plat_hash` mismatch (exit 1, `{ok: false, error: {code:
+  "plat_integrity_mismatch", ...}}`); a missing or malformed `plat_hash`
+  exits 2. `--no-verify-input` restores the prior replay-anything
+  behavior. This is a contract change — `run` previously replayed any
+  input and exited 0. See ADR 0024.
+
+### Fixed
+
+- `heso read` now accepts `--js-fetch`. The flag was advertised in
+  `read --help` but rejected by the argument parser.
+- `read` output is internally consistent after JavaScript runs: `tree`,
+  `title`, `description`, and `metadata` are derived from the post-JS
+  DOM, matching `text` and `actions`. Previously `tree` reflected the
+  pre-JS HTML while `text` reflected the post-JS mutated DOM.
+- `read`'s `cookies` field now includes cookies set by page JavaScript
+  via `document.cookie`, merged with the network `Set-Cookie` headers.
+  `batch` and `serve` keep their per-response cookie snapshot.
+
 ## [0.1.7] - 2026-05-28
 
 ### Added
