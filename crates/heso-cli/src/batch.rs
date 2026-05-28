@@ -78,7 +78,9 @@ use heso_engine_api::{EngineApi, Page};
 use heso_engine_fetch::FetchEngine;
 use tokio::sync::Semaphore;
 
-use crate::{collect_cookies, detect_framework, group_forms, parse_include_filter, IncludeFilter};
+use crate::{
+    collect_response_cookies, detect_framework, group_forms, parse_include_filter, IncludeFilter,
+};
 
 /// Hard cap on `--parallel`. Higher = more file descriptors + more
 /// in-flight TLS handshakes; 32 is generous for any realistic agent
@@ -619,7 +621,7 @@ async fn run_read_for_url(
         body["forms"] = group_forms(&page.actions);
     }
     if include.cookies {
-        body["cookies"] = collect_cookies(&page);
+        body["cookies"] = collect_response_cookies(&page);
     }
     if include.console {
         body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);

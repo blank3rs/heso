@@ -91,6 +91,7 @@ pub use plat::{
 };
 pub use step::{logical_step_timestamp, StepBoundary, StepStatus};
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
+pub use reqwest_cookie_store::CookieStoreMutex;
 // `RedirectHop` / `RedirectedFetch` are defined inline below alongside
 // `FetchEngine`'s redirect-aware fetch method; both are `pub struct`
 // at the crate root, so callers reach them as
@@ -107,7 +108,6 @@ use std::time::Duration;
 use heso_core::{Result as HesoResult, Url};
 use heso_engine_api::{EngineApi, Page};
 use reqwest::Client;
-use reqwest_cookie_store::CookieStoreMutex;
 use scraper::{ElementRef as ScraperElementRef, Html, Node};
 use serde::{Deserialize, Serialize};
 
@@ -1082,6 +1082,39 @@ fn snapshot_response_cookies(response: &reqwest::Response) -> Vec<ResponseCookie
         .collect()
 }
 
+/// Snapshot the cookies in `jar` that match `url`, as [`ResponseCookie`]s.
+///
+/// Where [`snapshot_response_cookies`] captures only the `Set-Cookie`
+/// headers of one HTTP response, this reads the live shared jar — the
+/// same store JS `document.cookie = ...` writes land in (see
+/// [`crate::FetchEngine::cookie_jar`]). RFC 6265 §5.4 path/domain/secure
+/// matching and expiry filtering are applied by
+/// [`cookie_store::CookieStore::matches`]; host-only is derived from the
+/// `Domain=` attribute the same way [`snapshot_response_cookies`] does.
+pub fn cookies_from_jar(jar: &CookieStoreMutex, url: &Url) -> Vec<ResponseCookie> {
+    let guard = match jar.lock() {
+        Ok(g) => g,
+        Err(_) => return Vec::new(),
+    };
+    guard
+        .matches(url)
+        .into_iter()
+        .map(|c| {
+            let domain = c.domain().map(str::to_owned);
+            let host_only = domain.as_deref().is_none_or(str::is_empty);
+            ResponseCookie {
+                name: c.name().to_owned(),
+                value: c.value().to_owned(),
+                domain,
+                path: c.path().map(str::to_owned),
+                host_only,
+                http_only: matches!(c.http_only(), Some(true)),
+                secure: matches!(c.secure(), Some(true)),
+            }
+        })
+        .collect()
+}
+
 // ============================================================================
 // FetchPage
 // ============================================================================
@@ -1775,5 +1808,26 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), variants.len());
+    }
+
+    #[test]
+    fn cookies_from_jar_surfaces_matching_cookies() {
+        use std::sync::Arc;
+        let jar = Arc::new(CookieStoreMutex::default());
+        let url = Url::parse("https://example.com/").unwrap();
+        {
+            let mut guard = jar.lock().unwrap();
+            guard.parse("session=abc; Path=/", &url).unwrap();
+            guard.parse("pref=dark; Path=/", &url).unwrap();
+        }
+        let cookies = cookies_from_jar(&jar, &url);
+        let names: std::collections::HashSet<&str> =
+            cookies.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains("session"), "missing session: {cookies:?}");
+        assert!(names.contains("pref"), "missing pref: {cookies:?}");
+        let session = cookies.iter().find(|c| c.name == "session").unwrap();
+        assert_eq!(session.value, "abc");
+        // No `Domain=` attribute → host-only per RFC 6265 §5.3 step 6.
+        assert!(session.host_only, "expected host-only cookie: {session:?}");
     }
 }

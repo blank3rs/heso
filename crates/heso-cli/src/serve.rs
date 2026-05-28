@@ -106,7 +106,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use crate::{
-    attach_failure_envelope, classify_failure_envelope, collect_cookies, compute_delta,
+    attach_failure_envelope, classify_failure_envelope, collect_response_cookies, compute_delta,
     compute_lazy_hints, delta_no_prior, detect_framework, engine_matched, group_forms,
     merge_submit_fields, parse_include_filter, run_auto_scroll_loop, selector_for_action,
     ReadSnapshot,
@@ -1336,7 +1336,7 @@ async fn dispatch_read(
             // (see `bug-reports/04-long-running.md`) doesn't apply
             // here, but using the snapshot keeps the JSON shape
             // identical across CLI and serve surfaces.
-            body["cookies"] = collect_cookies(static_page);
+            body["cookies"] = collect_response_cookies(static_page);
         }
         if include.console {
             body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);

@@ -487,6 +487,16 @@ impl JsEngine {
         )
     }
 
+    /// Like [`Self::new_with_fetch_and_cookies`] but without installing
+    /// the `fetch` global — page JS shares the same `document.cookie`
+    /// jar but cannot issue network requests. Use this for the default
+    /// `heso read` path, where the page's own scripts run against a
+    /// coherent cookie store but stay offline unless the caller opts in
+    /// to live fetch with `--js-fetch`.
+    pub fn new_with_cookies(cookie_jar: Arc<CookieStoreMutex>) -> Result<Self, EvalError> {
+        Self::new_inner(0, None, Some(cookie_jar))
+    }
+
     /// Like [`Self::new_with_fetch`] but also seeds the PRNG. When
     /// `seed` is non-zero this is `--seed N` mode WITHOUT a recording
     /// cassette and — per ADR 0008's "determinism gate" — `fetch()`

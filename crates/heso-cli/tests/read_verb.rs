@@ -190,6 +190,95 @@ async fn read_include_filter_drops_unlisted_optional_fields() {
     assert!(body.get("framework").is_none(), "framework should be filtered out");
 }
 
+#[tokio::test]
+async fn read_tree_reflects_post_js_dom_mutation() {
+    let server = MockServer::start().await;
+    // Inline script rewrites the body after load. The post-hydration
+    // `tree` (and `text`) must describe the mutated DOM, not the
+    // server-sent placeholder.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<!doctype html><html><body>
+                <div id="root"><h1>PreJS</h1></div>
+                <script>
+                    document.getElementById('root').innerHTML =
+                        '<h1>PostJS</h1><p>hydrated</p>';
+                </script>
+            </body></html>"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = run_read(&server.uri(), &[]);
+    let body = parse_stdout(&out);
+    let tree = serde_json::to_string(&body["tree"]).unwrap();
+    assert!(
+        tree.contains("PostJS"),
+        "tree should reflect post-JS DOM: {tree}"
+    );
+    assert!(
+        !tree.contains("PreJS"),
+        "tree leaked pre-JS content: {tree}"
+    );
+    let text = body["text"].as_str().unwrap_or("");
+    assert!(text.contains("PostJS"), "text should reflect post-JS DOM: {text}");
+    assert!(!text.contains("PreJS"), "text leaked pre-JS content: {text}");
+}
+
+#[tokio::test]
+async fn read_surfaces_js_set_cookie() {
+    let server = MockServer::start().await;
+    // No `Set-Cookie` header — the cookie is born entirely in page JS
+    // via `document.cookie`. It must still appear in the cookies field.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<!doctype html><html><body>ok
+                <script>document.cookie = 'jsmade=1; Path=/';</script>
+            </body></html>"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = run_read(&server.uri(), &[]);
+    let body = parse_stdout(&out);
+    let cookies = body["cookies"].as_array().expect("cookies array");
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c["name"] == "jsmade" && c["value"] == "1"),
+        "expected JS-set cookie jsmade=1, got: {cookies:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_accepts_js_fetch_flag() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "<!doctype html><html><body><p>hi</p></body></html>",
+        ))
+        .mount(&server)
+        .await;
+    // Flag after the URL is positionally tolerated by the walk; the
+    // primary form is `read --js-fetch <url>`. Both must succeed.
+    let out_before = run_read(&server.uri(), &["--js-fetch"]);
+    assert!(
+        out_before.status.success(),
+        "read --js-fetch <url> failed: {}",
+        String::from_utf8_lossy(&out_before.stderr)
+    );
+    let out_after = Command::new(heso_bin())
+        .args(["read", &server.uri(), "--js-fetch"])
+        .output()
+        .expect("spawn heso read");
+    assert!(
+        out_after.status.success(),
+        "read <url> --js-fetch failed: {}",
+        String::from_utf8_lossy(&out_after.stderr)
+    );
+}
+
 // ============================================================================
 // Session-mode test — `read` against a running `heso serve` session,
 // across a navigate from page A to page B.

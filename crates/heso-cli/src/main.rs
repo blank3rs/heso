@@ -2152,6 +2152,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let mut best_effort = false;
     let mut inject_scripts: Vec<String> = Vec::new();
     let mut complete = false;
+    let mut js_fetch = false;
     let mut sign_flags = receipts::SignFlags::default();
     let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut i = 0;
@@ -2218,9 +2219,17 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 complete = true;
                 i += 1;
             }
+            "--js-fetch" => {
+                js_fetch = true;
+                i += 1;
+            }
+            "--no-js-fetch" => {
+                js_fetch = false;
+                i += 1;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--timeout DUR] <url>");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--js-fetch] [--timeout DUR] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -2237,7 +2246,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         }
     }
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--timeout DUR] <url>");
+        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--js-fetch] [--timeout DUR] <url>");
         return ExitCode::from(2);
     };
 
@@ -2301,14 +2310,29 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let client = fetch_engine.client();
     let cookie_jar = fetch_engine.cookie_jar();
     let rt_handle = tokio::runtime::Handle::current();
-    let js_engine =
-        match heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("failed to create JS engine: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let engine_result = if js_fetch {
+        heso_engine_js::JsEngine::new_with_fetch_and_cookies(
+            client,
+            rt_handle,
+            cookie_jar.clone(),
+        )
+    } else {
+        heso_engine_js::JsEngine::new_with_cookies(cookie_jar.clone())
+    };
+    let js_engine = match engine_result {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("failed to create JS engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `--js-fetch` also gates external `<script src=...>`: without it,
+    // linked scripts are skipped rather than fetched over the network.
+    let script_policy = if js_fetch {
+        heso_engine_js::ScriptFetchPolicy::Fetch
+    } else {
+        heso_engine_js::ScriptFetchPolicy::Skip
+    };
     // Under `--best-effort` we never let a hydration engine error
     // sink the verb — agent can still use the static portion of the
     // page (title/tree/actions/cookies). Without the flag, today's
@@ -2323,7 +2347,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
             js_engine,
             &page.body_html,
             page.url().clone(),
-            heso_engine_js::ScriptFetchPolicy::Fetch,
+            script_policy,
             &inject_scripts,
         ) {
             Ok(pair) => pair,
@@ -2402,6 +2426,23 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // under `--complete`).
     let mut body = page.plat_body_base();
     body["actions"] = serde_json::to_value(&current_actions).unwrap_or(serde_json::Value::Null);
+    // `tree`, `title`, `description`, and `metadata` come off the
+    // static-fetch base, which was extracted from the pre-hydration
+    // HTML. Re-extract them from the post-hydration snapshot so they
+    // describe the same DOM that `text` and `actions` report against.
+    let post_page = heso_engine_fetch::FetchPage::from_html(
+        page.input_url.clone(),
+        page.url().clone(),
+        page.http_status,
+        Vec::new(),
+        post_html.clone(),
+    );
+    body["tree"] = serde_json::to_value(&post_page.tree).unwrap_or(serde_json::Value::Null);
+    body["title"] = serde_json::Value::String(post_page.tree.title.clone());
+    body["description"] =
+        serde_json::to_value(&post_page.tree.description).unwrap_or(serde_json::Value::Null);
+    body["metadata"] =
+        serde_json::to_value(&post_page.metadata).unwrap_or(serde_json::Value::Null);
     // Always compute visible_text + forms — they feed `content_hash`
     // and the `--since` snapshot store even when the include filter
     // would have dropped them from the user-visible body. The body
@@ -2421,7 +2462,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         body["forms"] = forms_json.clone();
     }
     if include.cookies {
-        body["cookies"] = collect_cookies(&page);
+        body["cookies"] = collect_cookies(&page, &cookie_jar);
     }
     if include.console {
         body["console"] = serde_json::to_value(&console).unwrap_or(serde_json::Value::Null);
@@ -2445,7 +2486,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // Snap is built off the post-loop `current_actions` + `forms_json`
     // so `content_hash` shifts when --complete loaded more content.
     let snap = ReadSnapshot::from_parts(
-        &page.tree.title,
+        &post_page.tree.title,
         &visible_text,
         &current_actions,
         &forms_json,
@@ -3334,20 +3375,30 @@ fn starts_with_section(child: &str, form: &str) -> bool {
 /// **HttpOnly filter.** Cookies with `HttpOnly` are dropped, matching
 /// the WHATWG HTML §6.1 `document.cookie` visibility rule a real
 /// browser applies.
-pub(crate) fn collect_cookies(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
-    let url_host = page.url().host_str().unwrap_or("").to_owned();
+/// Render a list of [`heso_engine_fetch::ResponseCookie`]s into the
+/// agent-facing JSON shape, dropping `HttpOnly` cookies (invisible to
+/// `document.cookie` per WHATWG HTML §6.1) and de-duplicating by name —
+/// earlier entries win, so callers order their slices accordingly.
+fn render_cookies<'a>(
+    url_host: &str,
+    cookies: impl IntoIterator<Item = &'a heso_engine_fetch::ResponseCookie>,
+) -> serde_json::Value {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for c in &page.response_cookies {
+    for c in cookies {
         if c.http_only {
             continue;
         }
-        // Host-only: the response did NOT carry a non-empty Domain=
+        if !seen.insert(c.name.as_str()) {
+            continue;
+        }
+        // Host-only: the cookie carried no non-empty Domain=
         // attribute. Render the effective scope (the request URL's
         // host) and tag with `host_only: true` so the agent can
         // distinguish "host-only via the RFC default" from
-        // "domain-wide cookie set by the server."
+        // "domain-wide cookie."
         let (domain, host_only) = if c.host_only {
-            (url_host.clone(), true)
+            (url_host.to_owned(), true)
         } else {
             (c.domain.clone().unwrap_or_default(), false)
         };
@@ -3360,6 +3411,32 @@ pub(crate) fn collect_cookies(page: &heso_engine_fetch::FetchPage) -> serde_json
         }));
     }
     serde_json::Value::Array(out)
+}
+
+/// Per-response cookie snapshot — only the `Set-Cookie` headers of
+/// *this* fetch. Used by the batch path, where the shared jar
+/// accumulates cookies from every parallel URL and a jar snapshot would
+/// leak unrelated rows into a per-URL result.
+pub(crate) fn collect_response_cookies(page: &heso_engine_fetch::FetchPage) -> serde_json::Value {
+    let url_host = page.url().host_str().unwrap_or("").to_owned();
+    render_cookies(&url_host, &page.response_cookies)
+}
+
+/// Cookies visible to the page after hydration: the response
+/// `Set-Cookie` headers merged with the live jar, so anything the
+/// page's JS wrote via `document.cookie` is surfaced too. The response
+/// headers come first so the network value stays authoritative when a
+/// name appears in both.
+pub(crate) fn collect_cookies(
+    page: &heso_engine_fetch::FetchPage,
+    cookie_jar: &heso_engine_fetch::CookieStoreMutex,
+) -> serde_json::Value {
+    let url_host = page.url().host_str().unwrap_or("").to_owned();
+    let jar_cookies = heso_engine_fetch::cookies_from_jar(cookie_jar, page.url());
+    render_cookies(
+        &url_host,
+        page.response_cookies.iter().chain(jar_cookies.iter()),
+    )
 }
 
 /// Best-effort framework sniff. Inspects (in priority order):
