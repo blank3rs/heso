@@ -1215,6 +1215,16 @@ pub struct FetchPage {
     /// agent expected, and the empty extraction shouldn't masquerade
     /// as a clean read.
     pub content_type: Option<String>,
+    /// The RNG seed used for the run that produced this page. Recorded
+    /// verbatim in the plat body's `seed` field by [`Self::plat_body_base`]
+    /// so the plat is self-describingly reproducible: an independent
+    /// verifier replays under the SAME seed and reproduces the same DOM
+    /// (HESO/1.0 §4 determinism — sources of nondeterminism MUST be
+    /// seeded or recorded so replay is byte-identical). Defaults to 0,
+    /// the unseeded default; the stamp / run paths set it to the seed the
+    /// session actually ran under. Covered by `plat_hash` like any other
+    /// field.
+    pub seed: u64,
 }
 
 impl Page for FetchPage {
@@ -1258,6 +1268,7 @@ impl FetchPage {
             inline_data,
             data_attrs,
             plan: None,
+            seed: 0,
         }
     }
 
@@ -1282,6 +1293,12 @@ impl FetchPage {
             "tree": self.tree,
             "actions": self.actions,
             "http_status": self.http_status,
+            // The RNG seed the run executed under (default 0). Recorded
+            // so a plat is self-describingly reproducible — an
+            // independent verifier replays under this seed and gets the
+            // same DOM (HESO/1.0 §4). Ordinary field; covered by
+            // `plat_hash`.
+            "seed": self.seed,
         });
         if !self.inline_data.is_empty() {
             if let Some(obj) = body.as_object_mut() {

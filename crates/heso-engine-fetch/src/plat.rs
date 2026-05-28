@@ -13,23 +13,21 @@
 //!    domain-separated by [`SIGNING_DOMAIN`]. Verifying needs only the
 //!    envelope; no key material, no network, no clock.
 //!
-//! The unbreakability property reduces to a single invariant:
+//! ## Single source of truth: `heso-verify`
 //!
-//! > *Mutating any content byte inside the plat changes the canonical
-//! > bytes, which changes the signed message, which fails Ed25519
-//! > `verify_strict`. Mutating the top-level `plat_hash` itself is caught
-//! > by hash verification before signature verification.*
+//! The canonicalization, `plat_hash`, and sealed-envelope **open/verify**
+//! logic does **not** live here. It lives in the standalone
+//! [`heso_verify`] crate — the Grade-0 verifier anyone can run with
+//! nothing but the artifacts. This module is the engine-side producer +
+//! thin wrapper layer: [`hash`], [`canonical_json`], [`verify`], and
+//! [`open`] all delegate DOWN to `heso_verify`, and [`SealedPlat`] /
+//! [`OpenOutcome`] / [`SIGNING_DOMAIN`] / [`ENVELOPE_ALG`] are
+//! re-exported from it. The verify path exists in exactly one place — no
+//! copy-paste. The dependency flows engine → verify, never the reverse.
 //!
-//! Everything else (Merkle aggregation, transparency-log anchoring,
-//! post-quantum hybrids) is a layer above this and a non-breaking
-//! addition under the [`SealedPlat::alg`] tag.
-//!
-//! ## Canonical bytes
-//!
-//! Canonicalization is delegated to [`serde_jcs`], which implements
-//! [RFC 8785] — sorted keys, ECMA-262 number serialization, JCS string
-//! escapes. Number/float and non-ASCII-key ambiguities the homegrown
-//! canonicalizer used to gloss over are handled by spec.
+//! The **producers** ([`seal`] / [`seal_checked`]) stay here because
+//! they need `heso_core::IdentityKey` — a private-key type the verify
+//! crate deliberately does not pull in.
 //!
 //! ## `plat_hash` is excluded at the top level only
 //!
@@ -43,125 +41,71 @@
 //!
 //! [RFC 8785]: https://datatracker.ietf.org/doc/html/rfc8785
 
-use heso_core::{IdentityError, IdentityKey, Signature};
-use serde::{Deserialize, Serialize};
+use heso_core::IdentityKey;
 use serde_json::Value;
 
-/// Domain-separation tag prepended to the canonical plat bytes before
-/// signing. Prevents a plat signature from being valid against any
-/// other signed payload shape in heso (receipts, fingerprints, …).
-pub const SIGNING_DOMAIN: &[u8] = b"heso-plat/v1\0";
-
-/// Envelope algorithm tag. Verifiers refuse envelopes carrying any
-/// other value rather than silently treating them as Ed25519.
-pub const ENVELOPE_ALG: &str = "heso-plat/v1+ed25519";
+// Re-export the verifier's surface so existing call sites
+// (`heso_engine_fetch::plat::SealedPlat`, the CLI's `PlatOpenOutcome`,
+// the §3.2 / §3.3 constants) keep working unchanged while the actual
+// implementation lives in exactly one place.
+pub use heso_verify::{
+    canonical_bytes, Outcome as OpenOutcome, SealedPlat, Signature, SignatureError, VerifyError,
+    ENVELOPE_ALG, SIGNING_DOMAIN,
+};
 
 /// Hex-encoded BLAKE3 of the plat's canonical-JSON bytes, with the
 /// top-level `plat_hash` field excluded. 64 hex chars (256 bits).
+///
+/// Thin wrapper over [`heso_verify::plat_hash`].
 pub fn hash(value: &Value) -> String {
-    let bytes = canonical_bytes(value);
-    blake3::hash(&bytes).to_hex().to_string()
+    heso_verify::plat_hash(value)
 }
 
 /// Canonical-JSON of `value` with any top-level `plat_hash` field
 /// removed. The exact bytes [`hash`] and [`seal`] operate on.
+///
+/// Thin wrapper over [`heso_verify::canonical_json`].
 pub fn canonical_json(value: &Value) -> String {
-    String::from_utf8(canonical_bytes(value))
-        .expect("serde_jcs emits valid UTF-8")
+    heso_verify::canonical_json(value)
 }
 
-fn canonical_bytes(value: &Value) -> Vec<u8> {
-    // Strip only the top-level `plat_hash` before canonicalization: a
-    // hash field cannot contain its own digest. Every other field is
-    // content. Nested `plat_hash` values (from `linked_pages[*]`) ARE
-    // preserved so a parent plat cryptographically commits to its
-    // children's hashes (Merkle-style).
-    let cleaned = match value {
-        Value::Object(map) if map.contains_key("plat_hash") => {
-            let mut stripped = map.clone();
-            stripped.remove("plat_hash");
-            Value::Object(stripped)
-        }
-        other => other.clone(),
-    };
-    serde_jcs::to_vec(&cleaned).expect("plat value canonicalizes")
-}
 /// Verify a plat's embedded `plat_hash` against a recomputed hash over
 /// the rest of its canonical bytes.
 ///
 /// `Err` distinguishes "no hash field" / "malformed hash field" from a
-/// genuine mismatch. A real tamper signal is `Ok(false)`.
+/// genuine mismatch. A real tamper signal is `Ok(false)`. Thin wrapper
+/// over [`heso_verify::verify_plat_hash`].
 pub fn verify(plat: &Value) -> Result<bool, VerifyError> {
-    let embedded = plat
-        .get("plat_hash")
-        .ok_or(VerifyError::MissingHashField)?
-        .as_str()
-        .ok_or(VerifyError::MalformedHashField)?;
-    Ok(embedded == hash(plat))
+    heso_verify::verify_plat_hash(plat)
 }
 
-/// Errors from [`verify`].
-#[derive(Debug, thiserror::Error)]
-pub enum VerifyError {
-    /// The plat has no `plat_hash` field — there is nothing to verify
-    /// against.
-    #[error("plat JSON has no `plat_hash` field")]
-    MissingHashField,
-    /// The `plat_hash` field exists but is not a string.
-    #[error("plat JSON's `plat_hash` is not a string")]
-    MalformedHashField,
+/// Verify a [`SealedPlat`] per HESO/1.0 §3.4. Thin wrapper over
+/// [`heso_verify::open`] — the verify path lives in `heso-verify`.
+pub fn open(sealed: &SealedPlat) -> OpenOutcome {
+    heso_verify::open(sealed)
 }
 
 // ============================================================================
-// Sealed envelope — signed, self-describing, offline-verifiable
+// Sealed envelope — producer side (stays in the engine; needs IdentityKey)
 // ============================================================================
 
-/// A plat sealed with an Ed25519 signature over its canonical bytes.
-///
-/// The envelope is the unit of trust: holding a [`SealedPlat`] and the
-/// `heso` binary is sufficient to decide whether the `content` was
-/// produced by the holder of `signature.public_key` and is byte-for-byte
-/// what they signed.
-///
-/// JSON shape (compact, sorted keys after canonicalization):
-///
-/// ```json
-/// {
-///   "alg": "heso-plat/v1+ed25519",
-///   "content": { ... the plat body ..., "plat_hash": "<blake3-hex>" },
-///   "signature": { "algorithm": "Ed25519", "public_key": "<b64>", "signature": "<b64>" }
-/// }
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SealedPlat {
-    /// Envelope algorithm tag. Always [`ENVELOPE_ALG`] for v1.
-    pub alg: String,
-    /// The plat body. Carries its own `plat_hash` (BLAKE3 of itself).
-    pub content: Value,
-    /// Ed25519 signature over [`SIGNING_DOMAIN`] ++ canonical bytes of
-    /// `content`.
-    pub signature: Signature,
-}
-
-/// Outcome of [`open`]. Three-way to mirror the receipt-verify CLI
-/// exit-code shape (0 valid / 1 invalid / 2 wrong-algorithm or
-/// mismatched hash).
-#[derive(Debug)]
-pub enum OpenOutcome {
-    /// Algorithm matches, embedded hash matches, signature verifies.
-    Valid,
-    /// Envelope carries an algorithm tag this binary does not know.
-    WrongAlgorithm(String),
-    /// `content.plat_hash` does not match the recomputed BLAKE3. The
-    /// signature is not even checked — the content has been mutated.
-    HashMismatch,
-    /// Signature does not verify against the canonical content bytes.
-    InvalidSignature(IdentityError),
+/// Convert the `heso_core` signature envelope an [`IdentityKey`] mints
+/// into the byte-identical [`heso_verify::Signature`] shape the verifier
+/// consumes. Same three fields, same JSON — this is the one place the
+/// producer (`heso-core`) and the verifier (`heso-verify`) signature
+/// types meet, so the conversion lives in the engine that depends on
+/// both rather than coupling either crate to the other.
+fn to_verify_signature(sig: heso_core::Signature) -> Signature {
+    Signature {
+        algorithm: sig.algorithm,
+        public_key: sig.public_key,
+        signature: sig.signature,
+    }
 }
 
 /// Seal a plat body with `key`. The resulting [`SealedPlat`] is the
-/// shipping form: anyone can verify it with [`open`] using nothing but
-/// the envelope.
+/// shipping form: anyone can verify it with [`open`] (or the standalone
+/// `heso-verify` binary) using nothing but the envelope.
 ///
 /// If `body` is a JSON object that already carries a `plat_hash` field,
 /// that field is preserved verbatim — the embedded hash is treated as
@@ -182,7 +126,7 @@ pub fn seal(key: &IdentityKey, mut body: Value) -> SealedPlat {
     let mut payload = Vec::with_capacity(SIGNING_DOMAIN.len() + 256);
     payload.extend_from_slice(SIGNING_DOMAIN);
     payload.extend_from_slice(&canonical_bytes(&body));
-    let signature = key.sign(&payload);
+    let signature = to_verify_signature(key.sign(&payload));
     SealedPlat {
         alg: ENVELOPE_ALG.to_owned(),
         content: body,
@@ -228,37 +172,6 @@ pub fn seal_checked(key: &IdentityKey, body: Value) -> Result<SealedPlat, SealEr
         }
     }
     Ok(seal(key, body))
-}
-
-/// Verify a [`SealedPlat`]. Checks, in order:
-///
-/// 1. `alg` is [`ENVELOPE_ALG`].
-/// 2. `content.plat_hash` equals the recomputed BLAKE3 of `content`.
-///    A failure here means the body was mutated after sealing; the
-///    signature check is skipped (it would fail too, but the
-///    `HashMismatch` variant is a clearer error).
-/// 3. The signature verifies against [`SIGNING_DOMAIN`] ++ canonical
-///    bytes of `content`.
-pub fn open(sealed: &SealedPlat) -> OpenOutcome {
-    if sealed.alg != ENVELOPE_ALG {
-        return OpenOutcome::WrongAlgorithm(sealed.alg.clone());
-    }
-    let recomputed = hash(&sealed.content);
-    let embedded = sealed
-        .content
-        .get("plat_hash")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if embedded != recomputed {
-        return OpenOutcome::HashMismatch;
-    }
-    let mut payload = Vec::with_capacity(SIGNING_DOMAIN.len() + 256);
-    payload.extend_from_slice(SIGNING_DOMAIN);
-    payload.extend_from_slice(&canonical_bytes(&sealed.content));
-    match sealed.signature.verify(&payload) {
-        Ok(()) => OpenOutcome::Valid,
-        Err(e) => OpenOutcome::InvalidSignature(e),
-    }
 }
 
 // ============================================================================
@@ -790,7 +703,7 @@ mod tests {
             b["plat_hash"] = json!(hash(&b));
             b
         };
-        let bare = key.sign(&canonical_bytes(&body));
+        let bare = to_verify_signature(key.sign(&canonical_bytes(&body)));
         let sealed = SealedPlat {
             alg: ENVELOPE_ALG.to_owned(),
             content: body,
@@ -952,28 +865,36 @@ mod tests {
     }
 
     // ========================================================================
-    // HESO/1.0 §1.9 — canonical test vectors. The assertions pin each
-    // (canonical bytes, plat_hash) pair as a regression test; if any
-    // change to canonicalization or the hash construction drifts these,
-    // the test fails before the spec falls out of sync.
+    // HESO/1.0 §1.9 — canonical test vectors, in two forms.
     //
-    // Run with `--nocapture` to dump human-readable canonical bytes
-    // alongside the hashes for cross-implementation conformance:
-    //   cargo test --release -p heso-engine-fetch \
-    //     plat::tests::heso_1_0_section_1_9_vectors -- --nocapture
+    // (a) `heso_1_0_section_1_9_spec_vectors_bare` pins the EXACT §1.9
+    //     spec ground-truth hashes over the *bare* bodies (no `seed`
+    //     field). These guard the canonicalization + hash construction
+    //     against drift relative to the spec doc — `bc272895…` etc. — and
+    //     must never change.
+    //
+    // (b) `heso_1_0_section_1_9_vectors` pins the same V1..V8 bodies as
+    //     the engine now actually emits them: WITH the recorded RNG
+    //     `seed` field (default 0). Adding a body field is a new input,
+    //     so these hashes DIFFER from (a) — that is expected and correct.
+    //     This is the dump test `generated-vectors.json` captures for the
+    //     merge seam; it emits `canonical_bytes_hex` + `plat_hash` for
+    //     V1..V8 under `--nocapture`:
+    //       cargo test -p heso-engine-fetch \
+    //         plat::tests::heso_1_0_section_1_9_vectors -- --nocapture
     // ========================================================================
 
-    #[test]
-    fn heso_1_0_section_1_9_vectors() {
-        fn hex(bytes: &[u8]) -> String {
-            use std::fmt::Write;
-            let mut s = String::with_capacity(bytes.len() * 2);
-            for b in bytes {
-                write!(s, "{:02x}", b).unwrap();
-            }
-            s
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            write!(s, "{:02x}", b).unwrap();
         }
+        s
+    }
 
+    #[test]
+    fn heso_1_0_section_1_9_spec_vectors_bare() {
         let vectors: Vec<(&str, Value, &str)> = vec![
             (
                 "V1 minimal plat",
@@ -1123,5 +1044,238 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ========================================================================
+    // §1.9 vectors as PLAT BODIES (with the recorded `seed` field) — the
+    // shape the engine now actually emits. These are the body-shaped
+    // vectors `generated-vectors.json` captures for the merge seam: each
+    // is the V1..V8 body with the recorded RNG `seed` field added
+    // (default 0), exactly as `plat_body_base` produces it. The pinned
+    // hashes are REGENERATED — they intentionally differ from the
+    // bare-body §1.9 spec hashes above because the body gained a field.
+    // ========================================================================
+
+    /// The V1..V8 §1.9 bodies WITH the recorded `seed` field, paired with
+    /// their regenerated `plat_hash`, in spec order. Shared by the dump
+    /// test and (via `generated-vectors.json`) the merge seam. The hashes
+    /// were generated by running the dump test — never hand-authored.
+    pub(crate) fn section_1_9_bodies_with_seed() -> Vec<(&'static str, Value, &'static str)> {
+        vec![
+            (
+                "V1 minimal plat",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Example",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "seed": 0
+                }),
+                "2c7fe735dbcc65ac5fe36297c122180790b6cba736c22ce34ba5aeff6d1fdcd4",
+            ),
+            (
+                "V2 Merkle parent over two child plat_hashes",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Parent",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "linked_pages": [
+                        {"url": "https://example.com/a", "plat_hash": "aaaa"},
+                        {"url": "https://example.com/b", "plat_hash": "bbbb"}
+                    ],
+                    "seed": 0
+                }),
+                "ce75148813caf0c10d8042b90fe5981be6b4b8fc54a02f3c95b40ef86ac69152",
+            ),
+            (
+                "V3 V1 plus populated telemetry (must hash differently)",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Example",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "cookies": [{"name": "s", "value": "session-123"}],
+                    "http_status": 200,
+                    "console": ["log"],
+                    "id": "page-uuid-7f3a2",
+                    "partial": false,
+                    "partial_reason": "ok",
+                    "seed": 0
+                }),
+                "c025d194b43e43fc4aff34998c1d21ab6efc7ef8899635b0a2c591a1cc0804f5",
+            ),
+            (
+                "V4 Unicode NFC (é = U+00E9)",
+                json!({
+                    "input_url": "https://example.com/caf\u{00e9}",
+                    "url": "https://example.com/caf\u{00e9}",
+                    "title": "caf\u{00e9}",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "seed": 0
+                }),
+                "3d95aac8b9e4c21a815f20a1be5f49288944348e1eebcc6dfbae63e96d7ff81b",
+            ),
+            (
+                "V5 Unicode NFD (é = U+0065 U+0301)",
+                json!({
+                    "input_url": "https://example.com/cafe\u{0301}",
+                    "url": "https://example.com/cafe\u{0301}",
+                    "title": "cafe\u{0301}",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "seed": 0
+                }),
+                "de6691fb8dd63bd0020b62365bb83db7b033d87631a00a539f89c0eba1244c9d",
+            ),
+            (
+                "V6a title is empty string",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "seed": 0
+                }),
+                "d3c80a5837bb7f795311c25118f6cce2ead344ce114b9786fe98508226347836",
+            ),
+            (
+                "V6b title is null",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": null,
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "seed": 0
+                }),
+                "63f41dd2f53b8a511a7471664ade493c105ef42ff48700b089359ef9f9657ace",
+            ),
+            (
+                "V6c title is absent",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "seed": 0
+                }),
+                "7a6f4008191fdc0716ab4da26f1217495a5b9ddc9a8463b71666c4a81a90b1a1",
+            ),
+            (
+                "V8 plat with a single ok step (§1.4.1)",
+                json!({
+                    "input_url": "https://example.com/",
+                    "url": "https://example.com/",
+                    "title": "Stepped",
+                    "description": "",
+                    "tree": [],
+                    "actions": [],
+                    "plan": [{"verb": "open", "url": "https://example.com/"}],
+                    "steps": [{
+                        "index": 0,
+                        "verb": "open",
+                        "action": {"verb": "open", "url": "https://example.com/"},
+                        "url_before": "https://example.com/",
+                        "url_after": "https://example.com/",
+                        "status": "ok",
+                        "observed": {"op": "open", "http_status": 200},
+                        "started_at": "1970-01-01T00:00:00.000Z",
+                        "finished_at": "1970-01-01T00:00:00.001Z"
+                    }],
+                    "seed": 0
+                }),
+                "8382289f9f3b1dfb53d2428c3a77be5a199389abf49ccd0861a8b318ca042532",
+            ),
+        ]
+    }
+
+    #[test]
+    fn heso_1_0_section_1_9_vectors() {
+        // V1..V8 as the engine emits them (WITH the `seed` field), each
+        // pinned to its regenerated `plat_hash`. Emits `canonical_bytes_hex`
+        // + `plat_hash` under `--nocapture`; the pinned hashes are
+        // captured into `generated-vectors.json` (the merge seam).
+        for (name, body, expected_hash) in section_1_9_bodies_with_seed() {
+            let bytes = canonical_bytes(&body);
+            let plat_hash = hash(&body);
+            eprintln!("=== {name} (with seed) ===");
+            eprintln!("input_json:           {}", serde_json::to_string(&body).unwrap());
+            eprintln!("canonical_bytes_hex:  {}", hex(&bytes));
+            eprintln!("plat_hash:            {}", plat_hash);
+            eprintln!();
+            assert_eq!(
+                plat_hash, expected_hash,
+                "{name}: plat_hash drifted from the pinned §1.9-with-seed vector"
+            );
+            assert_eq!(plat_hash.len(), 64);
+            assert!(plat_hash.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    // ========================================================================
+    // Conformance-constant dump tests. These GENERATE the constants that
+    // `generated-vectors.json` (and any cross-implementation test) needs,
+    // so no constant is ever hand-typed. Run under `--nocapture`:
+    //   cargo test -p heso-engine-fetch plat::tests::dump_ -- --nocapture
+    // ========================================================================
+
+    /// The fixed 32-byte seed used by the sealed-envelope / receipt
+    /// conformance vectors. All-zero so the vector is reproducible by any
+    /// implementation: `IdentityKey::from_bytes(&[0u8; 32])`.
+    const FIXED_SEED: [u8; 32] = [0u8; 32];
+
+    /// A known minimal plat body the sealed-envelope vector seals.
+    fn minimal_vector_body() -> Value {
+        json!({
+            "input_url": "https://example.com/",
+            "url": "https://example.com/",
+            "title": "Example",
+            "description": "",
+            "tree": [],
+            "actions": []
+        })
+    }
+
+    #[test]
+    fn dump_signing_domain() {
+        // §3.2: SIGNING_DOMAIN = ASCII "heso-plat/v1" + one NUL.
+        eprintln!("signing_domain_hex: {}", hex(SIGNING_DOMAIN));
+        assert_eq!(hex(SIGNING_DOMAIN), "6865736f2d706c61742f763100");
+    }
+
+    #[test]
+    fn dump_sealed_envelope_vector() {
+        let key = IdentityKey::from_bytes(&FIXED_SEED);
+        let sealed = seal(&key, minimal_vector_body());
+        let canonical_hex = hex(&canonical_bytes(&sealed.content));
+        eprintln!("seed_hex:            {}", hex(&FIXED_SEED));
+        eprintln!("public_key_b64:      {}", key.public_key_b64());
+        eprintln!("canonical_bytes_hex: {}", canonical_hex);
+        eprintln!(
+            "sealed_envelope_json: {}",
+            serde_json::to_string(&sealed).unwrap()
+        );
+        // The vector must verify under the same verify path it documents.
+        assert!(matches!(open(&sealed), OpenOutcome::Valid));
+        // Ed25519 is deterministic, so the public key for the all-zero
+        // seed is fixed across runs and implementations.
+        assert_eq!(
+            key.public_key_b64(),
+            "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik="
+        );
     }
 }

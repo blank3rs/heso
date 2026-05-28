@@ -467,6 +467,9 @@ pub(crate) async fn cmd_template_stamp(args: &[String]) -> ExitCode {
         final_snapshot.html,
     );
     page.plan = Some(plan_json);
+    // Record the seed the template run executed under (default 0) so the
+    // plat is self-describingly reproducible (HESO/1.0 §4).
+    page.seed = parsed.seed.unwrap_or(0);
     let mut body = page.plat_body_base();
     if let Some(obj) = body.as_object_mut() {
         let final_cassette = cassette.lock().expect("cassette mutex poisoned").clone();

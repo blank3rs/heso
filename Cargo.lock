@@ -901,6 +901,7 @@ dependencies = [
  "ego-tree",
  "heso-core",
  "heso-engine-api",
+ "heso-verify",
  "regex",
  "reqwest",
  "reqwest_cookie_store",
@@ -957,6 +958,7 @@ dependencies = [
  "heso-core",
  "heso-primitives",
  "serde",
+ "serde_jcs",
  "serde_json",
  "thiserror",
 ]
@@ -972,6 +974,18 @@ dependencies = [
  "heso-trace",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "heso-verify"
+version = "0.1.8"
+dependencies = [
+ "base64",
+ "blake3",
+ "ed25519-dalek",
+ "serde",
+ "serde_jcs",
+ "serde_json",
 ]
 
 [[package]]

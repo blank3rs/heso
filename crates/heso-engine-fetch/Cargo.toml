@@ -11,6 +11,12 @@ description = "heso fetch + parse engine. Native HTTP, HTML5 parsing, visible-te
 [dependencies]
 heso-core = { path = "../heso-core" }
 heso-engine-api = { path = "../heso-engine-api" }
+# Dependency direction is engine -> verify, never the reverse. The
+# canonicalization / plat_hash / sealed-envelope open+verify path lives
+# in `heso-verify` (the standalone Grade-0 verifier) and `plat.rs` here
+# is a thin producer/wrapper layer over it. `heso-verify` must NOT
+# depend on this crate or any engine/DOM/network crate.
+heso-verify = { path = "../heso-verify" }
 base64.workspace = true
 blake3.workspace = true
 reqwest.workspace = true

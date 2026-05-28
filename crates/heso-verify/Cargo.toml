@@ -1,0 +1,29 @@
+[package]
+name = "heso-verify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Standalone HESO/1.0 Grade-0 verifier: the single source of truth for canonicalization, plat_hash, and sealed-envelope verification. No engine, DOM, or network dependency — verify a run with nothing but the artifacts."
+
+[[bin]]
+name = "heso-verify"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_jcs.workspace = true
+blake3.workspace = true
+# Verify-only Ed25519. NO `rand_core`/rng feature — this crate never
+# generates keys, it only checks signatures, so it must not pull in an
+# entropy source. `std` for the error trait impls; default features off
+# to keep the dependency surface minimal.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
+base64.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

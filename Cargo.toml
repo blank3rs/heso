@@ -4,6 +4,7 @@ members = [
     "crates/heso-core",
     "crates/heso-engine-api",
     "crates/heso-engine-fetch",
+    "crates/heso-verify",
     "crates/heso-engine-js",
     "crates/heso-primitives",
     "crates/heso-trace",

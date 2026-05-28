@@ -5674,6 +5674,10 @@ async fn stamp_to_plat(
         page.actions = outcome.final_actions;
     }
     page.plan = Some(plan.actions_json.clone());
+    // Record the seed the run executed under so the plat is
+    // self-describingly reproducible (HESO/1.0 §4). `run_plan` uses
+    // `seed.unwrap_or(0)`; record the same resolved value.
+    page.seed = seed.unwrap_or(0);
     let mut body = page.plat_body_base();
     if !outcome.ok {
         if let Some(obj) = body.as_object_mut() {
@@ -6109,7 +6113,16 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         }
     };
 
-    let outcome = run_plan(&fetch, &plan.actions, seed, plan.start_url.clone()).await;
+    // Resolve the seed the replay executes under. An explicit `--seed`
+    // wins; otherwise default to the seed RECORDED in the input plat
+    // (HESO/1.0 §4 — the plat is self-describingly reproducible, so an
+    // independent verifier replays under the recorded seed and gets the
+    // same DOM, rather than a hardcoded 0 that might diverge). Falls back
+    // to 0 only for legacy plats that predate the `seed` field.
+    let recorded_seed = value.get("seed").and_then(|v| v.as_u64());
+    let effective_seed = seed.or(recorded_seed).unwrap_or(0);
+
+    let outcome = run_plan(&fetch, &plan.actions, Some(effective_seed), plan.start_url.clone()).await;
 
     // Per-step replay check. The input plat may carry a `steps` array
     // recorded when it was stamped; if so, compare each recorded
@@ -6151,6 +6164,12 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         page.actions = outcome.final_actions;
     }
     page.plan = Some(plan.actions_json);
+    // Re-record the seed the replay ran under so the output plat is
+    // itself self-describingly reproducible. For a faithful replay of an
+    // unmodified plat this equals the input's recorded seed, keeping the
+    // stamp -> run plat_hash byte-identical (the cassette_replay.rs
+    // contract).
+    page.seed = effective_seed;
     let mut body = page.plat_body_base();
     if !outcome.ok {
         if let Some(obj) = body.as_object_mut() {

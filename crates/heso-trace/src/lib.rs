@@ -1756,4 +1756,138 @@ mod tests {
             "PostAnchor signature must not verify against PreAnchor bytes",
         );
     }
+
+    // ========================================================================
+    // Drift-guard: this crate's hand-rolled receipt canonicalizer
+    // (`write_canonical`) MUST agree byte-for-byte with the RFC 8785 (JCS)
+    // reference encoder (`serde_jcs`) that `heso-verify` /
+    // `heso-engine-fetch` sign over. If they ever diverge, a receipt
+    // signed under one and verified under the other would mismatch — so a
+    // divergence is a SPEC DECISION to surface, not a thing to silently
+    // "fix" in this test.
+    // ========================================================================
+
+    #[test]
+    fn write_canonical_matches_serde_jcs_byte_for_byte() {
+        // A shared input object exercising the value shapes a receipt
+        // emits: nested objects (key-sort), arrays, ints, bools, null,
+        // strings needing JSON escapes, unicode, and the empty cases.
+        // Integers are kept inside the safe range (|n| < 2^53) — the
+        // domain every receipt field (u64 seed/cost, small indices, u16
+        // status) actually lives in. See `KNOWN DIVERGENCE` below for the
+        // one place the two encoders disagree, and why it is a spec
+        // decision rather than a bug to fix here.
+        let shared = serde_json::json!({
+            "z_last": 1,
+            "a_first": {"nested_b": 2, "nested_a": [3, 4, {"deep": "x"}]},
+            "bool_t": true,
+            "bool_f": false,
+            "nil": null,
+            "neg": -42,
+            "big_but_safe": 9007199254740991i64, // 2^53 - 1, the max safe integer
+            "empty_str": "",
+            "escapes": "quote:\" backslash:\\ newline:\n tab:\t",
+            "arr_of_obj": [{"b": 1, "a": 2}, {"d": 3, "c": 4}],
+            "unicode": "café — naïve"
+        });
+
+        let mut ours = String::new();
+        write_canonical(&shared, &mut ours);
+        let jcs = serde_jcs::to_string(&shared).expect("serde_jcs canonicalizes");
+
+        assert_eq!(
+            ours, jcs,
+            "heso-trace `write_canonical` diverged from RFC 8785 (serde_jcs) within the \
+             receipt value domain. This is a SPEC decision — do NOT paper over it here; \
+             surface it.\n  ours: {ours}\n  jcs:  {jcs}"
+        );
+    }
+
+    #[test]
+    fn write_canonical_known_divergence_above_2_pow_53_is_a_spec_decision() {
+        // KNOWN DIVERGENCE (reported, not fixed): for an integer outside
+        // the IEEE-754 double safe range (|n| >= 2^53), the two encoders
+        // disagree —
+        //   * `write_canonical` emits the EXACT i64 via serde_json::Number
+        //     Display (`9007199254740993`);
+        //   * `serde_jcs` applies RFC 8785's ECMA-262 number rule, which
+        //     routes through an f64 and rounds (`9007199254740992`).
+        // No `Receipt` field can carry such a value (seed/cost are
+        // realistic u64s, indices are small, status is u16), so this never
+        // bites a real receipt — but it IS a genuine canonicalization
+        // divergence and the choice of which rule is "correct" is a spec
+        // decision, not a thing to silently reconcile in this crate. This
+        // test pins the divergence so it can't change unnoticed.
+        let v = serde_json::json!({ "n": 9007199254740993i64 }); // 2^53 + 1
+        let mut ours = String::new();
+        write_canonical(&v, &mut ours);
+        let jcs = serde_jcs::to_string(&v).expect("serde_jcs canonicalizes");
+        assert_eq!(ours, r#"{"n":9007199254740993}"#);
+        assert_eq!(jcs, r#"{"n":9007199254740992}"#);
+        assert_ne!(
+            ours, jcs,
+            "the 2^53 boundary divergence is expected; if it vanished, re-evaluate the spec note"
+        );
+    }
+
+    #[test]
+    fn canonical_receipt_bytes_match_serde_jcs() {
+        // The full receipt path: `canonical_receipt_bytes` (which clears
+        // `signature`/`tsa_anchor` then runs `write_canonical`) must equal
+        // serde_jcs over the same cleared serde_json::Value.
+        let r = sample_receipt();
+        let ours = canonical_receipt_bytes(&r, SignatureScope::PreAnchor);
+
+        let mut v = serde_json::to_value(&r).unwrap();
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("signature".to_owned(), Value::Null);
+            obj.insert("tsa_anchor".to_owned(), Value::Null);
+        }
+        let jcs = serde_jcs::to_vec(&v).expect("serde_jcs canonicalizes");
+
+        assert_eq!(
+            ours, jcs,
+            "canonical_receipt_bytes diverged from RFC 8785 (serde_jcs) — spec decision, not a test fix"
+        );
+    }
+
+    // ========================================================================
+    // Conformance-constant dump test (Task 4): GENERATE the receipt
+    // vector so no constant is hand-typed. Run under `--nocapture`:
+    //   cargo test -p heso-trace tests::dump_receipt_vector -- --nocapture
+    // ========================================================================
+
+    #[test]
+    fn dump_receipt_vector() {
+        // Same FIXED 32-byte all-zero seed the sealed-envelope vector
+        // uses, so both vectors share one reproducible identity.
+        let key = IdentityKey::from_bytes(&[0u8; 32]);
+        // A minimal, fully-deterministic receipt: empty trace, no pages,
+        // seed 0, default cost/mode. trace_hash is computed, not typed.
+        let trace: Trace = Vec::new();
+        let mut receipt = Receipt {
+            trace: trace.clone(),
+            trace_hash: trace_hash(&trace),
+            seed: 0,
+            ..Default::default()
+        };
+        sign_receipt(&key, &mut receipt);
+
+        eprintln!("seed_hex:            {}", "00".repeat(32));
+        eprintln!(
+            "public_key_b64:      {}",
+            key.public_key_b64()
+        );
+        eprintln!(
+            "signed_receipt_json: {}",
+            serde_json::to_string(&receipt).unwrap()
+        );
+
+        // The vector must verify under the same path it documents.
+        assert!(matches!(verify_receipt(&receipt), VerifyOutcome::Valid));
+        assert_eq!(
+            key.public_key_b64(),
+            "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik="
+        );
+    }
 }
