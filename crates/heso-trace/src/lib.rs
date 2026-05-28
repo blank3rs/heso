@@ -574,13 +574,50 @@ pub fn parse_actions(actions: &Value) -> Result<Vec<Action>, ActionParseError> {
     let arr = actions.as_array().ok_or(ActionParseError::NotAnArray)?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, v) in arr.iter().enumerate() {
-        let a: Action = serde_json::from_value(v.clone()).map_err(|e| ActionParseError::Item {
-            index: i,
-            source: e,
+        let a: Action = serde_json::from_value(v.clone()).map_err(|e| {
+            // A common cross-surface mistake: writing a canonical plan
+            // action with the locator flags the CLI accepts
+            // (`--text` / `--selector` / `--aria-label`) instead of a
+            // stable `ref`. serde's `deny_unknown_fields` rejects those
+            // keys with a terse "unknown field" message that doesn't
+            // explain the actual fix. Detect that shape up front and
+            // return guidance instead.
+            if let Some(key) = cli_only_locator_key(v) {
+                return ActionParseError::CliLocatorInPlan { index: i, key };
+            }
+            ActionParseError::Item {
+                index: i,
+                source: e,
+            }
         })?;
         out.push(a);
     }
     Ok(out)
+}
+
+/// If `v` is a click/fill/submit action object carrying one of the
+/// CLI-only locator keys (`text`, `selector`, `aria_label` / its
+/// `aria-label` spelling) instead of `ref`, return the offending key.
+/// Returns `None` for any other shape so the generic schema error
+/// still fires (e.g. a typo'd verb, a missing `url`).
+fn cli_only_locator_key(v: &Value) -> Option<String> {
+    let obj = v.as_object()?;
+    let verb = obj.get("verb").and_then(|x| x.as_str())?;
+    if !matches!(verb, "click" | "fill" | "submit") {
+        return None;
+    }
+    // Only steer toward the ref-vs-locator guidance when the action is
+    // missing a `ref` — if `ref` is present the real problem is some
+    // other unknown field, and the generic message is more accurate.
+    if obj.contains_key("ref") {
+        return None;
+    }
+    for key in ["text", "selector", "aria_label", "aria-label"] {
+        if obj.contains_key(key) {
+            return Some(key.to_owned());
+        }
+    }
+    None
 }
 
 /// Failure modes for [`parse_actions`].
@@ -597,6 +634,22 @@ pub enum ActionParseError {
         /// The underlying deserialize error.
         #[source]
         source: serde_json::Error,
+    },
+    /// A click/fill/submit action used a CLI-only locator key
+    /// (`--text` / `--selector` / `--aria-label`) instead of a stable
+    /// `ref`. These flags resolve at runtime on the CLI; a canonical
+    /// plan needs a fixed ref so replay is deterministic.
+    #[error(
+        "action[{index}]: canonical plan actions require 'ref' (e.g. '@e7'); '--text', \
+         '--selector', '--aria-label' are CLI-only locator flags resolved at runtime (found \
+         '{key}'). Plans need stable refs for replay determinism. Use 'heso find <url>' or \
+         'heso read <url>' to discover refs."
+    )]
+    CliLocatorInPlan {
+        /// 0-based index into the actions array.
+        index: usize,
+        /// The CLI-only key that was found.
+        key: String,
     },
 }
 
@@ -1206,6 +1259,52 @@ mod tests {
     #[test]
     fn parse_actions_rejects_fill_without_value() {
         let arr = serde_json::json!([{"verb": "fill", "ref": "@e7"}]);
+        match parse_actions(&arr) {
+            Err(ActionParseError::Item { index, .. }) => assert_eq!(index, 0),
+            other => panic!("expected Item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_actions_guides_cli_locator_in_plan() {
+        // A click action written with the CLI's `--text` locator instead
+        // of a `ref` should get the dedicated guidance error, not the
+        // terse serde "unknown field" message.
+        let arr = serde_json::json!([{"verb": "click", "text": "More"}]);
+        match parse_actions(&arr) {
+            Err(ActionParseError::CliLocatorInPlan { index, key }) => {
+                assert_eq!(index, 0);
+                assert_eq!(key, "text");
+            }
+            other => panic!("expected CliLocatorInPlan, got {other:?}"),
+        }
+        // The rendered message names the fix and the discovery verbs.
+        let err = parse_actions(&arr).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("require 'ref'"), "got: {msg}");
+        assert!(msg.contains("heso find"), "got: {msg}");
+    }
+
+    #[test]
+    fn parse_actions_guides_selector_and_aria_label() {
+        for (key, json) in [
+            ("selector", serde_json::json!([{"verb": "fill", "selector": "#q", "value": "x"}])),
+            ("aria_label", serde_json::json!([{"verb": "submit", "aria_label": "Send"}])),
+        ] {
+            match parse_actions(&json) {
+                Err(ActionParseError::CliLocatorInPlan { key: found, .. }) => {
+                    assert_eq!(found, key, "for input {json}")
+                }
+                other => panic!("expected CliLocatorInPlan for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_actions_with_ref_plus_unknown_field_keeps_generic_error() {
+        // When `ref` IS present, an extra unknown field is a different
+        // mistake — keep the generic schema error so we don't mislead.
+        let arr = serde_json::json!([{"verb": "click", "ref": "@e3", "bogus": 1}]);
         match parse_actions(&arr) {
             Err(ActionParseError::Item { index, .. }) => assert_eq!(index, 0),
             other => panic!("expected Item, got {other:?}"),
