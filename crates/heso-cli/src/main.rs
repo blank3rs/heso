@@ -205,10 +205,13 @@ fn print_banner() {
     println!("                                --field name=value     repeatable; matched by input `name` attribute.");
     println!("                                --data '{{\"k\":\"v\"}}'    JSON dict alternative; --field wins on the same name.");
     println!("                                File inputs are skipped (FormData/Blob/File globals are unimplemented).");
-    println!("  heso eval-js [--seed N] <js>  Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
+    println!("  heso eval-js [--seed N] [--js-timeout DUR] <js>");
+    println!("                                Evaluate JS in a sandboxed QuickJS context; print value+console as JSON");
     println!("                                Pass `-` to read JS source from stdin. No DOM/window; use eval-dom for pages.");
     println!("                                --seed N seeds Math.random / crypto.getRandomValues / crypto.randomUUID (default 0).");
-    println!("  heso eval-dom [--seed N] [--js-fetch] <url> <js>");
+    println!("                                --js-timeout DUR caps script wallclock (default: no cap). On expiry the verb");
+    println!("                                emits `{{ok:false, error:{{kind:\"timeout\", timeout_ms, elapsed_ms}}}}` and exits 1.");
+    println!("  heso eval-dom [--seed N] [--js-fetch] [--js-timeout DUR] <url> <js>");
     println!("                                Fetch <url>, run every <script> in document order, then eval <js>");
     println!("                                against the post-hydration DOM. Pass `-` for <js> to read from stdin.");
     println!("                                --seed N seeds the determinism shims (default 0). Default skips <script src=...>;");
@@ -222,6 +225,8 @@ fn print_banner() {
     println!("                                resolve to their data before serialization. Bare side-effect reads like");
     println!("                                `globalThis.X = null; fetch(URL).then(j => globalThis.X = j); globalThis.X` will NOT");
     println!("                                work — the final expression captures `null` before the .then fires. Use shape (a).");
+    println!("                                Returning a DOM element serializes as `{{tag, outerHTML, attrs}}` (the engine reads");
+    println!("                                `outerHTML` + walks `attributes`, since DOM properties are non-enumerable own-props).");
     println!("  heso stamp  [--seed N] <plan-or-plat>");
     println!("                                Execute a plan against the live web and mint a fresh plat that");
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
@@ -272,7 +277,7 @@ fn print_banner() {
         "  heso identity show [--path P] Print the base64 public key of the identity at <path>"
     );
     println!();
-    println!("Global flags");
+    println!("Per-verb flags");
     println!("  --timeout <DUR>             Per-request wall-clock cap on every network verb");
     println!(
         "                              (open / read / click / fill / submit / eval-dom / batch /"
@@ -496,6 +501,31 @@ async fn cmd_update(args: &[String]) -> ExitCode {
 /// the matching batch-level cap.
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
+/// Reject URL inputs containing ASCII control characters before they
+/// reach `Url::parse`.
+///
+/// The `url` crate is WHATWG-compliant, which means it *silently
+/// strips* C0 control bytes (`< 0x20`) and `DEL` (`0x7F`) from the
+/// input during parsing. `https://example.com/\x00\x01foo` parses
+/// cleanly to `https://example.com/foo` with no error — so a caller
+/// that fat-fingered a control byte (or had one injected) would fetch
+/// a *different* URL than they typed and get a `200 OK` for it. That
+/// silent rewrite is the bug: the agent believes it fetched the URL it
+/// passed. We'd rather reject up front than fetch something the caller
+/// didn't ask for.
+///
+/// Returns `Err(message)` naming the rejection; the caller emits the
+/// structured `invalid_url` envelope.
+fn validate_url_input(s: &str) -> Result<(), String> {
+    if let Some(pos) = s.bytes().position(|b| b < 0x20 || b == 0x7F) {
+        return Err(format!(
+            "URL contains control characters (first at byte {pos}); refusing to fetch a \
+             silently-rewritten target"
+        ));
+    }
+    Ok(())
+}
+
 /// Open a URL with a configurable per-request timeout. `timeout_ms` of
 /// `Some(0)` (or any explicit `None`) drops the timeout — the engine
 /// will run unbounded. Used by the verbs that wire `--timeout DUR`
@@ -504,11 +534,16 @@ async fn open_or_die_with_timeout(
     url_arg: &str,
     timeout_ms: Option<u64>,
 ) -> Result<heso_engine_fetch::FetchPage, ExitCode> {
+    if let Err(msg) = validate_url_input(url_arg) {
+        eprintln!("{msg}");
+        return Err(emit_cli_error("invalid_url", &msg, 2));
+    }
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{url_arg}`: {e}");
-            return Err(ExitCode::from(2));
+            let msg = format!("invalid URL `{url_arg}`: {e}");
+            eprintln!("{msg}");
+            return Err(emit_cli_error("invalid_url", &msg, 2));
         }
     };
     let engine = match build_fetch_engine(timeout_ms) {
@@ -633,6 +668,37 @@ pub(crate) fn print_json(value: &serde_json::Value) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Emit a structured argument-error envelope to stdout and return the
+/// given exit code.
+///
+/// Agent callers parse stdout JSON; a bare `eprintln!` on stderr is
+/// invisible to them and reads as "the verb produced no output". This
+/// helper writes `{"ok": false, "error": {"code": <code>, "message":
+/// <message>}}` to stdout so the failure is machine-readable on the
+/// same channel as success. The matching human-readable line still
+/// goes to stderr at the call site for shell users — the stdout JSON
+/// is the contract, the stderr text is the convenience.
+///
+/// Reserved for *user-facing* argument errors (bad URL, unknown
+/// `--include` key, empty query, ref-not-found). Internal programmer
+/// errors (serialization failures, engine-alloc faults) stay
+/// stderr-only with a non-zero exit — they aren't part of the agent
+/// contract and shouldn't pollute the structured channel.
+pub(crate) fn emit_cli_error(code: &str, message: &str, exit: u8) -> ExitCode {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    });
+    // Best-effort: if even this serialization fails we still return the
+    // requested exit code — the stderr line at the call site remains
+    // the fallback diagnostic.
+    let _ = write_json_to_stdout(&body);
+    ExitCode::from(exit)
 }
 
 /// Pretty-print `value` to stdout and return whether serialization
@@ -1003,9 +1069,14 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
+    if let Err(msg) = validate_url_input(&url_str) {
+        eprintln!("{msg}");
+        return emit_cli_error("invalid_url", &msg, 2);
+    }
     if let Err(e) = Url::parse(&url_str) {
-        eprintln!("invalid URL `{url_str}`: {e}");
-        return ExitCode::from(2);
+        let msg = format!("invalid URL `{url_str}`: {e}");
+        eprintln!("{msg}");
+        return emit_cli_error("invalid_url", &msg, 2);
     }
 
     let engine = match build_fetch_engine(timeout_ms) {
@@ -1109,9 +1180,15 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts);
     // HTTP truthfulness wins over JS classification — a 403 with a
     // Cloudflare challenge body shouldn't pretend to be a `script_crash`
-    // from the missing CF JS. Same upstream signal for 5xx, etc.
-    let (partial, partial_reason) =
-        apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
+    // from the missing CF JS. Same upstream signal for 5xx, a non-HTML
+    // Content-Type, etc.
+    let (partial, partial_reason) = apply_http_truthfulness(
+        js_partial,
+        js_reason,
+        page.http_status,
+        &page.body_html,
+        page.content_type.as_deref(),
+    );
     // Then extraction-truthfulness: a usable page with title + actions
     // + tree content overrides script-side `script_crash`/`fetch_failed`
     // verdicts, since third-party tracker/ad failures don't stop the
@@ -1342,8 +1419,10 @@ pub(crate) fn apply_http_truthfulness(
     js_reason: &str,
     http_status: u16,
     body_html: &str,
+    content_type: Option<&str>,
 ) -> (bool, String) {
-    if let Some(http_reason) = heso_engine_fetch::partial_reason_for_status(http_status, body_html)
+    if let Some(http_reason) =
+        heso_engine_fetch::partial_reason_for_status(http_status, body_html, content_type)
     {
         return (true, http_reason);
     }
@@ -1401,15 +1480,94 @@ pub(crate) fn attach_failure_envelope(
 /// {"ok": false, "error": {"kind": "exception"|"thrown_value"|"engine", ...}}
 /// ```
 ///
+/// Run a JS-engine workload on a dedicated `std::thread` with an
+/// enlarged stack and an optional wallclock cap. `build_and_eval` is
+/// the engine-owning closure: it constructs the engine, installs an
+/// interrupt handler that reads the supplied watchdog flag, and runs
+/// `eval`. The whole closure runs on the spawned thread so
+/// `JsEngine`'s `!Send` constraint is satisfied (the engine never
+/// crosses a thread boundary).
+///
+/// Why 8 MB: Windows default thread stack is 1 MB, which collides with
+/// QuickJS's own ~1 MB managed-stack cap (the FFI call frames stack
+/// on top of QuickJS's counter, so the OS limit fires first and the
+/// host panics with `thread 'main' has overflowed its stack`).
+/// Bumping the OS stack to 8 MB lets QuickJS's own cap fire first and
+/// surface a structured engine error instead.
+///
+/// When `timeout` is `Some`, a small watchdog thread sleeps for the
+/// duration and flips the shared atomic. The engine's interrupt
+/// handler then returns `true` on the next QuickJS check, aborting
+/// the in-flight script. The returned `bool` is the watchdog's
+/// view of whether it fired — the caller uses it to decide between
+/// the generic engine-error envelope and a structured `timeout`
+/// envelope.
+fn run_eval_on_dedicated_thread<F>(
+    timeout: Option<std::time::Duration>,
+    build_and_eval: F,
+) -> (Result<heso_engine_js::EvalOutcome, heso_engine_js::EvalError>, bool)
+where
+    F: FnOnce(std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<
+            heso_engine_js::EvalOutcome,
+            heso_engine_js::EvalError,
+        > + Send
+        + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_eval = Arc::clone(&cancel);
+    let cancel_for_watchdog = Arc::clone(&cancel);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("heso-eval".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let result = build_and_eval(cancel_for_eval);
+            let _ = tx.send(result);
+        })
+        .expect("spawn eval worker thread");
+
+    let watchdog = timeout.map(|dur| {
+        std::thread::Builder::new()
+            .name("heso-eval-watchdog".to_owned())
+            .spawn(move || {
+                std::thread::sleep(dur);
+                cancel_for_watchdog.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn eval watchdog thread")
+    });
+
+    // Worker joins as soon as `build_and_eval` returns — either
+    // normally, after the interrupt fired, or never (in which case
+    // `rx.recv()` blocks indefinitely; that's intentional, the
+    // operator chose `--js-timeout 0` / no timeout).
+    let result = rx.recv().unwrap_or_else(|_| {
+        Err(heso_engine_js::EvalError::Engine(
+            "eval worker thread terminated without sending a result".to_owned(),
+        ))
+    });
+    let _ = worker.join();
+    // The watchdog may still be sleeping if the eval finished quickly;
+    // detaching it is fine — the thread holds no observable state past
+    // the atomic flip.
+    drop(watchdog);
+    let fired = cancel.load(Ordering::SeqCst);
+    (result, fired)
+}
+
 /// Exit codes: 0 on success, 1 on JS error, 2 on usage error. This is
 /// the Phase 1A demonstration surface (per ADR 0014) — no DOM, no
 /// `window`, no `<script>` on-load execution. Useful for sanity
 /// testing the engine independent of any page context.
 async fn cmd_eval_js(args: &[String]) -> ExitCode {
-    // Walk args once and split flags from positionals so `--seed N`
-    // can appear before or after `<js>`. Consistent with the rest of
-    // heso's CLI (raw arg parsing, no `clap`).
+    // Walk args once and split flags from positionals so `--seed N` /
+    // `--js-timeout DUR` can appear before or after `<js>`. Consistent
+    // with the rest of heso's CLI (raw arg parsing, no `clap`).
     let mut seed: u64 = 0;
+    let mut js_timeout_ms: Option<u64> = None;
     let mut positional: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -1428,10 +1586,24 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
                 };
                 i += 2;
             }
+            "--js-timeout" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--js-timeout needs a value");
+                    return ExitCode::from(2);
+                };
+                match parse_duration_ms(v) {
+                    Ok(ms) => js_timeout_ms = Some(ms),
+                    Err(e) => {
+                        eprintln!("--js-timeout: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             other if other.starts_with("--") && other != "-" => {
                 eprintln!("unknown flag `{other}`");
                 eprintln!(
-                    "usage: heso eval-js [--seed N] <js> | heso eval-js [--seed N] - < script.js"
+                    "usage: heso eval-js [--seed N] [--js-timeout DUR] <js> | heso eval-js [--seed N] [--js-timeout DUR] - < script.js"
                 );
                 return ExitCode::from(2);
             }
@@ -1442,8 +1614,9 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
         }
     }
     if positional.is_empty() {
-        eprintln!("usage: heso eval-js [--seed N] <js> | heso eval-js [--seed N] - < script.js");
-        return ExitCode::from(2);
+        let msg = "usage: heso eval-js [--seed N] [--js-timeout DUR] <js> | heso eval-js [--seed N] [--js-timeout DUR] - < script.js";
+        eprintln!("{msg}");
+        return emit_cli_error("missing_arg", msg, 2);
     }
     let src: String = if positional[0] == "-" {
         use tokio::io::AsyncReadExt;
@@ -1457,59 +1630,101 @@ async fn cmd_eval_js(args: &[String]) -> ExitCode {
         positional[0].clone()
     };
 
-    let engine = match heso_engine_js::JsEngine::new_with_seed(seed) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to create JS engine: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let timeout = js_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    let started = std::time::Instant::now();
+    let src_for_thread = src;
+    let (result, timed_out) = run_eval_on_dedicated_thread(timeout, move |cancel| {
+        let engine = heso_engine_js::JsEngine::new_with_seed(seed)?;
+        install_cancel_interrupt(&engine, cancel);
+        engine.eval(&src_for_thread)
+    });
 
-    match engine.eval(&src) {
-        Ok(outcome) => {
-            let body = serde_json::json!({
-                "ok": true,
-                "value": outcome.value,
-                "console": outcome.console,
-            });
-            match serde_json::to_string_pretty(&body) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("failed to serialize result: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            ExitCode::SUCCESS
-        }
+    emit_eval_envelope(result, timed_out, js_timeout_ms, started, None)
+}
+
+/// Install an rquickjs interrupt handler that aborts the running
+/// script when `cancel` is flipped. The handler runs on the same
+/// thread as the engine — `Arc<AtomicBool>` carries the signal from
+/// the watchdog thread that flips the flag on deadline.
+fn install_cancel_interrupt(
+    engine: &heso_engine_js::JsEngine,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    engine.set_interrupt_handler(Some(Box::new(move || cancel.load(Ordering::SeqCst))));
+}
+
+/// Render the eval-js / eval-dom result envelope. When `timed_out` is
+/// set, the engine error is translated into a structured `timeout`
+/// envelope with the configured budget; otherwise the standard
+/// exception / thrown-value / engine variants ship.
+///
+/// `extra_fields` lets `eval-dom` overlay its `url` (and, on success,
+/// `scripts`) onto the envelope without `eval-js` having to know about
+/// them. The same map is applied to both the success and failure
+/// bodies, so `url` rides the response either way.
+fn emit_eval_envelope(
+    result: Result<heso_engine_js::EvalOutcome, heso_engine_js::EvalError>,
+    timed_out: bool,
+    js_timeout_ms: Option<u64>,
+    started: std::time::Instant,
+    extra_fields: Option<serde_json::Map<String, serde_json::Value>>,
+) -> ExitCode {
+    let mut body = match &result {
+        Ok(outcome) => serde_json::json!({
+            "ok": true,
+            "value": outcome.value,
+            "console": outcome.console,
+        }),
         Err(e) => {
-            let err_body = match &e {
-                heso_engine_js::EvalError::Exception { message, stack } => serde_json::json!({
-                    "kind": "exception",
-                    "message": message,
-                    "stack": stack,
-                }),
-                heso_engine_js::EvalError::ThrownValue { value } => serde_json::json!({
-                    "kind": "thrown_value",
-                    "value": value,
-                }),
-                heso_engine_js::EvalError::Engine(msg) => serde_json::json!({
-                    "kind": "engine",
-                    "message": msg,
-                }),
+            let err_body = if timed_out {
+                serde_json::json!({
+                    "kind": "timeout",
+                    "code": "timeout",
+                    "message": format!(
+                        "JS execution timed out after {}ms",
+                        js_timeout_ms.unwrap_or(0)
+                    ),
+                    "timeout_ms": js_timeout_ms.unwrap_or(0),
+                    "elapsed_ms": started.elapsed().as_millis() as u64,
+                })
+            } else {
+                match e {
+                    heso_engine_js::EvalError::Exception { message, stack } => serde_json::json!({
+                        "kind": "exception",
+                        "message": message,
+                        "stack": stack,
+                    }),
+                    heso_engine_js::EvalError::ThrownValue { value } => serde_json::json!({
+                        "kind": "thrown_value",
+                        "value": value,
+                    }),
+                    heso_engine_js::EvalError::Engine(msg) => serde_json::json!({
+                        "kind": "engine",
+                        "message": msg,
+                    }),
+                }
             };
-            let body = serde_json::json!({
+            serde_json::json!({
                 "ok": false,
                 "error": err_body,
-            });
-            match serde_json::to_string_pretty(&body) {
-                Ok(s) => println!("{s}"),
-                Err(se) => {
-                    eprintln!("failed to serialize error body: {se}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            ExitCode::FAILURE
+            })
         }
+    };
+    if let (Some(obj), Some(extra)) = (body.as_object_mut(), extra_fields) {
+        for (k, v) in extra {
+            obj.insert(k, v);
+        }
+    }
+    if !write_json_to_stdout(&body) {
+        return ExitCode::FAILURE;
+    }
+    if result.is_ok() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
@@ -1585,6 +1800,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
     let mut seed: u64 = 0;
     let mut js_fetch = false;
     let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
+    let mut js_timeout_ms: Option<u64> = None;
     let mut positional: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0;
     while i < args.len() {
@@ -1620,9 +1836,23 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
                 js_fetch = false;
                 i += 1;
             }
+            "--js-timeout" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--js-timeout needs a value");
+                    return ExitCode::from(2);
+                };
+                match parse_duration_ms(v) {
+                    Ok(ms) => js_timeout_ms = Some(ms),
+                    Err(e) => {
+                        eprintln!("--js-timeout: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 2;
+            }
             other if other.starts_with("--") && other != "-" => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> <js> | heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> -  < script.js");
+                eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] [--js-timeout DUR] <url> <js> | heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] [--js-timeout DUR] <url> -  < script.js");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1632,8 +1862,9 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
     }
     if positional.len() < 2 {
-        eprintln!("usage: heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> <js> | heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] <url> -  < script.js");
-        return ExitCode::from(2);
+        let msg = "usage: heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] [--js-timeout DUR] <url> <js> | heso eval-dom [--seed N] [--js-fetch] [--timeout DUR] [--js-timeout DUR] <url> -  < script.js";
+        eprintln!("{msg}");
+        return emit_cli_error("missing_arg", msg, 2);
     }
     let url_arg = &positional[0];
     let js_src: String = if positional[1] == "-" {
@@ -1648,11 +1879,16 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         positional[1].clone()
     };
 
+    if let Err(msg) = validate_url_input(url_arg) {
+        eprintln!("{msg}");
+        return emit_cli_error("invalid_url", &msg, 2);
+    }
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{url_arg}`: {e}");
-            return ExitCode::from(2);
+            let msg = format!("invalid URL `{url_arg}`: {e}");
+            eprintln!("{msg}");
+            return emit_cli_error("invalid_url", &msg, 2);
         }
     };
     let fetch_engine = match build_fetch_engine(timeout_ms) {
@@ -1673,104 +1909,150 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
         }
     };
 
-    // Build the JS engine. When `--js-fetch` is set we install a
-    // live `fetch()` global routed through the same `reqwest::Client`
-    // the static path used to load the page (so cookies, TLS,
-    // User-Agent stay coherent — per `next-phase-plan.md` item C and
-    // the ADR 0014 Phase 2 row).
+    // Build the JS engine + run the page-script pass on a dedicated
+    // thread with an enlarged stack so a runaway recursion trips
+    // QuickJS's own ~1 MB managed-stack cap (structured engine
+    // error) instead of overflowing the OS stack (process abort).
+    // The engine is `!Send`, so construction AND evaluation both
+    // happen inside the spawned thread; the host passes in the
+    // already-fetched HTML and the resources the engine needs to
+    // wire up `fetch()` (a `reqwest::Client`, a `tokio::Handle`, a
+    // cookie jar).
     //
     // When `--seed N` is set without a recording cassette (item M is
     // not landed yet), the in-JS `fetch()` rejects every call with a
     // clear "not in cassette" error per ADR 0008's determinism gate.
     // Seed = 0 is treated as "no seed" for this purpose (it's the
     // default for unseeded runs and shouldn't lock out live fetch).
-    let js_engine_result = if js_fetch {
-        let client = fetch_engine.client();
-        let rt_handle = tokio::runtime::Handle::current();
-        if seed != 0 {
-            heso_engine_js::JsEngine::new_with_seed_and_fetch(seed, client, rt_handle)
-        } else {
-            // Share the *same* cookie jar reqwest's `cookie_provider`
-            // is wired against (see `FetchEngine::cookie_jar`). This is
-            // what makes `document.cookie` reads observe `Set-Cookie`
-            // responses AND makes JS `document.cookie = ...` writes
-            // travel on the next `fetch()` — login flows depend on it.
-            heso_engine_js::JsEngine::new_with_fetch_and_cookies(
-                client,
-                rt_handle,
-                fetch_engine.cookie_jar(),
-            )
-        }
-    } else {
-        heso_engine_js::JsEngine::new_with_seed(seed)
-    };
-    let js_engine = match js_engine_result {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to create JS engine: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
+    let client = fetch_engine.client();
+    let cookie_jar = fetch_engine.cookie_jar();
+    let rt_handle = tokio::runtime::Handle::current();
     let policy = if js_fetch {
         heso_engine_js::ScriptFetchPolicy::Fetch
     } else {
         heso_engine_js::ScriptFetchPolicy::Skip
     };
+    let timeout = js_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis);
+    let started = std::time::Instant::now();
+    let final_url_for_thread = final_url.clone();
+    let html_for_thread = html;
+    let js_src_for_thread = js_src;
+    let url_str_for_envelope = final_url.to_string();
 
-    // Set the page URL so the inline-script pump can resolve
-    // relative `<script src="...">` refs against it.
-    js_engine.set_base_url(Some(final_url.clone()));
-
-    match js_engine.eval_with_html_capture(&html, &js_src, policy) {
-        Ok((outcome, script_outcome)) => {
-            let body = serde_json::json!({
-                "ok": true,
-                "url": final_url.to_string(),
-                "value": outcome.value,
-                "console": outcome.console,
-                "scripts": script_outcome,
-            });
-            match serde_json::to_string_pretty(&body) {
-                Ok(s) => println!("{s}"),
-                Err(e) => {
-                    eprintln!("failed to serialize result: {e}");
-                    return ExitCode::FAILURE;
+    // Run the closure on a dedicated thread, capture both the eval
+    // outcome and the captured-scripts envelope so the success body
+    // can carry the per-page `scripts` field.
+    type DomEvalResult = Result<
+        (heso_engine_js::EvalOutcome, heso_engine_js::ScriptOutcome),
+        heso_engine_js::EvalError,
+    >;
+    let (dom_result, timed_out) = run_dom_eval_on_dedicated_thread(
+        timeout,
+        move |cancel| -> DomEvalResult {
+            let engine = if js_fetch {
+                if seed != 0 {
+                    heso_engine_js::JsEngine::new_with_seed_and_fetch(seed, client, rt_handle)?
+                } else {
+                    heso_engine_js::JsEngine::new_with_fetch_and_cookies(
+                        client, rt_handle, cookie_jar,
+                    )?
                 }
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            let err_body = match &e {
-                heso_engine_js::EvalError::Exception { message, stack } => serde_json::json!({
-                    "kind": "exception",
-                    "message": message,
-                    "stack": stack,
-                }),
-                heso_engine_js::EvalError::ThrownValue { value } => serde_json::json!({
-                    "kind": "thrown_value",
-                    "value": value,
-                }),
-                heso_engine_js::EvalError::Engine(msg) => serde_json::json!({
-                    "kind": "engine",
-                    "message": msg,
-                }),
+            } else {
+                heso_engine_js::JsEngine::new_with_seed(seed)?
             };
-            let body = serde_json::json!({
-                "ok": false,
-                "url": final_url.to_string(),
-                "error": err_body,
-            });
-            match serde_json::to_string_pretty(&body) {
-                Ok(s) => println!("{s}"),
-                Err(se) => {
-                    eprintln!("failed to serialize error body: {se}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            ExitCode::FAILURE
-        }
+            install_cancel_interrupt(&engine, cancel);
+            engine.set_base_url(Some(final_url_for_thread));
+            engine.eval_with_html_capture(&html_for_thread, &js_src_for_thread, policy)
+        },
+    );
+
+    // Split the success arm into its two payloads so the envelope
+    // helper can stay shared with `eval-js` (which has no
+    // `scripts` field).
+    let (eval_result, scripts_for_envelope): (
+        Result<heso_engine_js::EvalOutcome, heso_engine_js::EvalError>,
+        Option<heso_engine_js::ScriptOutcome>,
+    ) = match dom_result {
+        Ok((outcome, script_outcome)) => (Ok(outcome), Some(script_outcome)),
+        Err(e) => (Err(e), None),
+    };
+    // `url` rides both the success and failure envelopes (matching the
+    // pre-thread shape); `scripts` only appears on success because the
+    // error arm has no `ScriptOutcome` to report.
+    let mut extras = serde_json::Map::new();
+    extras.insert(
+        "url".to_owned(),
+        serde_json::Value::String(url_str_for_envelope),
+    );
+    if let Some(script_outcome) = scripts_for_envelope {
+        extras.insert(
+            "scripts".to_owned(),
+            serde_json::to_value(script_outcome).unwrap_or(serde_json::Value::Null),
+        );
     }
+    emit_eval_envelope(eval_result, timed_out, js_timeout_ms, started, Some(extras))
+}
+
+/// `cmd_eval_dom`'s flavor of [`run_eval_on_dedicated_thread`]. The
+/// closure returns the richer pair `(EvalOutcome, ScriptOutcome)` so
+/// the caller can surface the page-script counts on the success
+/// envelope.
+fn run_dom_eval_on_dedicated_thread<F>(
+    timeout: Option<std::time::Duration>,
+    build_and_eval: F,
+) -> (
+    Result<
+        (heso_engine_js::EvalOutcome, heso_engine_js::ScriptOutcome),
+        heso_engine_js::EvalError,
+    >,
+    bool,
+)
+where
+    F: FnOnce(
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Result<
+            (heso_engine_js::EvalOutcome, heso_engine_js::ScriptOutcome),
+            heso_engine_js::EvalError,
+        > + Send
+        + 'static,
+{
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_for_eval = Arc::clone(&cancel);
+    let cancel_for_watchdog = Arc::clone(&cancel);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("heso-eval-dom".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let result = build_and_eval(cancel_for_eval);
+            let _ = tx.send(result);
+        })
+        .expect("spawn eval-dom worker thread");
+
+    let watchdog = timeout.map(|dur| {
+        std::thread::Builder::new()
+            .name("heso-eval-dom-watchdog".to_owned())
+            .spawn(move || {
+                std::thread::sleep(dur);
+                cancel_for_watchdog.store(true, Ordering::SeqCst);
+            })
+            .expect("spawn eval-dom watchdog thread")
+    });
+
+    let result = rx.recv().unwrap_or_else(|_| {
+        Err(heso_engine_js::EvalError::Engine(
+            "eval-dom worker thread terminated without sending a result".to_owned(),
+        ))
+    });
+    let _ = worker.join();
+    drop(watchdog);
+    (result, cancel.load(Ordering::SeqCst))
 }
 
 /// `heso read <url>` — agent-facing one-call page report.
@@ -1912,15 +2194,33 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
 
+    if let Err(msg) = validate_url_input(&url_str) {
+        eprintln!("{msg}");
+        return emit_cli_error("invalid_url", &msg, 2);
+    }
     let url = match Url::parse(&url_str) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{url_str}`: {e}");
-            return ExitCode::from(2);
+            let msg = format!("invalid URL `{url_str}`: {e}");
+            eprintln!("{msg}");
+            return emit_cli_error("invalid_url", &msg, 2);
         }
     };
 
-    let include = parse_include_filter(include_csv.as_deref());
+    let (include, unknown_include) = parse_include_filter(include_csv.as_deref());
+    if !unknown_include.is_empty() {
+        let joined = unknown_include.join(", ");
+        eprintln!(
+            "unknown --include key(s): {joined} (valid: text,forms,cookies,console,framework,scripts)"
+        );
+        return emit_cli_error(
+            "unknown_include_key",
+            &format!(
+                "unknown --include key(s): {joined} (valid: text,forms,cookies,console,framework,scripts)"
+            ),
+            2,
+        );
+    }
 
     let fetch_engine = match build_fetch_engine(timeout_ms) {
         Ok(e) => e,
@@ -2117,8 +2417,13 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // exit 0 — the existing happy path already returns success here
     // since `JsSession::open_on_engine` succeeded.
     let (js_partial, js_reason) = classify_failure_envelope(&failed_scripts);
-    let (partial, partial_reason) =
-        apply_http_truthfulness(js_partial, js_reason, page.http_status, &page.body_html);
+    let (partial, partial_reason) = apply_http_truthfulness(
+        js_partial,
+        js_reason,
+        page.http_status,
+        &page.body_html,
+        page.content_type.as_deref(),
+    );
     let (partial, partial_reason) = apply_extraction_truthfulness(
         partial,
         partial_reason,
@@ -2189,9 +2494,25 @@ impl IncludeFilter {
     }
 }
 
-pub(crate) fn parse_include_filter(csv: Option<&str>) -> IncludeFilter {
+/// Parse the `--include` CSV into an [`IncludeFilter`]. Returns the
+/// unknown tokens (if any) alongside the filter so the caller can fail
+/// the verb on a typo instead of silently dropping the field the user
+/// asked for.
+///
+/// Three classes of token:
+/// - **Optional fields** (`text`, `forms`, `cookies`, `console`,
+///   `framework`, `scripts`) — toggled on in the returned filter.
+/// - **Always-ships fields** (`actions`, `tree`, `metadata`) — matched
+///   silently because they're part of the base envelope regardless;
+///   an agent listing them isn't making a mistake.
+/// - **Anything else** — collected into the returned `Vec<String>` so
+///   the caller can surface an `unknown_include_key` error. A bare
+///   typo like `txt` used to be eaten silently, which made the verb
+///   look like it ran but quietly returned less than the agent
+///   expected.
+pub(crate) fn parse_include_filter(csv: Option<&str>) -> (IncludeFilter, Vec<String>) {
     let Some(csv) = csv else {
-        return IncludeFilter::all();
+        return (IncludeFilter::all(), Vec::new());
     };
     let mut f = IncludeFilter {
         text: false,
@@ -2201,6 +2522,7 @@ pub(crate) fn parse_include_filter(csv: Option<&str>) -> IncludeFilter {
         framework: false,
         scripts: false,
     };
+    let mut unknown: Vec<String> = Vec::new();
     for token in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         match token {
             "text" => f.text = true,
@@ -2209,13 +2531,13 @@ pub(crate) fn parse_include_filter(csv: Option<&str>) -> IncludeFilter {
             "console" => f.console = true,
             "framework" => f.framework = true,
             "scripts" => f.scripts = true,
-            // Silently ignore unknown tokens — the contract is
-            // "additive whitelist of the optional surface"; an agent
-            // passing `actions` (which always ships) shouldn't fail.
-            _ => {}
+            // These always ship as part of the base envelope; accept
+            // them silently so an agent that lists them isn't punished.
+            "actions" | "tree" | "metadata" => {}
+            other => unknown.push(other.to_owned()),
         }
     }
-    f
+    (f, unknown)
 }
 
 // ============================================================================
@@ -3260,11 +3582,16 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
         eprintln!("usage: heso wait <url> [condition] [--timeout DUR]");
         return ExitCode::from(2);
     };
+    if let Err(msg) = validate_url_input(&url_str) {
+        eprintln!("{msg}");
+        return emit_cli_error("invalid_url", &msg, 2);
+    }
     let url = match Url::parse(&url_str) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{url_str}`: {e}");
-            return ExitCode::from(2);
+            let msg = format!("invalid URL `{url_str}`: {e}");
+            eprintln!("{msg}");
+            return emit_cli_error("invalid_url", &msg, 2);
         }
     };
 
@@ -3687,31 +4014,35 @@ pub(crate) fn normalize_ref(s: &str) -> String {
 fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
     match err {
         TargetError::NeitherRefNorLocator => {
-            eprintln!(
+            let msg = format!(
                 "{op_name}: need either an `@e<N>` ref OR one of --text/--selector/--aria-label"
             );
-            ExitCode::from(2)
+            eprintln!("{msg}");
+            emit_cli_error("missing_locator", &msg, 2)
         }
         TargetError::RefAndLocatorMixed => {
-            eprintln!(
+            let msg = format!(
                 "{op_name}: cannot combine an `@e<N>` ref with --text/--selector/--aria-label"
             );
-            ExitCode::from(2)
+            eprintln!("{msg}");
+            emit_cli_error("ref_and_locator_mixed", &msg, 2)
         }
         TargetError::UnknownRef(want) => {
-            eprintln!("no element at ref `{want}`");
-            ExitCode::from(2)
+            let msg = format!("no element at ref `{want}`");
+            eprintln!("{msg}");
+            emit_cli_error("ref_not_found", &msg, 2)
         }
         TargetError::BadSelector { selector, message } => {
-            eprintln!("invalid --selector `{selector}`: {message}");
-            ExitCode::from(2)
+            let msg = format!("invalid --selector `{selector}`: {message}");
+            eprintln!("{msg}");
+            emit_cli_error("invalid_selector", &msg, 2)
         }
         TargetError::NoMatch {
             text,
             css_selector,
             aria_label,
         } => {
-            eprintln!(
+            let msg = format!(
                 "no element matched locator {}",
                 format_locator(
                     text.as_deref(),
@@ -3719,7 +4050,8 @@ fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
                     aria_label.as_deref()
                 )
             );
-            ExitCode::from(2)
+            eprintln!("{msg}");
+            emit_cli_error("selector_not_matched", &msg, 2)
         }
         TargetError::Ambiguous {
             text,
@@ -3728,7 +4060,7 @@ fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
             candidates,
         } => {
             let n = candidates.len();
-            eprintln!(
+            let msg = format!(
                 "ambiguous: {n} elements matched locator {}",
                 format_locator(
                     text.as_deref(),
@@ -3736,6 +4068,7 @@ fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
                     aria_label.as_deref()
                 )
             );
+            eprintln!("{msg}");
             eprintln!("candidates (use one of these refs):");
             for c in &candidates {
                 // Single-line candidate: `<ref> <role> <tag> "<name>"`.
@@ -3751,6 +4084,28 @@ fn report_target_error(op_name: &str, err: TargetError) -> ExitCode {
                 };
                 eprintln!("  {} ({} {}) \"{}\"", c.ref_id, c.role, c.tag, snippet);
             }
+            // The structured envelope carries the candidate refs so an
+            // agent can pick one without re-parsing the stderr list.
+            let candidate_refs: Vec<serde_json::Value> = candidates
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "ref": c.ref_id,
+                        "role": c.role,
+                        "tag": c.tag,
+                        "name": c.name,
+                    })
+                })
+                .collect();
+            let body = serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": "ambiguous_locator",
+                    "message": msg,
+                    "candidates": candidate_refs,
+                },
+            });
+            let _ = write_json_to_stdout(&body);
             ExitCode::from(2)
         }
     }
@@ -3941,11 +4296,16 @@ where
         &str,
     ) -> Result<heso_engine_js::EvalOutcome, heso_engine_js::EvalError>,
 {
+    if let Err(msg) = validate_url_input(url_arg) {
+        eprintln!("{msg}");
+        return emit_cli_error("invalid_url", &msg, 2);
+    }
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{url_arg}`: {e}");
-            return ExitCode::from(2);
+            let msg = format!("invalid URL `{url_arg}`: {e}");
+            eprintln!("{msg}");
+            return emit_cli_error("invalid_url", &msg, 2);
         }
     };
     let engine = match build_fetch_engine(timeout_ms) {
@@ -4288,6 +4648,7 @@ async fn augment_click_with_destination(
                 if let Some(reason) = heso_engine_fetch::partial_reason_for_status(
                     dest_page.http_status,
                     &dest_page.body_html,
+                    dest_page.content_type.as_deref(),
                 ) {
                     obj.insert("partial".to_owned(), serde_json::Value::Bool(true));
                     obj.insert(
@@ -4687,11 +5048,16 @@ async fn cmd_submit_inner(
     fields: &[(String, String)],
     timeout_ms: Option<u64>,
 ) -> ExitCode {
+    if let Err(msg) = validate_url_input(url_arg) {
+        eprintln!("{msg}");
+        return emit_cli_error("invalid_url", &msg, 2);
+    }
     let url = match Url::parse(url_arg) {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("invalid URL `{url_arg}`: {e}");
-            return ExitCode::from(2);
+            let msg = format!("invalid URL `{url_arg}`: {e}");
+            eprintln!("{msg}");
+            return emit_cli_error("invalid_url", &msg, 2);
         }
     };
     let engine = match build_fetch_engine(timeout_ms) {
@@ -5959,8 +6325,11 @@ pub(crate) async fn execute_step_session(
                 .await
                 .map_err(|e| format!("fetch failed: {e}"))?;
             let http_status = page.http_status;
-            let partial_reason =
-                heso_engine_fetch::partial_reason_for_status(http_status, &page.body_html);
+            let partial_reason = heso_engine_fetch::partial_reason_for_status(
+                http_status,
+                &page.body_html,
+                page.content_type.as_deref(),
+            );
             *current_url = page.url().clone();
             *current_actions = page.actions.clone();
             let script_outcome = match session.as_mut() {
@@ -6057,8 +6426,11 @@ pub(crate) async fn execute_step_session(
                     .await
                     .map_err(|e| format!("fetch failed: {e}"))?;
                 let http_status = page.http_status;
-                let partial_reason =
-                    heso_engine_fetch::partial_reason_for_status(http_status, &page.body_html);
+                let partial_reason = heso_engine_fetch::partial_reason_for_status(
+                    http_status,
+                    &page.body_html,
+                    page.content_type.as_deref(),
+                );
                 *current_url = page.url().clone();
                 *current_actions = page.actions.clone();
                 let sess = session.as_mut().expect("session ensured above");
@@ -6402,8 +6774,45 @@ where
     }
 }
 
+/// Install a panic hook that turns a broken-stdout-pipe panic into a
+/// clean exit instead of a process abort.
+///
+/// When output is piped to a consumer that closes early (`heso --help
+/// | head -1`, `heso open ... | jq '.title'` where `jq` exits), the
+/// next `println!` hits a closed pipe. Rust's `println!` *panics* on a
+/// write error, so without this the process dies with exit 134 and a
+/// `thread 'main' has overflowed`-style backtrace on stderr — noisy
+/// and surprising for what is a normal shell idiom.
+///
+/// The hook inspects the panic payload for a broken-pipe signature
+/// (the `io::Error` Display contains "Broken pipe"; on Windows the
+/// underlying error is also `ErrorKind::BrokenPipe`). On a match it
+/// exits 0 silently — the consumer got what it wanted and tore the
+/// pipe down on purpose. Any other panic flows to the default hook
+/// (full backtrace, abort) so real bugs stay loud.
+fn install_broken_pipe_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let is_broken_pipe = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(|s| s.contains("Broken pipe"))
+            .or_else(|| {
+                info.payload()
+                    .downcast_ref::<&str>()
+                    .map(|s| s.contains("Broken pipe"))
+            })
+            .unwrap_or(false);
+        if is_broken_pipe {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    install_broken_pipe_hook();
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("-h" | "--help" | "help") => {

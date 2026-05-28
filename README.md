@@ -146,7 +146,7 @@ Three sample plats live as release assets on v0.0.10:
 
 **Recover from broken sites.**
 
-- `--best-effort` on `open` / `read` / `wait` — exit 0 even when scripts crash. Output includes `partial: true`, `partial_reason: "script_crash" | "wait_timeout" | "fetch_failed" | "parse_error"`, and `failed_scripts: [...]`. The agent sees what broke and decides what to try next.
+- `--best-effort` on `open` / `read` / `wait` — exit 0 even when scripts crash. Output includes `partial: true`, `partial_reason: "script_crash" | "wait_timeout" | "fetch_failed" | "parse_error" | "bot_challenge" | "non_html_content_type" | "http_<code>"`, and `failed_scripts: [...]`. The agent sees what broke and decides what to try next.
 - `--inject-script "<inline-js>"` or `--inject-script @file.js` — run JS before the page's own scripts. Use it to shim a missing global (the canonical `window.lunr` cascade kind of thing).
 
 **Detect cross-call state changes.**
@@ -155,7 +155,7 @@ Three sample plats live as release assets on v0.0.10:
 
 **Honest about failure.**
 
-- Every `open` / `read` / `fetch` response carries `http_status` (200, 403, 503, ...) — captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Cloudflare-style "Just a moment..." interstitials are detected via `__cf_chl_opt` / challenge-token markers and surfaced as `partial_reason: "bot_challenge"`. No more silent "I got something" when the server returned an error page.
+- Every `open` / `read` / `fetch` response carries `http_status` (200, 403, 503, ...) — captured pre-body-consumption so 4xx/5xx pages never come back wearing a 200 mask. Cloudflare-style "Just a moment..." interstitials (and Reddit-style "Please wait for verification" walls) are detected and surfaced as `partial_reason: "bot_challenge"`. A `200 OK` carrying a non-HTML body (PDF, JSON, octet-stream) surfaces as `partial_reason: "non_html_content_type"` rather than pretending the empty extraction was a real page. No more silent "I got something" when the server returned an error page or a binary blob.
 - `heso click @e7` on an `<a href="...">` actually follows the link — the response carries the destination page's `title`, `tree`, `actions`, and `http_status`, not the source page. `final_url` reports where the navigation actually landed after following the destination's redirect chain, and `redirects[]` lists each `{from, to, status}` hop along the way (empty when the click did not navigate or the destination served a direct 200).
 
 **Web platform coverage.**
@@ -450,7 +450,7 @@ Duration syntax matches `heso wait`: bare numbers are milliseconds, suffixes are
 {"ok": false, "error": {"code": "timeout", "timeout_ms": 30000, "elapsed_ms": 30000, "url": "https://..."}}
 ```
 
-The budget is per network request — it applies to the full request (TLS handshake, redirect chain, response-body stream) and does not reset across redirects. `--timeout` bounds HTTP only; JavaScript execution inside `eval-dom` / `read` / `stamp` is not interruptible from the timeout (it has its own cooperative cancel paths). The `npm/@ixla/heso` and `python/heso` wrappers also install a `timeout + 5s` process-kill backstop so a hung binary still eventually unblocks the caller.
+The budget is per network request — it applies to the full request (TLS handshake, redirect chain, response-body stream) and does not reset across redirects. `--timeout` bounds HTTP only. To bound JavaScript execution itself, `eval-js` and `eval-dom` accept a separate `--js-timeout <DUR>` that caps script wallclock and returns a structured `timeout` error on expiry (default: no cap). The `npm/@ixla/heso` and `python/heso` wrappers also install a `timeout + 5s` process-kill backstop so a hung binary still eventually unblocks the caller.
 
 ## Stats
 

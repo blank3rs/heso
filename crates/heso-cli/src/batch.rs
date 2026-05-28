@@ -348,7 +348,20 @@ async fn run_batch(args: BatchArgs) -> ExitCode {
     };
     let semaphore = Arc::new(Semaphore::new(args.parallel));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BatchRow>();
-    let include = parse_include_filter(args.include_csv.as_deref());
+    let (include, unknown_include) = parse_include_filter(args.include_csv.as_deref());
+    if !unknown_include.is_empty() {
+        let joined = unknown_include.join(", ");
+        eprintln!(
+            "unknown --include key(s): {joined} (valid: text,forms,cookies,console,framework,scripts)"
+        );
+        return crate::emit_cli_error(
+            "unknown_include_key",
+            &format!(
+                "unknown --include key(s): {joined} (valid: text,forms,cookies,console,framework,scripts)"
+            ),
+            2,
+        );
+    }
 
     // Two concurrent halves:
     //
@@ -628,6 +641,7 @@ async fn run_read_for_url(
         js_reason,
         page.http_status,
         &page.body_html,
+        page.content_type.as_deref(),
     );
     let (partial, partial_reason) = crate::apply_extraction_truthfulness(
         partial,
@@ -664,6 +678,7 @@ fn build_open_payload_with_envelope(page: &heso_engine_fetch::FetchPage) -> serd
     let partial_reason = heso_engine_fetch::partial_reason_for_status(
         page.http_status,
         &page.body_html,
+        page.content_type.as_deref(),
     );
     let (partial, reason): (bool, String) = match partial_reason {
         Some(r) => (true, r),

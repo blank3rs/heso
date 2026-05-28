@@ -1178,7 +1178,13 @@ async fn dispatch_read(
 ) -> Result<serde_json::Value, String> {
     let p: ReadParams = serde_json::from_value(params).map_err(|e| format!("bad params: {e}"))?;
     let page_id = resolve_page_id(&state, p.page_id).await?;
-    let include = parse_include_filter(p.include.as_deref());
+    let (include, unknown_include) = parse_include_filter(p.include.as_deref());
+    if !unknown_include.is_empty() {
+        return Err(format!(
+            "unknown include key(s): {} (valid: text,forms,cookies,console,framework,scripts)",
+            unknown_include.join(", ")
+        ));
+    }
     let since = p.since.clone();
     let complete = p.complete.unwrap_or(false);
 

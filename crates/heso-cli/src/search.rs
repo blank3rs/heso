@@ -288,7 +288,16 @@ pub async fn cmd_search(args: &[String]) -> ExitCode {
         Ok(r) => r,
         Err(msg) => {
             eprintln!("{msg}");
-            return ExitCode::from(2);
+            // Agents read stdout JSON; surface the argument error there
+            // too. An empty `<query>` gets the dedicated `empty_query`
+            // code; every other parse fault is a generic
+            // `invalid_argument`.
+            let code = if msg.contains("must not be empty") {
+                "empty_query"
+            } else {
+                "invalid_argument"
+            };
+            return crate::emit_cli_error(code, &msg, 2);
         }
     };
     let value = match run_search(&request).await {
