@@ -171,6 +171,14 @@ export interface WriteVerbResult {
   console?: unknown[];
   /** Present only on `ok: false`. */
   error?: WriteVerbError;
+  /**
+   * The following three fields appear on a NON-navigating `click`
+   * response (an in-page handler that mutated the DOM): a post-click
+   * DOM snapshot, the same shape `read` returns.
+   */
+  text?: string;
+  tree?: unknown;
+  content_hash?: string;
   [extra: string]: unknown;
 }
 
@@ -310,6 +318,8 @@ export interface PlanOptions extends CommonOptions {
   template?: string;
   /** `stamp` only: substitution map for `{{name}}` placeholders in the template. */
   values?: Record<string, string>;
+  /** `run` only — verifies the input plat's integrity before replay by default; set true to forward `--no-verify-input` and skip the check. */
+  noVerifyInput?: boolean;
 }
 
 /**

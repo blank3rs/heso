@@ -23,8 +23,11 @@ from . import HesoError, _find_binary
 def main() -> int:
     """Locate the bundled heso binary and exec into it.
 
-    Returns the binary's exit code so ``[project.scripts]``-generated
-    wrappers exit with the right status. On Unix this never returns
+    This is the ``python -m heso`` path: it finds the native binary
+    bundled in the wheel and re-execs into it, passing ``sys.argv[1:]``
+    through unchanged. Returns the binary's exit code so callers waiting
+    on ``python -m heso`` exit with the right status. On Unix this never
+    returns
     (``os.execv`` replaces the current process); on Windows we fall
     back to :func:`subprocess.call` because ``execv`` semantics on
     Windows don't replace the process the way POSIX does — Python's

@@ -7,7 +7,7 @@ binary. Every call here:
    (snake_case keys are translated to ``--dashed`` CLI flags).
 2. Locates the bundled binary via :func:`_find_binary` — preferring
    ``<this-package>/bin/heso(.exe)`` (populated at release time by
-   ``scripts/release.ps1``), falling back to ``heso`` on ``PATH``.
+   the release script / CI), falling back to ``heso`` on ``PATH``.
 3. Spawns the binary with the assembled argv, captures stdout, and
    parses it as JSON.
 4. Returns the parsed value as a native ``dict`` / ``list``, or raises
@@ -139,7 +139,7 @@ def _find_binary() -> str:
     Resolution order:
 
     1. The bundled binary at ``<package>/bin/heso{.exe}`` (populated
-       by the release script before the wheel is built).
+       by the release script / CI before the wheel is built).
     2. ``heso`` (or ``heso.exe`` on Windows) on ``PATH``.
 
     Returns the absolute path string. Raises :class:`HesoError` if
@@ -557,6 +557,11 @@ def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
     A selector miss surfaces as ``ok: False`` with
     ``error: {"code": "selector_not_matched", "message": ...}``.
 
+    A non-navigating click (an in-page handler that mutates the DOM
+    rather than following a link) additionally carries ``text``,
+    ``tree``, and ``content_hash`` — a post-click DOM snapshot, the
+    same shape :func:`read` returns.
+
     Navigation fields: ``url`` is the page where the click happened
     (post any redirects on that page's own fetch); ``final_url`` is
     where navigation actually landed after following an ``<a href>``
@@ -797,6 +802,10 @@ def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
 
     Named ``run_plat`` to avoid shadowing the low-level :func:`run`
     escape hatch.
+
+    By default the input plat's integrity is verified before replay;
+    ``no_verify_input=True`` forwards ``--no-verify-input`` to skip
+    that check.
 
     Keyword arguments (e.g. ``seed=42``) become CLI flags.
     """
