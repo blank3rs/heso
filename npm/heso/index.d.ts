@@ -387,10 +387,6 @@ export function refresh(file: string, options?: PlanOptions): Promise<RefreshRes
 export interface VerifyOptions extends CommonOptions {
   /** Path to a JSON allowlist of base64 pubkeys for sealed envelopes / receipts. */
   trustedKeys?: string;
-  /** Require a Time-Stamping Authority countersignature on the envelope. */
-  requireTsa?: boolean;
-  /** Path to a PEM bundle of trusted TSA root certificates. */
-  tsaTrustedRoots?: string;
 }
 
 /** Options for {@link info}. */
@@ -437,8 +433,7 @@ export function info(
 ): Promise<Record<string, unknown>>;
 
 /**
- * `heso seal <file> [--key PATH] [--tsa URL] [--no-resign]` — wrap a
- * plat in an Ed25519 envelope (and optionally a TSA countersignature).
+ * `heso seal <file> [--key PATH]` — wrap a plat in an Ed25519 envelope.
  */
 export function seal(
   file: string,

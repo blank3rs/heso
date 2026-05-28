@@ -134,19 +134,16 @@ heso unseal sealed.plat --extract          # verify, then print the inner plat b
 curl -sL https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json \
   | heso run - \
   | jq -r .plat_hash
-# → d93c08ba32b762dd6e47091a1d4bd4aa4d8308dbdbf44869f81146a3f5b8033a
+# → cff9a46a9dbe3163e5c00597f8d46255682e3efe52af3dbc2a628a49374a9acb
 ```
 
-That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia article. No network is involved in `heso run` itself.
+That hash is BLAKE3 over the canonical bytes of the resulting plat. Anyone, any machine, any time — same hash. The cassette inside the plat carries every HTTP response the engine touched when it was stamped against the live Wikipedia `Goldfinger (film)` article. No network is involved in `heso run` itself.
 
-Three sample plats live as release assets on v0.0.10:
-- [`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json) — Wikipedia `Goldfinger_(film)` (1 MB plat, hash `d93c08ba…`)
-- [`replay-demo-2-torvalds-bio.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-2-torvalds-bio.plat.json) — Wikipedia `Linus_Torvalds` (1 MB plat, hash `27e66b0d…`)
-- [`replay-demo-3-rust-lang-rust.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-3-rust-lang-rust.plat.json) — `github.com/rust-lang/rust` (640 KB plat, hash `201e9410…`)
+The sample plat ([`replay-demo-1-goldfinger.plat.json`](https://github.com/blank3rs/heso/releases/download/v0.0.10/replay-demo-1-goldfinger.plat.json), ~1 MB) lives as a release asset, re-minted by the current `heso`. A plat replays byte-identically under the version that produced it — pin the version if you archive one.
 
 **Recover from broken sites.**
 
-- `--best-effort` on `open` / `read` / `wait` — exit 0 even when scripts crash. Output includes `partial: true`, `partial_reason: "script_crash" | "wait_timeout" | "fetch_failed" | "parse_error" | "bot_challenge" | "non_html_content_type" | "http_<code>"`, and `failed_scripts: [...]`. The agent sees what broke and decides what to try next.
+- `--best-effort` on `read` / `wait` — exit 0 even when scripts crash. Output includes `partial: true`, `partial_reason: "script_crash" | "wait_timeout" | "fetch_failed" | "parse_error" | "bot_challenge" | "non_html_content_type" | "http_<code>"`, and `failed_scripts: [...]`. The agent sees what broke and decides what to try next.
 - `--inject-script "<inline-js>"` or `--inject-script @file.js` — run JS before the page's own scripts. Use it to shim a missing global (the canonical `window.lunr` cascade kind of thing).
 
 **Detect cross-call state changes.**
@@ -257,7 +254,7 @@ heso wait https://app.example.com/ --selector-exists ".dashboard" --timeout 5s
 Rescue a broken site with a polyfill:
 
 ```sh
-heso open https://shoelace.style --best-effort \
+heso read https://shoelace.style --best-effort \
   --inject-script "window.lunr = (() => ({ Index: { load: () => ({}) } }))()"
 ```
 
@@ -426,7 +423,7 @@ description: Use heso when an agent needs to touch the web — fetch pages, run 
 - `heso submit <url> @eN` — submit form
 - `heso eval-dom <url> "<js>"` — run JS against the page
 - `heso serve` — multi-step JSON-RPC session
-- `--best-effort` on open/read/wait — exit 0 on partial failures, surface what broke
+- `--best-effort` on read/wait — exit 0 on partial failures, surface what broke
 - `--inject-script "<js>" | @file` — inject a polyfill before page scripts run
 - `--timeout <DUR>` on every network verb — per-request wall-clock cap (default `30s`)
 - `--js-timeout <DUR>` on `eval-js` / `eval-dom` — cap JS execution wall-clock (default: no cap)
@@ -487,7 +484,7 @@ Requires Rust 1.90 (`rustup` from https://rustup.rs).
 
 ## Status
 
-`v0.1.9` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the 271-test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
+`v0.1.9` is shipping on every registry. The engine, the verbs, and plat replay are stable enough to use — the spot checks on GitHub, Cloudflare, and friends come back clean, and the full test suite is required green on every release. What may still shift before `v1.0` is the CLI surface: verb names, JSON field names, flag spellings. Pin the version if you embed it.
 
 ## License
 
