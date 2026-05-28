@@ -295,6 +295,20 @@ fn print_banner() {
     println!(
         "                              timeout_ms, elapsed_ms, url}}}} on stdout and exits 1."
     );
+    println!("  --no-private-networks       Refuse URLs that resolve to a private/loopback/");
+    println!(
+        "                              link-local/metadata IP (SSRF protection). Off by default"
+    );
+    println!(
+        "                              so localhost stays reachable; set HESO_BLOCK_PRIVATE_NETWORKS=1"
+    );
+    println!(
+        "                              for the same effect across every verb. On a refusal the verb"
+    );
+    println!(
+        "                              emits {{ok: false, error: {{code: \"private_network_blocked\","
+    );
+    println!("                              url}}}} on stdout and exits 1.");
     println!();
     println!("Native single binary — no Chrome, no Node, deploy anywhere.");
     println!("See README.md for usage and the full reference at heso.ca/docs.");
@@ -558,6 +572,10 @@ async fn open_or_die_with_timeout(
             emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
             Err(ExitCode::FAILURE)
         }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(url.as_str());
+            Err(ExitCode::FAILURE)
+        }
         Err(e) => {
             eprintln!("fetch failed: {e}");
             Err(ExitCode::FAILURE)
@@ -591,6 +609,27 @@ pub(crate) fn emit_timeout_envelope(url: &str, timeout_ms: u64, elapsed_ms: u64)
             "code": "timeout",
             "timeout_ms": timeout_ms,
             "elapsed_ms": elapsed_ms,
+            "url": url,
+        },
+    });
+    let _ = write_json_to_stdout(&body);
+}
+
+/// Print the canonical private-network-blocked envelope to stdout.
+/// Emitted when the opt-in SSRF guard refuses a URL that resolved to a
+/// private/loopback/metadata IP — a distinct, machine-readable outcome
+/// from the generic `fetch failed:` line, so an agent can tell "the
+/// operator's policy refused this target" apart from "the host was
+/// unreachable".
+pub(crate) fn emit_private_network_envelope(url: &str) {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "private_network_blocked",
+            "message": format!(
+                "{url} resolves to a private/loopback/metadata IP; refused \
+                 (set by --no-private-networks / HESO_BLOCK_PRIVATE_NETWORKS)"
+            ),
             "url": url,
         },
     });
@@ -1095,6 +1134,10 @@ async fn cmd_open(args: &[String]) -> ExitCode {
         Err(e) if e.is_timeout() => {
             let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
             emit_timeout_envelope(&url_str, timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(&url_str);
             return ExitCode::FAILURE;
         }
         Err(e) => {
@@ -1903,6 +1946,10 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
             emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
             return ExitCode::FAILURE;
         }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(url.as_str());
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -2235,6 +2282,10 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         Err(e) if e.is_timeout() => {
             let elapsed_ms = fetch_started.elapsed().as_millis() as u64;
             emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
         Err(e) => {
@@ -4325,6 +4376,10 @@ where
             emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
             return ExitCode::FAILURE;
         }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(url.as_str());
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -4357,6 +4412,10 @@ where
         Err(e) if e.is_timeout() => {
             let elapsed_ms = html_started.elapsed().as_millis() as u64;
             emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
         Err(e) => {
@@ -5073,6 +5132,10 @@ async fn cmd_submit_inner(
             emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
             return ExitCode::FAILURE;
         }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(url.as_str());
+            return ExitCode::FAILURE;
+        }
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -5105,6 +5168,10 @@ async fn cmd_submit_inner(
         Err(e) if e.is_timeout() => {
             let elapsed_ms = html_started.elapsed().as_millis() as u64;
             emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
+            return ExitCode::FAILURE;
+        }
+        Err(e) if e.is_private_network_blocked() => {
+            emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
         Err(e) => {
@@ -6810,10 +6877,32 @@ fn install_broken_pipe_hook() {
     }));
 }
 
+/// Strip the global `--no-private-networks` flag out of `args`,
+/// returning the remaining arguments. When present, it enables opt-in
+/// SSRF protection for this invocation by setting
+/// [`heso_engine_fetch::private_network::BLOCK_ENV_VAR`] in-process —
+/// the same switch an operator sets in the environment. Every
+/// `FetchEngine` is built after this point, so the single env-var check
+/// at construction protects all network verbs without per-verb wiring.
+///
+/// The flag is global rather than per-verb (it has no value to parse and
+/// the same meaning everywhere), so stripping it once here keeps each
+/// verb's positional parsing untouched.
+fn apply_private_network_flag(args: Vec<String>) -> Vec<String> {
+    if args.iter().any(|a| a == "--no-private-networks") {
+        std::env::set_var(heso_engine_fetch::private_network::BLOCK_ENV_VAR, "1");
+        return args
+            .into_iter()
+            .filter(|a| a != "--no-private-networks")
+            .collect();
+    }
+    args
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     install_broken_pipe_hook();
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = apply_private_network_flag(env::args().skip(1).collect());
     match args.first().map(String::as_str) {
         Some("-h" | "--help" | "help") => {
             print_banner();
