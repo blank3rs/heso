@@ -437,14 +437,17 @@ impl FetchEngine {
     pub async fn open_typed(&self, input: &str) -> Result<FetchPage, Error> {
         let parsed = Url::parse(input).map_err(Error::from)?;
         let raw = self.live_or_replay_typed(&parsed).await?;
+        let content_type = content_type_header(&raw.response_headers);
         let html_text = String::from_utf8_lossy(&raw.body_bytes).into_owned();
-        Ok(FetchPage::from_html(
+        let mut page = FetchPage::from_html(
             input.to_owned(),
             raw.final_url,
             raw.http_status,
             raw.response_cookies,
             html_text,
-        ))
+        );
+        page.content_type = content_type;
+        Ok(page)
     }
 
     /// Typed-error variant of [`Self::open_with_explore`]. Shape and
@@ -563,14 +566,17 @@ impl FetchEngine {
     async fn open_static(&self, input: &str) -> HesoResult<FetchPage> {
         let parsed = Url::parse(input).map_err(Error::from)?;
         let raw = self.do_http_get(&parsed).await?;
+        let content_type = content_type_header(&raw.response_headers);
         let html_text = String::from_utf8_lossy(&raw.body_bytes).into_owned();
-        Ok(FetchPage::from_html(
+        let mut page = FetchPage::from_html(
             input.to_owned(),
             raw.final_url,
             raw.http_status,
             raw.response_cookies,
             html_text,
-        ))
+        );
+        page.content_type = content_type;
+        Ok(page)
     }
 
     /// Centralized HTTP GET that all the engine's static-fetch paths
@@ -1073,6 +1079,15 @@ pub struct FetchPage {
     /// serialize time to match the WHATWG HTML §6.1 `document.cookie`
     /// visibility rule.
     pub response_cookies: Vec<ResponseCookie>,
+    /// The `Content-Type` header value from the response, verbatim
+    /// (including any `; charset=...` suffix). `None` on
+    /// synthetic pages and on replays where the header wasn't
+    /// recorded. Used by [`partial_reason_for_status`] to flag
+    /// non-HTML 200s — a `200 OK` with `application/pdf` or
+    /// `application/octet-stream` is not the page-shaped response the
+    /// agent expected, and the empty extraction shouldn't masquerade
+    /// as a clean read.
+    pub content_type: Option<String>,
 }
 
 impl Page for FetchPage {
@@ -1108,6 +1123,7 @@ impl FetchPage {
             body_html: html,
             http_status,
             response_cookies,
+            content_type: None,
             tree,
             metadata,
             actions,
@@ -1223,18 +1239,26 @@ pub fn extract_actions_from_html(html: &str) -> Vec<ElementRef> {
 /// page with the supplied `text_len` heuristic and discovers there's
 /// no body). Two signals here, both load-bearing:
 ///
-/// 1. Cloudflare's `__cf_chl_opt` / `cf_chl_jschl_tk__` JS shim names.
-///    These are uniquely Cloudflare; no real-world content page emits
-///    them by accident.
-/// 2. A `<title>` whose first 64 bytes (case-insensitive) start with
+/// 1. Cloudflare's `__cf_chl_opt` / `cf_chl_jschl_tk__` JS shim names,
+///    and Reddit's `verify.reddit.com` interstitial host. These are
+///    uniquely vendor-specific; no real-world content page emits them
+///    by accident.
+/// 2. A `<title>` whose first 96 bytes (case-insensitive) start with
 ///    one of a small set of phrases every major WAF vendor ships:
 ///    Cloudflare ("just a moment"), Akamai ("access denied"),
 ///    PerimeterX / HUMAN ("please verify you are a human"),
 ///    AWS WAF / Imperva ("attention required"), DataDome / generic
 ///    bot pages ("verify you are human"). These phrases are
 ///    near-zero collision against legitimate `<title>` content.
+/// 3. A `<title>` that *contains* (not just starts with) one of a
+///    few interstitial phrases vendors prefix with their brand —
+///    Reddit ships `Reddit - Please wait for verification`, so the
+///    phrase lands mid-title rather than at the front.
 pub fn is_bot_challenge(html: &str) -> bool {
-    if html.contains("__cf_chl_opt") || html.contains("cf_chl_jschl_tk__") {
+    if html.contains("__cf_chl_opt")
+        || html.contains("cf_chl_jschl_tk__")
+        || html.contains("verify.reddit.com")
+    {
         return true;
     }
     if let Some(idx) = html.find("<title>") {
@@ -1242,7 +1266,7 @@ pub fn is_bot_challenge(html: &str) -> bool {
         let probe_end = after.len().min(96);
         let probe = &after[..probe_end];
         let lowered: String = probe.chars().map(|c| c.to_ascii_lowercase()).collect();
-        const TITLE_NEEDLES: &[&str] = &[
+        const TITLE_PREFIX_NEEDLES: &[&str] = &[
             "just a moment",
             "attention required",
             "access denied",
@@ -1253,8 +1277,20 @@ pub fn is_bot_challenge(html: &str) -> bool {
             "checking your browser",
             "one moment, please",
         ];
-        for needle in TITLE_NEEDLES {
+        for needle in TITLE_PREFIX_NEEDLES {
             if lowered.starts_with(needle) {
+                return true;
+            }
+        }
+        // Phrases that brands prefix with their own name, so the
+        // interstitial wording lands mid-title (Reddit's
+        // "Reddit - Please wait for verification"). Matched with
+        // `contains` rather than `starts_with`; kept distinct from the
+        // prefix list so a legitimate article *titled* with one of the
+        // prefix phrases (rare) keeps its tighter anchor.
+        const TITLE_CONTAINS_NEEDLES: &[&str] = &["please wait for verification"];
+        for needle in TITLE_CONTAINS_NEEDLES {
+            if lowered.contains(needle) {
                 return true;
             }
         }
@@ -1262,17 +1298,46 @@ pub fn is_bot_challenge(html: &str) -> bool {
     false
 }
 
-/// Map an HTTP status + body to an optional `partial_reason` token.
-/// `None` means "clean 2xx"; `Some(...)` is the failure-envelope token
-/// the agent surface uses: `http_403`, `http_5xx`, `bot_challenge`, ...
+/// Map an HTTP status + body (+ optional Content-Type) to an optional
+/// `partial_reason` token.  `None` means "clean 2xx with an
+/// HTML-shaped body"; `Some(...)` is the failure-envelope token the
+/// agent surface uses: `http_403`, `http_5xx`, `bot_challenge`,
+/// `non_html_content_type`, ...
 ///
-/// Bot-challenge content is checked first and takes precedence over the
-/// HTTP label, since WAFs serve their interstitials under a mix of
-/// statuses (200, 403, 429, 503). The agent-relevant signal is "this is
-/// a challenge page", not the wrapper status code.
-pub fn partial_reason_for_status(http_status: u16, body_html: &str) -> Option<String> {
+/// Precedence: bot-challenge > non-HTML Content-Type > HTTP status.
+///
+/// Bot-challenge content wins because WAFs serve their interstitials
+/// under a mix of statuses (200, 403, 429, 503) — the agent-relevant
+/// signal is "this is a challenge page", not the wrapper code.
+///
+/// Non-HTML Content-Type wins over the status range because a
+/// `200 OK; application/pdf` is *technically* successful but heso
+/// extracted nothing usable from the bytes — the empty `title` and
+/// zero `actions` would otherwise pretend the agent got a real page
+/// view. The signal fires for genuinely non-textual bodies (PDF,
+/// `application/octet-stream`, images, video, fonts, binary JSON
+/// blobs); textual responses (`text/html`, `application/xhtml+xml`,
+/// `text/xml`, and the broader `text/*` family) extract readable
+/// content and stay clean. A server that mislabels HTML as
+/// `text/plain` is common enough that flagging it would punish the
+/// agent for the server's mistake — and the body text is still
+/// readable either way.
+///
+/// `content_type` is `Option<&str>` so callers without header access
+/// (replays of older cassettes, synthetic pages) pass `None` and get
+/// the legacy status-only behavior.
+pub fn partial_reason_for_status(
+    http_status: u16,
+    body_html: &str,
+    content_type: Option<&str>,
+) -> Option<String> {
     if is_bot_challenge(body_html) {
         return Some("bot_challenge".to_owned());
+    }
+    if let Some(ct) = content_type {
+        if !is_extractable_content_type(ct) {
+            return Some("non_html_content_type".to_owned());
+        }
     }
     if (200..300).contains(&http_status) {
         return None;
@@ -1290,6 +1355,41 @@ pub fn partial_reason_for_status(http_status: u16, body_html: &str) -> Option<St
         return Some(format!("http_{http_status}"));
     }
     Some(format!("http_{http_status}"))
+}
+
+/// Return the response's `Content-Type` header, if present. Case-
+/// insensitive header-name lookup (HTTP is `Content-Type` but we
+/// accept any casing per RFC 7230 §3.2). Returns the verbatim header
+/// value including any `; charset=...` suffix; callers strip
+/// parameters when they only care about the bare MIME type.
+fn content_type_header(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.clone())
+}
+
+/// Strip parameters off a Content-Type and return the bare,
+/// lowercased MIME type (`text/html; charset=UTF-8` → `text/html`).
+fn bare_mime(content_type: &str) -> String {
+    content_type
+        .trim()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// `true` when heso can extract readable content from a body with this
+/// Content-Type. That's the HTML-shaped set PLUS the broader `text/*`
+/// family (`text/plain`, `text/markdown`, …) whose bytes are still
+/// human-readable text the agent can use. Everything else — PDF,
+/// `application/octet-stream`, images, audio, video, fonts, protobuf —
+/// is opaque to the parser and drives `non_html_content_type`.
+fn is_extractable_content_type(content_type: &str) -> bool {
+    let bare = bare_mime(content_type);
+    bare == "application/xhtml+xml" || bare.starts_with("text/")
 }
 
 
@@ -1368,6 +1468,111 @@ mod tests {
     fn fetch_engine_constructs_cleanly() {
         // Just verify the default builder works in tests — no network call.
         let _engine = FetchEngine::new().expect("default engine builds");
+    }
+
+    #[test]
+    fn detects_reddit_verification_interstitial() {
+        // Reddit's non-Cloudflare bot wall: a 200 with a benign-looking
+        // status but a verification interstitial body. The title carries
+        // the phrase mid-string ("Reddit - Please wait ...") and the
+        // page links to the `verify.reddit.com` host.
+        let html = r#"<!doctype html><html><head>
+            <title>Reddit - Please wait for verification</title>
+            </head><body>
+            <form action="https://verify.reddit.com/challenge"></form>
+            </body></html>"#;
+        assert!(is_bot_challenge(html), "Reddit interstitial not detected");
+        // And it should drive `partial_reason` to `bot_challenge` even
+        // on a 200 status.
+        assert_eq!(
+            partial_reason_for_status(200, html, Some("text/html")).as_deref(),
+            Some("bot_challenge"),
+        );
+    }
+
+    #[test]
+    fn reddit_structural_signal_fires_without_title() {
+        // The `verify.reddit.com` host marker alone is enough — some
+        // interstitials ship without the verification title.
+        let html = r#"<html><body><script src="https://verify.reddit.com/shim.js"></script></body></html>"#;
+        assert!(is_bot_challenge(html));
+    }
+
+    #[test]
+    fn real_reddit_title_is_not_flagged() {
+        // A legitimate Reddit page title must NOT trip the detector.
+        let html = r#"<html><head><title>r/rust - Reddit</title></head><body><h1>posts</h1></body></html>"#;
+        assert!(!is_bot_challenge(html));
+    }
+
+    #[test]
+    fn non_html_content_type_is_partial() {
+        // A clean 200 carrying a non-HTML body (PDF, binary, JSON) is
+        // not the page-shaped response the agent asked for.
+        let body = ""; // binary responses extract to nothing
+        assert_eq!(
+            partial_reason_for_status(200, body, Some("application/pdf")).as_deref(),
+            Some("non_html_content_type"),
+        );
+        assert_eq!(
+            partial_reason_for_status(200, body, Some("application/octet-stream")).as_deref(),
+            Some("non_html_content_type"),
+        );
+        assert_eq!(
+            partial_reason_for_status(200, body, Some("application/json; charset=utf-8")).as_deref(),
+            Some("non_html_content_type"),
+        );
+    }
+
+    #[test]
+    fn html_content_types_stay_clean() {
+        let body = "<html><body>hi</body></html>";
+        // text/html with charset parameter is still HTML.
+        assert!(partial_reason_for_status(200, body, Some("text/html; charset=UTF-8")).is_none());
+        // Case-insensitive, leading whitespace tolerated.
+        assert!(partial_reason_for_status(200, body, Some("  TEXT/HTML  ")).is_none());
+        // XHTML and XML are HTML-shaped.
+        assert!(
+            partial_reason_for_status(200, body, Some("application/xhtml+xml")).is_none()
+        );
+        assert!(partial_reason_for_status(200, body, Some("text/xml")).is_none());
+        // Absent Content-Type falls back to the status-only behavior.
+        assert!(partial_reason_for_status(200, body, None).is_none());
+    }
+
+    #[test]
+    fn textual_content_types_stay_clean() {
+        // The broader `text/*` family extracts readable content, so it
+        // is NOT flagged — including a server that mislabels HTML as
+        // text/plain (a common misconfiguration we don't want to punish
+        // the agent for).
+        let body = "<html><body>hi</body></html>";
+        assert!(partial_reason_for_status(200, body, Some("text/plain")).is_none());
+        assert!(partial_reason_for_status(200, body, Some("text/plain; charset=utf-8")).is_none());
+        assert!(partial_reason_for_status(200, body, Some("text/markdown")).is_none());
+    }
+
+    #[test]
+    fn bot_challenge_wins_over_content_type() {
+        // A challenge page served as `application/pdf` (rare but
+        // possible) should still surface as `bot_challenge` — the more
+        // actionable signal.
+        let html = r#"<html><head><title>Just a moment...</title></head><body></body></html>"#;
+        assert_eq!(
+            partial_reason_for_status(200, html, Some("application/pdf")).as_deref(),
+            Some("bot_challenge"),
+        );
+    }
+
+    #[test]
+    fn non_html_content_type_wins_over_http_status() {
+        // A 404 that also carries a non-HTML body reports the
+        // Content-Type reason (it's checked before the status range).
+        let body = "";
+        assert_eq!(
+            partial_reason_for_status(404, body, Some("application/pdf")).as_deref(),
+            Some("non_html_content_type"),
+        );
     }
 
     /// Live network test, runs by default — example.com is a stable
