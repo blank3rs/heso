@@ -211,6 +211,79 @@ async fn click_non_anchor_does_not_navigate() {
     );
 }
 
+/// A non-navigating click whose handler mutates the DOM must surface
+/// the post-click `text`, `tree`, and `content_hash` so an agent can
+/// see what changed in-page (SPA-style interaction) without a
+/// follow-up `read`. The `<a href>` navigation path is covered by the
+/// tests above and keeps its destination fields.
+#[tokio::test(flavor = "multi_thread")]
+async fn click_non_navigating_surfaces_post_click_snapshot() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<!doctype html><html><head><title>Counter</title></head><body>
+                <p id="out">initial</p>
+                <button id="go">Go</button>
+                <script>
+                    document.getElementById('go').addEventListener('click', function () {
+                        document.getElementById('out').textContent = 'mutated by handler';
+                        history.pushState({}, '', '/next');
+                    });
+                </script>
+            </body></html>"#,
+        ))
+        .mount(&server)
+        .await;
+
+    // Baseline: the same DOM before any click, so we can prove the
+    // click body's hash diverges from the unmutated page's hash.
+    let baseline_html = r#"<!doctype html><html><head><title>Counter</title></head><body>
+                <p id="out">initial</p>
+                <button id="go">Go</button>
+            </body></html>"#;
+    let baseline = heso_engine_fetch::extract_visible_text(baseline_html);
+
+    let out = Command::new(heso_bin())
+        .args(["click", &server.uri(), "--text", "Go"])
+        .output()
+        .expect("spawn heso click on a button");
+    assert!(out.status.success());
+    let body = parse_body(&out);
+    assert_eq!(body["ok"], serde_json::json!(true));
+    assert_eq!(body["result"], serde_json::json!(true));
+    // No anchor to follow — the navigation augmentation must stay off.
+    assert!(
+        body.get("navigated").is_none(),
+        "button click must not surface a `navigated` field; got body={body}"
+    );
+
+    // Post-click snapshot fields are present and reflect the mutation.
+    let text = body["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected post-click `text`; body={body}"));
+    assert!(
+        text.contains("mutated by handler"),
+        "post-click text must reflect the handler's DOM mutation, got: {text:?}"
+    );
+    assert!(
+        !text.contains("initial"),
+        "post-click text must not still carry the pre-click value, got: {text:?}"
+    );
+    assert_eq!(body["tree"]["title"], serde_json::json!("Counter"));
+    let hash = body["content_hash"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected post-click `content_hash`; body={body}"));
+    assert!(
+        hash.starts_with("blake3:"),
+        "content_hash should be a blake3 digest, got: {hash}"
+    );
+    assert_ne!(
+        text, baseline,
+        "post-click text must differ from the unmutated page text"
+    );
+}
+
 /// A click whose `<a href>` lands on a multi-hop HTTP redirect chain
 /// must surface the chain on `redirects[]` and report the terminal
 /// URL on `final_url`. Pre-change the click body only carried `url`

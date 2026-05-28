@@ -4419,8 +4419,7 @@ async fn run_dispatch<F>(
 ) -> ExitCode
 where
     F: FnOnce(
-        &heso_engine_js::JsEngine,
-        &str,
+        &heso_engine_js::JsSession,
         &str,
     ) -> Result<heso_engine_js::EvalOutcome, heso_engine_js::EvalError>,
 {
@@ -4509,21 +4508,39 @@ where
         }
     };
 
+    // A stateful session keeps the post-dispatch DOM live so a
+    // non-navigating click (one whose handler mutates the DOM or calls
+    // `history.pushState`) can be snapshotted afterwards. Inline scripts
+    // run during open, matching `cmd_read`'s hydration pass.
+    let session = match heso_engine_js::JsSession::open_on_engine(
+        js_engine,
+        &html,
+        final_url.clone(),
+        heso_engine_js::ScriptFetchPolicy::Fetch,
+    ) {
+        Ok((s, _)) => s,
+        Err(e) => {
+            eprintln!("failed to load page into JS engine: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let value_field: serde_json::Value = match written_value {
         Some(s) => serde_json::Value::String(s.to_owned()),
         None => serde_json::Value::Null,
     };
 
-    match op(&js_engine, &html, &selector) {
+    match op(&session, &selector) {
         Ok(outcome) => {
-            // `dispatch_click` / `set_input_value` return a bare bool
-            // (`true` = selector hit, `false` = no element matched).
-            // `submit_form` returns a structured object with a
-            // `matched` key. Either way, a "didn't find it" outcome
-            // means the verb did NOT do what the agent asked, so we
-            // collapse that to `ok: false` with a typed error code —
-            // an agent must not mistake "selector missed" for success.
+            // The session verbs evaluate to `{matched, defaultPrevented}`.
+            // `matched: false` means the selector found nothing, so the
+            // verb did NOT do what the agent asked — collapse that to
+            // `ok: false` with a typed error code so an agent never
+            // mistakes "selector missed" for success. The reported
+            // `result` is the bare hit/miss bool the verbs have always
+            // surfaced.
             let matched = engine_matched(&outcome.value);
+            let result_value = serde_json::Value::Bool(matched);
             if !matched {
                 let body = serde_json::json!({
                     "ok": false,
@@ -4537,7 +4554,7 @@ where
                         "code": "selector_not_matched",
                         "message": format!("no element matched selector `{selector}` in the loaded DOM"),
                     },
-                    "result": outcome.value,
+                    "result": result_value,
                     "console": outcome.console,
                 });
                 match serde_json::to_string_pretty(&body) {
@@ -4565,7 +4582,7 @@ where
                 "selector": selector,
                 "element_id": element_id,
                 "value": value_field,
-                "result": outcome.value,
+                "result": result_value,
                 "console": outcome.console,
             });
             // When the clicked element is an `<a href>`, resolve the
@@ -4590,9 +4607,21 @@ where
             //   `nav_error` field so the agent can see what
             //   happened. The original click result (`value: null`,
             //   console) is preserved.
-            if op_name == "click" && action.tag == "a" {
-                if let Some(dest_url) = follow_anchor_href(&action, &final_url) {
-                    body = augment_click_with_destination(body, &engine, &dest_url).await;
+            if op_name == "click" {
+                let dest = if action.tag == "a" {
+                    follow_anchor_href(&action, &final_url)
+                } else {
+                    None
+                };
+                match dest {
+                    Some(dest_url) => {
+                        body = augment_click_with_destination(body, &engine, &dest_url).await;
+                    }
+                    // No navigation followed (button, JS-only handler,
+                    // `<a href="#">`, etc.). Snapshot the post-click DOM
+                    // so an agent can see what the handler changed —
+                    // mutated text or a `history.pushState` rewrite.
+                    None => attach_post_click_snapshot(&mut body, &session, &final_url),
                 }
             }
             match serde_json::to_string_pretty(&body) {
@@ -4701,6 +4730,42 @@ fn follow_anchor_href(action: &heso_engine_fetch::ElementRef, page_url: &Url) ->
     // (item-25 / RFC 3986 §5.2). Strips fragments only when the
     // input is purely a fragment; preserves the rest.
     page_url.join(trimmed).ok()
+}
+
+/// Snapshot the post-click DOM and fold it into a non-navigating click
+/// response. Surfaces `text`, `tree`, and `content_hash` computed from
+/// the live session document — the same fields, names, and hashing
+/// (`extract_visible_text` + `FetchPage::from_html` tree +
+/// [`ReadSnapshot::from_parts`]) `cmd_read` emits — so an agent can see
+/// what an in-page handler changed without a follow-up `read`.
+fn attach_post_click_snapshot(
+    body: &mut serde_json::Value,
+    session: &heso_engine_js::JsSession,
+    final_url: &Url,
+) {
+    let post_html = session.document_html();
+    let visible_text = heso_engine_fetch::extract_visible_text(&post_html);
+    let actions = heso_engine_fetch::extract_actions_from_html(&post_html);
+    let forms_json = group_forms(&actions);
+    let page = FetchPage::from_html(
+        final_url.as_str().to_owned(),
+        final_url.clone(),
+        200,
+        Vec::new(),
+        post_html,
+    );
+    let snap = ReadSnapshot::from_parts(&page.tree.title, &visible_text, &actions, &forms_json);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("text".to_owned(), serde_json::Value::String(visible_text));
+        obj.insert(
+            "tree".to_owned(),
+            serde_json::to_value(&page.tree).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "content_hash".to_owned(),
+            serde_json::Value::String(snap.content_hash),
+        );
+    }
 }
 
 /// Bug A helper: fetch the click destination and fold its page into
@@ -4877,8 +4942,8 @@ async fn cmd_click(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     let url_arg = &extra[0];
-    run_dispatch(url_arg, &target, "click", None, timeout_ms, |eng, html, sel| {
-        eng.dispatch_click(html, sel)
+    run_dispatch(url_arg, &target, "click", None, timeout_ms, |sess, sel| {
+        sess.click(sel)
     })
     .await
 }
@@ -4914,7 +4979,7 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
         "fill",
         Some(&value),
         timeout_ms,
-        move |eng, html, sel| eng.set_input_value(html, sel, &value_for_op),
+        move |sess, sel| sess.fill(sel, &value_for_op),
     )
     .await
 }
