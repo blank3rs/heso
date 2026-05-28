@@ -176,3 +176,6 @@ __pycache__/
 # transient agent reports go" and CLAUDE.md → "Don't" for the rule.
 /bug-reports/
 .pm-state.json
+
+# Generator scratch output; canonical conformance vectors live in heso-spec/vectors/
+/generated-vectors.json
