@@ -298,7 +298,10 @@ async fn run_against_tampered_cassette_errors_gracefully() {
 
     drop(server);
 
-    let run_out = run_verb("run", &["--seed", "0", plat_path.to_str().unwrap()]);
+    let run_out = run_verb(
+        "run",
+        &["--no-verify-input", "--seed", "0", plat_path.to_str().unwrap()],
+    );
     assert!(
         !run_out.status.success(),
         "run against a tampered cassette must exit non-zero"
@@ -381,7 +384,10 @@ async fn run_refuses_plat_without_cassette() {
     });
     let plat_path = write_temp("plat-nocassette.json", plat.to_string().as_bytes());
 
-    let out = run_verb("run", &["--seed", "0", plat_path.to_str().unwrap()]);
+    let out = run_verb(
+        "run",
+        &["--no-verify-input", "--seed", "0", plat_path.to_str().unwrap()],
+    );
     assert!(
         !out.status.success(),
         "run must refuse a plat with no cassette field"
@@ -421,7 +427,10 @@ async fn run_on_plat_with_malformed_cassette_emits_distinct_error() {
     });
     let plat_path = write_temp("plat-malformed-cassette.json", plat.to_string().as_bytes());
 
-    let out = run_verb("run", &["--seed", "0", plat_path.to_str().unwrap()]);
+    let out = run_verb(
+        "run",
+        &["--no-verify-input", "--seed", "0", plat_path.to_str().unwrap()],
+    );
     assert!(
         !out.status.success(),
         "run must refuse a plat with a malformed cassette"
@@ -465,5 +474,98 @@ async fn replay_refuses_plat_without_steps_field() {
         "exit code 2 is the documented refusal code"
     );
 
+    let _ = std::fs::remove_file(&plat_path);
+}
+
+#[tokio::test]
+async fn run_refuses_tampered_input_plat_by_default() {
+    let server =
+        fixture_server("<html><body>integrity fixture</body></html>").await;
+    let url = format!("{}/page", server.uri());
+    let plan = serde_json::json!([{ "verb": "open", "url": url }]);
+    let plan_path = write_temp("plan.json", plan.to_string().as_bytes());
+
+    let stamp_out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
+    assert!(stamp_out.status.success());
+    drop(server);
+
+    let mut plat: serde_json::Value =
+        serde_json::from_slice(&stamp_out.stdout).expect("plat is json");
+    let embedded = plat["plat_hash"]
+        .as_str()
+        .expect("plat_hash string")
+        .to_owned();
+    // Tamper a content field while leaving the embedded plat_hash in
+    // place — the embedded hash no longer matches the content.
+    plat["title"] = serde_json::Value::String("tampered title".into());
+    let plat_path = write_temp("plat-tampered-hash.json", plat.to_string().as_bytes());
+
+    let run_out = run_verb("run", &["--seed", "0", plat_path.to_str().unwrap()]);
+    assert_eq!(
+        run_out.status.code(),
+        Some(1),
+        "run must exit 1 on a tampered input plat by default: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let env: serde_json::Value =
+        serde_json::from_slice(&run_out.stdout).expect("envelope is json");
+    assert_eq!(env["ok"], serde_json::Value::Bool(false));
+    assert_eq!(env["error"]["code"], "plat_integrity_mismatch");
+    assert_eq!(env["error"]["embedded"].as_str(), Some(embedded.as_str()));
+    assert!(
+        env["error"]["recomputed"].as_str().is_some_and(|r| r != embedded),
+        "recomputed hash must be present and differ from the embedded one"
+    );
+    assert!(
+        env["error"].get("source").is_some(),
+        "envelope should carry the input source"
+    );
+    // No replayed plat: the output is the error envelope, not a plat.
+    assert!(
+        env.get("plat_hash").is_none(),
+        "a refused run must not mint a replayed plat"
+    );
+
+    let _ = std::fs::remove_file(&plan_path);
+    let _ = std::fs::remove_file(&plat_path);
+}
+
+#[tokio::test]
+async fn run_no_verify_input_replays_tampered_plat() {
+    let server =
+        fixture_server("<html><body>opt-out fixture</body></html>").await;
+    let url = format!("{}/page", server.uri());
+    let plan = serde_json::json!([{ "verb": "open", "url": url }]);
+    let plan_path = write_temp("plan.json", plan.to_string().as_bytes());
+
+    let stamp_out = run_verb("stamp", &["--seed", "0", plan_path.to_str().unwrap()]);
+    assert!(stamp_out.status.success());
+    drop(server);
+
+    let mut plat: serde_json::Value =
+        serde_json::from_slice(&stamp_out.stdout).expect("plat is json");
+    // Same tamper, but the cassette (keyed by method+url+body) is
+    // untouched, so replay still hits. With --no-verify-input the
+    // integrity gate is skipped and the old behavior holds.
+    plat["title"] = serde_json::Value::String("tampered title".into());
+    let plat_path = write_temp("plat-tampered-hash.json", plat.to_string().as_bytes());
+
+    let run_out = run_verb(
+        "run",
+        &[plat_path.to_str().unwrap(), "--no-verify-input", "--seed", "0"],
+    );
+    assert!(
+        run_out.status.success(),
+        "--no-verify-input must skip the integrity gate and replay: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let run_plat: serde_json::Value =
+        serde_json::from_slice(&run_out.stdout).expect("run plat is json");
+    assert!(
+        run_plat["plat_hash"].is_string(),
+        "the opt-out path must still mint a replayed plat"
+    );
+
+    let _ = std::fs::remove_file(&plan_path);
     let _ = std::fs::remove_file(&plat_path);
 }

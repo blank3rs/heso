@@ -232,10 +232,12 @@ fn print_banner() {
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
     println!("                                Accepts a bare Action[] array, a plat with a `plan` field, or a");
     println!("                                fingerprint. Exit 0 ok / 1 if any step failed.");
-    println!("  heso run    [--seed N] <plat.plat|plat-hash|->");
+    println!("  heso run    [--seed N] [--no-verify-input] <plat.plat|plat-hash|->");
     println!("                                Re-execute the plan against the plat's embedded cassette — no");
     println!("                                network. Mints a fresh plat; for an unchanged cassette its");
     println!("                                plat_hash equals the input's (byte-identical replay).");
+    println!("                                Verifies the input plat's integrity first (exit 1 on a tamper);");
+    println!("                                --no-verify-input skips that gate.");
     println!("                                Misses (page drifted since stamp) surface as graceful errors.");
     println!("  heso refresh [--seed N] <plat.plat|->");
     println!("                                Re-stamp a plat against the live web and report whether it has");
@@ -631,6 +633,28 @@ pub(crate) fn emit_private_network_envelope(url: &str) {
                  (set by --no-private-networks / HESO_BLOCK_PRIVATE_NETWORKS)"
             ),
             "url": url,
+        },
+    });
+    let _ = write_json_to_stdout(&body);
+}
+
+/// Print the canonical plat-integrity-mismatch envelope to stdout.
+/// Emitted when `run` is asked to replay a plat whose embedded
+/// `plat_hash` does not match its recomputed content — a tamper signal.
+/// Carries both hashes so an agent can see exactly what diverged
+/// instead of inferring it from a bare exit code.
+pub(crate) fn emit_plat_integrity_envelope(source: &str, embedded: &str, recomputed: &str) {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "plat_integrity_mismatch",
+            "message": format!(
+                "input plat `{source}` integrity check failed: embedded plat_hash \
+                 {embedded} does not match recomputed {recomputed}; refused"
+            ),
+            "source": source,
+            "embedded": embedded,
+            "recomputed": recomputed,
         },
     });
     let _ = write_json_to_stdout(&body);
@@ -5994,7 +6018,13 @@ fn parse_seed_timeout_and_path(
 ///   (`verb: open|click|fill|submit`). Schema-free fingerprints hash
 ///   fine but can't be auto-replayed; exit `2` with a clear message.
 async fn cmd_run(args: &[String]) -> ExitCode {
-    let (seed, path) = match parse_seed_and_path(args, "run") {
+    let verify_input = !args.iter().any(|a| a == "--no-verify-input");
+    let filtered: Vec<String> = args
+        .iter()
+        .filter(|a| *a != "--no-verify-input")
+        .cloned()
+        .collect();
+    let (seed, path) = match parse_seed_and_path(&filtered, "run") {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -6009,6 +6039,38 @@ async fn cmd_run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // The input plat's audit trust rests on its embedded `plat_hash`
+    // matching its own content; a run that replayed a tampered plat
+    // would silently overwrite that field with a fresh hash, laundering
+    // the tamper. Verify integrity first and refuse on mismatch so the
+    // replayed plat can only ever descend from an intact input. The
+    // `--no-verify-input` opt-out skips this gate for callers replaying
+    // plats that predate the field or are mid-construction.
+    if verify_input {
+        match heso_engine_fetch::plat_verify(&value) {
+            Ok(true) => {}
+            Ok(false) => {
+                let embedded = value
+                    .get("plat_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let recomputed = heso_engine_fetch::plat_hash(&value);
+                eprintln!(
+                    "run: input plat integrity check failed (embedded {embedded}, recomputed \
+                     {recomputed}); refusing to replay a tampered plat — pass `--no-verify-input` \
+                     to skip this check"
+                );
+                emit_plat_integrity_envelope(&source, &embedded, &recomputed);
+                return ExitCode::from(1);
+            }
+            Err(e) => {
+                eprintln!("run: cannot verify input plat integrity: {e}; pass `--no-verify-input` to skip this check");
+                return ExitCode::from(2);
+            }
+        }
+    }
     let plan = match extract_plan(&value) {
         Ok(p) => p,
         Err(e) => {
