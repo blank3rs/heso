@@ -347,6 +347,82 @@ async fn round_trip_no_allowlist_warns_and_still_passes() {
 }
 
 // ============================================================================
+// 5b. Empty allowlist file → REJECTED (no signer can be trusted)
+// ============================================================================
+
+#[tokio::test]
+async fn round_trip_empty_allowlist_is_rejected() {
+    let (_server, url) = start_mock_server().await;
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path();
+
+    let _pubkey = init_identity(cwd);
+    let receipt = sign_open(cwd, &url, "receipt.json");
+    // An explicit `[]` allowlist — the user asked to bind to a signer
+    // set and supplied an empty one. This must fail closed (exit 1),
+    // not silently treat "empty" as "trust anyone".
+    let allowlist = write_allowlist(cwd, "empty.json", &[]);
+
+    let out = run_in(
+        cwd,
+        &[
+            "verify",
+            "--trusted-keys",
+            allowlist.to_str().unwrap(),
+            receipt.to_str().unwrap(),
+        ],
+    );
+    let code = out.status.code().unwrap_or(-1);
+    assert_eq!(
+        code, 1,
+        "empty allowlist must exit 1; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("zero entries"),
+        "expected zero-entries rejection message, got stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("FAIL"),
+        "expected FAIL on stdout, got: {stdout}"
+    );
+}
+
+/// The same empty-allowlist rejection must fire when the source is the
+/// `HESO_TRUSTED_KEYS` env var rather than the `--trusted-keys` flag.
+#[tokio::test]
+async fn round_trip_empty_env_allowlist_is_rejected() {
+    let (_server, url) = start_mock_server().await;
+    let dir = TempDir::new().unwrap();
+    let cwd = dir.path();
+
+    let _pubkey = init_identity(cwd);
+    let receipt = sign_open(cwd, &url, "receipt.json");
+    let allowlist = write_allowlist(cwd, "empty.json", &[]);
+
+    let mut cmd = Command::new(heso_bin());
+    cmd.args(["verify", receipt.to_str().unwrap()])
+        .current_dir(cwd)
+        .env("HESO_TRUSTED_KEYS", &allowlist);
+    let out = cmd.output().expect("spawn heso");
+    let code = out.status.code().unwrap_or(-1);
+    assert_eq!(
+        code, 1,
+        "empty env allowlist must exit 1; stderr={}\nstdout={}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("zero entries"),
+        "expected zero-entries rejection, got stderr: {stderr}"
+    );
+}
+
+// ============================================================================
 // 6. Env-var allowlist works the same as the flag
 // ============================================================================
 

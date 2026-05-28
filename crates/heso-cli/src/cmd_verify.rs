@@ -221,6 +221,19 @@ fn verify_receipt_inner(
     }
 
     let allowlist = match receipts::load_trusted_keys(trusted_keys.as_deref()) {
+        receipts::AllowlistResult::Loaded(v) if v.is_empty() => {
+            // A supplied allowlist with zero entries is a configuration
+            // error, not a "trust anyone" wildcard. The user explicitly
+            // asked to bind verification to a set of signers and that
+            // set is empty, so no signer can satisfy it — fail closed.
+            // Same outcome whether the empty source was `--trusted-keys`
+            // or the env var (both arrive as `Loaded`).
+            println!("FAIL receipt");
+            eprintln!(
+                "INVALID: trusted-keys file contains zero entries — no signer can be trusted"
+            );
+            return ExitCode::from(1);
+        }
         receipts::AllowlistResult::Loaded(v) => Some(v),
         receipts::AllowlistResult::Empty => {
             eprintln!(
@@ -264,7 +277,7 @@ fn verify_receipt_inner(
                 .map(|s| s.public_key.as_str())
                 .unwrap_or("(unknown)");
             if let Some(allow) = allowlist.as_ref() {
-                if !allow.is_empty() && !receipts::pubkey_in_allowlist(pk, allow) {
+                if !receipts::pubkey_in_allowlist(pk, allow) {
                     println!("FAIL receipt");
                     eprintln!(
                         "INVALID: signing pubkey `{pk}` is not in the trusted-keys allowlist"
