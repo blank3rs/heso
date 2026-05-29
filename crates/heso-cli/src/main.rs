@@ -106,6 +106,7 @@ mod receipts;
 mod search;
 mod serve;
 mod template;
+mod tofu;
 
 // Replace the system allocator with mimalloc. Windows' UCRT
 // allocator is the weakest standard allocator of any major platform;
@@ -133,6 +134,165 @@ use heso_trace::{
 /// the caller doesn't pass `--path`. Lives under the gitignored
 /// `heso-local-data/` directory.
 pub(crate) const DEFAULT_IDENTITY_PATH: &str = "heso-local-data/identity.key";
+
+/// Default TOFU pin store path used by `heso verify` when the caller
+/// doesn't override it. The SSH-`known_hosts`-style file keys a signer
+/// fingerprint per plat lineage. Lives under the same gitignored
+/// `heso-local-data/` directory as the identity key.
+pub(crate) const DEFAULT_KNOWN_SIGNERS_PATH: &str = "heso-local-data/known_signers.json";
+
+/// How a CLI producer should finalize a freshly-built plat body before
+/// printing: insert the `lineage` pin key, then sign inline by default
+/// or leave the body bare under `--no-sign`.
+///
+/// `--no-sign` exists for two contracts: the cassette byte-identity
+/// guarantee (a bare plat that pipes into `run` unchanged) and the
+/// pre-signing regression anchor (a `--no-sign` plat is byte-identical
+/// to a pre-default-signing plat).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ProducerSignOpts {
+    /// `--no-sign` — skip the inline `sig` and emit today's bare plat.
+    pub(crate) no_sign: bool,
+    /// `--lineage <label>` — override the derived lineage (e.g. to group
+    /// a multi-page crawl under one TOFU pin). When `None` the lineage is
+    /// derived from the normalized input URL.
+    pub(crate) lineage: Option<String>,
+    /// `--key <path>` — identity key to sign with. Defaults to
+    /// [`DEFAULT_IDENTITY_PATH`].
+    pub(crate) key_path: Option<PathBuf>,
+}
+
+/// Derive the default lineage pin key for `input_url`:
+/// `"site:" || blake3(Url::parse(input_url).as_str())[..16].hex()`.
+///
+/// The normalized form is the same `Url::parse(input_url).as_str()` the
+/// plat body already carries, so the lineage is stable across callers of
+/// the same logical page. Falls back to the verbatim `input_url` bytes
+/// when it doesn't parse — a producer only reaches here after the URL was
+/// already validated, so this is a defensive total function.
+pub(crate) fn derive_lineage(input_url: &str) -> String {
+    let normalized = Url::parse(input_url)
+        .map(|u| u.as_str().to_owned())
+        .unwrap_or_else(|_| input_url.to_owned());
+    let digest = blake3::hash(normalized.as_bytes());
+    let mut hex = String::with_capacity(32);
+    for b in &digest.as_bytes()[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    format!("site:{hex}")
+}
+
+/// Pull `--no-sign` / `--lineage <label>` / `--key <path>` out of `args`,
+/// returning the parsed [`ProducerSignOpts`] alongside the remaining args
+/// (with those flags removed) for a verb whose own walker doesn't know
+/// them — `stamp` and `run`, which thread the rest into the shared
+/// seed/timeout/path parser.
+pub(crate) fn strip_producer_sign_flags(
+    args: &[String],
+) -> Result<(ProducerSignOpts, Vec<String>), ExitCode> {
+    let mut opts = ProducerSignOpts::default();
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--no-sign" => {
+                opts.no_sign = true;
+                i += 1;
+            }
+            "--lineage" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--lineage needs a value (a label to group plats under one TOFU pin)");
+                    return Err(ExitCode::from(2));
+                };
+                opts.lineage = Some(v.clone());
+                i += 2;
+            }
+            "--key" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--key needs a value (path to the Ed25519 identity key)");
+                    return Err(ExitCode::from(2));
+                };
+                opts.key_path = Some(PathBuf::from(v));
+                i += 2;
+            }
+            _ => {
+                rest.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok((opts, rest))
+}
+
+/// Finalize a plat `body` that already carries a stamped `plat_hash`:
+/// insert the `lineage` pin key (kept in the hash region), re-stamp
+/// `plat_hash` over the now-larger hash region, and sign inline with the
+/// producer's identity.
+///
+/// Lineage lives in exactly one place (the producer path) so the engine
+/// stays signature-agnostic. Because lineage is content (covered by both
+/// `plat_hash` and the signature), the `plat_hash` is recomputed after
+/// the insert; the inline `sig` itself is stripped from the hash region,
+/// so adding it never moves `plat_hash`.
+///
+/// `--no-sign` emits today's bare plat: no `sig`, and — unless the caller
+/// explicitly grouped this run under a `--lineage <label>` — no `lineage`
+/// either, so the output is byte-identical to a pre-signing plat (the
+/// cassette byte-identity contract and the regression anchor). An
+/// explicit `--lineage` under `--no-sign` still carries the label for
+/// callers who want the pin key without the signature.
+///
+/// Returns the finalized body on success, or a usage [`ExitCode`] when
+/// the signing key can't be loaded.
+pub(crate) fn finalize_produced_plat(
+    mut body: serde_json::Value,
+    input_url: &str,
+    opts: &ProducerSignOpts,
+) -> Result<serde_json::Value, ExitCode> {
+    // A bare-plat `--no-sign` (no explicit lineage) must stay byte-for-
+    // byte identical to a pre-signing plat, so skip both the lineage
+    // insert and the hash recompute.
+    if opts.no_sign && opts.lineage.is_none() {
+        return Ok(body);
+    }
+    let lineage = opts
+        .lineage
+        .clone()
+        .unwrap_or_else(|| derive_lineage(input_url));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("lineage".to_owned(), serde_json::Value::String(lineage));
+        // Lineage is in the hash region, so the `plat_hash` the producer
+        // already stamped is now stale. Recompute it over the body that
+        // now carries `lineage` (and no `sig` yet).
+        let rehashed = heso_engine_fetch::plat_hash(&serde_json::Value::Object(obj.clone()));
+        obj.insert("plat_hash".to_owned(), serde_json::Value::String(rehashed));
+    }
+    if opts.no_sign {
+        return Ok(body);
+    }
+    let key_path = opts
+        .key_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH));
+    let key = match IdentityKey::load_or_create(&key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!(
+                "failed to load or create signing identity at `{}`: {e} (pass --no-sign to emit an unsigned plat)",
+                key_path.display()
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
+    match heso_engine_fetch::plat::sign_inline_checked(&key, body) {
+        Ok(signed) => Ok(signed),
+        Err(e) => {
+            eprintln!("failed to sign plat: {e}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
 
 fn print_banner() {
     let version = env!("CARGO_PKG_VERSION");
@@ -223,12 +383,16 @@ fn print_banner() {
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
     println!("                                Accepts a bare Action[] array, a plat with a `plan` field, or a");
     println!("                                fingerprint. Exit 0 ok / 1 if any step failed.");
-    println!("  heso run    [--seed N] [--no-verify-input] <plat.plat|->");
+    println!("  heso run    [--seed N] [--no-verify-input] [--lineage LABEL] [--no-sign] <plat.plat|->");
     println!("                                Re-execute the plan against the plat's embedded cassette — no");
     println!("                                network. Mints a fresh plat; for an unchanged cassette its");
     println!("                                plat_hash equals the input's (byte-identical replay).");
-    println!("                                Verifies the input plat's integrity first (exit 1 on a tamper);");
-    println!("                                --no-verify-input skips that gate.");
+    println!("                                Verifies the input plat's integrity first (exit 1 on a tamper)");
+    println!("                                and, for a signed input, that its inline signature is valid;");
+    println!("                                --no-verify-input skips BOTH checks.");
+    println!("                                A bare/legacy input replays unsigned; a signed input is re-signed.");
+    println!("                                --lineage LABEL re-groups the output and engages signing even for");
+    println!("                                a bare input; --no-sign forces an unsigned output.");
     println!("                                Misses (page drifted since stamp) surface as graceful errors.");
     println!("  heso refresh [--seed N] <plat.plat|->");
     println!("                                Re-stamp a plat against the live web and report whether it has");
@@ -1070,15 +1234,18 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     let mut link_cap: usize = DEFAULT_LINK_CAP;
     let mut inject_scripts: Vec<String> = Vec::new();
     let mut sign_flags = receipts::SignFlags::default();
+    let mut no_sign = false;
+    let mut lineage_override: Option<String> = None;
     let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut i = 0;
     while i < args.len() {
         // `--receipt PATH` / `--key PATH` / `--mode M` / `--seed N` —
         // the receipt-sign flag suite is shared across `open` and
-        // `read`, so the parsing lives in [`receipts`]. The helper
-        // returns how many arg slots it consumed (0 / 1 / 2); when it
-        // returns `None` the flag wasn't ours and we fall through to
-        // the open-specific match below.
+        // `read`, so the parsing lives in [`receipts`]. `--key` doubles
+        // as the inline-signing identity. The helper returns how many
+        // arg slots it consumed (0 / 1 / 2); when it returns `None` the
+        // flag wasn't ours and we fall through to the open-specific
+        // match below.
         match receipts::try_consume_sign_flag(args, i, &mut sign_flags) {
             Ok(Some(n)) => {
                 i += n;
@@ -1147,9 +1314,21 @@ async fn cmd_open(args: &[String]) -> ExitCode {
                 }
                 i += 2;
             }
+            "--no-sign" => {
+                no_sign = true;
+                i += 1;
+            }
+            "--lineage" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--lineage needs a value (a label to group plats under one TOFU pin)");
+                    return ExitCode::from(2);
+                };
+                lineage_override = Some(v.clone());
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] [--timeout DUR] <url>");
+                eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] [--lineage LABEL] [--no-sign] [--timeout DUR] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -1167,7 +1346,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     }
 
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] [--timeout DUR] <url>");
+        eprintln!("usage: heso open [--explore-links N] [--link-cap M] [--inject-script JS|@FILE]... [--receipt PATH [--key PATH] [--mode deterministic|recording|live] [--seed N]] [--lineage LABEL] [--no-sign] [--timeout DUR] <url>");
         return ExitCode::from(2);
     };
 
@@ -1357,6 +1536,17 @@ async fn cmd_open(args: &[String]) -> ExitCode {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
+    // Stamp the lineage pin key and sign inline by default — the
+    // tamper-evidence layer. `--no-sign` emits today's bare plat.
+    let sign_opts = ProducerSignOpts {
+        no_sign,
+        lineage: lineage_override,
+        key_path: sign_flags.key_path.clone(),
+    };
+    body = match finalize_produced_plat(body, &url_str, &sign_opts) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
     // `--receipt PATH` (P0 fix): emit a signed [`heso_trace::Receipt`]
     // alongside the verb's normal stdout JSON. The trace is a single
     // `cd <url>` primitive — the natural intent of `heso open <url>`.
@@ -2213,12 +2403,15 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let mut complete = false;
     let mut js_fetch = false;
     let mut sign_flags = receipts::SignFlags::default();
+    let mut no_sign = false;
+    let mut lineage_override: Option<String> = None;
     let mut timeout_ms: Option<u64> = Some(DEFAULT_TIMEOUT_MS);
     let mut i = 0;
     while i < args.len() {
-        // Receipt-sign flag suite — shared with `cmd_open`. The helper
-        // returns how many arg slots it consumed; on `None` we fall
-        // through to the read-specific match below.
+        // Receipt-sign flag suite — shared with `cmd_open`. `--key`
+        // doubles as the inline-signing identity. The helper returns how
+        // many arg slots it consumed; on `None` we fall through to the
+        // read-specific match below.
         match receipts::try_consume_sign_flag(args, i, &mut sign_flags) {
             Ok(Some(n)) => {
                 i += n;
@@ -2286,9 +2479,21 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                 js_fetch = false;
                 i += 1;
             }
+            "--no-sign" => {
+                no_sign = true;
+                i += 1;
+            }
+            "--lineage" => {
+                let Some(v) = args.get(i + 1) else {
+                    eprintln!("--lineage needs a value (a label to group plats under one TOFU pin)");
+                    return ExitCode::from(2);
+                };
+                lineage_override = Some(v.clone());
+                i += 2;
+            }
             other if other.starts_with("--") => {
                 eprintln!("unknown flag `{other}`");
-                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--js-fetch] [--timeout DUR] <url>");
+                eprintln!("usage: heso read [--include text,forms,cookies,console,framework,scripts] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--js-fetch] [--lineage LABEL] [--no-sign] [--timeout DUR] <url>");
                 return ExitCode::from(2);
             }
             _ => {
@@ -2305,7 +2510,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         }
     }
     let Some(url_str) = url_arg else {
-        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--js-fetch] [--timeout DUR] <url>");
+        eprintln!("usage: heso read [--include ...] [--since <prev_hash>] [--best-effort] [--inject-script JS|@FILE]... [--complete] [--js-fetch] [--lineage LABEL] [--no-sign] [--timeout DUR] <url>");
         return ExitCode::from(2);
     };
 
@@ -2431,6 +2636,15 @@ async fn cmd_read(args: &[String]) -> ExitCode {
                     if let Some(obj) = body.as_object_mut() {
                         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
                     }
+                    let sign_opts = ProducerSignOpts {
+                        no_sign,
+                        lineage: lineage_override.clone(),
+                        key_path: sign_flags.key_path.clone(),
+                    };
+                    body = match finalize_produced_plat(body, &url_str, &sign_opts) {
+                        Ok(b) => b,
+                        Err(code) => return code,
+                    };
                     return print_json(&body);
                 }
                 // The error's Display names the offending --inject-script
@@ -2605,6 +2819,18 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
+    // Stamp the lineage pin key and sign inline by default — same
+    // tamper-evidence layer as `heso open`. `--no-sign` emits today's
+    // bare plat.
+    let sign_opts = ProducerSignOpts {
+        no_sign,
+        lineage: lineage_override,
+        key_path: sign_flags.key_path.clone(),
+    };
+    body = match finalize_produced_plat(body, &url_str, &sign_opts) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
     // `--receipt PATH` (P0 fix): emit a signed [`heso_trace::Receipt`]
     // alongside the stdout JSON. Same shape as `cmd_open`; the trace
     // is a single `cd <url>` primitive matching the user's intent.
@@ -5617,7 +5843,13 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
         return template::cmd_stamp_from_template_args(args).await;
     }
 
-    let (seed, timeout_ms, path) = match parse_seed_timeout_and_path(args, "stamp") {
+    // Strip the tamper-evidence flags before the shared seed/timeout/path
+    // walk (which doesn't know them and would reject them as unknown).
+    let (sign_opts, rest) = match strip_producer_sign_flags(args) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
+    let (seed, timeout_ms, path) = match parse_seed_timeout_and_path(&rest, "stamp") {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -5639,7 +5871,7 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let body = match stamp_to_plat(&plan, seed, timeout_ms).await {
+    let body = match stamp_to_plat(&plan, seed, timeout_ms, &sign_opts).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{e}");
@@ -5658,16 +5890,27 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
 }
 
 /// Re-stamp a plan against the live web and return the fully-formed
-/// plat body (with embedded plan, cassette, step log, and `plat_hash`).
+/// plat body (with embedded plan, cassette, step log, lineage, and
+/// `plat_hash`, plus an inline `sig` unless `sign_opts.no_sign`).
+///
+/// `sign_opts` finalizes the body: the lineage pin key (derived from
+/// the plan's `start_url`, or `sign_opts.lineage` if overridden) is kept
+/// in the hash region, so it is applied here — the one place — rather
+/// than split between the producer and `cmd_refresh`. `cmd_refresh`
+/// re-stamps with the same default lineage and `no_sign: true`, so its
+/// drift comparison stays apples-to-apples against a default-stamped
+/// input (signing never moves `plat_hash`).
 ///
 /// Returns `Ok(body)` for both clean and partial runs — partial runs
 /// carry an `"error"` key plus the per-step log, exactly like the
-/// stdout that `cmd_stamp` would have printed. The only `Err` case is
-/// engine initialization, which can't yield a meaningful plat at all.
+/// stdout that `cmd_stamp` would have printed. The `Err(String)` cases
+/// are engine initialization and a signing-key load/sign failure,
+/// neither of which can yield a meaningful plat.
 async fn stamp_to_plat(
     plan: &PlanInput,
     seed: Option<u64>,
     timeout_ms: Option<u64>,
+    sign_opts: &ProducerSignOpts,
 ) -> Result<serde_json::Value, String> {
     // Fresh shared cassette: the static `FetchEngine` and the JS-side
     // `fetch` / XHR shims (via `open_js_session_with_cassette`) both
@@ -5751,7 +5994,42 @@ async fn stamp_to_plat(
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
-    Ok(body)
+    // A bare-plat `--no-sign` (no explicit lineage) stays byte-for-byte
+    // identical to a pre-signing plat — skip both the lineage insert and
+    // the sign. `cmd_refresh` re-stamps with an explicit default lineage
+    // (so the byte-identity skip does NOT fire), giving a `plat_hash`
+    // comparable to a default-stamped input.
+    if sign_opts.no_sign && sign_opts.lineage.is_none() {
+        return Ok(body);
+    }
+    // Stamp the lineage pin key (kept in the hash region). Lineage is
+    // derived from the plan's `start_url` — the input URL of this plat —
+    // matching `cmd_refresh`'s re-stamp so a default-stamped plat
+    // refreshes apples-to-apples.
+    let lineage = sign_opts
+        .lineage
+        .clone()
+        .unwrap_or_else(|| derive_lineage(plan.start_url.as_str()));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("lineage".to_owned(), serde_json::Value::String(lineage));
+        let rehashed = heso_engine_fetch::plat_hash(&serde_json::Value::Object(obj.clone()));
+        obj.insert("plat_hash".to_owned(), serde_json::Value::String(rehashed));
+    }
+    if sign_opts.no_sign {
+        return Ok(body);
+    }
+    let key_path = sign_opts
+        .key_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH));
+    let key = IdentityKey::load_or_create(&key_path).map_err(|e| {
+        format!(
+            "failed to load or create signing identity at `{}`: {e} (pass --no-sign to emit an unsigned plat)",
+            key_path.display()
+        )
+    })?;
+    heso_engine_fetch::plat::sign_inline_checked(&key, body)
+        .map_err(|e| format!("failed to sign plat: {e}"))
 }
 
 /// `heso refresh [--seed N] <plat.plat|->` — drift detection. Reads a
@@ -5846,7 +6124,20 @@ async fn cmd_refresh(args: &[String]) -> ExitCode {
         Ok(p) => p,
         Err(e) => return emit_refresh_error("no_plan", e),
     };
-    let live_body = match stamp_to_plat(&plan, seed, timeout_ms).await {
+    // Refresh compares `plat_hash` only, and the hash region includes
+    // `lineage`. Re-stamp under the INPUT plat's lineage so the comparison
+    // is apples-to-apples: a signed/lineaged input re-stamps with that
+    // same lineage; a bare (legacy / `--no-sign`) input re-stamps bare.
+    // Always `no_sign: true` so a stray identity isn't minted (and no
+    // icacls delay is paid) just to compute a drift hash — the inline
+    // `sig` never affects `plat_hash`.
+    let input_lineage = input_value.get("lineage").and_then(|v| v.as_str());
+    let refresh_sign_opts = ProducerSignOpts {
+        no_sign: true,
+        lineage: input_lineage.map(str::to_owned),
+        key_path: None,
+    };
+    let live_body = match stamp_to_plat(&plan, seed, timeout_ms, &refresh_sign_opts).await {
         Ok(b) => b,
         Err(e) => return emit_refresh_error("stamp_failed", e),
     };
@@ -6029,6 +6320,13 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         .filter(|a| *a != "--no-verify-input")
         .cloned()
         .collect();
+    // Pull the tamper-evidence flags before the seed/path walk (which
+    // doesn't know them). `run` re-stamps a fresh plat over the replay,
+    // so it is a producer and signs its output by default.
+    let (sign_opts, filtered) = match strip_producer_sign_flags(&filtered) {
+        Ok(v) => v,
+        Err(code) => return code,
+    };
     let (seed, path) = match parse_seed_and_path(&filtered, "run") {
         Ok(v) => v,
         Err(code) => return code,
@@ -6073,6 +6371,26 @@ async fn cmd_run(args: &[String]) -> ExitCode {
             Err(e) => {
                 eprintln!("run: cannot verify input plat integrity: {e}; pass `--no-verify-input` to skip this check");
                 return ExitCode::from(2);
+            }
+        }
+        // A signed input must also carry a VALID inline signature. The
+        // `plat_hash` gate above only proves the content matches its own
+        // digest — a forger who edits the body, recomputes `plat_hash`,
+        // and re-signs with their own key passes that gate. Verifying the
+        // `sig` closes the launder-through-replay path: a tampered-but-
+        // resigned plat is refused before its cassette is replayed into a
+        // fresh, freshly-signed output. Unsigned plats skip this check
+        // (`InlineOutcome::Unsigned`) and keep replaying on integrity
+        // alone, per the migration window.
+        match heso_engine_fetch::plat::verify_inline_signature(&value) {
+            heso_engine_fetch::plat::InlineOutcome::Valid { .. }
+            | heso_engine_fetch::plat::InlineOutcome::Unsigned => {}
+            other => {
+                eprintln!(
+                    "run: input plat carries an invalid inline signature ({other:?}); refusing to \
+                     replay a tampered plat — pass `--no-verify-input` to skip this check"
+                );
+                return ExitCode::from(1);
             }
         }
     }
@@ -6164,6 +6482,9 @@ async fn cmd_run(args: &[String]) -> ExitCode {
     if !outcome.final_actions.is_empty() {
         page.actions = outcome.final_actions;
     }
+    // Capture the input URL for the output plat's lineage before
+    // `plan.actions_json` is moved into the page below.
+    let run_input_url = plan.start_url.as_str().to_owned();
     page.plan = Some(plan.actions_json);
     // Re-record the seed the replay ran under so the output plat is
     // itself self-describingly reproducible. For a faithful replay of an
@@ -6198,6 +6519,37 @@ async fn cmd_run(args: &[String]) -> ExitCode {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
+    // `run` is byte-identical replay: its output `plat_hash` must match
+    // the input's. Since `lineage` lives in the hash region, the output
+    // must carry the INPUT's lineage verbatim, not a freshly-derived one
+    // — otherwise a plat stamped under `--lineage`, or a bare/legacy
+    // plat with no lineage, would re-hash differently on replay.
+    //
+    // - Input carries a `lineage` → reuse it (the `sig` is re-minted by
+    //   `run`'s own key; signing never moves `plat_hash`).
+    // - Input is bare (no `lineage`, no `sig`) → emit a bare output so a
+    //   legacy/`--no-sign`/template-stamped plat replays byte-identically.
+    // An explicit `--lineage` on the `run` command still wins.
+    let input_lineage = value.get("lineage").and_then(|v| v.as_str());
+    let input_signed = value.get("sig").is_some();
+    let run_opts = ProducerSignOpts {
+        // A bare/legacy input replays unsigned (preserving byte-identity),
+        // but an explicit `--lineage` is a request to group this output
+        // under a label and therefore to engage the signing path — so it
+        // overrides the bare-input coercion, matching `--lineage` winning on
+        // the value above.
+        no_sign: sign_opts.no_sign
+            || (sign_opts.lineage.is_none() && input_lineage.is_none() && !input_signed),
+        lineage: sign_opts
+            .lineage
+            .clone()
+            .or_else(|| input_lineage.map(str::to_owned)),
+        key_path: sign_opts.key_path.clone(),
+    };
+    body = match finalize_produced_plat(body, &run_input_url, &run_opts) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
     if !write_json_to_stdout(&body) {
         return ExitCode::FAILURE;
     }
@@ -6989,6 +7341,7 @@ fn cmd_identity_init(args: &[String]) -> ExitCode {
     let body = serde_json::json!({
         "path": path.display().to_string(),
         "public_key": key.public_key_b64(),
+        "fingerprint": key.fingerprint(),
         "algorithm": "Ed25519",
     });
     match serde_json::to_string_pretty(&body) {
@@ -7018,6 +7371,7 @@ fn cmd_identity_show(args: &[String]) -> ExitCode {
     let body = serde_json::json!({
         "path": path.display().to_string(),
         "public_key": key.public_key_b64(),
+        "fingerprint": key.fingerprint(),
         "algorithm": "Ed25519",
     });
     match serde_json::to_string_pretty(&body) {

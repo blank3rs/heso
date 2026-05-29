@@ -317,7 +317,7 @@ export interface PlanOptions extends CommonOptions {
   template?: string;
   /** `stamp` only: substitution map for `{{name}}` placeholders in the template. */
   values?: Record<string, string>;
-  /** `run` only — verifies the input plat's integrity before replay by default; set true to forward `--no-verify-input` and skip the check. */
+  /** `run` only — by default verifies both the input plat's `plat_hash` integrity and (for a signed input) its inline signature before replay; set true to forward `--no-verify-input` and skip BOTH checks. */
   noVerifyInput?: boolean;
 }
 

@@ -801,9 +801,10 @@ def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
     Named ``run_plat`` to avoid shadowing the low-level :func:`run`
     escape hatch.
 
-    By default the input plat's integrity is verified before replay;
-    ``no_verify_input=True`` forwards ``--no-verify-input`` to skip
-    that check.
+    By default both the input plat's ``plat_hash`` integrity and (for a
+    signed input) its inline signature are verified before replay;
+    ``no_verify_input=True`` forwards ``--no-verify-input`` to skip both
+    checks.
 
     Keyword arguments (e.g. ``seed=42``) become CLI flags.
     """

@@ -36,6 +36,7 @@
 //!
 //! [ADR 0005]: ../../../decisions/0005-ed25519-identity.md
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -96,6 +97,45 @@ impl IdentityKey {
         }
     }
 
+    /// Load the identity at `path`, or generate and save a fresh one if
+    /// the file is absent. Generation uses the same `OsRng` path as
+    /// [`IdentityKey::generate`].
+    ///
+    /// Concurrency: two first-run processes can both observe the missing
+    /// file and race to create it. The loser of the [`save`](Self::save)
+    /// race gets [`IdentityError::AlreadyExists`] and falls back to
+    /// loading the now-present file, so both end up on the same key.
+    ///
+    /// On first creation, a single line is written to **stderr** (never
+    /// stdout — stdout stays pure JSON for the artifact) announcing the
+    /// new identity and its fingerprint, so signing-by-default is
+    /// discoverable without polluting the plat.
+    pub fn load_or_create(path: &Path) -> Result<Self, IdentityError> {
+        match Self::load(path) {
+            Ok(key) => Ok(key),
+            Err(IdentityError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                let key = Self::generate();
+                match key.save(path) {
+                    Ok(()) => {
+                        eprintln!(
+                            "heso: created a new signing identity at {} (fingerprint {})",
+                            path.display(),
+                            key.fingerprint()
+                        );
+                        Ok(key)
+                    }
+                    // Lost a first-run race: another process created the
+                    // file between our load and save. Re-load it.
+                    Err(IdentityError::AlreadyExists(_)) => Self::load(path),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Load an identity from disk. The file must be exactly 32 bytes —
     /// the raw Ed25519 seed.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
@@ -119,9 +159,6 @@ impl IdentityKey {
     /// needed. Refuses to overwrite an existing file — callers should
     /// delete first if rotation is intended.
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
-        if path.exists() {
-            return Err(IdentityError::AlreadyExists(path.to_path_buf()));
-        }
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| IdentityError::Io {
@@ -130,13 +167,40 @@ impl IdentityKey {
                 })?;
             }
         }
-        fs::write(path, self.signing.to_bytes()).map_err(|e| IdentityError::Io {
-            path: path.to_path_buf(),
-            source: e,
-        })?;
+        // `create_new` is O_EXCL / CREATE_NEW: the existence check and the
+        // create are one atomic syscall, so two first-run processes racing
+        // to write the same key cannot both succeed. The loser gets
+        // `AlreadyExists`, which `load_or_create` maps to a re-load of the
+        // winner's key — both end up on the same identity.
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(IdentityError::AlreadyExists(path.to_path_buf()));
+            }
+            Err(e) => {
+                return Err(IdentityError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                });
+            }
+        };
+        {
+            use std::io::Write as _;
+            file.write_all(&self.signing.to_bytes()).map_err(|e| IdentityError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+        }
+        // Close the handle before hardening so the Windows `icacls` path
+        // operates on a settled file.
+        drop(file);
         // A failed hardening must leave no artifact behind: the partial key
         // would otherwise sit on disk with the parent's broad ACL, and the
-        // `path.exists()` guard above would block the caller from retrying.
+        // `create_new` open above would block the caller from retrying.
         // Delete it before surfacing the error so a failed `save` is both
         // loud and retryable.
         if let Err(e) = Self::harden_permissions(path) {
@@ -200,6 +264,24 @@ impl IdentityKey {
     /// precomputed value cached at construction time.
     pub fn public_key_b64(&self) -> String {
         self.public_key_b64.clone()
+    }
+
+    /// Short fingerprint of this identity's public key, rendered
+    /// `heso:<32-hex>`: BLAKE3 of the raw 32 public-key bytes, first 16
+    /// bytes, lowercase hex. Stable across machines and cheap to compare
+    /// out-of-band.
+    ///
+    /// `heso-verify` exposes the byte-identical `signer_fingerprint` for
+    /// the keyless verify path; this producer-side copy computes it inline
+    /// (heso-core does not depend on heso-verify) and the two must always
+    /// agree.
+    pub fn fingerprint(&self) -> String {
+        let digest = blake3::hash(&self.public_key_bytes());
+        let mut hex = String::with_capacity(32);
+        for b in &digest.as_bytes()[..16] {
+            write!(hex, "{b:02x}").expect("writing to a String never fails");
+        }
+        format!("heso:{hex}")
     }
 
     /// Sign `payload` and produce an on-the-wire [`Signature`] envelope.
@@ -507,6 +589,66 @@ mod tests {
         // Roundtrip.
         let back: Signature = serde_json::from_value(j).expect("envelope round-trips");
         assert_eq!(sig, back);
+    }
+
+    #[test]
+    fn fingerprint_is_heso_prefixed_32_hex_and_stable() {
+        let k = IdentityKey::generate();
+        let fp = k.fingerprint();
+        assert!(fp.starts_with("heso:"));
+        let hex = &fp["heso:".len()..];
+        assert_eq!(hex.len(), 32);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // Deterministic for the same key.
+        assert_eq!(fp, k.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_matches_pinned_all_zero_seed() {
+        // The all-zero seed's public key is fixed (shared with the sealed-
+        // envelope / inline vectors). Pinning its fingerprint guarantees
+        // this producer-side computation stays byte-identical to
+        // `heso_verify::signer_fingerprint` over the same pubkey.
+        use std::fmt::Write as _;
+        let k = IdentityKey::from_bytes(&[0u8; SECRET_KEY_LENGTH]);
+        assert_eq!(
+            k.public_key_b64(),
+            "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik="
+        );
+        let digest = blake3::hash(&k.public_key_bytes());
+        let mut expected = String::from("heso:");
+        for b in &digest.as_bytes()[..16] {
+            write!(expected, "{b:02x}").unwrap();
+        }
+        assert_eq!(k.fingerprint(), expected);
+    }
+
+    #[test]
+    fn load_or_create_generates_then_loads_same_key() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+        assert!(!path.exists());
+
+        let created = IdentityKey::load_or_create(&path).expect("first call creates");
+        assert!(path.exists());
+        let created_pk = created.public_key_bytes();
+
+        // Second call loads the now-present file — same key, no overwrite.
+        let loaded = IdentityKey::load_or_create(&path).expect("second call loads");
+        assert_eq!(loaded.public_key_bytes(), created_pk);
+    }
+
+    #[test]
+    fn load_or_create_propagates_non_notfound_errors() {
+        // A wrong-length file is a real corruption, not an absence — it
+        // must surface, not silently regenerate over the user's key.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+        fs::write(&path, [0u8; 31]).unwrap();
+        match IdentityKey::load_or_create(&path) {
+            Err(IdentityError::BadKeyLength { actual, .. }) => assert_eq!(actual, 31),
+            other => panic!("expected BadKeyLength, got {other:?}"),
+        }
     }
 
     #[test]

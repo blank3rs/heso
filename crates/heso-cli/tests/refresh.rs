@@ -61,11 +61,17 @@ fn assert_success(out: &std::process::Output, context: &str) {
 
 /// Stamp a single-page `open` plan against the server's `/page` route
 /// and return the parsed plat plus the path it was written to.
+///
+/// Stamps with `--no-sign`: refresh compares `plat_hash` only, and the
+/// drift contract is about content, not the signature. A bare input keeps
+/// the input-stamp and the refresh re-stamp on the same (unsigned) path,
+/// so neither pays the first-run key-creation cost that would widen the
+/// window between the two `Date`-header-bearing fetches.
 async fn stamp_open_plan(server: &MockServer, dir: &Path) -> (serde_json::Value, PathBuf) {
     let url = format!("{}/page", server.uri());
     let plan = serde_json::json!([{ "verb": "open", "url": url }]);
     let plan_path = write_json(dir, "plan.json", &plan);
-    let out = run(&["stamp", "--seed", "0", plan_path.to_str().unwrap()]);
+    let out = run(&["stamp", "--no-sign", "--seed", "0", plan_path.to_str().unwrap()]);
     assert_success(&out, "stamp");
     let plat: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stamp emits JSON");
     let plat_path = write_bytes(dir, "stamped.plat", &out.stdout);

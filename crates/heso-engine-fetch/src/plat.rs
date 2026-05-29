@@ -49,8 +49,9 @@ use serde_json::Value;
 // the §3.2 / §3.3 constants) keep working unchanged while the actual
 // implementation lives in exactly one place.
 pub use heso_verify::{
-    canonical_bytes, CanonError, Outcome as OpenOutcome, SealedPlat, Signature, SignatureError,
-    VerifyError, ENVELOPE_ALG, SIGNING_DOMAIN,
+    canonical_bytes, canonical_bytes_signing, signer_fingerprint, verify_inline_signature,
+    CanonError, InlineOutcome, Outcome as OpenOutcome, SealedPlat, Signature, SignatureError,
+    VerifyError, ENVELOPE_ALG, INLINE_SIG_ALG, SIGNING_DOMAIN, SIGNING_DOMAIN_INLINE,
 };
 
 /// Hex-encoded BLAKE3 of the plat's canonical-JSON bytes, with the
@@ -186,6 +187,80 @@ pub fn seal_checked(key: &IdentityKey, body: Value) -> Result<SealedPlat, SealEr
         }
     }
     Ok(seal(key, body))
+}
+
+// ============================================================================
+// Inline signature — producer side (the default sign-at-stamp `sig` field)
+// ============================================================================
+
+/// Sign `body` in place with an inline `sig` field — the default
+/// sign-at-stamp form. Unlike [`seal`], the top-level shape is unchanged:
+/// `sig` is one extra object next to `plat_hash`, so every consumer that
+/// reads `{url, title, …, plat_hash}` at the root keeps working and the
+/// signature is verifiable with nothing but the artifact via
+/// [`verify_inline_signature`].
+///
+/// The two canonicalization regions are distinct (HESO/1.0 §1.8):
+/// `plat_hash` is stamped (if absent) over the **hash region**
+/// (`{plat_hash, sig}` stripped), and the Ed25519 signature covers the
+/// **signing input** ([`SIGNING_DOMAIN_INLINE`] ++
+/// [`canonical_bytes_signing`], which strips `sig` only and so keeps
+/// `plat_hash`). The signature therefore transitively commits to all
+/// content (via `plat_hash`), to `plat_hash` itself, and to `lineage`.
+///
+/// A freshly built body carries no `sig`, so the stamped `plat_hash` is
+/// byte-identical to today's bare-plat hash.
+pub fn sign_inline(key: &IdentityKey, mut body: Value) -> Value {
+    // Stamp plat_hash over the hash region if absent — the owned body has
+    // no `sig` yet, so this is byte-identical to the bare-plat hash.
+    let needs_hash = body
+        .as_object()
+        .is_some_and(|o| !o.contains_key("plat_hash"));
+    if needs_hash {
+        let h = hash(&body);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("plat_hash".to_owned(), Value::String(h));
+        }
+    }
+    let mut payload = Vec::with_capacity(SIGNING_DOMAIN_INLINE.len() + 256);
+    payload.extend_from_slice(SIGNING_DOMAIN_INLINE);
+    payload.extend_from_slice(&canonical_bytes_signing(&body));
+    let signature = to_verify_signature(key.sign(&payload));
+    // The inline `sig` object reuses the three-field envelope shape but
+    // carries the inline scheme tag in `alg`, distinct from the sealed
+    // envelope's domain + algorithm so the two signatures are never
+    // transplantable.
+    let sig = serde_json::json!({
+        "alg": INLINE_SIG_ALG,
+        "public_key": signature.public_key,
+        "signature": signature.signature,
+    });
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("sig".to_owned(), sig);
+    }
+    body
+}
+
+/// Like [`sign_inline`] but refuses to sign a body whose claimed
+/// `plat_hash` doesn't match its content. Bodies without a `plat_hash`
+/// field are stamped just like [`sign_inline`].
+pub fn sign_inline_checked(key: &IdentityKey, body: Value) -> Result<Value, SealError> {
+    if let Some(obj) = body.as_object() {
+        if let Some(embedded_val) = obj.get("plat_hash") {
+            let embedded = embedded_val
+                .as_str()
+                .ok_or(SealError::MalformedHashField)?
+                .to_owned();
+            let recomputed = hash(&body);
+            if embedded != recomputed {
+                return Err(SealError::HashMismatch {
+                    embedded,
+                    recomputed,
+                });
+            }
+        }
+    }
+    Ok(sign_inline(key, body))
 }
 
 // ============================================================================
@@ -1291,5 +1366,168 @@ mod tests {
             key.public_key_b64(),
             "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik="
         );
+    }
+
+    // ---- inline signature (the default sign-at-stamp `sig` field) ----
+
+    #[test]
+    fn sign_inline_then_verify_is_valid() {
+        let key = IdentityKey::generate();
+        let body = sign_inline(&key, sample());
+        match verify_inline_signature(&body) {
+            InlineOutcome::Valid { public_key } => {
+                assert_eq!(public_key, key.public_key_b64());
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_inline_stamps_self_hash_over_hash_region() {
+        let key = IdentityKey::generate();
+        let body = sign_inline(&key, sample());
+        let embedded = body["plat_hash"].as_str().unwrap();
+        // The hash region strips {plat_hash, sig}, so the embedded hash
+        // equals a recompute over the now-signed body.
+        assert_eq!(embedded, hash(&body));
+    }
+
+    #[test]
+    fn sign_inline_sig_object_has_inline_alg() {
+        let key = IdentityKey::generate();
+        let body = sign_inline(&key, sample());
+        let sig = body["sig"].as_object().expect("sig object");
+        assert_eq!(sig["alg"].as_str().unwrap(), INLINE_SIG_ALG);
+        assert_eq!(sig["public_key"].as_str().unwrap(), key.public_key_b64());
+        assert!(sig["signature"].is_string());
+    }
+
+    #[test]
+    fn sign_inline_survives_json_roundtrip() {
+        let key = IdentityKey::generate();
+        let body = sign_inline(&key, sample());
+        let s = serde_json::to_string(&body).unwrap();
+        let back: Value = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            verify_inline_signature(&back),
+            InlineOutcome::Valid { .. }
+        ));
+    }
+
+    #[test]
+    fn sign_inline_detects_content_tamper() {
+        let key = IdentityKey::generate();
+        let mut body = sign_inline(&key, sample());
+        body["title"] = json!("hijacked");
+        assert!(matches!(
+            verify_inline_signature(&body),
+            InlineOutcome::HashMismatch
+        ));
+    }
+
+    #[test]
+    fn sign_inline_detects_hash_field_forgery() {
+        // Mutate content AND rewrite plat_hash to match. BLAKE3 lines up;
+        // Ed25519 over the new signing input does not.
+        let key = IdentityKey::generate();
+        let mut body = sign_inline(&key, sample());
+        body["title"] = json!("hijacked");
+        // Recompute plat_hash over the hash region of the tampered body.
+        let h = hash(&body);
+        body["plat_hash"] = json!(h);
+        assert!(matches!(
+            verify_inline_signature(&body),
+            InlineOutcome::InvalidSignature(_)
+        ));
+    }
+
+    #[test]
+    fn sign_inline_domain_prevents_seal_signature_transplant() {
+        // A `seal`-envelope signature (domain b"heso-plat/v1\0") dropped
+        // into an inline `sig` slot must be rejected: the inline verify
+        // path prefixes the distinct b"heso-plat-sig:v1\0" domain.
+        let key = IdentityKey::generate();
+        let mut body = sample();
+        body["plat_hash"] = json!(hash(&body));
+        let envelope_sig = to_verify_signature(key.sign(&{
+            let mut p = Vec::new();
+            p.extend_from_slice(SIGNING_DOMAIN);
+            p.extend_from_slice(&canonical_bytes(&body));
+            p
+        }));
+        body["sig"] = json!({
+            "alg": INLINE_SIG_ALG,
+            "public_key": envelope_sig.public_key,
+            "signature": envelope_sig.signature,
+        });
+        assert!(matches!(
+            verify_inline_signature(&body),
+            InlineOutcome::InvalidSignature(_)
+        ));
+    }
+
+    #[test]
+    fn sign_inline_checked_refuses_stale_plat_hash() {
+        let key = IdentityKey::generate();
+        let mut body = sample();
+        body["plat_hash"] = json!("0000000000000000000000000000000000000000000000000000000000000000");
+        match sign_inline_checked(&key, body) {
+            Err(SealError::HashMismatch { embedded, recomputed }) => {
+                assert_eq!(
+                    embedded,
+                    "0000000000000000000000000000000000000000000000000000000000000000"
+                );
+                assert_ne!(recomputed, embedded);
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sign_inline_checked_accepts_bare_and_honest_bodies() {
+        let key = IdentityKey::generate();
+        let bare = sign_inline_checked(&key, sample()).expect("bare body must sign");
+        assert!(matches!(
+            verify_inline_signature(&bare),
+            InlineOutcome::Valid { .. }
+        ));
+
+        let mut honest = sample();
+        honest["plat_hash"] = json!(hash(&honest));
+        let signed = sign_inline_checked(&key, honest).expect("honest hash must sign");
+        assert!(matches!(
+            verify_inline_signature(&signed),
+            InlineOutcome::Valid { .. }
+        ));
+    }
+
+    #[test]
+    fn dump_inline_signed_vector_matches_verify_crate() {
+        // Producer-side companion to heso-verify's `dump_inline_signed_vector`:
+        // the inline `sig` minted here over the all-zero seed must verify and
+        // carry the pinned public key, proving the producer and the verifier
+        // agree on the signing input byte-for-byte.
+        let key = IdentityKey::from_bytes(&FIXED_SEED);
+        let body = sign_inline(&key, minimal_vector_body());
+        assert_eq!(
+            body["sig"]["public_key"].as_str().unwrap(),
+            "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik="
+        );
+        assert_eq!(body["sig"]["alg"].as_str().unwrap(), INLINE_SIG_ALG);
+        // The load-bearing cross-impl anchor: the 64-byte signature must be
+        // byte-identical to heso-verify's `dump_inline_signed_vector` pin
+        // (same all-zero seed over the same content). If the producer and
+        // the verifier ever disagree on the signing input, these two pins
+        // diverge and one side fails — exactly the §8.2 guarantee.
+        assert_eq!(
+            body["sig"]["signature"].as_str().unwrap(),
+            "TgyK/FJQe80g4+p2DRChjf667cQZM5U9+ONm9PlDebW+pl9c+gF/CxmT0Muao11Zt+IL0n+nNx7h9z9/iFtPAQ=="
+        );
+        match verify_inline_signature(&body) {
+            InlineOutcome::Valid { public_key } => {
+                assert_eq!(public_key, "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik=");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
     }
 }

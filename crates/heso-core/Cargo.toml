@@ -16,6 +16,11 @@ serde = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 base64 = { workspace = true }
+# Signer fingerprint: BLAKE3 of the raw public key. `heso-verify` exposes
+# the same `signer_fingerprint` for the keyless verify path; heso-core does
+# not depend on heso-verify, so the producer side computes it inline here
+# rather than inverting the engine -> verify dependency direction.
+blake3 = { workspace = true }
 
 [dev-dependencies]
 serde_json.workspace = true

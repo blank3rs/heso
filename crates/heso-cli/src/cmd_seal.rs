@@ -112,7 +112,20 @@ pub async fn cmd_seal(args: &[String]) -> ExitCode {
     }
 }
 
-pub(crate) fn seal_plat(body: serde_json::Value, key_path: Option<PathBuf>) -> ExitCode {
+pub(crate) fn seal_plat(mut body: serde_json::Value, key_path: Option<PathBuf>) -> ExitCode {
+    // A sealed envelope is the stronger, standalone trust unit; its
+    // `content` is the canonical bare body. If the input is already
+    // inline-signed, strip the top-level `sig` so the envelope signs clean
+    // content rather than re-wrapping a second signature. `sig` is in the
+    // hash region's strip-set, so removing it leaves `plat_hash` valid and
+    // the envelope verifies.
+    let stripped_sig = body
+        .as_object_mut()
+        .is_some_and(|obj| obj.remove("sig").is_some());
+    if stripped_sig {
+        eprintln!("seal: stripped the inline `sig` from the input; the envelope signs the bare body");
+    }
+
     let path = key_path.unwrap_or_else(|| PathBuf::from(DEFAULT_IDENTITY_PATH));
     let key = match IdentityKey::load(&path) {
         Ok(k) => k,

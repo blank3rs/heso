@@ -4,7 +4,7 @@
 
 A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of what happened.
 
-Every run can be **stamped** into a *plat* — a signed replay file holding the plan that ran, the page observation, and the recorded network cassette, all hashed together. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. Tamper one byte and the hash flags it. Hand the artifact to an auditor.
+Every run can be **stamped** into a *plat* — a replay file holding the plan that ran, the page observation, and the recorded network cassette, all hashed together and **signed by default** with your identity key. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. `heso verify` recomputes the hash, checks the signature, and always shows you who signed it. Hand the artifact to an auditor.
 
 Capabilities return JSON. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss), not opaque browser crashes. One Rust binary; no Chromium, no Node.
 
@@ -19,7 +19,7 @@ batch        ~1.1 s   for 8 URLs in parallel
 
 [![heso agent demo — 50 second screen recording](https://raw.githubusercontent.com/blank3rs/heso/main/demo/poster.jpg)](https://www.heso.ca/#demo)
 
-A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a verifiable plat (tamper one byte → the hash flags it). No Chromium, no rendering pipeline, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
+A 50-second real recording — an LLM agent (Gemini) drives heso to find and compare two GitHub repositories by star count and README description, then stamps the run into a signed, verifiable plat. No Chromium, no rendering pipeline, no driver. [▶ Watch the full demo on heso.ca](https://www.heso.ca/#demo)
 
 ## Contents
 
@@ -29,6 +29,7 @@ A 50-second real recording — an LLM agent (Gemini) drives heso to find and com
 - [Why not just use X?](#why-not-just-use-x)
 - [Use as a library](#use-as-a-library)
 - [Examples](#examples)
+- [Tamper-evidence](#tamper-evidence)
 - [Signed receipts](#signed-receipts)
 - [Error handling](#error-handling)
 - [Plug into agent harnesses](#plug-into-agent-harnesses)
@@ -114,7 +115,9 @@ heso replay out.plat                      # plat → step log (pure read, no exe
 heso replay --plan out.plat > plan-again.json    # plat → plan (edit, restamp)
 ```
 
-The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, the recorded seed, AND the embedded cassette. Tamper with any of them and the hash no longer matches; `heso verify` will say so. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
+The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, the recorded seed, AND the embedded cassette. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
+
+The hash alone is not tamper-proof: anyone who edits the body can recompute it. That is what the **signature** is for — see [Tamper-evidence](#tamper-evidence) below.
 
 **Inspect a plat.** Text dev tools, all baked into the main binary:
 
@@ -126,7 +129,7 @@ heso unseal sealed.plat                    # verify; exit 0 valid / 1 invalid / 
 heso unseal sealed.plat --extract          # verify, then print the inner plat body for piping
 ```
 
-`seal` produces a `SealedPlat` JSON envelope (`{alg, content, signature}`) that any holder of the envelope + the `heso` binary can verify offline — no key material, no network, no clock. Mint a key once with `heso identity init`; from then on the same key signs every plat. `unseal` checks the algorithm tag, the embedded `plat_hash`, and the Ed25519 signature in order, and refuses to silently treat an unknown `alg` as Ed25519.
+`seal` is the **stronger, opt-in** envelope. It produces a standalone `SealedPlat` JSON (`{alg, content, signature}`) that any holder of the envelope + the `heso` binary can verify offline — no key material, no network, no clock. (Plats already carry an inline signature by default; `seal` wraps the bare body in a separate, self-contained trust unit and strips any inline `sig` first so the envelope signs clean content.) Mint a key once with `heso identity init`; from then on the same key signs every plat. `unseal` checks the algorithm tag, the embedded `plat_hash`, and the Ed25519 signature in order, and refuses to silently treat an unknown `alg` as Ed25519.
 
 **Replay a published plat in one command.** Install `heso` (`uv tool install heso` / `pipx install heso` / `npm install -g @ixla/heso`), then:
 
@@ -271,6 +274,41 @@ Reproducibility (same seed → same output across machines):
 heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
 heso eval-js --seed 42 'Math.random()'   # 0.5140492957650241
 ```
+
+## Tamper-evidence
+
+Every plat heso stamps is **signed by default**. `open`, `read`, `stamp`, and `run` add an inline `sig` field carrying an Ed25519 signature over the plat's canonical bytes, using a local identity key (auto-created on first use at `heso-local-data/identity.key`). The signature sits next to `plat_hash` and leaves the rest of the JSON untouched, so every consumer that reads the body keeps working.
+
+`heso verify` checks the signature and **always prints who signed it** — it never says `OK` without a signer fingerprint:
+
+```sh
+heso verify out.plat
+# → OK plat <hash> signer heso:9f2c… (first-use, pinned now)
+```
+
+Two distinct properties are at stake, and the output keeps them honest:
+
+- **Integrity** — "these bytes are unchanged since signing." A valid signature gives this unconditionally.
+- **Authenticity** — "the *right* key signed it." A signature alone can't give this: an attacker can edit the body and re-sign with *their own* fresh key, and that signature is internally valid. Authenticity only exists relative to a key you already trust.
+
+heso closes that gap with **trust-on-first-use** pinning, like SSH `known_hosts`. The first time you verify a plat for a given page, heso pins that signer; later verifies of the same page must present the same signer or `verify` **fails loud**:
+
+```sh
+heso verify forged.plat
+# → FAIL plat
+# stderr: SIGNER MISMATCH: lineage site:… was pinned to heso:9f2c…, this plat is signed by heso:1ab7… — refusing
+```
+
+TOFU has one honest limit: the *very first* contact can't tell a real signer from a forger, because there's nothing pinned yet. To close that, pin the expected signer out-of-band:
+
+```sh
+heso verify --expect-signer heso:9f2c… plat.json    # fail unless this exact signer
+heso verify --signer-key ./trusted.pub plat.json    # fail unless this exact public key
+```
+
+Either flag fully defeats a self-signed forgery even on first contact, and takes precedence over TOFU — the escape hatch for CI and auditors. Get a signer's fingerprint to distribute with `heso identity show` (it prints `fingerprint`, `public_key`, and `path`).
+
+A plat with no signature still verifies on integrity and exits 0, but `verify` warns on stderr that authenticity is unknown — so legacy and `--no-sign` plats keep working during the migration. Pass `--no-sign` to `open` / `read` / `stamp` / `run` to emit a bare, unsigned plat (byte-identical to a pre-signing plat — useful for piping into `run`). For the stronger, standalone trust unit, reach for `heso seal` (above).
 
 ## Signed receipts
 

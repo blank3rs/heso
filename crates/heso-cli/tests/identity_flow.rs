@@ -41,6 +41,15 @@ fn identity_init_creates_a_keyfile_and_prints_public_key() {
     assert_eq!(body["algorithm"], "Ed25519");
     let pk = body["public_key"].as_str().expect("public_key string");
     assert_eq!(pk.len(), 44, "base64 of 32 bytes is 44 chars");
+    // The fingerprint is the SSH-style short id users compare out-of-band:
+    // `heso:` + 32 lowercase hex chars (BLAKE3 of the pubkey, first 16 B).
+    let fp = body["fingerprint"].as_str().expect("fingerprint string");
+    let hex = fp.strip_prefix("heso:").expect("fingerprint is `heso:`-prefixed");
+    assert_eq!(hex.len(), 32, "fingerprint is 16 bytes => 32 hex chars");
+    assert!(
+        hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "fingerprint hex is lowercase: {fp}"
+    );
     // Keyfile must exist at the default path.
     let key_path = dir.path().join("heso-local-data").join("identity.key");
     let bytes = std::fs::read(&key_path).expect("identity.key was written");
@@ -82,6 +91,12 @@ fn identity_show_prints_the_same_public_key_as_init() {
     );
     let show_body: serde_json::Value = serde_json::from_slice(&show.stdout).expect("show json");
     assert_eq!(show_body["public_key"].as_str().unwrap(), init_pk);
+    // `show` and `init` agree on the fingerprint too — it's derived from
+    // the same key, so the out-of-band comparison value is stable.
+    let init_fp = init_body["fingerprint"].as_str().expect("init fingerprint");
+    let show_fp = show_body["fingerprint"].as_str().expect("show fingerprint");
+    assert_eq!(show_fp, init_fp, "fingerprint must be stable for one key");
+    assert!(show_fp.starts_with("heso:"), "fingerprint is `heso:`-prefixed");
 }
 
 #[test]
