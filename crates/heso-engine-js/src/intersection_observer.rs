@@ -392,6 +392,11 @@ const INTERSECTION_OBSERVER_BOOTSTRAP: &str = r#"
             // suppress in this case (§3.2.2 "the queued notifications
             // are dropped if disconnect was called").
             if (observer.__targets.indexOf(target) === -1) return;
+            // A re-observe of an already-delivered, still-connected target
+            // is a no-op in real browsers — no second initial entry.
+            // `unobserve` clears `_fired`, so a re-fire after unobserve
+            // still works.
+            if (observer._fired.indexOf(target) !== -1) return;
             var entry = buildEntry(target);
             // Mark this target as fired BEFORE invoking the callback —
             // pending_count reads `_targets - _fired`, and the callback

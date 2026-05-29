@@ -13,8 +13,7 @@
 //!   plain object. Full WHATWG method surface: `get`, `getAll`,
 //!   `set`, `append`, `delete`, `has`, `sort`, `toString`, `entries`,
 //!   `keys`, `values`, `forEach`, `size` getter, and the iterator
-//!   protocol (via [`Symbol.iterator`] patched in
-//!   [`install_url_search_params_iterator`]).
+//!   protocol (via [`Symbol.iterator`] patched in [`install_url`]).
 //!
 //! ## Parent-URL reflection
 //!

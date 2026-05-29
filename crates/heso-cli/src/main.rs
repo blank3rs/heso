@@ -1524,12 +1524,6 @@ pub(crate) fn attach_failure_envelope(
     }
 }
 
-/// `heso plat-hash <file>` — compute the BLAKE3 hash of a plat JSON
-/// file (the output of `heso open`). Useful for: caching by hash,
-/// deduplication, comparing plats across machines. Prints the hex hash
-/// to stdout. If the file already contains a `plat_hash` field, it is
-/// IGNORED during hashing (otherwise we'd be hashing the hash); the
-/// printed value is the hash of the rest of the content.
 /// `heso eval-js <js>` — evaluate a JavaScript expression in a fresh
 /// sandboxed QuickJS context (via `heso-engine-js`) and print the
 /// result + captured console output as JSON.
@@ -5701,7 +5695,7 @@ async fn stamp_to_plat(
     // Snapshot the cassette out of the shared Arc and embed it under
     // the canonical `cassette` field. Any cassette mutation flips the
     // plat hash, so replay can't quietly diverge.
-    let final_cassette = cassette.lock().expect("cassette mutex poisoned").clone();
+    let final_cassette = cassette.lock().unwrap_or_else(|p| p.into_inner()).clone();
     if let Some(obj) = body.as_object_mut() {
         if let Ok(c) = serde_json::to_value(&final_cassette) {
             obj.insert("cassette".to_owned(), c);
@@ -5963,6 +5957,10 @@ fn parse_seed_timeout_and_path(
                 }
                 i += 2;
             }
+            other if other.starts_with("--") => {
+                eprintln!("unknown flag `{other}`");
+                return Err(ExitCode::from(2));
+            }
             other => {
                 if path.is_some() {
                     eprintln!("unexpected positional `{other}`");
@@ -5984,43 +5982,26 @@ fn parse_seed_timeout_and_path(
 // Replay — execute the actions in a fingerprint against the live site
 // ============================================================================
 
-/// `heso replay <fingerprint.json>` — re-execute every action in a saved
-/// fingerprint, in order, against the live site.
+/// `heso run <plat.json|->` — re-execute a stamped plan OFF-NETWORK by
+/// replaying its embedded cassette, and mint a fresh plat.
 ///
-/// **Reconstruction, with caveats.** The saved fingerprint JSON already
-/// records *what* the agent intended (`url` + `actions[]`). This command
-/// re-runs that intent through the same engine paths `heso click` /
-/// `heso fill` / `heso submit` use today. The output is a "session
-/// record" — per-step intent + outcome + URL transitions — saved as one
-/// JSON document the caller can diff, archive, or hand to a downstream
-/// tool.
-///
-/// ## What's preserved across steps
-///
-/// - **URL navigation.** A click on `<a href>` follows the link; the
-///   next action runs against the new URL. `Open` actions navigate
-///   explicitly.
-///
-/// ## What's NOT preserved across steps
-///
-/// - **In-page DOM mutations.** Each click / fill / submit re-fetches
-///   the current URL and rebuilds the DOM. A `fill` that JS-handlers
-///   would react to is fired, but the next step starts from a fresh
-///   fetch — so if a click depends on the fill's mutation persisting,
-///   that's lost. Stateful multi-action replay against one engine is a
-///   follow-up.
-/// - **Byte-identical results.** The live site may have changed since
-///   the fingerprint was created. For byte-identical replay (record the
-///   network on first run, replay against the cassette on later runs),
-///   see ADR 0008 — designed, not yet implemented.
+/// This is the deterministic replay half of the cassette contract
+/// (ADR 0008): `heso stamp` records every HTTP exchange into the plat's
+/// cassette, and `heso run` replays those recorded bytes with the
+/// network disabled. A cassette miss is a hard structured error, never a
+/// silent live fetch. On an unmodified cassette the resulting `plat_hash`
+/// is byte-identical to the stamped input's, on any machine.
 ///
 /// ## Refusal modes
 ///
-/// - **Integrity:** `verify_fingerprint` runs first. A tampered file is
-///   refused, exit `1`.
+/// - **Integrity:** the embedded plan's input integrity is verified
+///   first (skip with `--no-verify-input`); a tampered plan is refused,
+///   exit `1`.
 /// - **Schema:** actions must use the canonical [`Action`] schema
-///   (`verb: open|click|fill|submit`). Schema-free fingerprints hash
-///   fine but can't be auto-replayed; exit `2` with a clear message.
+///   (`verb: open|click|fill|submit`), and the plat must carry a
+///   replayable `cassette`; otherwise exit `2` with a clear message.
+///
+/// `--seed N` pins the JS engine's RNG/clock for the replay.
 async fn cmd_run(args: &[String]) -> ExitCode {
     let verify_input = !args.iter().any(|a| a == "--no-verify-input");
     let filtered: Vec<String> = args

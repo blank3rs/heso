@@ -6799,48 +6799,6 @@ const BROWSER_APIS_BOOTSTRAP: &str = r#"
         if (typeof globalThis.SVGElement === 'function' && globalThis.SVGElement.prototype) {
             installDatasetAccessor(globalThis.SVGElement.prototype);
         }
-        // Disable the prior single-prototype branch — the function
-        // form above handles all three. Keep a no-op guard so the
-        // OLD `if (!Object.getOwnPropertyDescriptor(elProto, 'dataset'))` block
-        // below short-circuits.
-        if (false && !Object.getOwnPropertyDescriptor(elProto, 'dataset')) {
-            // The proxy is created on-demand from the rquickjs side
-            // in custom_elements.rs. Add a getter that reaches into
-            // that pathway — but only if the class-installed
-            // property is genuinely absent (the typical case where
-            // the runtime hasn't materialized the lazy property
-            // yet). Otherwise the existing accessor wins via the
-            // `Object.getOwnPropertyDescriptor` short-circuit above.
-            try {
-                Object.defineProperty(elProto, 'dataset', {
-                    get: function () {
-                        // Build a fresh Proxy each call. Lazy
-                        // pattern matches the rquickjs class.
-                        var el = this;
-                        return new Proxy({}, {
-                            get: function (_t, key) {
-                                if (typeof key !== 'string') return undefined;
-                                // Translate camelCase to data-kebab.
-                                var kebab = 'data-' + key.replace(/[A-Z]/g, function (m) {
-                                    return '-' + m.toLowerCase();
-                                });
-                                try { return el.getAttribute(kebab); } catch (e) { return undefined; }
-                            },
-                            set: function (_t, key, value) {
-                                if (typeof key !== 'string') return false;
-                                var kebab = 'data-' + key.replace(/[A-Z]/g, function (m) {
-                                    return '-' + m.toLowerCase();
-                                });
-                                try { el.setAttribute(kebab, String(value)); } catch (e) {}
-                                return true;
-                            }
-                        });
-                    },
-                    set: function () {},
-                    enumerable: false, configurable: true,
-                });
-            } catch (e) {}
-        }
         // ValidityState exposed via `el.validity` on form controls.
         // The accessor returns a {valid, valueMissing, ...} object.
         if (!Object.getOwnPropertyDescriptor(elProto, 'validity')) {
@@ -7556,7 +7514,11 @@ fn collect_dom_attrs<'js>(
     let Some(attrs_obj) = attrs_val.as_object() else {
         return Ok(out);
     };
-    let len: u32 = attrs_obj.get("length").unwrap_or(0);
+    // Clamp the attacker-controllable `attributes.length`: this loop is
+    // pure Rust, so the QuickJS interrupt / `--js-timeout` watchdog never
+    // fires inside it. A real element never has thousands of attributes.
+    const MAX_DOM_ATTRS: u32 = 4096;
+    let len: u32 = attrs_obj.get::<_, u32>("length").unwrap_or(0).min(MAX_DOM_ATTRS);
     for i in 0..len {
         let Ok(attr_val) = attrs_obj.get::<_, Value<'js>>(i) else {
             continue;

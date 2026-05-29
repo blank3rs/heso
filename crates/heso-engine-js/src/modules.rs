@@ -435,6 +435,12 @@ pub fn fetch_module_source(
             "heso: cannot fetch module `{url}` — engine has no fetch client (build with JsEngine::new_with_fetch)"
         ));
     };
+    // SSRF pre-flight: reqwest skips `PrivateNetworkGuard` for IP-literal
+    // hosts, so an ES-module `import` of a blocked literal IP would bypass
+    // the opt-in block without this. Mirrors `guard_literal_host`.
+    if let Some(reason) = heso_engine_fetch::private_network::literal_host_block_reason(url) {
+        return Err(format!("blocked: {reason}"));
+    }
     // `block_in_place` lets us run a sync HTTP call from the
     // CLI's `#[tokio::main]` flow without tripping the
     // "runtime from within a runtime" panic — same trick as

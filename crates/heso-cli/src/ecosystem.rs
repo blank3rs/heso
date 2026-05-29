@@ -93,8 +93,10 @@ pub(crate) async fn download_plat(hash: &str) -> Result<Vec<u8>, String> {
         return Err(format!("no plat with hash {hash} in the registry"));
     }
     if !status.is_success() {
-        let bytes = read_body_capped(resp).await.unwrap_or_default();
-        let txt = String::from_utf8_lossy(&bytes);
+        let txt = match read_body_capped(resp).await {
+            Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+            Err(e) => e,
+        };
         return Err(format!("registry returned {status}: {txt}"));
     }
     read_body_capped(resp).await
@@ -235,7 +237,13 @@ pub async fn cmd_publish(args: &[String]) -> ExitCode {
         }
     };
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let txt = match read_body_capped(resp).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) => {
+            eprintln!("publish: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if !status.is_success() {
         eprintln!("publish: registry returned {status}: {txt}");
         return ExitCode::FAILURE;
@@ -393,12 +401,7 @@ pub async fn cmd_list(args: &[String]) -> ExitCode {
                     eprintln!("list: --sort must be one of: trending, downloads, newest");
                     return ExitCode::from(2);
                 }
-                sort = match v {
-                    "trending" => "trending",
-                    "downloads" => "downloads",
-                    "newest" => "newest",
-                    _ => unreachable!(),
-                };
+                sort = v;
                 i += 2;
             }
             "--limit" => {

@@ -101,6 +101,26 @@ pub fn blocked_literal_host_ip(url: &heso_core::Url) -> Option<IpAddr> {
     }
 }
 
+/// String-input pre-flight for callers that hold a URL as text — the
+/// JS-side `fetch()` / `XMLHttpRequest` / `<script src>` / ES-module
+/// `import` paths, which issue requests on the shared `reqwest::Client`
+/// without going through [`crate::FetchEngine`]'s typed
+/// [`blocked_literal_host_ip`] check.
+///
+/// Returns the human-readable [`BlockedAddr`] message (carrying
+/// [`BLOCK_ERROR_MARKER`]) when [`blocking_env_enabled`] is on AND the
+/// URL's host is a literal IP in a blocked range; `None` otherwise —
+/// including when blocking is off, the URL is unparseable, or the host
+/// is a name (names are caught post-DNS by [`PrivateNetworkGuard`]).
+pub fn literal_host_block_reason(url: &str) -> Option<String> {
+    if !blocking_env_enabled() {
+        return None;
+    }
+    let parsed = heso_core::Url::parse(url).ok()?;
+    let ip = blocked_literal_host_ip(&parsed)?;
+    Some(BlockedAddr::new(parsed.host_str().unwrap_or_default(), ip).to_string())
+}
+
 /// Error returned when an address is in a blocked range — by
 /// [`PrivateNetworkGuard`] after DNS, or by the engine's literal-IP
 /// pre-flight ([`blocked_literal_host_ip`]). Its `Display` carries
@@ -260,5 +280,39 @@ mod tests {
             ip: ip("169.254.169.254"),
         };
         assert!(e.to_string().contains(BLOCK_ERROR_MARKER));
+    }
+
+    #[test]
+    fn literal_ip_urls_are_classified_for_the_js_side_paths() {
+        // The JS-side fetch/XHR/<script src>/import paths key their
+        // pre-flight off this URL-literal check; reqwest skips the DNS
+        // guard for IP literals, so this is the only block for them.
+        for blocked in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/",
+            "http://[::1]/",
+            "http://10.0.0.1/",
+            "http://192.168.1.1/admin",
+        ] {
+            let u = heso_core::Url::parse(blocked).unwrap();
+            assert!(
+                blocked_literal_host_ip(&u).is_some(),
+                "expected {blocked} to be classified as a blocked literal IP"
+            );
+        }
+        // Hostnames are handled post-DNS, not here; public literals pass.
+        for allowed in ["http://example.com/", "http://93.184.216.34/"] {
+            let u = heso_core::Url::parse(allowed).unwrap();
+            assert!(blocked_literal_host_ip(&u).is_none(), "{allowed} should pass the literal check");
+        }
+    }
+
+    #[test]
+    fn literal_host_block_reason_is_noop_when_blocking_off() {
+        // Default posture is "fetch anything"; with blocking unset the
+        // pre-flight must never refuse, even for a literal metadata IP.
+        // (Exercised without mutating process-global env — see
+        // `env_truthy_parsing` for the env-gate logic.)
+        assert!(literal_host_block_reason("http://169.254.169.254/").is_none());
     }
 }

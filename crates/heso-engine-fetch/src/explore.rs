@@ -370,6 +370,11 @@ pub(crate) trait LinkFetcher: Clone + Send + Sync + 'static {
 
 impl LinkFetcher for FetchEngine {
     async fn fetch_html(&self, url: Url) -> Result<(Url, String), String> {
+        // Pre-flight literal-IP hosts like every other live path: reqwest
+        // skips the `PrivateNetworkGuard` DNS resolver for IP-literal hosts,
+        // so without this an explore hop to a blocked literal IP would slip
+        // past the opt-in SSRF block.
+        crate::guard_literal_host(&url).map_err(|e| e.to_string())?;
         let resp = self
             .client_ref()
             .get(url.as_str())

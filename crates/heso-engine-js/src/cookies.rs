@@ -103,14 +103,11 @@ fn current_url(ctx: &rquickjs::Ctx<'_>) -> Option<Url> {
 /// Returns the empty string if nothing matches, which is the spec
 /// default and matches what real browsers return.
 pub fn cookies_for_url(jar: &CookieStoreMutex, url: &Url) -> String {
-    let guard = match jar.lock() {
-        Ok(g) => g,
-        // Poisoned mutex — treat as empty store rather than panicking
-        // in JS-callable code. Should never happen unless an earlier
-        // panic poisoned it; the engine is single-threaded for normal
-        // operation.
-        Err(_) => return String::new(),
-    };
+    // Recover a poisoned guard rather than reporting an empty jar (which
+    // would log the user out mid-flow): the cookie store is plain data,
+    // not invariant-broken by an unrelated panic. Poisoning should never
+    // happen anyway — the engine is single-threaded in normal operation.
+    let guard = jar.lock().unwrap_or_else(|p| p.into_inner());
     let mut out = String::new();
     for c in guard.matches(url) {
         // `http_only()` returns `Option<bool>` — `None` means "the
@@ -146,10 +143,9 @@ pub fn cookies_for_url(jar: &CookieStoreMutex, url: &Url) -> String {
 /// a time); the parser handles only the first cookie if multiple
 /// appear, which matches browser behavior.
 pub fn set_cookie_from_js(jar: &CookieStoreMutex, spec: &str, url: &Url) {
-    let mut guard = match jar.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+    // Recover a poisoned guard rather than silently dropping the write
+    // (same rationale as `cookies_for_url`).
+    let mut guard = jar.lock().unwrap_or_else(|p| p.into_inner());
     // Best-effort: a malformed cookie string is a silent no-op per
     // spec. The `_` swallows both `CookieError` (parse failure) and a
     // successful `StoreAction::*` discriminant we don't care about.

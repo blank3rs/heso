@@ -2591,6 +2591,12 @@ pub(crate) fn dispatch_with_map<'js>(
     if let Some(target) = target.as_ref() {
         if let Some(ev_obj) = event.as_object() {
             ev_obj.set(PROP_TARGET, target.clone())?;
+            // Flat dispatch has no capture/bubble phase, so currentTarget is
+            // always the target. Set it explicitly rather than relying on the
+            // PROP_TARGET fallback — a re-dispatch of an event previously sent
+            // through the tree path leaves PROP_CURRENT_TARGET = null, which
+            // would otherwise make the fallback report a stale null here.
+            ev_obj.set(PROP_CURRENT_TARGET, target.clone())?;
         }
     }
 
@@ -2613,9 +2619,9 @@ pub(crate) fn dispatch_with_map<'js>(
         }
     }
 
-    let mut once_to_remove: Vec<Function<'js>> = Vec::new();
+    let mut once_to_remove: Vec<(Function<'js>, bool)> = Vec::new();
 
-    for (callback, _capture, once) in &snapshot {
+    for (callback, capture, once) in &snapshot {
         if view.state.immediate_propagation_stopped.get() {
             break;
         }
@@ -2637,16 +2643,18 @@ pub(crate) fn dispatch_with_map<'js>(
             report_listener_exception(ctx, err);
         }
         if *once {
-            once_to_remove.push(callback.clone());
+            once_to_remove.push((callback.clone(), *capture));
         }
     }
 
-    // Remove `once` listeners from the live list.
+    // Remove `once` listeners from the live list. Listener identity is
+    // (callback, capture) per WHATWG, so remove only the exact capture
+    // that fired — removing both phases would also unregister a separate,
+    // still-live listener that happens to share the same function value.
     if !once_to_remove.is_empty() {
         if let Some(map) = map {
-            for cb in &once_to_remove {
-                remove_listener_from_map(ctx, map, &view.event_type, cb, false)?;
-                remove_listener_from_map(ctx, map, &view.event_type, cb, true)?;
+            for (cb, capture) in &once_to_remove {
+                remove_listener_from_map(ctx, map, &view.event_type, cb, *capture)?;
             }
         }
     }

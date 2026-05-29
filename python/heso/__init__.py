@@ -1161,8 +1161,7 @@ from . import registry  # noqa: E402,F401
 # Version
 # ---------------------------------------------------------------------------
 
-# Kept in sync by `scripts/release.ps1` step 6 (writes the workspace
-# version into setup.cfg / pyproject for the wheel build). The value
-# here is the same default the workspace ships with; it gets bumped
-# at release time.
+# Kept in sync at release time by `.github/workflows/pypi.yml` (its
+# "Set Python package __version__ from tag" step rewrites this line).
+# The value here is the same default the workspace ships with.
 __version__ = "0.1.9"

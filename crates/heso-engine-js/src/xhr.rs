@@ -575,7 +575,7 @@ pub(crate) fn drain_pending(
                 {
                     cassette
                         .lock()
-                        .expect("cassette mutex poisoned")
+                        .unwrap_or_else(|p| p.into_inner())
                         .record(
                             &p.method,
                             &p.url,
@@ -661,6 +661,13 @@ fn perform_request(
             headers: vec![("content-type".into(), payload.mime)],
             body: payload.body,
         };
+    }
+
+    // SSRF pre-flight: reqwest skips `PrivateNetworkGuard` for IP-literal
+    // hosts, so an XHR straight to a blocked literal IP would bypass the
+    // opt-in block without this. Mirrors the static `guard_literal_host`.
+    if let Some(reason) = heso_engine_fetch::private_network::literal_host_block_reason(&p.url) {
+        return XhrOutcome::Err(format!("xhr: {reason}"));
     }
 
     let method = match p.method.as_str() {

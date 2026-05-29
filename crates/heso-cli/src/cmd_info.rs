@@ -102,6 +102,10 @@ pub async fn cmd_info(args: &[String]) -> ExitCode {
     };
 
     if let Some(file_b) = parsed.file_b.as_ref() {
+        if parsed.hash_only {
+            eprintln!("info: --hash-only takes a single file, not diff mode");
+            return ExitCode::from(2);
+        }
         let (_, value_b, kind_b) = match load_artifact(file_b).await {
             Ok(t) => t,
             Err(code) => return code,

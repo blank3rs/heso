@@ -631,11 +631,23 @@ async fn main() {
         match args[i].as_str() {
             "--filter" => {
                 i += 1;
-                filter = args.get(i).cloned();
+                match args.get(i) {
+                    Some(v) => filter = Some(v.clone()),
+                    None => {
+                        eprintln!("--filter requires a value");
+                        std::process::exit(2);
+                    }
+                }
             }
             "--markdown" => {
                 i += 1;
-                markdown_out = args.get(i).map(PathBuf::from);
+                match args.get(i) {
+                    Some(v) => markdown_out = Some(PathBuf::from(v)),
+                    None => {
+                        eprintln!("--markdown requires a value");
+                        std::process::exit(2);
+                    }
+                }
             }
             "--strict" => strict = true,
             "--help" | "-h" => {

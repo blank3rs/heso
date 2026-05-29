@@ -896,10 +896,10 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
                 var tag = '';
                 try { tag = el && el.tagName ? String(el.tagName).toLowerCase() : ''; } catch (_) {}
                 var label = '<' + (tag || '?') + '>.' + (callbackName || 'callback');
-                var name = (e && e.name) || 'Error';
+                var errName = (e && e.name) || 'Error';
                 var msg  = (e && e.message != null) ? String(e.message) : '';
                 var stack = (e && e.stack) ? String(e.stack) : '';
-                console.error(label + ' threw: ' + name + ': ' + msg + '\n' + stack);
+                console.error(label + ' threw: ' + errName + ': ' + msg + '\n' + stack);
             }
         }
     }
@@ -1177,7 +1177,16 @@ const CUSTOM_ELEMENTS_BOOTSTRAP: &str = r#"
                 try {
                     constructUpgradeOnto(el, def.ctor);
                     markUpgraded(el, def);
-                } catch (e) { /* per spec, swallow */ }
+                } catch (e) {
+                    // Per spec the reaction is report-and-continue; report
+                    // means routing to the error console (as define() and
+                    // createElement already do), not silently dropping —
+                    // otherwise a throwing constructor reached via
+                    // customElements.upgrade() leaves no breadcrumb.
+                    if (typeof console !== 'undefined' && console.error) {
+                        console.error('customElements.upgrade threw:', e && e.message ? e.message : e);
+                    }
+                }
             });
         },
     };

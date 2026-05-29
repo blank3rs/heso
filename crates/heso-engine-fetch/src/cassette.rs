@@ -57,10 +57,10 @@ use serde::{Deserialize, Serialize};
 
 /// A single recorded HTTP request/response pair.
 ///
-/// Field order in this struct matches the canonical-JSON output order
-/// after [`serde_jcs`] runs (which sorts object keys alphabetically),
-/// so a reader of the wire shape sees the same key order regardless
-/// of the field declaration here. Kept aligned for source readability.
+/// Field order here is HTTP-logical for source readability and is
+/// independent of the canonical-JSON output order: [`serde_jcs`] sorts
+/// object keys alphabetically at serialization time, so the wire/hashed
+/// key order is re-sorted regardless of this declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// HTTP method, uppercase canonical form: `"GET"`, `"POST"`,

@@ -32,7 +32,7 @@
 //! client can confirm it's alive and see the supported methods:
 //!
 //! ```json
-//! {"jsonrpc":"2.0","method":"ready","params":{"version":"...","methods":["open","ls","cat","find","close","ping","fill","click","submit","eval","navigate"]}}
+//! {"jsonrpc":"2.0","method":"ready","params":{"version":"...","methods":["open","ls","cat","find","close","ping","fill","click","submit","eval","navigate","read","wait","search"]}}
 //! ```
 //!
 //! ## Methods
@@ -52,6 +52,7 @@
 //! | `navigate` | `{url, page_id?}` | `{ok, url, page_id, scripts}` |
 //! | `read`     | `{page_id?, include?, inject_scripts?: [string]}` | `{url, title, text, tree, actions, forms, cookies, console, framework, scripts, plat_hash}` |
 //! | `wait`     | `{page_id?, selector_exists?, text_contains?, url_matches?, network_idle?, idle_window_ms?, time_ms?, timeout_ms?, inject_scripts?: [string]}` | `{ok, elapsed_ms, condition, error?}` |
+//! | `search`   | `{query, engines?: [string], limit?: usize, searx_url?: string}` | `{query, engines_used, results, knowledge, errors}` |
 //!
 //! `open` with `explore_links_depth >= 1` pre-fetches up to `link_cap`
 //! same-origin links per level and embeds their tree + metadata + actions
@@ -1107,14 +1108,17 @@ async fn dispatch_navigate(
         // a session-creator when nothing is active" contract.
     }
 
-    // No active page → mint a fresh page_id and install the record.
+    // No active page → mint a fresh page_id and install the record
+    // through install_page (matching dispatch_open) so it is counted
+    // toward and evicted by PAGE_LRU_CAP and the pages/page_order maps
+    // stay in sync — a bare insert would leak records past the cap.
     let page_id = state.next_id();
     let url_str = fetched.url().as_str().to_owned();
-    state
-        .pages
-        .lock()
-        .await
-        .insert(page_id.clone(), PageRecord::new(fetched));
+    {
+        let mut pages = state.pages.lock().await;
+        let mut order = state.page_order.lock().await;
+        install_page(&mut pages, &mut order, page_id.clone(), PageRecord::new(fetched));
+    }
     *state.last_page_id.lock().await = Some(page_id.clone());
     Ok(serde_json::json!({
         "ok": true,

@@ -383,7 +383,7 @@ fn rewrite_js_only_escapes(input: &str) -> String {
                     i += 2;
                     continue;
                 }
-                b'0' if i + 2 < bytes.len() && !bytes[i + 2].is_ascii_digit() => {
+                b'0' if i + 2 >= bytes.len() || !bytes[i + 2].is_ascii_digit() => {
                     out.extend_from_slice(JSON_ESC_NUL);
                     i += 2;
                     continue;

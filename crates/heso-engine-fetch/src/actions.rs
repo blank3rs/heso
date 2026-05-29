@@ -74,8 +74,9 @@ pub struct ElementRef {
     /// `select`, `form`).
     pub tag: String,
     /// Accessible name. Order of precedence: `aria-label` →
-    /// (inputs) `placeholder` / button `value` / `name` → text content →
-    /// `alt` → `title`. `None` if nothing identifying was found.
+    /// (form controls) `alt` / submit-button `value` / `placeholder` /
+    /// `name` → text content → `title`. `None` if nothing identifying
+    /// was found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// Heading-tree path of the section this element is in (`"/"` if

@@ -880,6 +880,13 @@ fn fetch_script_source(
         },
         None => src.to_owned(),
     };
+    // SSRF pre-flight: reqwest skips `PrivateNetworkGuard` for IP-literal
+    // hosts, so a `<script src>` pointing straight at a blocked literal IP
+    // would bypass the opt-in block without this. Mirrors the static
+    // engine's `guard_literal_host`.
+    if let Some(reason) = heso_engine_fetch::private_network::literal_host_block_reason(&resolved) {
+        return Err(format!("blocked: {reason}"));
+    }
     // `block_in_place` lets the CLI's `#[tokio::main]` flow run this
     // synchronously without tripping the "runtime from within a
     // runtime" panic — same trick as `crate::fetch::perform_request`.
@@ -1018,12 +1025,12 @@ fn collect_scripts(document: &dom_query::Document) -> Vec<ClassifiedScript> {
         // 2. Inline vs external. Per jsdom's `_eval()`:
         //    `if (hasAttribute("src")) fetchExternalScript(); else
         //    fetchInternalScript();`
-        if let Some(src) = descendant.attr("src") {
-            // Empty src — happens with `<script src=""></script>` in
-            // the wild. WHATWG says treat as if no src for the
-            // classification step, then the empty-URL fetch fails. We
-            // simplify: empty src → External("") and let the policy
-            // surface its standard warning.
+        // An empty (or whitespace-only) `src` — `<script src=""></script>`
+        // in the wild — is treated as if absent, so it falls through to the
+        // inline branch (empty inline source = clean no-op) instead of
+        // resolving `src=""` to the page's own URL and re-fetching the HTML
+        // as a classic script.
+        if let Some(src) = descendant.attr("src").filter(|s| !s.trim().is_empty()) {
             let kind = if is_module {
                 ScriptKind::ExternalModule {
                     src: src.to_string(),

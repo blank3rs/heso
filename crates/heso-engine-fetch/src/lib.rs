@@ -202,7 +202,7 @@ impl Error {
 /// when opt-in SSRF protection is enabled. A no-op when blocking is off
 /// or the host is a name (names are checked post-resolution by
 /// [`private_network::PrivateNetworkGuard`]) or a public IP.
-fn guard_literal_host(url: &Url) -> Result<(), Error> {
+pub(crate) fn guard_literal_host(url: &Url) -> Result<(), Error> {
     if !private_network::blocking_env_enabled() {
         return Ok(());
     }
@@ -579,7 +579,7 @@ impl FetchEngine {
                 let headers: Vec<(String, String)> = raw.response_headers.to_vec();
                 cassette
                     .lock()
-                    .expect("cassette mutex poisoned")
+                    .unwrap_or_else(|p| p.into_inner())
                     .record(
                         "GET",
                         url.as_str(),
@@ -605,6 +605,10 @@ impl FetchEngine {
                 Ok(HttpFetchResult {
                     final_url,
                     http_status: record.status,
+                    // Empty on replay: `Set-Cookie` survives in
+                    // `response_headers` and cookies are not part of the hashed
+                    // plat body, so the cassette carries no separate
+                    // response-cookie field to reconstruct here.
                     response_cookies: Vec::new(),
                     response_headers: record.response_headers.clone(),
                     body_bytes,
@@ -688,7 +692,7 @@ impl FetchEngine {
                 // Lock briefly — no await held while locked.
                 cassette
                     .lock()
-                    .expect("cassette mutex poisoned")
+                    .unwrap_or_else(|p| p.into_inner())
                     .record(
                         "GET",
                         url.as_str(),
@@ -714,6 +718,10 @@ impl FetchEngine {
                 Ok(HttpFetchResult {
                     final_url,
                     http_status: record.status,
+                    // Empty on replay: `Set-Cookie` survives in
+                    // `response_headers` and cookies are not part of the hashed
+                    // plat body, so the cassette carries no separate
+                    // response-cookie field to reconstruct here.
                     response_cookies: Vec::new(),
                     response_headers: record.response_headers.clone(),
                     body_bytes,
@@ -870,6 +878,7 @@ impl FetchEngine {
         // ceiling-hit rather than an unbounded loop. We return the
         // body of the final 3xx response so the chain stays
         // recoverable.
+        guard_literal_host(&current)?;
         let response = manual_client
             .get(current.as_str())
             .send()
@@ -1407,9 +1416,9 @@ pub fn is_bot_challenge(html: &str) -> bool {
     }
     if let Some(idx) = html.find("<title>") {
         let after = &html[idx + "<title>".len()..];
-        let probe_end = after.len().min(96);
-        let probe = &after[..probe_end];
-        let lowered: String = probe.chars().map(|c| c.to_ascii_lowercase()).collect();
+        // Take a char-bounded prefix: a byte slice at a fixed offset can
+        // split a multi-byte UTF-8 char in an untrusted remote <title>.
+        let lowered: String = after.chars().take(96).map(|c| c.to_ascii_lowercase()).collect();
         const TITLE_PREFIX_NEEDLES: &[&str] = &[
             "just a moment",
             "attention required",

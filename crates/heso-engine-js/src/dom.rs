@@ -1074,7 +1074,10 @@ impl Document {
         // CSS attribute selector handles the simple case. The value
         // is wrapped in double-quotes so attribute values containing
         // hyphens / dots round-trip cleanly.
-        let css = format!("[name=\"{}\"]", name.replace('"', "\\\""));
+        let css = format!(
+            "[name=\"{}\"]",
+            name.replace('\\', "\\\\").replace('"', "\\\"")
+        );
         match self.doc.try_select(&css) {
             Some(sel) => sel
                 .nodes()
@@ -1560,7 +1563,8 @@ impl Document {
     ) -> rquickjs::Result<bool> {
         let map = document_listener_map_opt(&ctx)?;
         let doc_value: Value<'js> = ctx.globals().get("document")?;
-        events::dispatch_with_map(&ctx, map.as_ref(), Some(doc_value), event)    }
+        events::dispatch_with_map(&ctx, map.as_ref(), Some(doc_value), event)
+    }
 }
 
 /// Escape `s` so it is safe to embed in HTML text content.

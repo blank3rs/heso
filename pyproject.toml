@@ -14,9 +14,9 @@
 # `heso`/`heso.exe` — the native binary, with no Python interpreter in
 # the hot path. Same binary, two faces.
 #
-# Build flow:
-#   1. `scripts/release.ps1` builds `target/release/heso.exe` first.
-#   2. The script copies that binary into `python/heso/bin/heso.exe`.
+# Build flow (CI — `.github/workflows/pypi.yml`):
+#   1. CI builds the native `heso` binary for each release target.
+#   2. CI stages that binary into `python/heso/bin/` (e.g. `heso.exe`).
 #   3. `python -m build --wheel --no-isolation` (or `pip wheel . -w
 #      dist/python/`) produces a wheel.
 #   4. The wheel platform tag is fixed up to `py3-none-win_amd64` (the

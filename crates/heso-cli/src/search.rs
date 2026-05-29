@@ -19,12 +19,15 @@
 //!     "title": "Web scraping",
 //!     "summary": "Web scraping is...",
 //!     "url": "https://en.wikipedia.org/wiki/Web_scraping"
-//!   }
+//!   },
+//!   "errors": null
 //! }
 //! ```
 //!
-//! `knowledge` is `null` if no Wikipedia direct match. `results` is
-//! capped by `--limit N` (default 30, max 100).
+//! `knowledge` is `null` if no Wikipedia direct match. `errors` is
+//! `null` when every engine succeeded, otherwise an array of
+//! `{engine, message}`. `results` is capped by `--limit N` (default 30,
+//! max 100).
 //!
 //! ## Backends
 //!
@@ -460,16 +463,12 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
         match eng {
             Engine::Ddg => match ddg_search(&client, &req.query, req.limit).await {
                 Ok(rs) => {
-                    if !rs.is_empty() {
-                        engines_used.push("ddg");
-                    } else {
-                        // Empty results are still a "we used this
-                        // engine" event — DDG returned an HTML page,
-                        // it just had zero rows. Surface it in
-                        // `engines_used` so callers can tell "I asked
-                        // and got nothing" from "I didn't ask".
-                        engines_used.push("ddg");
-                    }
+                    // Empty results still count as "we used this engine"
+                    // (DDG returned a page, just with zero rows), so record
+                    // it unconditionally — callers tell "asked, got nothing"
+                    // from "didn't ask" by `ddg` being present in
+                    // `engines_used`.
+                    engines_used.push("ddg");
                     ddg_results = rs;
                 }
                 Err(e) => {

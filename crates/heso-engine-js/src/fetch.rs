@@ -541,7 +541,7 @@ pub(crate) fn drain_pending(
                     };
                     cassette
                         .lock()
-                        .expect("cassette mutex poisoned")
+                        .unwrap_or_else(|p| p.into_inner())
                         .record(
                             &p.request.method,
                             &p.request.url,
@@ -648,6 +648,13 @@ fn perform_request(
             headers: vec![("content-type".into(), payload.mime)],
             body: payload.body,
         };
+    }
+    // SSRF pre-flight: reqwest does not run `PrivateNetworkGuard` for
+    // IP-literal hosts, so a JS-initiated request straight to a blocked
+    // literal IP (metadata/loopback/RFC1918) would slip past the opt-in
+    // block. Mirror the static engine's `guard_literal_host`.
+    if let Some(reason) = heso_engine_fetch::private_network::literal_host_block_reason(&req.url) {
+        return FetchOutcome::Err(format!("fetch: {reason}"));
     }
     let method = match req.method.as_str() {
         "GET" => reqwest::Method::GET,

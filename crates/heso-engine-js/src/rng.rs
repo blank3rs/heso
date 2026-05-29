@@ -64,30 +64,31 @@ impl SeededRng {
     /// [`Math.random()`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Math/random)
     /// returns.
     ///
-    /// Returns `0.0` if the mutex is poisoned (which can only happen if
-    /// a panic interrupted a prior draw — see [`Mutex`] docs). The
-    /// engine is single-threaded so this is effectively unreachable;
-    /// we degrade to `0.0` rather than panicking so a poisoned RNG
-    /// never crashes the JS surface.
+    /// A poisoned mutex (only possible if a panic interrupted a prior
+    /// draw — see [`Mutex`] docs; the single-threaded engine makes it
+    /// effectively unreachable) is recovered rather than degraded: the
+    /// ChaCha20 state is plain data, so the correct deterministic stream
+    /// continues instead of silently collapsing to a stream of `0.0`.
     pub fn next_f64(&self) -> f64 {
-        match self.inner.lock() {
-            // `Rng::gen()` for `f64` returns a uniform value in
-            // `[0.0, 1.0)` — exactly the `Math.random()` contract.
-            Ok(mut rng) => rng.gen::<f64>(),
-            Err(_) => 0.0,
-        }
+        // `Rng::gen()` for `f64` returns a uniform value in `[0.0, 1.0)`
+        // — exactly the `Math.random()` contract.
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .gen::<f64>()
     }
 
     /// Fill `out` with deterministic random bytes — the workhorse for
     /// `crypto.getRandomValues(view)`. After this returns, the slice
     /// contains `out.len()` bytes drawn from the seeded stream.
     ///
-    /// No-ops on a poisoned mutex (same rationale as
-    /// [`Self::next_f64`]).
+    /// Recovers a poisoned mutex (same rationale as [`Self::next_f64`])
+    /// so the deterministic stream is preserved rather than no-op'd.
     pub fn fill_bytes(&self, out: &mut [u8]) {
-        if let Ok(mut rng) = self.inner.lock() {
-            rng.fill_bytes(out);
-        }
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .fill_bytes(out);
     }
 
     /// Generate a deterministic v4-format UUID string —
@@ -98,10 +99,6 @@ impl SeededRng {
     /// dash layout. The version nibble (byte 6 high half) is forced to
     /// `0100` (= 4); the variant bits (byte 8 high half) are forced to
     /// `10xx` (RFC 4122).
-    ///
-    /// On a poisoned mutex returns the nil UUID
-    /// (`00000000-0000-4000-8000-000000000000`, still v4-shaped) so the
-    /// JS side never sees a malformed string.
     ///
     /// [RFC 4122]: https://www.rfc-editor.org/rfc/rfc4122#section-4.4
     pub fn random_uuid(&self) -> String {

@@ -305,7 +305,7 @@ Verify the receipt — bind it to a trusted signer with `--trusted-keys`:
 echo '["fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE="]' > trusted.json
 
 heso verify --trusted-keys trusted.json receipt.json
-# → OK fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE=
+# → OK receipt fdibx2rLqGfrIf+duGbRKlM1iPwVSynHUq+nEisjwIE=
 # exit 0
 ```
 
@@ -335,7 +335,7 @@ Verify without an allowlist still works for backwards compatibility, but emits a
 ```sh
 heso verify receipt.json
 # stderr: warning: no pubkey allowlist configured (pass --trusted-keys PATH or set HESO_TRUSTED_KEYS ...)
-# stdout: OK fdibx2...IE=
+# stdout: OK receipt fdibx2...IE=
 # exit 0
 ```
 
@@ -388,7 +388,7 @@ The verbs are the contract — no heso-specific framework dependency, no adapter
 
 ## Verbs are open
 
-**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The full spec lives at [`spec/HESO-1.0.md`](spec/HESO-1.0.md). It defines the core verb set — every conformant implementation MUST dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
+**HESO/1.0** is an open protocol; the `heso` binary is one implementation of it. The full spec lives at <https://heso.ca/spec>; [`spec/HESO-1.0.md`](spec/HESO-1.0.md) in this tree is a pointer carrying the core verb table. It defines the core verb set — every conformant implementation MUST dispatch these. Beyond the core, anyone can define a verb under a domain they control, reverse-DNS style:
 
 ```json
 {"verb": "com.example.scrape-pricing", "url": "https://example.com/products"}

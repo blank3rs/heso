@@ -331,7 +331,10 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         "ms" => Duration::from_millis(n),
         "us" => Duration::from_micros(n),
         "s" => Duration::from_secs(n),
-        "m" => Duration::from_secs(n * 60),
+        "m" => n
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| format!("duration `{s}` too large"))?,
         _ => unreachable!(),
     };
     Ok(d)
@@ -590,7 +593,10 @@ async fn run_read_for_url(
         heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar)
             .map_err(|e| format!("engine: {e}"))?
     } else {
-        heso_engine_js::JsEngine::new().map_err(|e| format!("engine: {e}"))?
+        // Share the batch's cookie jar even without --js-fetch, so
+        // document.cookie observes Set-Cookie from sibling URLs — matching
+        // the single-URL `read` path and this module's documented contract.
+        heso_engine_js::JsEngine::new_with_cookies(cookie_jar).map_err(|e| format!("engine: {e}"))?
     };
     let script_policy = if js_fetch {
         heso_engine_js::ScriptFetchPolicy::Fetch

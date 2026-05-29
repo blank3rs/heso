@@ -422,12 +422,8 @@ impl JsSession {
         // supplied data. Note: the apply pass dispatches `input` /
         // `change` events the same way `JsSession::fill` does, so any
         // validation listener that runs on those is honored.
-        let (fields_applied, fields_skipped, fields_matched_form) = if fields.is_empty() {
-            (
-                serde_json::Value::Null,
-                serde_json::Value::Null,
-                true, // no overrides → don't second-guess the snapshot
-            )
+        let (fields_applied, fields_skipped) = if fields.is_empty() {
+            (serde_json::Value::Null, serde_json::Value::Null)
         } else {
             let apply_js = build_apply_fields_js(selector, fields);
             let apply_outcome = self.engine.eval(&apply_js)?;
@@ -441,12 +437,7 @@ impl JsSession {
                 .get("skipped")
                 .cloned()
                 .unwrap_or(serde_json::Value::Array(vec![]));
-            let matched = apply_outcome
-                .value
-                .get("matched")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            (applied, skipped, matched)
+            (applied, skipped)
         };
 
         // Phase 1: extract the snapshot (dispatches the submit event
@@ -478,10 +469,6 @@ impl JsSession {
                 });
             }
         };
-
-        // If the override pass didn't find the form but the snapshot
-        // also didn't, surface that — the selector pointed at nothing.
-        let _ = fields_matched_form; // reserved for future surface
 
         // No match / no submitter / cancelled → no HTTP traffic.
         let outcome = self.classify_skip(&snapshot);

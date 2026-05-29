@@ -934,6 +934,16 @@ pub(crate) fn issue_request(
     let record_method = method.as_str().to_owned();
     let record_url = request_url.as_str().to_owned();
 
+    // SSRF pre-flight: reqwest skips `PrivateNetworkGuard` for IP-literal
+    // hosts, so a `<form action>` pointing straight at a blocked literal IP
+    // would bypass the opt-in block without this. Mirrors the static
+    // engine's `guard_literal_host`. (Replaying returns above, off-network.)
+    if let Some(reason) =
+        heso_engine_fetch::private_network::literal_host_block_reason(&record_url)
+    {
+        return Err(EvalError::Engine(format!("form submit blocked: {reason}")));
+    }
+
     // Build the reqwest request and drive it via the engine's tokio
     // handle. `block_in_place` matches the pattern in `crate::fetch`
     // — we're single-threaded on the JS engine thread but the host
@@ -983,7 +993,7 @@ pub(crate) fn issue_request(
                 .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
                 .map(|(_, value)| value.clone());
             if let Some(cassette) = recording_cassette {
-                cassette.lock().expect("cassette mutex poisoned").record(
+                cassette.lock().unwrap_or_else(|p| p.into_inner()).record(
                     &record_method,
                     &record_url,
                     final_url.as_str(),

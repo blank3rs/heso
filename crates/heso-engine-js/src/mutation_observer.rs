@@ -371,6 +371,10 @@ const MUTATION_OBSERVER_BOOTSTRAP: &str = r#"
         // observers AND empty the pending records queue.
         this._targets.length = 0;
         this._pendingRecords.length = 0;
+        // Track scheduling state honestly: leaving this true after a
+        // disconnect would let a later re-observe skip scheduling its own
+        // microtask and rely on the (already-drained) stale one.
+        this._microtaskScheduled = false;
         var idx = observerRegistry.indexOf(this);
         if (idx >= 0) observerRegistry.splice(idx, 1);
     };

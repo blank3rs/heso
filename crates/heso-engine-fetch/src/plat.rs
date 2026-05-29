@@ -117,9 +117,16 @@ fn to_verify_signature(sig: heso_core::Signature) -> Signature {
 /// Bodies that carry no `plat_hash` get one stamped on before signing
 /// so the resulting envelope is self-describing.
 pub fn seal(key: &IdentityKey, mut body: Value) -> SealedPlat {
-    if let Some(obj) = body.as_object_mut() {
-        if !obj.contains_key("plat_hash") {
-            let h = hash(&Value::Object(obj.clone()));
+    // Hash the owned body before taking the mutable borrow — `canonical_bytes`
+    // only ever strips a top-level `plat_hash` (absent here), so hashing
+    // `&body` is byte-identical to hashing a clone of the object map, without
+    // the deep clone of the tree/actions/embedded cassette.
+    let needs_hash = body
+        .as_object()
+        .is_some_and(|o| !o.contains_key("plat_hash"));
+    if needs_hash {
+        let h = hash(&body);
+        if let Some(obj) = body.as_object_mut() {
             obj.insert("plat_hash".to_owned(), Value::String(h));
         }
     }
