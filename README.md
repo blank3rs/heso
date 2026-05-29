@@ -2,9 +2,9 @@
 
 **Site:** [heso.ca](https://www.heso.ca) · **Docs:** [heso.ca/docs](https://www.heso.ca/docs) · **[npm](https://www.npmjs.com/package/@ixla/heso)** · **[PyPI](https://pypi.org/project/heso/)** · **[Releases](https://github.com/blank3rs/heso/releases)**
 
-A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of what happened.
+A Rust runtime that lets an agent touch the web — fetch, JavaScript, DOM, forms, clicks, sessions — and emits a signed, replayable record of the run.
 
-Every run can be **stamped** into a *plat* — a replay file holding the plan that ran, the page observation, and the recorded network cassette, all hashed together and **signed by default** with your identity key. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. `heso verify` recomputes the hash, checks the signature, and always shows you who signed it. Hand the artifact to an auditor.
+Every run can be **stamped** into a *plat* — a replay file holding the plan that ran, the page observation, and the recorded network cassette, all hashed together and **signed by default** with your identity key. `heso run` re-executes the plat off-network and the resulting `plat_hash` is byte-identical to the original. `heso verify` recomputes the hash, checks the signature, and always shows you who signed it. Hand the artifact to anyone: they replay it off-network, confirm it's unchanged, and see who signed it.
 
 Capabilities return JSON. Failures come back as structured data (`partial: true`, `bot_challenge`, cassette miss), not opaque browser crashes. One Rust binary; no Chromium, no Node.
 
@@ -26,7 +26,6 @@ A 50-second real recording — an LLM agent (Gemini) drives heso to find and com
 - [Install](#install)
 - [What it can do](#what-it-can-do)
 - [What it can't do](#what-it-cant-do)
-- [Why not just use X?](#why-not-just-use-x)
 - [Use as a library](#use-as-a-library)
 - [Examples](#examples)
 - [Tamper-evidence](#tamper-evidence)
@@ -117,7 +116,7 @@ heso replay out.plat                      # plat → step log (pure read, no exe
 heso replay --plan out.plat > plan-again.json    # plat → plan (edit, restamp)
 ```
 
-The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, the recorded seed, AND the embedded cassette. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift.
+The plat's `plat_hash` (BLAKE3 over canonical JSON via RFC 8785) commits to the plan, the observed content, the recorded seed, AND the embedded cassette. Two different `<url>` inputs always produce different `plat_hash` values — the URL is part of the hashed canonical bytes, and a regression test in `crates/heso-engine-fetch/src/plat.rs::tests` pins that invariant against future drift. A `plat_hash` identifies one capture, not a URL — re-stamp the same page and the hash changes, because the signed cassette pins the exact bytes the server sent (`Date`, `Set-Cookie`, CDN request-IDs included).
 
 The hash alone is not tamper-proof: anyone who edits the body can recompute it. That is what the **signature** is for — see [Tamper-evidence](#tamper-evidence) below.
 
@@ -175,21 +174,6 @@ The sample plat ([`replay-demo-1-goldfinger.plat.json`](https://github.com/blank
 - **CAPTCHAs and hard bot-detect.** Hits one, stops. The default user-agent is `heso/<version>` so anything fingerprinting will see us coming. We detect Cloudflare interstitials and surface them as `partial_reason: "bot_challenge"` rather than pretending the page loaded.
 - **Service Workers, WebRTC, WebUSB, WebBluetooth.** Not implemented. The JS engine itself runs modern Next.js / React / Vue / Svelte / SSR sites cleanly; the gaps are in browser features above ECMAScript.
 - **Sibling-script cascades we haven't shimmed.** When script A sets `window.X` and script B reads it, and X doesn't exist on first load, heso surfaces the crash and the agent can `--inject-script` a stub.
-
-## Why not just use X?
-
-Partial overlap everywhere; no exact shelf neighbor. The win is not "smaller browser" — it is **smaller failure surface** when the task is structured data, not pixels.
-
-| Layer | Examples | What they ship | Gap vs heso |
-|---|---|---|---|
-| **Full Chromium stack** | [Playwright](https://playwright.dev/), [Puppeteer](https://pptr.dev/), [Browser Use](https://github.com/browser-use/browser-use), [Stagehand](https://www.browserbase.com/stagehand), [Skyvern](https://github.com/Skyvern-AI/skyvern) | V8 + full browser; often an AI planner on top | Heavy deps, opaque failures, no native JSON verb surface, no plat replay |
-| **Smaller browser engine** | [Lightpanda](https://lightpanda.io/) | Zig engine, V8, CDP — drop-in for Playwright/Puppeteer | Still a *browser* mental model; agents drive it through CDP/wrappers, not verbs; no plat/cassette/receipt story |
-| **Scraper APIs** | Firecrawl, Jina Reader, Crawl4AI | Fetch + extract markdown/JSON | Weak or no real click/fill/submit; often no honest partial-failure envelope |
-| **DOM simulators (Node)** | [jsdom](https://github.com/jsdom/jsdom), [happy-dom](https://github.com/capricorn86/happy-dom) | Minimal DOM + JS in JS | Proven lane for the agent-relevant half; test harnesses, not shipped agent products |
-| **Built-in fetch tools** | WebFetch (Claude), curl | Static HTML / no JS hydration | No DOM events, no forms, no session |
-| **heso** | this repo | QuickJS + agent-shaped DOM + verbs + plats | QuickJS ≠ V8 (honest limit); CAPTCHAs/hard bot-detect still stop you |
-
-**What heso adds on top of the capability list:** explicit in/out scope, verb-native JSON (no Playwright/CDP/Node required), structured partial failures, and byte-identical off-network replay via stamp/run.
 
 ## Use as a library
 
@@ -448,7 +432,7 @@ heso is built to be a tool an agent calls, not a library a human drives. The cle
 ```markdown
 ---
 name: heso
-description: Use heso when an agent needs to touch the web — fetch pages, run JavaScript, click buttons, fill forms, get structured JSON back. Every run can be stamped into a signed, byte-identically replayable plat — proof of what the agent saw and did. One Rust binary; no Chromium, no Node. Prefer this over WebFetch when you need a DOM, stateful clicks, framework-rendered content, or a verifiable artifact.
+description: Use heso when an agent needs to touch the web — fetch pages, run JavaScript, click buttons, fill forms, get structured JSON back. Every run can be stamped into a signed, byte-identically replayable plat — a tamper-evident record of the run, signed by the agent that produced it. One Rust binary; no Chromium, no Node. Prefer this over WebFetch when you need a DOM, stateful clicks, framework-rendered content, or a verifiable artifact.
 ---
 
 ## Verbs
