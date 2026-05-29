@@ -1131,4 +1131,4 @@ def session(binary: Optional[str] = None) -> Session:
 # Kept in sync at release time by `.github/workflows/pypi.yml` (its
 # "Set Python package __version__ from tag" step rewrites this line).
 # The value here is the same default the workspace ships with.
-__version__ = "0.1.9"
+__version__ = "0.2.0"

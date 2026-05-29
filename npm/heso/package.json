@@ -1,6 +1,6 @@
 {
   "name": "@ixla/heso",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "The auditable layer for the agent web. A Rust runtime that lets an agent touch the web and signs every run into a replayable artifact.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://www.heso.ca",
@@ -31,11 +31,11 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@ixla/heso-win32-x64": "0.1.9",
-    "@ixla/heso-linux-x64": "0.1.9",
-    "@ixla/heso-linux-arm64": "0.1.9",
-    "@ixla/heso-darwin-x64": "0.1.9",
-    "@ixla/heso-darwin-arm64": "0.1.9"
+    "@ixla/heso-win32-x64": "0.2.0",
+    "@ixla/heso-linux-x64": "0.2.0",
+    "@ixla/heso-linux-arm64": "0.2.0",
+    "@ixla/heso-darwin-x64": "0.2.0",
+    "@ixla/heso-darwin-arm64": "0.2.0"
   },
   "engines": {
     "node": ">=14"
