@@ -13,16 +13,9 @@ heso-core = { path = "../heso-core" }
 heso-primitives = { path = "../heso-primitives" }
 serde = { workspace = true }
 serde_json.workspace = true
+serde_jcs.workspace = true
 blake3.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-# Test-only: the drift-guard test asserts this crate's hand-rolled
-# receipt canonicalizer (`write_canonical`) stays byte-identical to the
-# RFC 8785 reference encoder `heso-verify`/`heso-engine-fetch` use. Not a
-# production dependency — `heso-trace` stays pure data + a self-contained
-# canonicalizer.
-serde_jcs.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"

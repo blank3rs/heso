@@ -138,6 +138,7 @@ fn verify_recognizes_receipt_via_signed_path() {
         signature: None,
         tsa_anchor: None,
         produced_plat_hash: None,
+        canon: None,
     };
     heso_trace::sign_receipt(&key, &mut receipt);
     let path = dir.path().join("receipt.json");
@@ -217,6 +218,7 @@ fn verify_require_tsa_exits_two_with_not_implemented_message() {
         signature: None,
         tsa_anchor: None,
         produced_plat_hash: None,
+        canon: None,
     };
     heso_trace::sign_receipt(&key, &mut receipt);
     let path = dir.path().join("receipt.json");

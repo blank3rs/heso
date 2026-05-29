@@ -43,7 +43,9 @@
 use heso_core::IdentityKey;
 use heso_engine_api::EngineApi;
 use heso_primitives::{execute, PrimitiveResult};
-use heso_trace::{sign_receipt, trace_hash, ContentHash, Cost, Mode, Receipt, Trace};
+use heso_trace::{
+    sign_receipt, trace_hash, ContentHash, Cost, Mode, Receipt, Trace, RECEIPT_CANON_ALG,
+};
 
 /// Per-session configuration the runner needs to build a [`Receipt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +124,7 @@ pub async fn run<E: EngineApi>(engine: &E, trace: &Trace, config: &SessionConfig
         signature: None,
         tsa_anchor: None,
         produced_plat_hash: None,
+        canon: Some(RECEIPT_CANON_ALG.to_owned()),
     }
 }
 
@@ -283,6 +286,13 @@ mod tests {
             "run() must leave receipts unsigned; got {:?}",
             r.signature
         );
+    }
+
+    #[tokio::test]
+    async fn run_stamps_the_current_canon_tag() {
+        let trace = vec![cd("https://example.com/")];
+        let r = run(&DummyEngine, &trace, &SessionConfig::default()).await;
+        assert_eq!(r.canon.as_deref(), Some(RECEIPT_CANON_ALG));
     }
 
     #[tokio::test]

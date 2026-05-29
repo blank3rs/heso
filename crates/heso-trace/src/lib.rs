@@ -106,6 +106,14 @@ pub struct TsaAnchor {
     pub gen_time: String,
 }
 
+/// Canonicalization-algorithm tag stamped on a [`Receipt`] via
+/// [`Receipt::canon`]. Names the exact byte-encoding the `signature`
+/// covers — RFC 8785 (JCS) over the receipt's canonical JSON. A future
+/// number rule (or a new f64-bearing field) ships under a new tag (e.g.
+/// `"jcs/v2"`) so verifiers refuse it rather than silently re-hashing
+/// under the wrong rules. Mirrors [`FINGERPRINT_ALGO`].
+pub const RECEIPT_CANON_ALG: &str = "jcs/v1";
+
 /// Receipt of one trace run.
 ///
 /// Per [ADR 0009], every `heso.run` call returns a receipt. The receipt
@@ -165,6 +173,13 @@ pub struct Receipt {
     /// when a plat is emitted alongside the receipt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub produced_plat_hash: Option<String>,
+    /// Canonicalization-algorithm provenance tag ([`RECEIPT_CANON_ALG`]).
+    /// Names the byte-encoding the `signature` covers so a future number
+    /// rule is refused rather than silently re-hashed. Omitted entirely
+    /// when `None`, so receipts that don't carry it produce identical
+    /// canonical bytes (and signatures) to receipts that predate the tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canon: Option<String>,
 }
 
 impl Receipt {
@@ -359,8 +374,7 @@ pub fn trace_fingerprint(url: &Url, actions: &Value) -> TraceFingerprint {
     let action_hashes: Vec<blake3::Hash> = action_slice
         .iter()
         .map(|a| {
-            let mut canon = String::new();
-            write_canonical(a, &mut canon);
+            let canon = serde_jcs::to_string(a).expect("action canonicalizes");
             dst_hash(DST_ACTION, canon.as_bytes())
         })
         .collect();
@@ -375,12 +389,11 @@ pub fn trace_fingerprint(url: &Url, actions: &Value) -> TraceFingerprint {
         state = hasher.finalize();
     }
 
-    let mut canonical = String::new();
     let payload_val = serde_json::json!({
         "actions": actions,
         "url": normalized,
     });
-    write_canonical(&payload_val, &mut canonical);
+    let canonical = serde_jcs::to_string(&payload_val).expect("fingerprint payload canonicalizes");
 
     TraceFingerprint {
         algorithm: FINGERPRINT_ALGO.to_owned(),
@@ -715,18 +728,14 @@ pub enum SignatureScope {
 /// The signature field is always cleared to JSON null; the anchor field
 /// is cleared only under [`SignatureScope::PreAnchor`].
 ///
-/// Canonicalization rules (same as the [`plat`] module — chosen so two
-/// implementations produce identical bytes):
+/// Canonicalization is RFC 8785 (JSON Canonicalization Scheme) via
+/// `serde_jcs` — the same encoder the [`plat`] module signs over, so a
+/// receipt and a plat produced from the same logical content yield
+/// identical bytes:
 ///
 /// - Object keys sorted lexicographically (recursively, depth-first).
 /// - Compact: no insignificant whitespace.
-/// - Strings escaped via `serde_json::to_string` for the string-value
-///   subset (handles `\"`, `\\`, `\n`, `\t`, `\uXXXX`, etc.).
-/// - Numbers via `serde_json::Number`'s `Display`, which preserves the
-///   integer-vs-float distinction.
-///
-/// This is a subset of RFC 8785 (JSON Canonicalization Scheme) sufficient
-/// for the value shapes a receipt emits.
+/// - Strings and numbers per RFC 8785 (ECMA-262 number formatting).
 ///
 /// [`plat`]: ../heso_engine_fetch/plat/index.html
 pub fn canonical_receipt_bytes(receipt: &Receipt, scope: SignatureScope) -> Vec<u8> {
@@ -737,9 +746,7 @@ pub fn canonical_receipt_bytes(receipt: &Receipt, scope: SignatureScope) -> Vec<
             obj.insert("tsa_anchor".to_owned(), Value::Null);
         }
     }
-    let mut out = String::new();
-    write_canonical(&v, &mut out);
-    out.into_bytes()
+    serde_jcs::to_vec(&v).expect("receipt value canonicalizes")
 }
 
 /// Canonical-JSON form of a receipt with `signature` cleared, suitable as
@@ -752,88 +759,6 @@ pub fn canonical_receipt_bytes(receipt: &Receipt, scope: SignatureScope) -> Vec<
 pub fn canonical_receipt_json(receipt: &Receipt) -> String {
     String::from_utf8(canonical_receipt_bytes(receipt, SignatureScope::PreAnchor))
         .expect("canonical JSON is valid UTF-8")
-}
-
-fn write_canonical<W: std::fmt::Write>(v: &Value, out: &mut W) {
-    match v {
-        Value::Null => {
-            let _ = out.write_str("null");
-        }
-        Value::Bool(b) => {
-            let _ = out.write_str(if *b { "true" } else { "false" });
-        }
-        Value::Number(n) => {
-            let _ = write!(out, "{n}");
-        }
-        Value::String(s) => {
-            // Inline escape (no per-string allocation). Same output as
-            // `serde_json::to_string(s)` for the value shapes receipts
-            // carry.
-            write_json_string(out, s);
-        }
-        Value::Array(arr) => {
-            let _ = out.write_char('[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    let _ = out.write_char(',');
-                }
-                write_canonical(item, out);
-            }
-            let _ = out.write_char(']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let _ = out.write_char('{');
-            for (i, key) in keys.iter().enumerate() {
-                if i > 0 {
-                    let _ = out.write_char(',');
-                }
-                write_json_string(out, key);
-                let _ = out.write_char(':');
-                // SAFETY: `keys` came from `map.keys()`, so the lookup
-                // can't fail.
-                write_canonical(&map[*key], out);
-            }
-            let _ = out.write_char('}');
-        }
-    }
-}
-
-fn write_json_string<W: std::fmt::Write>(out: &mut W, s: &str) {
-    let _ = out.write_char('"');
-    for c in s.chars() {
-        match c {
-            '"' => {
-                let _ = out.write_str("\\\"");
-            }
-            '\\' => {
-                let _ = out.write_str("\\\\");
-            }
-            '\n' => {
-                let _ = out.write_str("\\n");
-            }
-            '\r' => {
-                let _ = out.write_str("\\r");
-            }
-            '\t' => {
-                let _ = out.write_str("\\t");
-            }
-            '\x08' => {
-                let _ = out.write_str("\\b");
-            }
-            '\x0c' => {
-                let _ = out.write_str("\\f");
-            }
-            c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => {
-                let _ = out.write_char(c);
-            }
-        }
-    }
-    let _ = out.write_char('"');
 }
 
 // ============================================================================
@@ -877,6 +802,15 @@ pub fn verify_receipt(receipt: &Receipt) -> VerifyOutcome {
     let Some(sig) = receipt.signature.as_ref() else {
         return VerifyOutcome::Missing;
     };
+    // A present canon tag must name the rule this verifier hashes under;
+    // anything else means the bytes were canonicalized differently, so the
+    // signature cannot meaningfully verify. An absent tag is a pre-tag
+    // receipt and verifies under the legacy rule (which equals `jcs/v1`).
+    if let Some(tag) = receipt.canon.as_deref() {
+        if tag != RECEIPT_CANON_ALG {
+            return VerifyOutcome::Invalid(IdentityError::UnknownCanon(tag.to_owned()));
+        }
+    }
     let scope = if receipt.tsa_anchor.is_some() {
         SignatureScope::PostAnchor
     } else {
@@ -1489,6 +1423,32 @@ mod tests {
     }
 
     #[test]
+    fn current_canon_tag_verifies_valid() {
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        r.canon = Some(RECEIPT_CANON_ALG.to_owned());
+        sign_receipt(&key, &mut r);
+        match verify_receipt(&r) {
+            VerifyOutcome::Valid => {}
+            other => panic!("expected Valid for current canon tag, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_canon_tag_is_refused() {
+        let key = IdentityKey::generate();
+        let mut r = sample_receipt();
+        r.canon = Some("jcs/v2".to_owned());
+        sign_receipt(&key, &mut r);
+        match verify_receipt(&r) {
+            VerifyOutcome::Invalid(IdentityError::UnknownCanon(tag)) => {
+                assert_eq!(tag, "jcs/v2");
+            }
+            other => panic!("expected Invalid(UnknownCanon), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn signature_verifies_after_json_roundtrip() {
         // Signing must survive serialize → deserialize, since the CLI is
         // going to write JSON and a separate process is going to read it.
@@ -1564,10 +1524,8 @@ mod tests {
 
         // The two Values are NOT structurally equal as Rust types if the
         // backing maps preserve order; but their canonical JSON must be.
-        let mut a = String::new();
-        let mut b = String::new();
-        super::write_canonical(&v_natural, &mut a);
-        super::write_canonical(&v_shuffled, &mut b);
+        let a = serde_jcs::to_string(&v_natural).expect("serde_jcs canonicalizes");
+        let b = serde_jcs::to_string(&v_shuffled).expect("serde_jcs canonicalizes");
         assert_eq!(
             a, b,
             "canonical form must not depend on object-key insertion order"
@@ -1578,8 +1536,8 @@ mod tests {
     /// inserted in reverse order. With `serde_json`'s
     /// `preserve_order = off` (the default), maps are `BTreeMap` and the
     /// canonical form is naturally stable; with `preserve_order = on`,
-    /// this exercise actually shuffles. Either way, the canonical
-    /// writer's `keys.sort()` defends the property.
+    /// this exercise actually shuffles. Either way, RFC 8785's
+    /// lexicographic key sort defends the property.
     fn reverse_object_keys(v: Value) -> Value {
         match v {
             Value::Array(items) => {
@@ -1758,82 +1716,43 @@ mod tests {
     }
 
     // ========================================================================
-    // Drift-guard: this crate's hand-rolled receipt canonicalizer
-    // (`write_canonical`) MUST agree byte-for-byte with the RFC 8785 (JCS)
-    // reference encoder (`serde_jcs`) that `heso-verify` /
-    // `heso-engine-fetch` sign over. If they ever diverge, a receipt
-    // signed under one and verified under the other would mismatch — so a
-    // divergence is a SPEC DECISION to surface, not a thing to silently
-    // "fix" in this test.
+    // Canonicalizer: the receipt / fingerprint path canonicalizes with the
+    // same RFC 8785 (JCS) encoder (`serde_jcs`) that `heso-verify` /
+    // `heso-engine-fetch` sign over, so a receipt and a plat with the same
+    // logical content hash identically. These tests pin the RFC 8785
+    // number rules at the spots most likely to surprise a future editor.
     // ========================================================================
 
     #[test]
-    fn write_canonical_matches_serde_jcs_byte_for_byte() {
-        // A shared input object exercising the value shapes a receipt
-        // emits: nested objects (key-sort), arrays, ints, bools, null,
-        // strings needing JSON escapes, unicode, and the empty cases.
-        // Integers are kept inside the safe range (|n| < 2^53) — the
-        // domain every receipt field (u64 seed/cost, small indices, u16
-        // status) actually lives in. See `KNOWN DIVERGENCE` below for the
-        // one place the two encoders disagree, and why it is a spec
-        // decision rather than a bug to fix here.
-        let shared = serde_json::json!({
-            "z_last": 1,
-            "a_first": {"nested_b": 2, "nested_a": [3, 4, {"deep": "x"}]},
-            "bool_t": true,
-            "bool_f": false,
-            "nil": null,
-            "neg": -42,
-            "big_but_safe": 9007199254740991i64, // 2^53 - 1, the max safe integer
-            "empty_str": "",
-            "escapes": "quote:\" backslash:\\ newline:\n tab:\t",
-            "arr_of_obj": [{"b": 1, "a": 2}, {"d": 3, "c": 4}],
-            "unicode": "café — naïve"
-        });
-
-        let mut ours = String::new();
-        write_canonical(&shared, &mut ours);
-        let jcs = serde_jcs::to_string(&shared).expect("serde_jcs canonicalizes");
-
-        assert_eq!(
-            ours, jcs,
-            "heso-trace `write_canonical` diverged from RFC 8785 (serde_jcs) within the \
-             receipt value domain. This is a SPEC decision — do NOT paper over it here; \
-             surface it.\n  ours: {ours}\n  jcs:  {jcs}"
-        );
+    fn integer_valued_float_canonicalizes_to_an_integer() {
+        // RFC 8785 number formatting (ECMA-262) strips the fractional part
+        // of an integer-valued float: `1.0` is emitted as `1`, never
+        // `1.0`. No receipt field carries an f64 today, so this never
+        // bites a real receipt — but if one ever does, the encoder must
+        // not fork the digit string for the integer-valued case.
+        let v = serde_json::json!({ "n": 1.0 });
+        let jcs = serde_jcs::to_string(&v).expect("serde_jcs canonicalizes");
+        assert_eq!(jcs, r#"{"n":1}"#);
     }
 
     #[test]
-    fn write_canonical_known_divergence_above_2_pow_53_is_a_spec_decision() {
-        // KNOWN DIVERGENCE (reported, not fixed): for an integer outside
-        // the IEEE-754 double safe range (|n| >= 2^53), the two encoders
-        // disagree —
-        //   * `write_canonical` emits the EXACT i64 via serde_json::Number
-        //     Display (`9007199254740993`);
-        //   * `serde_jcs` applies RFC 8785's ECMA-262 number rule, which
-        //     routes through an f64 and rounds (`9007199254740992`).
-        // No `Receipt` field can carry such a value (seed/cost are
-        // realistic u64s, indices are small, status is u16), so this never
-        // bites a real receipt — but it IS a genuine canonicalization
-        // divergence and the choice of which rule is "correct" is a spec
-        // decision, not a thing to silently reconcile in this crate. This
-        // test pins the divergence so it can't change unnoticed.
+    fn integer_above_2_pow_53_rounds_per_rfc_8785() {
+        // For an integer outside the IEEE-754 double safe range
+        // (|n| >= 2^53), RFC 8785's ECMA-262 number rule routes through an
+        // f64 and rounds: 2^53 + 1 canonicalizes to 2^53. No `Receipt`
+        // field can carry such a value (seed/cost are realistic u64s,
+        // indices are small, status is u16), so this never bites a real
+        // receipt; the test pins the boundary behavior so it can't change
+        // unnoticed.
         let v = serde_json::json!({ "n": 9007199254740993i64 }); // 2^53 + 1
-        let mut ours = String::new();
-        write_canonical(&v, &mut ours);
         let jcs = serde_jcs::to_string(&v).expect("serde_jcs canonicalizes");
-        assert_eq!(ours, r#"{"n":9007199254740993}"#);
         assert_eq!(jcs, r#"{"n":9007199254740992}"#);
-        assert_ne!(
-            ours, jcs,
-            "the 2^53 boundary divergence is expected; if it vanished, re-evaluate the spec note"
-        );
     }
 
     #[test]
     fn canonical_receipt_bytes_match_serde_jcs() {
         // The full receipt path: `canonical_receipt_bytes` (which clears
-        // `signature`/`tsa_anchor` then runs `write_canonical`) must equal
+        // `signature`/`tsa_anchor` then canonicalizes) must equal
         // serde_jcs over the same cleared serde_json::Value.
         let r = sample_receipt();
         let ours = canonical_receipt_bytes(&r, SignatureScope::PreAnchor);

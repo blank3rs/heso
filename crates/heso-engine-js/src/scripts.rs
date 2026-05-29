@@ -861,7 +861,7 @@ fn fetch_script_source(
     // uses; decode base64 / percent-encoding; hand the body straight
     // to the script engine without a network round-trip.
     if src.starts_with("data:") {
-        if let Some(payload) = crate::fetch::parse_data_url(src) {
+        if let Some(payload) = heso_engine_fetch::parse_data_url(src) {
             return String::from_utf8(payload.body).map_err(|e| {
                 format!("data: URL body is not valid UTF-8 (script must be text): {e}")
             });

@@ -49,8 +49,8 @@ use serde_json::Value;
 // the §3.2 / §3.3 constants) keep working unchanged while the actual
 // implementation lives in exactly one place.
 pub use heso_verify::{
-    canonical_bytes, Outcome as OpenOutcome, SealedPlat, Signature, SignatureError, VerifyError,
-    ENVELOPE_ALG, SIGNING_DOMAIN,
+    canonical_bytes, CanonError, Outcome as OpenOutcome, SealedPlat, Signature, SignatureError,
+    VerifyError, ENVELOPE_ALG, SIGNING_DOMAIN,
 };
 
 /// Hex-encoded BLAKE3 of the plat's canonical-JSON bytes, with the
@@ -59,6 +59,13 @@ pub use heso_verify::{
 /// Thin wrapper over [`heso_verify::plat_hash`].
 pub fn hash(value: &Value) -> String {
     heso_verify::plat_hash(value)
+}
+
+/// Fallible hex-encoded BLAKE3 of the plat's canonical-JSON bytes — the
+/// [`Result`]-returning form of [`hash`] for paths that canonicalize
+/// page-derived content. Thin wrapper over [`heso_verify::try_plat_hash`].
+pub fn try_hash(value: &Value) -> Result<String, CanonError> {
+    heso_verify::try_plat_hash(value)
 }
 
 /// Canonical-JSON of `value` with any top-level `plat_hash` field

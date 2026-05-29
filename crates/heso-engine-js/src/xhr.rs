@@ -653,7 +653,7 @@ fn perform_request(
     p: &PendingXhr,
 ) -> XhrOutcome {
     // data: URL fast path — same logic as the script-src loader.
-    if let Some(payload) = crate::fetch::parse_data_url(&p.url) {
+    if let Some(payload) = heso_engine_fetch::parse_data_url(&p.url) {
         return XhrOutcome::Ok {
             status: 200,
             status_text: "OK".into(),

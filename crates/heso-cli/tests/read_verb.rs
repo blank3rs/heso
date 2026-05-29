@@ -493,3 +493,73 @@ fn run_open(url: &str) -> std::process::Output {
         .output()
         .expect("spawn heso open")
 }
+
+// ============================================================================
+// `data:` URL handling — decode text/HTML-ish bodies into a real
+// document with no network; emit a structured error for non-text MIME
+// and malformed URLs. No wiremock: a `data:` URL is self-contained.
+// ============================================================================
+
+/// Parse `out.stdout` as JSON without asserting the exit status —
+/// used by the `data:` error cases which intentionally exit non-zero.
+fn stdout_json(out: &std::process::Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "stdout not JSON: {e}\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        )
+    })
+}
+
+#[tokio::test]
+async fn read_data_url_text_html_builds_document() {
+    let out = run_read("data:text/html,<h1>hi</h1><p>world</p>", &[]);
+    assert!(
+        out.status.success(),
+        "read data:text/html should exit 0: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body = parse_stdout(&out);
+    assert_eq!(body["http_status"], serde_json::json!(200));
+    assert_eq!(body["partial"], serde_json::json!(false));
+    let text = body["text"].as_str().expect("text field");
+    assert!(text.contains("hi"), "expected 'hi' in text: {text}");
+    assert!(text.contains("world"), "expected 'world' in text: {text}");
+}
+
+#[tokio::test]
+async fn read_data_url_image_is_unsupported() {
+    // 1x1 transparent PNG, base64. Decodes fine but is not a document.
+    let out = run_read(
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/IsTAAAAAElFTkSuQmCC",
+        &[],
+    );
+    assert!(
+        !out.status.success(),
+        "read data:image/png should exit non-zero"
+    );
+    let body = stdout_json(&out);
+    assert_eq!(body["ok"], serde_json::json!(false));
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::json!("unsupported_data_url")
+    );
+    assert_eq!(body["error"]["mime"], serde_json::json!("image/png"));
+}
+
+#[tokio::test]
+async fn read_data_url_malformed_is_invalid() {
+    // No comma separator — not a parseable data: URL.
+    let out = run_read("data:text/html", &[]);
+    assert!(
+        !out.status.success(),
+        "read malformed data: should exit non-zero"
+    );
+    let body = stdout_json(&out);
+    assert_eq!(body["ok"], serde_json::json!(false));
+    assert_eq!(
+        body["error"]["code"],
+        serde_json::json!("invalid_data_url")
+    );
+}

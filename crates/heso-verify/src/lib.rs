@@ -63,6 +63,49 @@ pub const SIG_ALGORITHM: &str = "Ed25519";
 // Canonicalization + content hash (HESO/1.0 §1.7, §1.8)
 // ============================================================================
 
+/// A value could not be reduced to RFC 8785 canonical bytes.
+///
+/// The only shape that triggers this is a JSON number that is not finite
+/// (`NaN` / `±Infinity`): RFC 8785 has no representation for it, so the
+/// canonicalizer rejects it. Internal producers (`seal`, the stamp/run
+/// flows, the conformance vectors) never construct such a value, so they
+/// use the infallible [`canonical_bytes`] / [`plat_hash`]. Callers that
+/// canonicalize page-derived content reach for the `try_*` variants and
+/// surface this as a structured error instead of aborting the process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonError(String);
+
+impl std::fmt::Display for CanonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "value is not RFC 8785 canonicalizable: {}", self.0)
+    }
+}
+
+impl std::error::Error for CanonError {}
+
+fn strip_top_level_plat_hash(value: &Value) -> Value {
+    match value {
+        Value::Object(map) if map.contains_key("plat_hash") => {
+            let mut stripped = map.clone();
+            stripped.remove("plat_hash");
+            Value::Object(stripped)
+        }
+        other => other.clone(),
+    }
+}
+
+/// Canonical-JSON bytes of `value` with any **top-level** `plat_hash`
+/// field removed — the fallible form of [`canonical_bytes`].
+///
+/// Returns [`CanonError`] when `value` carries a non-finite number that
+/// RFC 8785 cannot represent. Use this on any path that canonicalizes
+/// page-derived content so a malformed value becomes a structured error
+/// rather than a process abort.
+pub fn try_canonical_bytes(value: &Value) -> Result<Vec<u8>, CanonError> {
+    let cleaned = strip_top_level_plat_hash(value);
+    serde_jcs::to_vec(&cleaned).map_err(|e| CanonError(e.to_string()))
+}
+
 /// Canonical-JSON bytes of `value` with any **top-level** `plat_hash`
 /// field removed — the exact bytes [`plat_hash`] hashes and a sealed
 /// envelope signs over.
@@ -71,22 +114,32 @@ pub const SIG_ALGORITHM: &str = "Ed25519";
 /// its own digest. Every other field is content; nested `plat_hash`
 /// values (from `linked_pages[*]`) ARE preserved so a parent plat
 /// cryptographically commits to its children's hashes (Merkle-style).
+///
+/// Infallible: every internal producer feeds finite numbers only. Paths
+/// that canonicalize page-derived content use [`try_canonical_bytes`].
 pub fn canonical_bytes(value: &Value) -> Vec<u8> {
-    let cleaned = match value {
-        Value::Object(map) if map.contains_key("plat_hash") => {
-            let mut stripped = map.clone();
-            stripped.remove("plat_hash");
-            Value::Object(stripped)
-        }
-        other => other.clone(),
-    };
-    serde_jcs::to_vec(&cleaned).expect("plat value canonicalizes")
+    try_canonical_bytes(value).expect("plat value canonicalizes")
+}
+
+/// Canonical-JSON of `value` (top-level `plat_hash` removed) as a UTF-8
+/// string — the fallible form of [`canonical_json`].
+pub fn try_canonical_json(value: &Value) -> Result<String, CanonError> {
+    let bytes = try_canonical_bytes(value)?;
+    Ok(String::from_utf8(bytes).expect("serde_jcs emits valid UTF-8"))
 }
 
 /// Canonical-JSON of `value` (top-level `plat_hash` removed) as a UTF-8
 /// string. The string form of [`canonical_bytes`].
 pub fn canonical_json(value: &Value) -> String {
     String::from_utf8(canonical_bytes(value)).expect("serde_jcs emits valid UTF-8")
+}
+
+/// Lowercase-hex BLAKE3 of the plat's canonical bytes — the fallible
+/// form of [`plat_hash`].
+///
+/// Returns [`CanonError`] when `value` carries a non-finite number.
+pub fn try_plat_hash(value: &Value) -> Result<String, CanonError> {
+    Ok(blake3::hash(&try_canonical_bytes(value)?).to_hex().to_string())
 }
 
 /// Lowercase-hex BLAKE3 of the plat's canonical bytes, with the

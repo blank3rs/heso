@@ -38,6 +38,17 @@
 //! - **1** — all URLs failed (or `--fail-fast` and the first error stopped the batch)
 //! - **2** — flag-parse / usage error
 //!
+//! ## Plat hashing
+//!
+//! Batch rows stamp `plat_hash` via the infallible
+//! [`heso_engine_fetch::plat_hash`], not the `try_*` form, because `batch`
+//! is a short-lived CLI process: a canonicalization panic ends one
+//! invocation, not a server's in-flight requests. The long-lived `serve`
+//! path canonicalizes the same page-derived content through
+//! `try_plat_hash` so a rejecting value surfaces as a structured error
+//! instead of aborting the process — exposing `batch` through `serve`
+//! would require the same upgrade here.
+//!
 //! ## Concurrency model
 //!
 //! - One shared [`FetchEngine`] per batch — single cookie jar, single

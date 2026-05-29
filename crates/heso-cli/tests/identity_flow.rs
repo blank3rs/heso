@@ -146,6 +146,7 @@ fn receipt_verify_returns_zero_for_a_valid_signed_receipt() {
         signature: None,
         tsa_anchor: None,
         produced_plat_hash: None,
+        canon: None,
     };
     heso_trace::sign_receipt(&key, &mut receipt);
     let json = serde_json::to_string_pretty(&receipt).unwrap();
@@ -193,6 +194,7 @@ fn receipt_verify_returns_one_for_tampered_receipt() {
         signature: None,
         tsa_anchor: None,
         produced_plat_hash: None,
+        canon: None,
     };
     heso_trace::sign_receipt(&key, &mut receipt);
     // Tamper: mutate the seed AFTER signing.
@@ -242,6 +244,7 @@ fn receipt_verify_returns_two_for_unsigned_receipt() {
         signature: None,
         tsa_anchor: None,
         produced_plat_hash: None,
+        canon: None,
     };
     let json = serde_json::to_string_pretty(&receipt).unwrap();
     std::fs::write(&receipt_path, json).unwrap();

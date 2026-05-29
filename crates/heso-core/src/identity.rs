@@ -19,10 +19,11 @@
 //!    no PEM-vs-binary debate to have when the bytes never leave the
 //!    machine.
 //!
-//! **Permissions on Windows are not tightened to 0600** today — Windows
-//! ACLs are not a one-line `chmod`. The directory is gitignored and the
-//! file is only readable by the user account anyway under default NTFS
-//! permissions. A follow-up can wire `cacls`-equivalents per platform.
+//! **Permissions are tightened per platform on save.** On Unix the file
+//! is `chmod 0600`. On Windows [`IdentityKey::save`] shells out to
+//! `icacls` to break ACL inheritance and grant full control only to the
+//! current user — a failed hardening is loud (the save returns an error)
+//! rather than leaving a broadly-readable key.
 //!
 //! ## Signing
 //!
@@ -133,9 +134,21 @@ impl IdentityKey {
             path: path.to_path_buf(),
             source: e,
         })?;
-        // On Unix, tighten permissions to 0600. On Windows, default NTFS
-        // ACLs already restrict access to the user account; a follow-up
-        // can run `icacls` to be even stricter.
+        // A failed hardening must leave no artifact behind: the partial key
+        // would otherwise sit on disk with the parent's broad ACL, and the
+        // `path.exists()` guard above would block the caller from retrying.
+        // Delete it before surfacing the error so a failed `save` is both
+        // loud and retryable.
+        if let Err(e) = Self::harden_permissions(path) {
+            let _ = fs::remove_file(path);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Restrict the key file to the current user. On Unix that's a
+    /// 0600 `chmod`; on Windows it's an `icacls` ACL reset.
+    fn harden_permissions(path: &Path) -> Result<(), IdentityError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -144,6 +157,35 @@ impl IdentityKey {
                 path: path.to_path_buf(),
                 source: e,
             })?;
+        }
+        #[cfg(windows)]
+        {
+            // Break inheritance from the parent directory's NTFS ACL, then
+            // grant the running user full control. Anything short of a clean
+            // success is surfaced as an error so the key is never left with
+            // a broader ACL than intended.
+            let user = std::env::var("USERNAME").map_err(|_| IdentityError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("USERNAME not set; cannot restrict key permissions"),
+            })?;
+            let status = std::process::Command::new("icacls")
+                .arg(path)
+                .arg("/inheritance:r")
+                .arg("/grant:r")
+                .arg(format!("{user}:F"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| IdentityError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
+            if !status.success() {
+                return Err(IdentityError::Io {
+                    path: path.to_path_buf(),
+                    source: std::io::Error::other("icacls failed to restrict key permissions"),
+                });
+            }
         }
         Ok(())
     }
@@ -277,6 +319,12 @@ pub enum IdentityError {
     /// Signature verification failed.
     #[error("signature verification failed")]
     VerificationFailed,
+
+    /// The receipt carries a canonicalization-algorithm tag this verifier
+    /// does not understand. Refusing rather than re-hashing under the
+    /// wrong number rule.
+    #[error("unsupported canonicalization tag `{0}`")]
+    UnknownCanon(String),
 }
 
 // ============================================================================
@@ -375,6 +423,35 @@ mod tests {
         let sig = loaded.sign(b"after load");
         sig.verify(b"after load")
             .expect("loaded key signs+verifies");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_restricts_acl_to_current_user_on_windows() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.key");
+        IdentityKey::generate().save(&path).expect("save ok");
+
+        let out = std::process::Command::new("icacls")
+            .arg(&path)
+            .output()
+            .expect("icacls runs");
+        assert!(out.status.success(), "icacls query failed");
+        let acl = String::from_utf8_lossy(&out.stdout);
+
+        let user = std::env::var("USERNAME").expect("USERNAME set");
+        assert!(
+            acl.contains(&user),
+            "ACL should grant the current user; got:\n{acl}"
+        );
+        assert!(
+            !acl.contains("Everyone"),
+            "ACL must not grant Everyone; got:\n{acl}"
+        );
+        assert!(
+            !acl.contains("Authenticated Users"),
+            "ACL must not grant Authenticated Users; got:\n{acl}"
+        );
     }
 
     #[test]

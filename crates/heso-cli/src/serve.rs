@@ -544,7 +544,8 @@ async fn dispatch_open(
     let page_id_value = payload
         .as_object_mut()
         .and_then(|obj| obj.remove("page_id"));
-    let hash = heso_engine_fetch::plat_hash(&payload);
+    let hash = heso_engine_fetch::try_plat_hash(&payload)
+        .map_err(|e| format!("canonicalization failed: {e}"))?;
     if let Some(obj) = payload.as_object_mut() {
         if let Some(pid) = page_id_value {
             obj.insert("page_id".to_owned(), pid);
@@ -1420,7 +1421,8 @@ async fn dispatch_read(
         body["scroll"] = serde_json::to_value(&s).unwrap_or(serde_json::Value::Null);
     }
 
-    let hash = heso_engine_fetch::plat_hash(&body);
+    let hash = heso_engine_fetch::try_plat_hash(&body)
+        .map_err(|e| format!("canonicalization failed: {e}"))?;
     if let Some(obj) = body.as_object_mut() {
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
         obj.insert("page_id".to_owned(), serde_json::Value::String(page_id));

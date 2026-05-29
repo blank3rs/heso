@@ -64,6 +64,7 @@
 pub mod actions;
 pub mod cassette;
 pub mod data_attrs;
+pub mod data_url;
 pub mod explore;
 pub mod inline_data;
 pub mod metadata;
@@ -78,6 +79,7 @@ pub use actions::{
 };
 pub use cassette::{Cassette, CassetteMiss, Record as CassetteRecord};
 pub use data_attrs::{extract as extract_data_attrs, DataAttrValue};
+pub use data_url::{parse_data_url, DataPayload};
 pub use explore::{
     linked_pages_to_json, ExploreOptions, LinkedPage, DEFAULT_LINK_CAP, HARD_LINK_CAP,
 };
@@ -85,9 +87,9 @@ pub use inline_data::extract as extract_inline_data;
 pub use metadata::{extract as extract_metadata, PageMetadata};
 pub use plat::{
     canonical_json as plat_canonical_json, hash as plat_hash, open as plat_open,
-    seal as plat_seal, seal_checked as plat_seal_checked, verify as plat_verify,
-    OpenOutcome as PlatOpenOutcome, SealError as PlatSealError, SealedPlat,
-    VerifyError as PlatVerifyError,
+    seal as plat_seal, seal_checked as plat_seal_checked, try_hash as try_plat_hash,
+    verify as plat_verify, CanonError, OpenOutcome as PlatOpenOutcome, SealError as PlatSealError,
+    SealedPlat, VerifyError as PlatVerifyError,
 };
 pub use step::{logical_step_timestamp, StepBoundary, StepStatus};
 pub use tree::{build_tree, HtmlTree, LsRow, PwdRow, TreeError, TreeNode};
@@ -146,6 +148,23 @@ pub enum Error {
     /// [`private_network::BLOCK_ERROR_MARKER`].
     #[error("{0}")]
     PrivateNetworkBlocked(private_network::BlockedAddr),
+
+    /// A `data:` URL decoded to a non-text body (image, audio, font, …).
+    /// heso serves `data:` URLs as documents only when the MIME is
+    /// text/HTML-ish; an opaque payload has no document to extract.
+    #[error("data: body is {mime}, not a text/HTML document")]
+    UnsupportedDataUrl {
+        /// The bare MIME type carried by the `data:` URL.
+        mime: String,
+    },
+
+    /// A `data:` URL that could not be parsed — no `,` separator, or a
+    /// malformed base64 payload.
+    #[error("malformed data: URL: {message}")]
+    InvalidDataUrl {
+        /// Human-readable detail for the structured CLI envelope.
+        message: String,
+    },
 }
 
 impl From<Error> for heso_core::Error {
@@ -194,6 +213,26 @@ impl Error {
                 false
             }
             _ => false,
+        }
+    }
+
+    /// The bare MIME type when this error is a `data:` URL whose body is
+    /// not a text/HTML document. The CLI uses it to emit a structured
+    /// `{code: "unsupported_data_url", ...}` envelope carrying the `mime`.
+    pub fn unsupported_data_url_mime(&self) -> Option<&str> {
+        match self {
+            Error::UnsupportedDataUrl { mime } => Some(mime),
+            _ => None,
+        }
+    }
+
+    /// The detail message when this error is a malformed `data:` URL. The
+    /// CLI uses it to emit a structured `{code: "invalid_data_url", ...}`
+    /// envelope.
+    pub fn invalid_data_url_message(&self) -> Option<&str> {
+        match self {
+            Error::InvalidDataUrl { message } => Some(message),
+            _ => None,
         }
     }
 }
@@ -592,6 +631,12 @@ impl FetchEngine {
                 Ok(raw)
             }
             CassetteMode::Replaying(cassette) => {
+                // A `data:` URL is self-contained and deterministic — it is
+                // never recorded into a cassette, so decode it in-process the
+                // same way the live path does rather than reporting a miss.
+                if url.scheme() == "data" {
+                    return data_url_result(url);
+                }
                 let record = cassette.lookup("GET", url.as_str(), &[]).ok_or_else(|| {
                     Error::CassetteMiss(cassette::CassetteMiss {
                         method: "GET".to_owned(),
@@ -622,6 +667,9 @@ impl FetchEngine {
     /// the underlying `reqwest::Error` survives the round-trip and
     /// [`Error::is_timeout`] can read its `is_timeout()` flag.
     async fn live_get_typed(&self, url: &Url) -> Result<HttpFetchResult, Error> {
+        if url.scheme() == "data" {
+            return data_url_result(url);
+        }
         guard_literal_host(url)?;
         let response = self
             .client
@@ -1545,6 +1593,33 @@ fn is_extractable_content_type(content_type: &str) -> bool {
     bare == "application/xhtml+xml" || bare.starts_with("text/")
 }
 
+/// Decode a `data:` URL into the same [`HttpFetchResult`] shape the
+/// network path produces, so the rest of the read pipeline builds a
+/// document with no HTTP round-trip. reqwest only speaks HTTP(S), so
+/// `data:` is intercepted here before it ever reaches the client.
+///
+/// A text/HTML-ish body becomes a synthetic 200 carrying the decoded
+/// bytes and a `content-type` header. A non-text body
+/// ([`Error::UnsupportedDataUrl`]) or an unparseable URL
+/// ([`Error::InvalidDataUrl`]) surfaces as a typed error the CLI maps
+/// to a structured envelope.
+fn data_url_result(url: &Url) -> Result<HttpFetchResult, Error> {
+    let payload = data_url::parse_data_url(url.as_str()).ok_or_else(|| Error::InvalidDataUrl {
+        message: format!("`{url}` has no comma separator or a malformed base64 payload"),
+    })?;
+    let mime = bare_mime(&payload.mime);
+    if !is_extractable_content_type(&mime) {
+        return Err(Error::UnsupportedDataUrl { mime });
+    }
+    Ok(HttpFetchResult {
+        final_url: url.clone(),
+        http_status: 200,
+        response_cookies: Vec::new(),
+        response_headers: vec![("content-type".to_owned(), mime)],
+        body_bytes: payload.body,
+    })
+}
+
 
 /// Walk an already-parsed document and return the visible body text, with
 /// `<script>`, `<style>`, `<noscript>`, and `<template>` content skipped.
@@ -1726,6 +1801,21 @@ mod tests {
             partial_reason_for_status(404, body, Some("application/pdf")).as_deref(),
             Some("non_html_content_type"),
         );
+    }
+
+    /// A `data:` URL is self-contained, so a replaying engine over an
+    /// empty cassette decodes it in-process rather than reporting a miss.
+    #[tokio::test]
+    async fn replaying_engine_decodes_data_url_without_a_cassette_hit() {
+        let engine =
+            FetchEngine::with_replaying_cassette(Arc::new(Cassette::new())).expect("engine builds");
+        let page = engine
+            .open_typed("data:text/html,<h1>hi</h1><p>world</p>")
+            .await
+            .expect("data: URL decodes under replay");
+        let text = extract_visible_text(&page.body_html);
+        assert!(text.contains("hi"), "got: {text}");
+        assert!(text.contains("world"), "got: {text}");
     }
 
     /// Live network test, runs by default — example.com is a stable

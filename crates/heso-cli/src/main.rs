@@ -561,6 +561,7 @@ async fn open_or_die_with_timeout(
             emit_private_network_envelope(url.as_str());
             Err(ExitCode::FAILURE)
         }
+        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => Err(ExitCode::FAILURE),
         Err(e) => {
             eprintln!("fetch failed: {e}");
             Err(ExitCode::FAILURE)
@@ -615,6 +616,61 @@ pub(crate) fn emit_private_network_envelope(url: &str) {
                 "{url} resolves to a private/loopback/metadata IP; refused \
                  (set by --no-private-networks / HESO_BLOCK_PRIVATE_NETWORKS)"
             ),
+            "url": url,
+        },
+    });
+    let _ = write_json_to_stdout(&body);
+}
+
+/// If `e` is a `data:`-URL error, print the matching structured
+/// envelope (`unsupported_data_url` for a non-text body,
+/// `invalid_data_url` for a malformed URL) and return `true`. Returns
+/// `false` for any other error so the caller falls through to its
+/// generic `fetch failed:` line. Lets every fetch site map both
+/// `data:` outcomes to stdout JSON without repeating the two arms.
+pub(crate) fn emit_data_url_error_envelope(
+    url: &str,
+    e: &heso_engine_fetch::Error,
+) -> bool {
+    if let Some(mime) = e.unsupported_data_url_mime() {
+        emit_unsupported_data_url_envelope(url, mime);
+        return true;
+    }
+    if let Some(message) = e.invalid_data_url_message() {
+        emit_invalid_data_url_envelope(url, message);
+        return true;
+    }
+    false
+}
+
+/// Print the canonical unsupported-`data:`-URL envelope to stdout.
+/// Emitted when a `data:` URL decodes to a non-text body (image, audio,
+/// font, …): heso serves `data:` URLs as documents only when the MIME
+/// is text/HTML-ish, so an opaque payload has no document to extract.
+/// Carries the `mime` so an agent can see exactly what it asked for.
+pub(crate) fn emit_unsupported_data_url_envelope(url: &str, mime: &str) {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "unsupported_data_url",
+            "message": format!("data: body is {mime}, not a text/HTML document"),
+            "mime": mime,
+            "url": url,
+        },
+    });
+    let _ = write_json_to_stdout(&body);
+}
+
+/// Print the canonical malformed-`data:`-URL envelope to stdout.
+/// Emitted when a `data:` URL has no `,` separator or a malformed
+/// base64 payload — a distinct, machine-readable outcome from the
+/// generic `fetch failed:` line.
+pub(crate) fn emit_invalid_data_url_envelope(url: &str, message: &str) {
+    let body = serde_json::json!({
+        "ok": false,
+        "error": {
+            "code": "invalid_data_url",
+            "message": message,
             "url": url,
         },
     });
@@ -1147,6 +1203,7 @@ async fn cmd_open(args: &[String]) -> ExitCode {
             emit_private_network_envelope(&url_str);
             return ExitCode::FAILURE;
         }
+        Err(e) if emit_data_url_error_envelope(&url_str, &e) => return ExitCode::FAILURE,
         Err(e) => {
             // Hard fetch failures (DNS, connection refused, HTTP error
             // before any body returned) exit non-zero — no payload was
@@ -1951,6 +2008,7 @@ async fn cmd_eval_dom(args: &[String]) -> ExitCode {
             emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
+        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -2298,6 +2356,7 @@ async fn cmd_read(args: &[String]) -> ExitCode {
             emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
+        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -4457,6 +4516,7 @@ where
             emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
+        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -4495,6 +4555,7 @@ where
             emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
+        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
         Err(e) => {
             eprintln!("fetch (html) failed: {e}");
             return ExitCode::FAILURE;
@@ -5279,6 +5340,7 @@ async fn cmd_submit_inner(
             emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
+        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
         Err(e) => {
             eprintln!("fetch failed: {e}");
             return ExitCode::FAILURE;
@@ -5317,6 +5379,7 @@ async fn cmd_submit_inner(
             emit_private_network_envelope(url.as_str());
             return ExitCode::FAILURE;
         }
+        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
         Err(e) => {
             eprintln!("fetch (html) failed: {e}");
             return ExitCode::FAILURE;
