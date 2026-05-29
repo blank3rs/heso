@@ -345,11 +345,17 @@ fn print_banner() {
     println!("    --network-idle [--idle-window DUR]   No queued fetch/timer for DUR (default 500ms; Playwright `networkidle` parity)");
     println!("    --time DUR                     Advance the deterministic virtual clock by DUR (e.g. `2s`, `750ms`)");
     println!("    [--timeout DUR]                Overall wall-clock cap (default 30s, Playwright default)");
-    println!("  heso click  <url> (<@ref> | --text S | --selector CSS | --aria-label S)");
+    println!("  heso click  <url> (<@ref> | --text S | --selector CSS | --aria-label S) [--js]");
     println!("                                Fetch <url>, locate element by ref OR locator flag, dispatch a click.");
     println!("                                One-shot ergonomic: skips the `read` → scan → `click @e7` round-trip.");
-    println!("  heso fill   <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value>");
+    println!("                                --js resolves refs against the post-hydration DOM (pair with `read --js-fetch`,");
+    println!("                                which emits the same hydrated graph). Live --js clicks are best-effort: a");
+    println!("                                handler that calls fetch() is non-deterministic, same stance as `submit`.");
+    println!("  heso fill   <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value> [--js]");
     println!("                                Fetch <url>, locate input by ref OR locator flag, set its .value and fire input+change.");
+    println!("                                --js resolves against the hydrated DOM and snapshots the post-fill page (pair with");
+    println!("                                `read --js-fetch`); best-effort: a handler that calls fetch() is non-deterministic,");
+    println!("                                same stance as `submit`.");
     println!("  heso submit <url> (<@form-ref> | --text S | --selector CSS | --aria-label S) [--field NAME=VALUE]... [--data JSON]");
     println!("                                Fetch <url>, locate form by ref OR locator flag, optionally pre-fill named inputs,");
     println!("                                dispatch submit, POST per enctype, return response body + status + parsed JSON.");
@@ -2666,11 +2672,13 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let mut console = session.engine().drain_console();
     let failed_scripts = session.engine().drain_script_failures();
     let mut post_html = session.document_html();
-    // Action graph the rest of the envelope speaks against. Starts as
-    // the static-side extraction so plain `read` matches its previous
-    // shape exactly; under `--complete` we'll re-extract after the
-    // load loop so any newly-appended interactive elements get refs.
-    let mut current_actions = page.actions.clone();
+    // Action graph the rest of the envelope speaks against. Extracted
+    // from the post-hydration DOM so the `@eN` refs, `forms`, and
+    // `lazy_hints` describe the same document that `text`, `tree`, and
+    // `title` report against. Under `--complete` the load loop
+    // re-extracts after each step so newly-appended interactive
+    // elements pick up refs too.
+    let mut current_actions = heso_engine_fetch::extract_actions_from_html(&post_html);
 
     // ---- lazy_hints (always emit) ----
     // Heuristics computed from the post-hydration DOM + JS-side IO
@@ -2705,14 +2713,12 @@ async fn cmd_read(args: &[String]) -> ExitCode {
         .count();
 
     // Same canonical base as `cmd_open`. Override `actions` with the
-    // post-load action graph (which may differ from `page.actions`
-    // under `--complete`).
+    // post-hydration action graph.
     let mut body = page.plat_body_base();
     body["actions"] = serde_json::to_value(&current_actions).unwrap_or(serde_json::Value::Null);
-    // `tree`, `title`, `description`, and `metadata` come off the
-    // static-fetch base, which was extracted from the pre-hydration
-    // HTML. Re-extract them from the post-hydration snapshot so they
-    // describe the same DOM that `text` and `actions` report against.
+    // Re-extract `tree`, `title`, `description`, and `metadata` from
+    // the post-hydration snapshot so every envelope field describes the
+    // same DOM that `text` and `actions` report against.
     let post_page = heso_engine_fetch::FetchPage::from_html(
         page.input_url.clone(),
         page.url().clone(),
@@ -2730,11 +2736,10 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     // and the `--since` snapshot store even when the include filter
     // would have dropped them from the user-visible body. The body
     // gates them per `include`, the hash always sees them.
-    // Compute against the POST-LOOP state (`current_actions` +
-    // `post_html`) so `--complete` is reflected in the hash and in
-    // every reader-facing field. When `--complete` is off,
-    // `current_actions` == `page.actions` clone, so this is a no-op
-    // change for the plain `read` path.
+    // Compute against the post-hydration state (`current_actions` +
+    // `post_html`) so `--complete`'s loaded content and the hydrated
+    // DOM are both reflected in the hash and in every reader-facing
+    // field.
     let visible_text = heso_engine_fetch::extract_visible_text(&post_html);
     let forms_json = group_forms(&current_actions);
 
@@ -2802,9 +2807,9 @@ async fn cmd_read(args: &[String]) -> ExitCode {
     let (partial, partial_reason) = apply_extraction_truthfulness(
         partial,
         partial_reason,
-        &page.tree.title,
-        page.actions.len(),
-        page.tree.root.children.len(),
+        &post_page.tree.title,
+        current_actions.len(),
+        post_page.tree.root.children.len(),
         &failed_scripts,
     );
     attach_failure_envelope(
@@ -4669,6 +4674,116 @@ pub(crate) fn parse_locator_flags(
     Ok((target, extra))
 }
 
+/// The pieces `run_dispatch` needs once a target has been resolved: the
+/// live session to dispatch against, the resolved [`ElementRef`] (the
+/// anchor-follow path inspects its `tag`/`href`), the CSS selector, the
+/// `@eN` ref label, the optional `id` attribute, and the page's
+/// post-redirect URL.
+type ResolvedDispatch = (
+    heso_engine_js::JsSession,
+    ElementRef,
+    String,
+    String,
+    Option<String>,
+    Url,
+);
+
+/// Resolve a click/fill target against the HYDRATED DOM for the `--js`
+/// path. Reuses the `body_html` already fetched by `run_dispatch` (no
+/// second HTTP round-trip), opens a fetch+cookie session so handlers
+/// that `fetch()` or write `document.cookie` work, re-extracts the
+/// action graph from the post-hydration document, and resolves the
+/// target against that graph.
+///
+/// Ref coherence: `@eN` refs are document-order indices stable only
+/// within one parse, so the static and hydrated graphs can disagree.
+/// When the target resolves against the static graph but NOT the
+/// hydrated one, the failure is reported as `ref_needs_js` — the agent
+/// is holding a ref from a static read whose element moved or vanished
+/// after hydration, distinct from a ref that names nothing anywhere
+/// (`ref_not_found`).
+async fn resolve_js_dispatch(
+    engine: &FetchEngine,
+    page: &FetchPage,
+    target: &LocatorTarget,
+    op_name: &str,
+) -> Result<ResolvedDispatch, ExitCode> {
+    let client = engine.client();
+    let cookie_jar = engine.cookie_jar();
+    let rt_handle = tokio::runtime::Handle::current();
+    let js_engine =
+        match heso_engine_js::JsEngine::new_with_fetch_and_cookies(client, rt_handle, cookie_jar) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to create JS engine: {e}");
+                return Err(ExitCode::FAILURE);
+            }
+        };
+
+    let final_url = page.url().clone();
+    let session = match heso_engine_js::JsSession::open_on_engine_with_pre_scripts(
+        js_engine,
+        &page.body_html,
+        final_url.clone(),
+        heso_engine_js::ScriptFetchPolicy::Fetch,
+        &[],
+    ) {
+        Ok((s, _)) => s,
+        Err(e) => {
+            eprintln!("failed to load page into JS engine: {e}");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+
+    let post_html = session.document_html();
+    let hydrated_actions = heso_engine_fetch::extract_actions_from_html(&post_html);
+
+    let action = match resolve_target(&post_html, &hydrated_actions, target) {
+        Ok(a) => a,
+        Err(e) => {
+            // A target that the static parse could resolve but the
+            // hydrated DOM cannot is a stale ref from a non-`--js`
+            // read, not a genuine miss — steer the agent to the
+            // matched pair rather than letting them give up.
+            if matches!(
+                e,
+                TargetError::UnknownRef(_) | TargetError::NoMatch { .. }
+            ) && resolve_target(&page.body_html, &page.actions, target).is_ok()
+            {
+                let msg = match target.ref_id.as_deref() {
+                    Some(r) => format!(
+                        "ref `{}` exists in the static page but not the hydrated DOM; the hydrated action graph renumbered or removed it",
+                        normalize_ref(r)
+                    ),
+                    None => "locator matched the static page but not the hydrated DOM".to_owned(),
+                };
+                eprintln!("{msg}");
+                return Err(emit_cli_error("ref_needs_js", &msg, 2));
+            }
+            return Err(report_target_error(op_name, e));
+        }
+    };
+
+    let want = action.ref_id.clone();
+    let element_id = action
+        .attrs
+        .get("id")
+        .filter(|s| !s.is_empty())
+        .cloned();
+    let selector = match selector_for_action(&action) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
+                action.tag, action.attrs
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    };
+
+    Ok((session, action, selector, want, element_id, final_url))
+}
+
 /// Shared body for `heso click` / `heso fill` / `heso submit`. Fetches
 /// `url`, resolves `ref_str` in the action graph, builds a CSS
 /// selector, and hands `(html, selector)` to `op`. `op` is the
@@ -4710,6 +4825,7 @@ async fn run_dispatch<F>(
     op_name: &str,
     written_value: Option<&str>,
     timeout_ms: Option<u64>,
+    js: bool,
     op: F,
 ) -> ExitCode
 where
@@ -4757,69 +4873,88 @@ where
             return ExitCode::FAILURE;
         }
     };
-    let action = match resolve_target(&page.body_html, &page.actions, target) {
-        Ok(a) => a,
-        Err(e) => return report_target_error(op_name, e),
-    };
-    let want = action.ref_id.clone();
-    let element_id = action
-        .attrs
-        .get("id")
-        .filter(|s| !s.is_empty())
-        .cloned();
-    let selector = match selector_for_action(&action) {
-        Some(s) => s,
-        None => {
-            eprintln!(
-                "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
-                action.tag, action.attrs
-            );
-            return ExitCode::FAILURE;
-        }
-    };
 
-    let html_started = std::time::Instant::now();
-    let (final_url, html) = match engine.fetch_text_typed(&url).await {
-        Ok(pair) => pair,
-        Err(e) if e.is_timeout() => {
-            let elapsed_ms = html_started.elapsed().as_millis() as u64;
-            emit_timeout_envelope(url.as_str(), timeout_ms_for_envelope(timeout_ms), elapsed_ms);
-            return ExitCode::FAILURE;
+    // `--js` resolves the target against the post-hydration DOM and
+    // dispatches against that same live session, so a control that only
+    // exists after a script runs is reachable. The default path resolves
+    // against the static parse and re-fetches the HTML for a fresh
+    // session — two distinct snapshots, but the one agents reach for when
+    // the page is server-rendered.
+    let (session, action, selector, want, element_id, final_url) = if js {
+        match resolve_js_dispatch(&engine, &page, target, op_name).await {
+            Ok(r) => r,
+            Err(code) => return code,
         }
-        Err(e) if e.is_private_network_blocked() => {
-            emit_private_network_envelope(url.as_str());
-            return ExitCode::FAILURE;
-        }
-        Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
-        Err(e) => {
-            eprintln!("fetch (html) failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    } else {
+        let action = match resolve_target(&page.body_html, &page.actions, target) {
+            Ok(a) => a,
+            Err(e) => return report_target_error(op_name, e),
+        };
+        let want = action.ref_id.clone();
+        let element_id = action
+            .attrs
+            .get("id")
+            .filter(|s| !s.is_empty())
+            .cloned();
+        let selector = match selector_for_action(&action) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "could not build a CSS selector for `{want}` (tag={:?}, attrs={:?})",
+                    action.tag, action.attrs
+                );
+                return ExitCode::FAILURE;
+            }
+        };
 
-    let js_engine = match heso_engine_js::JsEngine::new() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("failed to create JS engine: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+        let html_started = std::time::Instant::now();
+        let (final_url, html) = match engine.fetch_text_typed(&url).await {
+            Ok(pair) => pair,
+            Err(e) if e.is_timeout() => {
+                let elapsed_ms = html_started.elapsed().as_millis() as u64;
+                emit_timeout_envelope(
+                    url.as_str(),
+                    timeout_ms_for_envelope(timeout_ms),
+                    elapsed_ms,
+                );
+                return ExitCode::FAILURE;
+            }
+            Err(e) if e.is_private_network_blocked() => {
+                emit_private_network_envelope(url.as_str());
+                return ExitCode::FAILURE;
+            }
+            Err(e) if emit_data_url_error_envelope(url.as_str(), &e) => return ExitCode::FAILURE,
+            Err(e) => {
+                eprintln!("fetch (html) failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
 
-    // A stateful session keeps the post-dispatch DOM live so a
-    // non-navigating click (one whose handler mutates the DOM or calls
-    // `history.pushState`) can be snapshotted afterwards. Inline scripts
-    // run during open, matching `cmd_read`'s hydration pass.
-    let session = match heso_engine_js::JsSession::open_on_engine(
-        js_engine,
-        &html,
-        final_url.clone(),
-        heso_engine_js::ScriptFetchPolicy::Fetch,
-    ) {
-        Ok((s, _)) => s,
-        Err(e) => {
-            eprintln!("failed to load page into JS engine: {e}");
-            return ExitCode::FAILURE;
-        }
+        let js_engine = match heso_engine_js::JsEngine::new() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("failed to create JS engine: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+        // A stateful session keeps the post-dispatch DOM live so a
+        // non-navigating click (one whose handler mutates the DOM or calls
+        // `history.pushState`) can be snapshotted afterwards. Inline scripts
+        // run during open, matching `cmd_read`'s hydration pass.
+        let session = match heso_engine_js::JsSession::open_on_engine(
+            js_engine,
+            &html,
+            final_url.clone(),
+            heso_engine_js::ScriptFetchPolicy::Fetch,
+        ) {
+            Ok((s, _)) => s,
+            Err(e) => {
+                eprintln!("failed to load page into JS engine: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        (session, action, selector, want, element_id, final_url)
     };
 
     let value_field: serde_json::Value = match written_value {
@@ -4920,6 +5055,12 @@ where
                     // mutated text or a `history.pushState` rewrite.
                     None => attach_post_click_snapshot(&mut body, &session, &final_url),
                 }
+            } else if op_name == "fill" && js {
+                // A `--js` fill runs against the live hydrated DOM, so an
+                // `input`/`change` listener may rewrite the page. Snapshot
+                // it with the same fields a non-navigating click surfaces
+                // so the agent sees the post-fill document.
+                attach_post_click_snapshot(&mut body, &session, &final_url);
             }
             match serde_json::to_string_pretty(&body) {
                 Ok(s) => println!("{s}"),
@@ -5225,21 +5366,31 @@ async fn augment_click_with_destination(
 /// - `--aria-label "<string>"` — case-insensitive substring match
 ///   against the `aria-label` attribute.
 ///
+/// `--js` resolves the target against the post-hydration DOM and
+/// dispatches against that live session — it reaches controls that
+/// only exist after a script runs, and runs handlers on a fetch+cookie
+/// engine so `fetch()`/`document.cookie` writes work. Pair it with
+/// `read --js-fetch`, which emits the same hydrated action graph; a ref
+/// from a static `read` that the hydrated DOM renumbered away returns
+/// `error.code: "ref_needs_js"`. Live `--js` clicks are best-effort
+/// (non-deterministic when a handler calls `fetch()`, same as `submit`).
+///
 /// Exit codes: 0 on success, 1 on fetch/JS failure or selector miss,
 /// 2 on usage error, unknown ref, zero locator matches, ambiguous
-/// matches (with the candidate refs printed to stderr), or invalid
-/// CSS selector.
+/// matches (with the candidate refs printed to stderr), invalid CSS
+/// selector, or a `ref_needs_js` mismatch under `--js`.
 async fn cmd_click(args: &[String]) -> ExitCode {
-    let (target, extra, timeout_ms) = match parse_locator_flags_with_timeout(args, "click") {
+    let (args, js) = split_js_flag(args);
+    let (target, extra, timeout_ms) = match parse_locator_flags_with_timeout(&args, "click") {
         Ok(p) => p,
         Err(code) => return code,
     };
     if extra.is_empty() {
-        eprintln!("usage: heso click <url> (<@ref> | --text S | --selector CSS | --aria-label S) [--timeout DUR]");
+        eprintln!("usage: heso click <url> (<@ref> | --text S | --selector CSS | --aria-label S) [--js] [--timeout DUR]");
         return ExitCode::from(2);
     }
     let url_arg = &extra[0];
-    run_dispatch(url_arg, &target, "click", None, timeout_ms, |sess, sel| {
+    run_dispatch(url_arg, &target, "click", None, timeout_ms, js, |sess, sel| {
         sess.click(sel)
     })
     .await
@@ -5256,14 +5407,24 @@ async fn cmd_click(args: &[String]) -> ExitCode {
 /// `false` with `error.code: "selector_not_matched"` and `value`
 /// still reflects what the agent asked to write — the request shape
 /// is preserved so the caller can retry with a different locator.
+///
+/// `--js` resolves the target against the post-hydration DOM and
+/// dispatches the fill against that live session, so an input that only
+/// exists after a script runs is reachable; it then snapshots the
+/// post-fill document (the same `text`/`tree`/`content_hash` fields a
+/// non-navigating click surfaces) so an `input`/`change` listener's
+/// mutation is visible. Pair it with `read --js-fetch`, which emits the
+/// same hydrated action graph. Live `--js` fills are best-effort:
+/// non-deterministic when a handler calls `fetch()`, same as `submit`.
 async fn cmd_fill(args: &[String]) -> ExitCode {
-    let (target, extra, timeout_ms) = match parse_locator_flags_with_timeout(args, "fill") {
+    let (args, js) = split_js_flag(args);
+    let (target, extra, timeout_ms) = match parse_locator_flags_with_timeout(&args, "fill") {
         Ok(p) => p,
         Err(code) => return code,
     };
     if extra.len() < 2 {
         eprintln!(
-            "usage: heso fill <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value> [--timeout DUR]"
+            "usage: heso fill <url> (<@ref> | --text S | --selector CSS | --aria-label S) <value> [--js] [--timeout DUR]"
         );
         return ExitCode::from(2);
     }
@@ -5276,9 +5437,28 @@ async fn cmd_fill(args: &[String]) -> ExitCode {
         "fill",
         Some(&value),
         timeout_ms,
+        js,
         move |sess, sel| sess.fill(sel, &value_for_op),
     )
     .await
+}
+
+/// Strip a bare `--js` flag out of the argv before locator-flag
+/// parsing. `--js` resolves refs against the hydrated DOM (see
+/// [`run_dispatch`]); it carries no value, so it would otherwise land
+/// in the positional `extra` list. Returns the filtered argv plus
+/// whether the flag was present.
+fn split_js_flag(args: &[String]) -> (Vec<String>, bool) {
+    let mut js = false;
+    let mut filtered = Vec::with_capacity(args.len());
+    for a in args {
+        if a == "--js" {
+            js = true;
+        } else {
+            filtered.push(a.clone());
+        }
+    }
+    (filtered, js)
 }
 
 /// `heso submit <url> <@form-ref> [--field NAME=VALUE]... [--data JSON]`

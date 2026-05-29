@@ -226,6 +226,69 @@ async fn read_tree_reflects_post_js_dom_mutation() {
 }
 
 #[tokio::test]
+async fn read_actions_reflect_inline_injected_controls() {
+    let server = MockServer::start().await;
+    // The server sends a page with no interactive controls. An inline
+    // script injects a link, a form, and a button after load. The
+    // emitted `actions`/`forms` are re-extracted from the hydrated DOM,
+    // so those injected controls must appear with `@eN` refs even though
+    // the pre-hydration HTML carried none.
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"<!doctype html><html><body>
+                <div id="app"></div>
+                <script>
+                    document.getElementById('app').innerHTML =
+                        '<a href="/next">Next</a>' +
+                        '<form action="/login" method="post">' +
+                        '<input name="user" type="text">' +
+                        '<button type="submit">Go</button>' +
+                        '</form>' +
+                        '<button id="ping">Ping</button>';
+                </script>
+            </body></html>"#,
+        ))
+        .mount(&server)
+        .await;
+    let out = run_read(&server.uri(), &["--js-fetch"]);
+    let body = parse_stdout(&out);
+
+    let actions = body["actions"].as_array().expect("actions array");
+    assert!(
+        actions.len() >= 2,
+        "expected the injected link + button(s) in actions, got {}: {actions:?}",
+        actions.len()
+    );
+    // Every emitted action carries an `@eN` ref into the hydrated DOM.
+    for a in actions {
+        let r = a["ref"].as_str().unwrap_or("");
+        assert!(
+            r.starts_with("@e"),
+            "action missing an @eN ref: {a:?}"
+        );
+    }
+    let refs: Vec<&str> = actions
+        .iter()
+        .filter_map(|a| a["ref"].as_str())
+        .collect();
+    assert!(
+        refs.contains(&"@e0"),
+        "expected document-order @e0 on the first hydrated control: {refs:?}"
+    );
+
+    // The injected form is grouped too, with its post-hydration inputs.
+    let forms = body["forms"].as_array().expect("forms array");
+    assert_eq!(forms.len(), 1, "expected the injected form: {forms:?}");
+    assert_eq!(forms[0]["action"], serde_json::json!("/login"));
+    let names: Vec<&str> = forms[0]["inputs"]
+        .as_array()
+        .map(|inputs| inputs.iter().filter_map(|i| i["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(names.contains(&"user"), "missing injected input 'user': {names:?}");
+}
+
+#[tokio::test]
 async fn read_surfaces_js_set_cookie() {
     let server = MockServer::start().await;
     // No `Set-Cookie` header — the cookie is born entirely in page JS

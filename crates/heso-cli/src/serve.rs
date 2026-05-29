@@ -1248,7 +1248,13 @@ async fn dispatch_read(
             .as_ref()
             .expect("session ensured above")
             .document_html();
-        let mut current_actions = record.current_actions.clone();
+        // Action graph the rest of the envelope speaks against, extracted
+        // from the post-hydration DOM so the `@eN` refs, `forms`, and
+        // `lazy_hints` describe the same document that `text`, `tree`,
+        // and `title` report against. Mirrors the one-shot `cmd_read`
+        // path. Under `--complete` the load loop re-extracts after each
+        // step.
+        let mut current_actions = heso_engine_fetch::extract_actions_from_html(&post_html);
 
         // ---- lazy_hints (always-on, same shape as the CLI verb) ----
         let mut lazy_hints = compute_lazy_hints(
@@ -1282,6 +1288,20 @@ async fn dispatch_read(
         let static_page = &record.page;
         let session = record.session.as_ref().expect("session ensured above");
 
+        // Re-extract `tree`/`title`/`description`/`metadata` from the
+        // post-hydration snapshot so every envelope field describes the
+        // same DOM that `text` and `actions` report against. Mirrors the
+        // one-shot `cmd_read` path; `inline_data`/`data_attrs`/`cookies`/
+        // `framework` stay on the static page (they are response- and
+        // raw-HTML-derived, not part of the hydrated graph).
+        let post_page = heso_engine_fetch::FetchPage::from_html(
+            static_page.input_url.clone(),
+            live_url.clone(),
+            static_page.http_status,
+            Vec::new(),
+            post_html.clone(),
+        );
+
         // Best-effort envelope — session-mode `read` peeks the script
         // failures snapshot (without clearing) so a subsequent verb on
         // the same `page_id` still sees the same failure list. This is
@@ -1301,10 +1321,10 @@ async fn dispatch_read(
 
         let mut body = serde_json::json!({
             "url": live_url.as_str(),
-            "title": static_page.tree.title,
-            "description": static_page.tree.description,
-            "metadata": static_page.metadata,
-            "tree": static_page.tree,
+            "title": post_page.tree.title,
+            "description": post_page.tree.description,
+            "metadata": post_page.metadata,
+            "tree": post_page.tree,
             "actions": current_actions,
         });
         if !static_page.inline_data.is_empty() {
@@ -1359,7 +1379,7 @@ async fn dispatch_read(
             body["scripts"] = serde_json::Value::Null;
         }
         let snap = ReadSnapshot::from_parts(
-            &static_page.tree.title,
+            &post_page.tree.title,
             &visible_text,
             &current_actions,
             &forms_json,
