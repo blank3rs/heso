@@ -96,7 +96,7 @@ pub async fn cmd_verify(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
-    let (contents, _source) = match crate::read_plat_input_or_hash(&parsed.file, "verify").await {
+    let (contents, _source) = match crate::read_plat_input_with_source(&parsed.file) {
         Ok(pair) => pair,
         Err(code) => return code,
     };

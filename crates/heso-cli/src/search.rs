@@ -2,18 +2,26 @@
 //!
 //! `heso search <query>` — first-class multi-source web search verb. Pure
 //! HTTP + HTML parsing; no JS engine is spun up. Default engines are
-//! DuckDuckGo HTML and Wikipedia REST `summary` — no API keys, no signup.
-//! Optional SearXNG via `--searx-url` or `HESO_SEARX_URL`.
+//! Mojeek (an independent, scrape-friendly web index), DuckDuckGo HTML,
+//! and the Wikipedia REST `summary` knowledge block — no API keys, no
+//! signup. Optional SearXNG via `--searx-url` or `HESO_SEARX_URL`.
+//!
+//! DuckDuckGo's HTML endpoint rate-limits hard per IP and intermittently
+//! serves its no-results landing page to scripted callers, so it is
+//! treated as **best-effort**: a blocked or empty DDG response is not an
+//! error, and Mojeek carries the result set so a search never comes back
+//! empty just because DDG throttled this caller. Running both by default
+//! is the redundancy that makes the verb reliable.
 //!
 //! ## Output shape (JSON to stdout)
 //!
 //! ```json
 //! {
 //!   "query": "rust web scraping",
-//!   "engines_used": ["ddg", "wiki"],
+//!   "engines_used": ["ddg", "mojeek", "wiki"],
 //!   "results": [
 //!     {"rank": 1, "title": "...", "url": "https://...",
-//!      "snippet": "...", "source": "ddg"}
+//!      "snippet": "...", "source": "mojeek"}
 //!   ],
 //!   "knowledge": {
 //!     "title": "Web scraping",
@@ -31,23 +39,35 @@
 //!
 //! ## Backends
 //!
-//! 1. **DuckDuckGo HTML** (primary, no key): POST to
+//! 1. **Mojeek** (primary general-web backend, no key): GET
+//!    `https://www.mojeek.com/search?q=<query>`. Mojeek runs its own
+//!    independent crawl and index and does not gate scripted callers
+//!    behind the aggressive per-IP rate limiting the big engines use, so
+//!    it is the reliable backbone of the result set. Pagination via
+//!    `s=N` (offset 1, 11, 21, 31 — first page omits `s`, then `+10` per
+//!    additional page). Cap at 4 pages regardless of `--limit`. Each
+//!    result is a `<ul class="results-standard"> <li>` carrying an
+//!    `<a class="title" href="…">` (page title + direct href) and a
+//!    `<p class="s">` snippet. Parse with [`scraper`] (workspace dep).
+//!
+//! 2. **DuckDuckGo HTML** (best-effort, no key): POST to
 //!    `https://html.duckduckgo.com/html/` with form `q=<query>&l=us-en`.
 //!    Pagination via `s=N` (offset 0, 10, 25, 40, 55 — first page is
 //!    `s=0`, then `+15` per additional page, matching the `ddgs` Python
 //!    library). Cap pagination at 4 pages regardless of `--limit`. Parse
 //!    with [`scraper`] (workspace dep). The href on each result is wrapped
 //!    in DDG's redirect (`//duckduckgo.com/l/?uddg=<urlencoded>&...`); we
-//!    unwrap via `uddg=` query-param decode.
+//!    unwrap via `uddg=` query-param decode. DDG throttles scripted
+//!    callers, so an empty page is treated as zero results, not an error.
 //!
-//! 2. **Wikipedia REST `summary`** (knowledge block, no key): GET
+//! 3. **Wikipedia REST `summary`** (knowledge block, no key): GET
 //!    `https://en.wikipedia.org/api/rest_v1/page/summary/<urlencoded>`.
 //!    Returns JSON with `title`, `extract`, `content_urls.desktop.page`.
 //!    404 → omitted; 200 with `type == "disambiguation"` → omitted (the
 //!    page is a list of meanings, not a knowledge answer). Other errors
 //!    → omitted with a stderr note.
 //!
-//! 3. **SearXNG** (optional, only if a URL is configured): GET
+//! 4. **SearXNG** (optional, only if a URL is configured): GET
 //!    `<base>/search?q=<q>&format=json`. Returns `{results: [{title, url,
 //!    content, ...}]}` (the field name is `content`, not `snippet`).
 //!    Mapped to our shape with `source: "searxng"`. Note: most public
@@ -58,9 +78,10 @@
 //!
 //! Multiple engines → dedupe by canonical URL (lowercase host, strip
 //! trailing `/` from path). Final order is round-robin from each
-//! engine's top: DDG[0], Searx[0], DDG[1], Searx[1], ... Wikipedia is
-//! NOT in the results array — it goes in the top-level `knowledge`
-//! block.
+//! engine's top: DDG[0], Mojeek[0], Searx[0], DDG[1], Mojeek[1], ... so
+//! when DDG comes back empty the merged list is simply Mojeek's (and
+//! SearXNG's, if configured) in rank order. Wikipedia is NOT in the
+//! results array — it goes in the top-level `knowledge` block.
 //!
 //! ## User-Agent
 //!
@@ -74,10 +95,13 @@
 //!
 //! ## Tests
 //!
-//! See `crates/heso-cli/tests/search.rs` — wiremock stubs DDG HTML +
-//! Wikipedia + SearXNG endpoints; we verify merge order, dedupe,
+//! See `crates/heso-cli/tests/search.rs` — wiremock stubs the SearXNG
+//! endpoint (the one backend whose base URL is configurable from
+//! outside the binary) end-to-end; we verify merge order, dedupe,
 //! limit, missing-knowledge handling, and the empty-results-no-crash
-//! behaviour DDG exhibits for nonsense queries.
+//! behaviour for nonsense queries. The Mojeek and DDG HTML parsers,
+//! whose hosts aren't configurable, are unit-tested against fixtures in
+//! the `tests` module below.
 
 use std::collections::HashSet;
 use std::process::ExitCode;
@@ -175,6 +199,7 @@ pub const SEARX_URL_ENV: &str = "HESO_SEARX_URL";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Engine {
     Ddg,
+    Mojeek,
     Wiki,
     SearxNg,
 }
@@ -183,6 +208,7 @@ impl Engine {
     fn as_str(&self) -> &'static str {
         match self {
             Engine::Ddg => "ddg",
+            Engine::Mojeek => "mojeek",
             Engine::Wiki => "wiki",
             Engine::SearxNg => "searxng",
         }
@@ -191,6 +217,7 @@ impl Engine {
     pub(crate) fn parse(s: &str) -> Option<Engine> {
         match s {
             "ddg" => Some(Engine::Ddg),
+            "mojeek" => Some(Engine::Mojeek),
             "wiki" => Some(Engine::Wiki),
             "searxng" => Some(Engine::SearxNg),
             _ => None,
@@ -221,7 +248,7 @@ pub(crate) fn parse_engines_value(v: &Value) -> Result<Vec<Engine>, String> {
                 }
                 let e = Engine::parse(t).ok_or_else(|| {
                     format!(
-                        "engines: unknown engine `{t}` — supported: ddg, wiki, searxng"
+                        "engines: unknown engine `{t}` — supported: ddg, mojeek, wiki, searxng"
                     )
                 })?;
                 if seen.insert(t.to_owned()) {
@@ -345,7 +372,7 @@ pub async fn cmd_search(args: &[String]) -> ExitCode {
 fn parse_cli_args(args: &[String]) -> Result<SearchRequest, String> {
     let mut query: Option<String> = None;
     let mut limit = DEFAULT_LIMIT;
-    let mut engines = vec![Engine::Ddg, Engine::Wiki];
+    let mut engines = vec![Engine::Ddg, Engine::Mojeek, Engine::Wiki];
     let mut searx_url: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -420,7 +447,7 @@ fn parse_cli_args(args: &[String]) -> Result<SearchRequest, String> {
     })
 }
 
-const USAGE: &str = "usage: heso search <query> [--limit N] [--engines ddg,wiki,searxng] [--searx-url URL]";
+const USAGE: &str = "usage: heso search <query> [--limit N] [--engines ddg,mojeek,wiki,searxng] [--searx-url URL]";
 
 fn parse_engines_csv(raw: &str) -> Result<Vec<Engine>, String> {
     let mut out = Vec::new();
@@ -432,7 +459,7 @@ fn parse_engines_csv(raw: &str) -> Result<Vec<Engine>, String> {
         }
         let e = Engine::parse(t).ok_or_else(|| {
             format!(
-                "unknown engine `{t}` — supported: ddg, wiki, searxng"
+                "unknown engine `{t}` — supported: ddg, mojeek, wiki, searxng"
             )
         })?;
         if seen.insert(t.to_owned()) {
@@ -454,6 +481,7 @@ fn parse_engines_csv(raw: &str) -> Result<Vec<Engine>, String> {
 pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
     let client = build_client()?;
     let mut ddg_results: Vec<RawResult> = Vec::new();
+    let mut mojeek_results: Vec<RawResult> = Vec::new();
     let mut searx_results: Vec<RawResult> = Vec::new();
     let mut knowledge: Option<KnowledgeBlock> = None;
     let mut engines_used: Vec<&'static str> = Vec::new();
@@ -475,6 +503,22 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
                     eprintln!("ddg search error: {e}");
                     errors.push(serde_json::json!({
                         "engine": "ddg",
+                        "message": e,
+                    }));
+                }
+            },
+            Engine::Mojeek => match mojeek_search(&client, &req.query, req.limit).await {
+                Ok(rs) => {
+                    // Like DDG, an empty page still counts as "we asked"
+                    // — record the engine so callers can tell "asked, got
+                    // nothing" from "didn't ask".
+                    engines_used.push("mojeek");
+                    mojeek_results = rs;
+                }
+                Err(e) => {
+                    eprintln!("mojeek search error: {e}");
+                    errors.push(serde_json::json!({
+                        "engine": "mojeek",
                         "message": e,
                     }));
                 }
@@ -530,7 +574,7 @@ pub(crate) async fn run_search(req: &SearchRequest) -> Result<Value, String> {
         }
     }
 
-    let merged = round_robin_merge(&[&ddg_results, &searx_results], req.limit);
+    let merged = round_robin_merge(&[&ddg_results, &mojeek_results, &searx_results], req.limit);
     let results: Vec<SearchResult> = merged
         .into_iter()
         .enumerate()
@@ -591,11 +635,12 @@ fn round_robin_merge(
     out
 }
 
-/// Lossy canonicalisation for dedupe keys ONLY. Lowercases the host
-/// (URLs are case-insensitive there), strips a single trailing `/`
-/// from the path, and drops the fragment. Query string is preserved
-/// because `?id=42` is a distinct page in most stores. Not a URL
-/// normalizer — don't use this for anything outside of dedupe.
+/// Lossy canonicalisation for dedupe keys ONLY. Lowercases the host,
+/// strips a single trailing `/` from the path, drops the fragment, and
+/// folds out the scheme so `http://` and `https://` of the same page
+/// collapse to one result. Query string is preserved because `?id=42`
+/// is a distinct page in most stores. Not a URL normalizer — don't use
+/// this for anything outside of dedupe.
 fn canonical_url(raw: &str) -> String {
     let parsed = match url::Url::parse(raw) {
         Ok(u) => u,
@@ -606,9 +651,8 @@ fn canonical_url(raw: &str) -> String {
     if path.len() > 1 && path.ends_with('/') {
         path.pop();
     }
-    let scheme = parsed.scheme();
     let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
-    format!("{scheme}://{host}{path}{query}")
+    format!("{host}{path}{query}")
 }
 
 // ============================================================================
@@ -816,6 +860,123 @@ fn unwrap_ddg_href(raw: &str) -> Option<String> {
 }
 
 // ============================================================================
+// Mojeek backend
+// ============================================================================
+
+/// Mojeek serves ~10 results per page. 4 pages ≈ 40 results — enough to
+/// fill `--limit` toward its 100 cap alongside DDG without hammering a
+/// small independent index harder than necessary.
+const MAX_MOJEEK_PAGES: usize = 4;
+
+/// Hit `https://www.mojeek.com/search` for the given query, paging until
+/// we have `target` results or have requested [`MAX_MOJEEK_PAGES`] pages,
+/// whichever comes first.
+async fn mojeek_search(
+    client: &Client,
+    query: &str,
+    target: usize,
+) -> Result<Vec<RawResult>, String> {
+    let mut out: Vec<RawResult> = Vec::with_capacity(target);
+    let mut seen: HashSet<String> = HashSet::new();
+    for page in 0..MAX_MOJEEK_PAGES {
+        let offset = mojeek_offset_for_page(page);
+        let html = mojeek_fetch_page(client, query, offset).await?;
+        let rows = mojeek_parse_html(&html);
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            if seen.insert(canonical_url(&row.url)) {
+                out.push(row);
+                if out.len() >= target {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Mojeek's result-start parameter (`?s=`): page 0 → 1 (omitted), page 1
+/// → 11, page 2 → 21, page 3 → 31. Ten results per page, 1-indexed.
+fn mojeek_offset_for_page(page: usize) -> usize {
+    page * 10 + 1
+}
+
+async fn mojeek_fetch_page(
+    client: &Client,
+    query: &str,
+    offset: usize,
+) -> Result<String, String> {
+    let mut req = client
+        .get("https://www.mojeek.com/search")
+        .query(&[("q", query)]);
+    // The first page omits `s` (Mojeek treats a bare query as offset 1);
+    // later pages send the 11 / 21 / 31… start index.
+    if offset > 1 {
+        req = req.query(&[("s", offset.to_string())]);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("mojeek GET failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        // Mojeek occasionally rate-limits or errors; surface the status
+        // and pass the body through so the parser can try. A non-result
+        // body simply yields zero rows, the same as a no-match page.
+        eprintln!("mojeek returned HTTP {status}; attempting parse anyway");
+    }
+    read_search_body_capped(resp, "mojeek").await
+}
+
+/// Parse one Mojeek results page. Each result is a
+/// `<ul class="results-standard"> <li>` carrying an
+/// `<a class="title" href="…">title</a>` (the href is the direct
+/// destination, not a redirect wrapper) plus a `<p class="s">` snippet.
+fn mojeek_parse_html(html: &str) -> Vec<RawResult> {
+    let doc = Html::parse_document(html);
+    let item_sel = Selector::parse("ul.results-standard li")
+        .expect("static selector ul.results-standard li");
+    let title_sel = Selector::parse("a.title").expect("static selector a.title");
+    let snippet_sel = Selector::parse("p.s").expect("static selector p.s");
+
+    let mut out = Vec::new();
+    for item in doc.select(&item_sel) {
+        let title_el = match item.select(&title_sel).next() {
+            Some(el) => el,
+            None => continue,
+        };
+        let url = match title_el.value().attr("href") {
+            Some(h) => h.trim().to_owned(),
+            None => continue,
+        };
+        // Mojeek result hrefs are absolute; defend against the on-site
+        // "see more results from <host>" refinement links (relative
+        // `/search?q=site:…`) sneaking in if the markup shifts.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            continue;
+        }
+        let title = collapse_ws(&extract_text(&title_el));
+        if title.is_empty() {
+            continue;
+        }
+        let snippet = item
+            .select(&snippet_sel)
+            .next()
+            .map(|el| collapse_ws(&extract_text(&el)))
+            .unwrap_or_default();
+        out.push(RawResult {
+            title,
+            url,
+            snippet,
+            source: Engine::Mojeek,
+        });
+    }
+    out
+}
+
+// ============================================================================
 // Wikipedia REST summary backend
 // ============================================================================
 
@@ -980,8 +1141,11 @@ mod tests {
 
     #[test]
     fn parse_engines_csv_accepts_known() {
-        let v = parse_engines_csv("ddg,wiki,searxng").unwrap();
-        assert_eq!(v, vec![Engine::Ddg, Engine::Wiki, Engine::SearxNg]);
+        let v = parse_engines_csv("ddg,mojeek,wiki,searxng").unwrap();
+        assert_eq!(
+            v,
+            vec![Engine::Ddg, Engine::Mojeek, Engine::Wiki, Engine::SearxNg]
+        );
     }
 
     #[test]
@@ -1012,7 +1176,7 @@ mod tests {
         let r = parse_cli_args(&["rust web scraping".into()]).unwrap();
         assert_eq!(r.query, "rust web scraping");
         assert_eq!(r.limit, DEFAULT_LIMIT);
-        assert_eq!(r.engines, vec![Engine::Ddg, Engine::Wiki]);
+        assert_eq!(r.engines, vec![Engine::Ddg, Engine::Mojeek, Engine::Wiki]);
         assert!(r.searx_url.is_none());
     }
 
@@ -1060,6 +1224,15 @@ mod tests {
         assert_ne!(
             canonical_url("https://example.com/?a=1"),
             canonical_url("https://example.com/?a=2"),
+        );
+    }
+
+    #[test]
+    fn canonical_url_folds_scheme() {
+        // http:// and https:// of the same page dedupe to one result.
+        assert_eq!(
+            canonical_url("http://pandas.pydata.org/"),
+            canonical_url("https://pandas.pydata.org/"),
         );
     }
 
@@ -1219,6 +1392,52 @@ mod tests {
         // panicking — this test pins that contract.
         let html = "<!doctype html><html><body><h1>No results</h1></body></html>";
         assert!(ddg_parse_html(html).is_empty());
+    }
+
+    #[test]
+    fn mojeek_offsets_increment_by_ten() {
+        assert_eq!(mojeek_offset_for_page(0), 1);
+        assert_eq!(mojeek_offset_for_page(1), 11);
+        assert_eq!(mojeek_offset_for_page(2), 21);
+        assert_eq!(mojeek_offset_for_page(3), 31);
+    }
+
+    #[test]
+    fn mojeek_parse_html_extracts_title_url_snippet() {
+        // Mirrors the live Mojeek markup: each result is a
+        // `ul.results-standard > li` with an `a.title` (direct href) and
+        // a `p.s` snippet, followed by a relative `p.more` refinement
+        // link that must NOT be promoted to a result.
+        let html = r#"<!doctype html><html><body>
+            <ul class="results-standard">
+                <li>
+                    <h2><a class="title" title="https://www.rust-lang.org/" href="https://www.rust-lang.org/">Rust Programming Language</a></h2>
+                    <p class="s">A language empowering everyone to build <strong>reliable</strong> and efficient software.</p>
+                    <p class="more"><a href="/search?q=site%3Awww.rust-lang.org+rust">See more results &raquo;</a></p>
+                </li>
+                <li>
+                    <h2><a class="title" title="https://docs.rs/" href="https://docs.rs/">docs.rs</a></h2>
+                    <p class="s">Documentation host for Rust crates.</p>
+                </li>
+            </ul>
+        </body></html>"#;
+        let rows = mojeek_parse_html(html);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].title, "Rust Programming Language");
+        assert_eq!(rows[0].url, "https://www.rust-lang.org/");
+        assert!(rows[0].snippet.contains("reliable"));
+        assert_eq!(rows[0].source, Engine::Mojeek);
+        assert_eq!(rows[1].url, "https://docs.rs/");
+        // The relative "see more results" refinement link must be filtered.
+        assert!(rows.iter().all(|r| r.url.starts_with("http")));
+    }
+
+    #[test]
+    fn mojeek_parse_html_empty_for_no_results() {
+        // A page with no `ul.results-standard` yields zero rows without
+        // panicking — search then falls through to the other engines.
+        let html = "<!doctype html><html><body><p>No results found.</p></body></html>";
+        assert!(mojeek_parse_html(html).is_empty());
     }
 
     #[test]

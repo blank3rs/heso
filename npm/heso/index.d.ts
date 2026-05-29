@@ -183,10 +183,9 @@ export interface WriteVerbResult {
 }
 
 /**
- * `heso search <query>` — multi-source web search (DuckDuckGo HTML +
- * Wikipedia REST `summary` by default; optional SearXNG via `searxUrl`).
- * Resolves with `{ query, engines_used, results, knowledge }`. Also
- * available as `registry.search`.
+ * `heso search <query>` — web search across Mojeek, DuckDuckGo, and
+ * Wikipedia (optional SearXNG via `searxUrl`). No API key. Resolves with
+ * `{ query, engines_used, results, knowledge }`.
  */
 export function search(
   query: string,
@@ -449,51 +448,6 @@ export function unseal(
   file: string,
   options?: UnsealOptions,
 ): Promise<Record<string, unknown>>;
-
-// Registry namespace (publish / pull / list / search) ------------------
-
-/** Options for {@link registry.publish}. */
-export interface PublishOptions extends CommonOptions {
-  /** Required by the CLI — passed through as `-d "…"`. */
-  description: string;
-  /**
-   * Comma-separated tag list passed through as `-t "a,b,c"`. Arrays are
-   * joined with `,` for you; empty entries are dropped.
-   */
-  tags?: string | string[];
-}
-
-/** Options for {@link registry.pull}. */
-export interface PullOptions extends CommonOptions {
-  /** Output path; default is `./<hash>.plat`. Passed through as `-o`. */
-  out?: string;
-}
-
-/** Options for {@link registry.list}. */
-export interface ListOptions extends CommonOptions {
-  /** Substring match on description / URL / tags (`-q`). */
-  q?: string;
-  /** Single-tag filter (`-t`). */
-  tag?: string;
-  /** Ranking; default `trending` (`--sort`). */
-  sort?: "trending" | "downloads" | "newest";
-  /** 1..=100, default 20 (`--limit`). */
-  limit?: number;
-}
-
-/**
- * Registry namespace — `heso registry <publish|pull|list|search>`.
- *
- * `publish` / `pull` / `list` print human-readable banners on stdout
- * and resolve with the raw stdout string; `search` returns parsed JSON.
- * All failures surface as `HesoError`.
- */
-export declare const registry: {
-  publish(file: string, options: PublishOptions): Promise<string>;
-  pull(hash: string, options?: PullOptions): Promise<string>;
-  list(options?: ListOptions): Promise<string>;
-  search(query: string, options?: SearchOptions): Promise<Record<string, unknown>>;
-};
 
 // Identity --------------------------------------------------------------
 

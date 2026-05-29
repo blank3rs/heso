@@ -4,6 +4,23 @@ All notable changes to heso are documented here. The format follows
 [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-05-28
+
+### Removed
+
+- The plat registry. The `publish`, `pull`, and `list` verbs and the
+  `heso registry` namespace are gone, along with the hosted store at
+  `heso.ca/ecosystem`. Sharing a plat now means handing someone the
+  file (or a URL to it); they run `heso run -` or `heso verify` against
+  it. heso no longer publishes or hosts plats.
+
+### Changed
+
+- `search` now queries Mojeek alongside DuckDuckGo and the Wikipedia
+  knowledge block (plus an optional SearXNG endpoint via `--searx-url`
+  / `HESO_SEARX_URL`), so results are returned more reliably when one
+  backend is unavailable. No API key is required.
+
 ## [0.1.9] - 2026-05-28
 
 ### Added

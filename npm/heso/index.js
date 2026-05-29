@@ -426,16 +426,15 @@ function wait(url, options) {
 }
 
 /**
- * `heso search <query>` — multi-source web search (DuckDuckGo HTML +
- * Wikipedia REST `summary` by default; optional SearXNG via `searxUrl`).
- * Resolves with `{ query, engines_used, results, knowledge }`. `results`
- * is the round-robin merged list of `{ rank, title, url, snippet,
- * source }` rows; `knowledge` is the Wikipedia summary block (or `null`
- * when Wikipedia had no direct match / wasn't requested). Also available
- * as `registry.search`.
+ * `heso search <query>` — web search across Mojeek, DuckDuckGo, and
+ * Wikipedia (optional SearXNG via `searxUrl`). No API key. Resolves with
+ * `{ query, engines_used, results, knowledge }`: `results` is a list of
+ * `{ rank, title, url, snippet, source }` rows; `knowledge` is the
+ * Wikipedia summary block (or `null` when there's no direct match).
  *
- * Common options: `limit` (default 30, max 100), `engines` ("ddg,wiki",
- * "ddg", "searxng", ...), `searxUrl` (also reads `HESO_SEARX_URL`).
+ * Common options: `limit` (default 30, max 100), `engines`
+ * ("ddg,mojeek,wiki" by default, or any subset), `searxUrl` (also reads
+ * `HESO_SEARX_URL`).
  */
 function search(query, options) {
   return _spawnJson(["search", String(query), ..._optsToArgv(options)]);
@@ -641,54 +640,6 @@ function unseal(filePath, options) {
   const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
   return _spawnJson(["unseal", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
 }
-
-// ---------------------------------------------------------------------------
-// Registry namespace
-// ---------------------------------------------------------------------------
-
-const registry = {
-  publish(filePath, options) {
-    if (!options || typeof options.description !== "string" || options.description.trim() === "") {
-      return Promise.reject(
-        new HesoError("registry.publish: `description` is required (CLI flag -d)", {
-          command: ["heso", "registry", "publish"],
-        }),
-      );
-    }
-    const argv = ["registry", "publish", String(filePath), "-d", options.description];
-    if (options.tags !== undefined && options.tags !== null) {
-      const csv = Array.isArray(options.tags) ? options.tags.join(",") : String(options.tags);
-      if (csv.length > 0) argv.push("-t", csv);
-    }
-    const passthrough = { ...options };
-    delete passthrough.description;
-    delete passthrough.tags;
-    delete passthrough.timeout;
-    delete passthrough.binary;
-    argv.push(..._optsToArgv(passthrough));
-    return run(argv, { parseJson: false, timeout: options.timeout, binary: options.binary });
-  },
-
-  pull(hash, options) {
-    return run(["registry", "pull", String(hash), ..._optsToArgv(options)], {
-      parseJson: false,
-      timeout: options && options.timeout,
-      binary: options && options.binary,
-    });
-  },
-
-  list(options) {
-    return run(["registry", "list", ..._optsToArgv(options)], {
-      parseJson: false,
-      timeout: options && options.timeout,
-      binary: options && options.binary,
-    });
-  },
-
-  search(query, options) {
-    return _spawnJson(["registry", "search", String(query), ..._optsToArgv(options)]);
-  },
-};
 
 /**
  * `heso identity <subcommand> [args]`. Today's subcommands (`init`,
@@ -931,8 +882,6 @@ module.exports = {
   info,
   seal,
   unseal,
-  // registry
-  registry,
   // identity
   identity,
   // session

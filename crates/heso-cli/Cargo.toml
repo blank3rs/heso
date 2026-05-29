@@ -36,11 +36,11 @@ regex.workspace = true
 # same crate `heso-engine-fetch` uses for `plat_hash`, no new
 # top-level dep introduced.
 blake3.workspace = true
-# `reqwest` powers HTTP for the CLI's standalone clients (the
-# `heso registry` verb and any other path that needs a UA distinct
-# from `FetchEngine::client()`'s `heso/<version>`). Workspace dep —
-# the engine pulls it through `heso-engine-fetch`, the CLI imports
-# it directly so its clients can carry browser-shaped UAs.
+# `reqwest` powers HTTP for the CLI's standalone clients — the search
+# verb's backends need a browser-shaped UA distinct from
+# `FetchEngine::client()`'s `heso/<version>`. Workspace dep — the engine
+# pulls it through `heso-engine-fetch`, the CLI imports it directly so
+# its clients can carry browser-shaped UAs.
 reqwest.workspace = true
 # `scraper` is used by the search verb's DuckDuckGo HTML parser. Same
 # crate `heso-engine-fetch` uses for the action graph and tree

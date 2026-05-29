@@ -80,7 +80,6 @@ __all__ = [
     "info",
     "seal",
     "unseal",
-    "registry",
     "identity",
     "run",
 ]
@@ -514,19 +513,18 @@ def wait(url: str, **kwargs: Any) -> dict:
 
 
 def search(query: str, **kwargs: Any) -> dict:
-    """``heso search <query>`` — multi-source web search.
+    """``heso search <query>`` — web search across Mojeek, DuckDuckGo, and
+    Wikipedia (optional SearXNG). No API key.
 
-    Returns ``{query, engines_used, results, knowledge}`` as a dict.
-    ``results`` is a list of ``{rank, title, url, snippet, source}``
-    rows interleaved round-robin from the engines used; ``knowledge``
-    is a single ``{title, summary, url}`` block from Wikipedia (or
-    ``None`` if Wikipedia had no direct match / wasn't requested).
-    Pure HTTP + HTML parsing — no JS engine spin-up.
+    Returns ``{query, engines_used, results, knowledge}`` as a dict:
+    ``results`` is a list of ``{rank, title, url, snippet, source}`` rows;
+    ``knowledge`` is a single ``{title, summary, url}`` block from
+    Wikipedia (or ``None`` when there's no direct match).
 
     Common kwargs:
-        limit: int — cap on merged result count (default 30, max 100).
-        engines: str — comma-separated subset of ``ddg,wiki,searxng``
-            (default ``ddg,wiki``).
+        limit: int — cap on results (default 30, max 100).
+        engines: str — comma-separated subset of ``ddg,mojeek,wiki,searxng``
+            (default ``ddg,mojeek,wiki``).
         searx_url: str — base URL for a SearXNG instance. Also reads
             ``HESO_SEARX_URL`` from the environment.
     """
@@ -876,13 +874,6 @@ def unseal(path: Union[str, Path], **kwargs: Any) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Registry namespace — implementation lives in :mod:`heso.registry`.
-# Imported at the bottom of this module so its functions can reach the
-# subprocess-wrapper plumbing without circular-import gymnastics.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Identity
 # ---------------------------------------------------------------------------
 
@@ -1131,30 +1122,6 @@ def session(binary: Optional[str] = None) -> Session:
     ``heso.Session()`` so ``with heso.session() as s: ...`` reads
     naturally."""
     return Session(binary=binary)
-
-
-# ---------------------------------------------------------------------------
-# Top-level search alias — `heso search <query>` dispatches the same way
-# `heso registry search <query>` does, so the wrapper exposes both
-# spellings. Keeps `heso.search("...")` calls (which the README has
-# always advertised) working without forcing every caller to reach
-# through the registry namespace.
-# ---------------------------------------------------------------------------
-
-
-def search(query: str, **kwargs: Any) -> dict:
-    """``heso search <query>`` — multi-backend web search (DDG + Wikipedia,
-    optional SearXNG). Alias for :func:`heso.registry.search`."""
-    return run("search", query, *_kwargs_to_argv(kwargs))
-
-
-# ---------------------------------------------------------------------------
-# Submodule registry — defined in heso.registry; imported here so
-# `heso.registry.publish(...)` keeps working under the same name the
-# previous `class registry:` exposed.
-# ---------------------------------------------------------------------------
-
-from . import registry  # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------

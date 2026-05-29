@@ -79,10 +79,6 @@
 //!   `heso-local-data/identity.key`.
 //! - `heso unseal <file> [--extract]` — Verify a sealed envelope and
 //!   optionally print the inner plat body for piping.
-//! - `heso registry <publish|pull|list> ...` — Public-registry surface
-//!   for plats hosted at `heso.ca/ecosystem`. `publish` uploads a stamped
-//!   plat with a description; `pull` downloads by 64-character BLAKE3
-//!   hash; `list` browses with optional query, tag, and sort filters.
 //! - `heso update [--dry-run]` — Detect global heso installs owned by
 //!   npm, PyPI tooling, Cargo, or Homebrew and delegate updates to those
 //!   managers.
@@ -106,9 +102,7 @@ mod cmd_info;
 mod cmd_seal;
 mod cmd_unseal;
 mod cmd_verify;
-mod ecosystem;
 mod receipts;
-mod registry;
 mod search;
 mod serve;
 mod template;
@@ -122,7 +116,7 @@ mod template;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 use heso_core::{IdentityKey, Url};
@@ -152,13 +146,10 @@ fn print_banner() {
     println!("  heso cat   <url> <path|@ref>  Fetch + read intro text at <path>, or the element at <@ref>");
     println!("  heso find  <url> [--role X] [--name SUBSTR] [--section /p]   List interactive elements (action graph)");
     println!("  heso meta  <url>              Fetch + extract metadata (JSON-LD, OpenGraph, SEO meta) as JSON");
-    println!("  heso search <query>           Multi-source web search: DDG HTML + Wikipedia summary (default).");
-    println!("                                Pure HTTP + HTML — no JS engine spin-up. No API key required.");
-    println!("    [--limit N]                    Max merged results (default 30, max 100). Wikipedia goes in");
-    println!("                                   the top-level `knowledge` block, not in `results`.");
-    println!("    [--engines ddg,wiki,searxng]   Pick subset (default ddg,wiki). Round-robin ranked merge,");
-    println!("                                   dedupe by canonical URL.");
-    println!("    [--searx-url URL]              Optional SearXNG base URL. Also reads HESO_SEARX_URL env.");
+    println!("  heso search <query>           Web search across Mojeek, DuckDuckGo, and Wikipedia. No API key.");
+    println!("    [--limit N]                    Cap on results (default 30, max 100).");
+    println!("    [--engines ddg,mojeek,wiki,searxng]  Which engines to query (default ddg,mojeek,wiki).");
+    println!("    [--searx-url URL]              Use a SearXNG instance (or set HESO_SEARX_URL).");
     println!("  heso open  <url>              Fetch once, return {{url,title,description,metadata,tree,actions,plat_hash}} (agent-facing)");
     println!("    [--explore-links N]            Pre-fetch up to --link-cap direct (depth=1) or nested (depth>=2) same-origin links");
     println!("    [--link-cap M]                 Cap on links followed per level (default 20, hard max 50)");
@@ -232,7 +223,7 @@ fn print_banner() {
     println!("                                embeds the plan, the recorded network cassette, and a step log.");
     println!("                                Accepts a bare Action[] array, a plat with a `plan` field, or a");
     println!("                                fingerprint. Exit 0 ok / 1 if any step failed.");
-    println!("  heso run    [--seed N] [--no-verify-input] <plat.plat|plat-hash|->");
+    println!("  heso run    [--seed N] [--no-verify-input] <plat.plat|->");
     println!("                                Re-execute the plan against the plat's embedded cassette — no");
     println!("                                network. Mints a fresh plat; for an unchanged cassette its");
     println!("                                plat_hash equals the input's (byte-identical replay).");
@@ -244,7 +235,7 @@ fn print_banner() {
     println!("                                drifted. Exit 0 no change / 1 drifted / 2 usage or input error.");
     println!("                                Emits structured JSON: {{ok, drifted, input_plat_hash, live_plat_hash,");
     println!("                                diff?}}. The plat MUST have a `plan` field.");
-    println!("  heso replay [--plan] <plat.plat|plat-hash|->");
+    println!("  heso replay [--plan] <plat.plat|->");
     println!("                                Emit the recorded step log from a plat. Pure observation — no");
     println!("                                engine, no network, no JS. Use `run` to re-execute. With");
     println!("                                --plan, extract just the `plan` field for editing.");
@@ -264,14 +255,6 @@ fn print_banner() {
     println!("  heso unseal <file> [--extract]");
     println!("                                Verify a sealed envelope. With --extract, also write the inner plat to stdout.");
     println!("                                Exit 0 valid / 1 invalid / 2 wrong-alg or malformed.");
-    println!("  heso registry <publish|pull|list|search> [args...]");
-    println!("                                Public plat ecosystem and web search, behind one dispatcher.");
-    println!("    publish <plat-file> -d \"...\" [-t \"tag1,tag2\"]   Upload a stamped plat to heso.ca/ecosystem.");
-    println!("    pull    <plat-hash> [-o PATH]                   Download a published plat by its 64-char BLAKE3 hash.");
-    println!("    list    [-q ...] [-t ...] [--sort ...] [--limit N]   Browse the public plat registry.");
-    println!("    search  <query> [--limit N] [--engines ddg,wiki,searxng] [--searx-url URL]");
-    println!("                                                    Multi-source web search: DDG HTML + Wikipedia summary.");
-    println!("                                                    Pure HTTP + HTML — no JS engine spin-up, no API key.");
     println!("  heso update [--dry-run]       Update every detected global heso install channel.");
     println!("  heso serve                    Long-running JSON-RPC server over stdin/stdout (framework integration)");
     println!("  heso identity init [--path P] Generate a fresh Ed25519 identity at <path> (default: heso-local-data/identity.key)");
@@ -5575,7 +5558,7 @@ async fn cmd_stamp(args: &[String]) -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let (contents, source) = match read_plat_input_or_hash(&path, "stamp").await {
+    let (contents, source) = match read_plat_input_with_source(&path) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -5882,36 +5865,10 @@ fn read_plat_input(path: &str) -> Result<String, ExitCode> {
     }
 }
 
-/// Read a plat from stdin, a local file, or the public registry when
-/// the argument is a bare 64-char plat hash.
-pub(crate) async fn read_plat_input_or_hash(input: &str, verb: &str) -> Result<(String, String), ExitCode> {
-    if input != "-" && !Path::new(input).exists() && ecosystem::is_plat_hash(input) {
-        match ecosystem::download_plat_text(input).await {
-            Ok(s) => {
-                let value: serde_json::Value = match serde_json::from_str(&s) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("{verb}: downloaded plat `{input}` is not valid JSON: {e}");
-                        return Err(ExitCode::FAILURE);
-                    }
-                };
-                let embedded = value.get("plat_hash").and_then(|v| v.as_str());
-                let recomputed = heso_engine_fetch::plat_hash(&value);
-                if embedded != Some(input) || recomputed != input {
-                    eprintln!("{verb}: registry returned a plat that does not match requested hash `{input}`");
-                    eprintln!("  embedded:   {}", embedded.unwrap_or("(missing)"));
-                    eprintln!("  recomputed: {recomputed}");
-                    return Err(ExitCode::FAILURE);
-                }
-                return Ok((s, format!("registry:{input}")));
-            }
-            Err(e) => {
-                eprintln!("{verb}: {e}");
-                return Err(ExitCode::FAILURE);
-            }
-        }
-    }
-
+/// Read a plat from stdin (`-`) or a local file, returning the contents
+/// paired with a human-readable source label (the path, or `-` for
+/// stdin) that the verbs echo in their output and error envelopes.
+pub(crate) fn read_plat_input_with_source(input: &str) -> Result<(String, String), ExitCode> {
     read_plat_input(input).map(|s| (s, input.to_owned()))
 }
 
@@ -6013,7 +5970,7 @@ async fn cmd_run(args: &[String]) -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let (contents, source) = match read_plat_input_or_hash(&path, "run").await {
+    let (contents, source) = match read_plat_input_with_source(&path) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -6278,7 +6235,7 @@ async fn cmd_replay(args: &[String]) -> ExitCode {
         eprintln!("usage: heso replay [--plan] <plat.plat|plat-hash|->");
         return ExitCode::from(2);
     };
-    let (contents, source) = match read_plat_input_or_hash(input, "replay").await {
+    let (contents, source) = match read_plat_input_with_source(input) {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -7142,7 +7099,6 @@ async fn main() -> ExitCode {
         Some("info") => cmd_info::cmd_info(&args[1..]).await,
         Some("seal") => cmd_seal::cmd_seal(&args[1..]).await,
         Some("unseal") => cmd_unseal::cmd_unseal(&args[1..]).await,
-        Some("registry") => registry::cmd_registry(&args[1..]).await,
         Some(other) => {
             eprintln!("unknown subcommand: {other}\n");
             print_banner();

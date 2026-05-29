@@ -89,8 +89,7 @@ heso-local-data/
 /pitch-assets/
 
 # Local prototypes / sandbox services that live alongside the repo for
-# convenience but ship out-of-band. Each subdirectory is its own thing
-# (e.g. services/ecosystem-api is the heso.ca/ecosystem backend).
+# convenience but ship out-of-band. Each subdirectory is its own thing.
 /services/
 
 # Vendored source dropped locally for reference / experimentation —

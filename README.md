@@ -74,7 +74,7 @@ You get JSON: title, description, a heading tree, and a list of clickable elemen
 
 **Find and read things.**
 
-- `heso search "<query>"` — searches the web (DuckDuckGo + Wikipedia, optional SearXNG). No API key.
+- `heso search "<query>"` — searches the web (Mojeek + DuckDuckGo + Wikipedia, optional SearXNG). No API key.
 - `heso open <url>` — fetches and returns a page summary: title, headings, actionable elements.
 - `heso read <url>` — fetches, runs JS, returns the full picture: title, visible text, actions, forms, cookies, console output, framework detection. One call.
 - `heso read <url> --complete` — same, but heso loops "fire pending observers + click load-more + wait for DOM to settle" until the page stops changing. For lazy-loaded sites.
@@ -413,7 +413,7 @@ description: Use heso when an agent needs to touch the web — fetch pages, run 
 
 ## Verbs
 
-- `heso search "<query>" [--limit N]` — web search via DDG + Wikipedia
+- `heso search "<query>" [--limit N]` — web search via Mojeek + DDG + Wikipedia
 - `heso open <url>` — page summary
 - `heso read <url> [--complete]` — full content + actions + forms (use --complete for lazy-loaded sites)
 - `heso wait <url> --selector-exists ".x"` — block until a condition is true
@@ -467,7 +467,7 @@ Measured on Windows 11, AMD x86_64, with the release binary:
 | Cold start (`open https://example.com`, network included) | ~77 ms |
 | Engine-only (no network, local fixture) | ~28 ms |
 | Batch (8 URLs, `--parallel 8`) | ~1.1 s total |
-| Search (DDG, 5 results) | ~1 s |
+| Search (5 results) | ~1.5 s |
 
 ## Building from source
 
