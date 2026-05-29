@@ -145,10 +145,9 @@ pub(crate) const DEFAULT_KNOWN_SIGNERS_PATH: &str = "heso-local-data/known_signe
 /// printing: insert the `lineage` pin key, then sign inline by default
 /// or leave the body bare under `--no-sign`.
 ///
-/// `--no-sign` exists for two contracts: the cassette byte-identity
-/// guarantee (a bare plat that pipes into `run` unchanged) and the
-/// pre-signing regression anchor (a `--no-sign` plat is byte-identical
-/// to a pre-default-signing plat).
+/// `--no-sign` exists for the cassette byte-identity guarantee: a bare
+/// plat carries no `sig`, pipes into `run` unchanged, and is byte-identical
+/// to a plat produced with signing disabled.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProducerSignOpts {
     /// `--no-sign` — skip the inline `sig` and emit today's bare plat.
@@ -236,12 +235,12 @@ pub(crate) fn strip_producer_sign_flags(
 /// the insert; the inline `sig` itself is stripped from the hash region,
 /// so adding it never moves `plat_hash`.
 ///
-/// `--no-sign` emits today's bare plat: no `sig`, and — unless the caller
+/// `--no-sign` emits the bare plat: no `sig`, and — unless the caller
 /// explicitly grouped this run under a `--lineage <label>` — no `lineage`
-/// either, so the output is byte-identical to a pre-signing plat (the
-/// cassette byte-identity contract and the regression anchor). An
-/// explicit `--lineage` under `--no-sign` still carries the label for
-/// callers who want the pin key without the signature.
+/// either, so the output is the bare plat shape, byte-identical to a plat
+/// with no `sig` (the cassette byte-identity contract). An explicit
+/// `--lineage` under `--no-sign` still carries the label for callers who
+/// want the pin key without the signature.
 ///
 /// Returns the finalized body on success, or a usage [`ExitCode`] when
 /// the signing key can't be loaded.
@@ -251,7 +250,7 @@ pub(crate) fn finalize_produced_plat(
     opts: &ProducerSignOpts,
 ) -> Result<serde_json::Value, ExitCode> {
     // A bare-plat `--no-sign` (no explicit lineage) must stay byte-for-
-    // byte identical to a pre-signing plat, so skip both the lineage
+    // byte identical to a plat with no `sig`, so skip both the lineage
     // insert and the hash recompute.
     if opts.no_sign && opts.lineage.is_none() {
         return Ok(body);
@@ -6184,7 +6183,7 @@ async fn stamp_to_plat(
         obj.insert("plat_hash".to_owned(), serde_json::Value::String(hash));
     }
     // A bare-plat `--no-sign` (no explicit lineage) stays byte-for-byte
-    // identical to a pre-signing plat — skip both the lineage insert and
+    // identical to a plat with no `sig` — skip both the lineage insert and
     // the sign. `cmd_refresh` re-stamps with an explicit default lineage
     // (so the byte-identity skip does NOT fire), giving a `plat_hash`
     // comparable to a default-stamped input.

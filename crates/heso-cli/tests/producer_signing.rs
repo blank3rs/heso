@@ -58,12 +58,11 @@ fn parse_ok(out: &std::process::Output) -> serde_json::Value {
 
 const PAGE: &str = "data:text/html,<h1>hi</h1>";
 
-/// A plat captured from the `heso open <PAGE>` binary BEFORE default
-/// signing landed — the regression anchor. `heso open --no-sign <PAGE>`
-/// must reproduce these exact bytes (pretty-printed JSON + trailing
-/// newline from `println!`), proving the bare path is byte-identical to a
-/// pre-signing plat.
-const PRE_D_BARE_OPEN_GOLDEN: &str = "{\n  \"actions\": [],\n  \"console_errors_count\": 0,\n  \"description\": null,\n  \"failed_scripts\": [],\n  \"http_status\": 200,\n  \"input_url\": \"data:text/html,<h1>hi</h1>\",\n  \"metadata\": {},\n  \"partial\": false,\n  \"partial_reason\": \"ok\",\n  \"plat_hash\": \"8133f737db272370d22dfe4ab10dd05015185f5927c6d215538975e1bc75dca7\",\n  \"seed\": 0,\n  \"title\": \"\",\n  \"tree\": {\n    \"description\": null,\n    \"root\": {\n      \"byte_count\": 0,\n      \"child_count\": 1,\n      \"children\": [\n        {\n          \"byte_count\": 0,\n          \"child_count\": 0,\n          \"children\": [],\n          \"heading\": \"hi\",\n          \"intro\": \"\",\n          \"level\": 1,\n          \"path\": \"/hi\",\n          \"slug\": \"hi\",\n          \"summary\": \"hi\"\n        }\n      ],\n      \"heading\": null,\n      \"intro\": \"\",\n      \"level\": 0,\n      \"path\": \"/\",\n      \"slug\": \"\",\n      \"summary\": \"\"\n    },\n    \"title\": \"\",\n    \"url\": \"data:text/html,<h1>hi</h1>\"\n  },\n  \"url\": \"data:text/html,<h1>hi</h1>\"\n}\n";
+/// The canonical bare-plat shape for `heso open <PAGE>`. `heso open
+/// --no-sign <PAGE>` reproduces these exact bytes (pretty-printed JSON +
+/// trailing newline from `println!`): a bare plat carries no `sig` and no
+/// `lineage`.
+const BARE_OPEN_GOLDEN: &str = "{\n  \"actions\": [],\n  \"console_errors_count\": 0,\n  \"description\": null,\n  \"failed_scripts\": [],\n  \"http_status\": 200,\n  \"input_url\": \"data:text/html,<h1>hi</h1>\",\n  \"metadata\": {},\n  \"partial\": false,\n  \"partial_reason\": \"ok\",\n  \"plat_hash\": \"8133f737db272370d22dfe4ab10dd05015185f5927c6d215538975e1bc75dca7\",\n  \"seed\": 0,\n  \"title\": \"\",\n  \"tree\": {\n    \"description\": null,\n    \"root\": {\n      \"byte_count\": 0,\n      \"child_count\": 1,\n      \"children\": [\n        {\n          \"byte_count\": 0,\n          \"child_count\": 0,\n          \"children\": [],\n          \"heading\": \"hi\",\n          \"intro\": \"\",\n          \"level\": 1,\n          \"path\": \"/hi\",\n          \"slug\": \"hi\",\n          \"summary\": \"hi\"\n        }\n      ],\n      \"heading\": null,\n      \"intro\": \"\",\n      \"level\": 0,\n      \"path\": \"/\",\n      \"slug\": \"\",\n      \"summary\": \"\"\n    },\n    \"title\": \"\",\n    \"url\": \"data:text/html,<h1>hi</h1>\"\n  },\n  \"url\": \"data:text/html,<h1>hi</h1>\"\n}\n";
 
 #[test]
 fn open_signs_by_default_with_sig_and_lineage() {
@@ -120,11 +119,11 @@ fn no_sign_open_is_byte_identical_to_a_bare_plat() {
     assert!(
         plat.get("lineage").is_none(),
         "--no-sign without an explicit --lineage must omit `lineage` so the \
-         output is byte-identical to a pre-signing bare plat"
+         output is byte-identical to the bare plat shape"
     );
 
-    // The regression anchor: --no-sign emits exactly the historical bare
-    // shape. The required fields are present; no signing artifacts leak.
+    // --no-sign emits the bare plat shape: the required fields are present;
+    // no signing artifacts leak.
     assert!(plat["plat_hash"].as_str().is_some_and(|h| h.len() == 64));
     assert_eq!(plat["input_url"].as_str(), Some(PAGE));
 
@@ -136,14 +135,14 @@ fn no_sign_open_is_byte_identical_to_a_bare_plat() {
         "--no-sign must not generate a default identity"
     );
 
-    // Byte-for-byte regression anchor against a plat captured from the
-    // pre-signing binary. On Windows the OS line ending is the only
-    // permitted difference, so normalize CRLF before comparing.
+    // Byte-for-byte check against the canonical bare-plat golden. On Windows
+    // the OS line ending is the only permitted difference, so normalize CRLF
+    // before comparing.
     let stdout = String::from_utf8(bare.stdout).expect("stdout is utf8");
     let normalized = stdout.replace("\r\n", "\n");
     assert_eq!(
-        normalized, PRE_D_BARE_OPEN_GOLDEN,
-        "--no-sign output must be byte-identical to the pre-signing plat"
+        normalized, BARE_OPEN_GOLDEN,
+        "--no-sign output must be byte-identical to the bare plat shape"
     );
 }
 
