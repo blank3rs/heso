@@ -1575,15 +1575,15 @@ async fn dispatch_wait(
 
 /// JSON-RPC params for the `search` method. Stateless — no `page_id`,
 /// no session, no `engine` reuse with the rest of the server. Defaults
-/// match the CLI verb: 30-result cap, `ddg,wiki` engines, SearXNG only
-/// if a URL is supplied (or `HESO_SEARX_URL` is set in the parent
-/// process env).
+/// match the CLI verb: 30-result cap, the full default backend pool,
+/// SearXNG only if a URL is supplied (or `HESO_SEARX_URL` is set in the
+/// parent process env).
 #[derive(Deserialize)]
 struct SearchParams {
     query: String,
     #[serde(default)]
     limit: Option<usize>,
-    /// Comma-separated string like `"ddg,wiki"`, OR a JSON array of
+    /// Comma-separated string like `"mojeek,ddg"`, OR a JSON array of
     /// strings. Either shape is accepted to keep RPC clients honest —
     /// JSON arrays are the obvious form, but TOML / env / config-file
     /// callers that already have a string can pass that too.
@@ -1591,6 +1591,11 @@ struct SearchParams {
     engines: Option<serde_json::Value>,
     #[serde(default)]
     searx_url: Option<String>,
+    /// Per-request inner deadline in milliseconds, mirroring the CLI's
+    /// `--timeout`. Omitted lets the client pick its default; `0` opts out
+    /// of the per-request cap.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 async fn dispatch_search(
@@ -1607,7 +1612,9 @@ async fn dispatch_search(
         .unwrap_or(crate::search::DEFAULT_LIMIT)
         .clamp(1, crate::search::MAX_LIMIT);
     let engines = match p.engines {
-        None => vec![crate::search::Engine::Ddg, crate::search::Engine::Wiki],
+        // The default pool matches the CLI's default sweep — same backends,
+        // same priority order.
+        None => crate::search::DEFAULT_POOL.to_vec(),
         Some(v) => crate::search::parse_engines_value(&v)?,
     };
     let searx_url = match p.searx_url {
@@ -1621,6 +1628,7 @@ async fn dispatch_search(
         limit,
         engines,
         searx_url,
+        timeout_ms: p.timeout_ms,
     };
     crate::search::run_search(&req).await
 }
@@ -1742,6 +1750,23 @@ mod tests {
     #[test]
     fn normalize_ref_adds_leading_at_when_missing() {
         assert_eq!(normalize_ref("e7"), "@e7");
+    }
+
+    #[test]
+    fn rpc_search_default_engines_include_mojeek() {
+        // The RPC `search` method, when given no `engines`, must resolve to
+        // the full default pool, matching the CLI. Mirrors the
+        // `None => DEFAULT_POOL.to_vec()` branch in `dispatch_search`.
+        let default = match Option::<serde_json::Value>::None {
+            None => crate::search::DEFAULT_POOL.to_vec(),
+            Some(v) => crate::search::parse_engines_value(&v).unwrap(),
+        };
+        assert!(
+            default.contains(&crate::search::BackendId::Mojeek),
+            "RPC default pool must include mojeek: {default:?}"
+        );
+        // And it must be the breadth pool, not a two-engine fallback.
+        assert!(default.len() >= 5, "RPC default pool too small: {default:?}");
     }
 
     #[test]

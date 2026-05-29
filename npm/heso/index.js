@@ -426,18 +426,32 @@ function wait(url, options) {
 }
 
 /**
- * `heso search <query>` — web search across Mojeek, DuckDuckGo, and
- * Wikipedia (optional SearXNG via `searxUrl`). No API key. Resolves with
- * `{ query, engines_used, results, knowledge }`: `results` is a list of
- * `{ rank, title, url, snippet, source }` rows; `knowledge` is the
- * Wikipedia summary block (or `null` when there's no direct match).
+ * `heso search <query>` — web search across an always-on rotating pool
+ * (Mojeek, Brave, Marginalia, the two DuckDuckGo endpoints) plus a
+ * Wikipedia knowledge block, and SearXNG via `searxUrl`. No API key.
+ * Resolves with `{ query, engines_used, blocked, results, knowledge,
+ * errors }`:
+ *   - `results`: a list of `{ rank, title, url, snippet, source }` rows.
+ *   - `engines_used`: the backends that returned results (a throttled
+ *     backend is NOT listed here).
+ *   - `knowledge`: the Wikipedia summary block, or `null` with no match.
+ *   - `blocked`: the backends that were throttled/challenged this run
+ *     (`null` when nothing was). A throttled backend is surfaced loudly
+ *     rather than folded into a silent empty.
+ *   - `errors`: `null` when every attempted backend returned results,
+ *     otherwise an array of `{ engine, code, message, ... }` rows whose
+ *     `code` is one of `"rate_limited" | "bot_challenge" |
+ *     "config_error" | "transport_error"`.
  *
  * Common options: `limit` (default 30, max 100), `engines`
- * ("ddg,mojeek,wiki" by default, or any subset), `searxUrl` (also reads
- * `HESO_SEARX_URL`).
+ * ("mojeek,brave,marginalia,ddg,ddg-lite,wiki" by default, or any
+ * subset), `searxUrl` (also reads `HESO_SEARX_URL`), `timeout` (per-
+ * backend request budget in ms; the always-on retry layer may spend it
+ * up to 4x per backend).
  */
 function search(query, options) {
-  return _spawnJson(["search", String(query), ..._optsToArgv(options)]);
+  const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
+  return _spawnJson(["search", String(query), ..._optsToArgv(cliOpts)], spawnOpts);
 }
 
 /**

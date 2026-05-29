@@ -431,7 +431,7 @@ fn print_banner() {
     println!(
         "                              (open / read / click / fill / submit / eval-dom / batch /"
     );
-    println!("                              stamp / refresh / meta / find / tree / ls / cat).");
+    println!("                              stamp / refresh / meta / find / tree / ls / cat / search).");
     println!(
         "                              Default 30s. Accepts `5s`, `200ms`, `1m`, or a bare number"
     );
@@ -442,7 +442,16 @@ fn print_banner() {
         "                              timeout the verb emits {{ok: false, error: {{code: \"timeout\","
     );
     println!(
-        "                              timeout_ms, elapsed_ms, url}}}} on stdout and exits 1."
+        "                              timeout_ms, elapsed_ms, url}}}} on stdout and exits 1. For"
+    );
+    println!(
+        "                              `search` this caps EACH backend request; the always-on retry"
+    );
+    println!(
+        "                              layer may spend it up to 4x per backend, so total wall-clock"
+    );
+    println!(
+        "                              is roughly timeout x (1 + retries) plus backoff."
     );
     println!("  --no-private-networks       Refuse URLs that resolve to a private/loopback/");
     println!(
@@ -4123,7 +4132,7 @@ async fn cmd_wait(args: &[String]) -> ExitCode {
 /// Why not a crate: the parse is 12 lines and zero deps. `humantime`
 /// or `duration-str` would add a transitive crate (and a new arg
 /// shape — `5sec` vs `5 seconds`) for no expressivity win.
-fn parse_duration_ms(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_duration_ms(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
         return Err("expected a duration like `500ms` / `5s` / `1m`".to_owned());
@@ -7495,7 +7504,9 @@ async fn main() -> ExitCode {
         Some("cat") => cmd_cat(&args[1..]).await,
         Some("find") => cmd_find(&args[1..]).await,
         Some("meta") => cmd_meta(&args[1..]).await,
-        Some("search") => search::cmd_search(&args[1..]).await,
+        Some("search") => {
+            run_with_single_verb_timeout("search", search::cmd_search(&args[1..])).await
+        }
         Some("open") => run_with_single_verb_timeout("open", cmd_open(&args[1..])).await,
         Some("read") => run_with_single_verb_timeout("read", cmd_read(&args[1..])).await,
         Some("batch") => batch::cmd_batch(&args[1..]).await,

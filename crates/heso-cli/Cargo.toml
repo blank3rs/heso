@@ -49,6 +49,13 @@ scraper.workspace = true
 # `url::form_urlencoded` is used by the search verb to build the DDG
 # POST body and unwrap the `uddg=` redirect parameter.
 url.workspace = true
+# Always-on search resilience (ADR 0026): `backon` drives full-jitter
+# exponential retry, `governor` paces per-host outbound requests, and
+# `fastrand` seeds fingerprint rotation + jitter. All workspace deps.
+backon = { workspace = true }
+governor = { workspace = true }
+fastrand = { workspace = true }
+httpdate = { workspace = true }
 # Global allocator: mimalloc beats Windows' UCRT allocator by
 # 20–50% on alloc-heavy workloads (reqwest body buffers, scraper
 # tree, serde_json, canonical-JSON writes) and has near-zero init

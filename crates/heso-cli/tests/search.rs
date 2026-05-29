@@ -192,7 +192,7 @@ async fn searxng_empty_results_handled_cleanly() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn searxng_5xx_does_not_crash_returns_empty() {
+async fn searxng_5xx_surfaces_rate_limited_and_exits_nonzero() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/search"))
@@ -207,23 +207,143 @@ async fn searxng_5xx_does_not_crash_returns_empty() {
         "--searx-url",
         &server.uri(),
     ]);
-    // The search-backend error surfaces via non-zero exit and an
-    // errors[] entry; the JSON envelope is still emitted on stdout
-    // with empty results and engines_used.
+    // A 5xx that survives the retry layer is a throttle, not a silent
+    // empty: the sole backend is blocked, so the process exits non-zero
+    // and the envelope reports it loudly.
+    assert!(
+        !out.status.success(),
+        "all-blocked sweep must exit non-zero: stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert!(v["results"].as_array().unwrap().is_empty());
     assert!(
         v["engines_used"].as_array().unwrap().is_empty(),
-        "engines_used must NOT include searxng on hard error: {v}"
+        "engines_used must NOT include a blocked searxng: {v}"
     );
+    let blocked: Vec<&str> = v["blocked"]
+        .as_array()
+        .expect("blocked array")
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert_eq!(blocked, vec!["searxng"]);
     let errors = v["errors"].as_array().expect("errors array");
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["engine"], serde_json::json!("searxng"));
-    assert!(errors[0]["message"]
-        .as_str()
+    assert_eq!(errors[0]["code"], serde_json::json!("rate_limited"));
+    assert_eq!(errors[0]["http_status"], serde_json::json!(500));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn searxng_429_envelope_lists_blocked_and_exits_nonzero() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(429))
+        .mount(&server)
+        .await;
+
+    let out = run_search(&[
+        "any",
+        "--engines",
+        "searxng",
+        "--searx-url",
+        &server.uri(),
+    ]);
+    assert!(
+        !out.status.success(),
+        "a 429 from the only backend must exit non-zero"
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert!(v["engines_used"].as_array().unwrap().is_empty());
+    let blocked: Vec<&str> = v["blocked"]
+        .as_array()
+        .expect("blocked array")
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert_eq!(blocked, vec!["searxng"]);
+    let errors = v["errors"].as_array().expect("errors array");
+    assert_eq!(errors[0]["code"], serde_json::json!("rate_limited"));
+    assert_eq!(errors[0]["http_status"], serde_json::json!(429));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn searxng_html_when_json_requested_is_config_error() {
+    let server = MockServer::start().await;
+    // A public instance with JSON output disabled answers `format=json`
+    // with its HTML search page — a config error, not a throttle.
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("<!doctype html><html><body>searx</body></html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let out = run_search(&[
+        "any",
+        "--engines",
+        "searxng",
+        "--searx-url",
+        &server.uri(),
+    ]);
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    let errors = v["errors"].as_array().expect("errors array");
+    assert_eq!(errors[0]["engine"], serde_json::json!("searxng"));
+    assert_eq!(errors[0]["code"], serde_json::json!("config_error"));
+    let blocked: Vec<&str> = v["blocked"]
+        .as_array()
+        .expect("blocked array")
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert_eq!(blocked, vec!["searxng"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn searxng_clean_200_has_null_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{
+                "title": "clean",
+                "url": "https://example.com/clean",
+                "content": "no errors expected"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let out = run_search(&[
+        "any",
+        "--engines",
+        "searxng",
+        "--searx-url",
+        &server.uri(),
+    ]);
+    let v = parse_stdout(&out);
+    assert!(
+        v["errors"].is_null(),
+        "errors must be null when every attempted backend returned results: {v}"
+    );
+    assert!(
+        v["blocked"].is_null(),
+        "blocked must be null when nothing was throttled: {v}"
+    );
+    let engines: Vec<&str> = v["engines_used"]
+        .as_array()
         .unwrap()
-        .contains("HTTP 500"));
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert_eq!(engines, vec!["searxng"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -237,6 +357,31 @@ async fn unknown_engine_rejected_with_usage() {
     assert!(
         stderr.contains("unknown engine") || stderr.contains("google"),
         "stderr should explain the bad engine: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_engine_named_after_new_pool_still_rejected() {
+    // The closed pool grew (`brave`, `marginalia`, `ddg-lite`), but a name
+    // outside it must still be rejected at parse time — before any fetch,
+    // so no network is touched. (The accept-side of the new names is
+    // covered by the network-free `parse_engines_csv_accepts_known` unit
+    // test; driving them end-to-end would hit live upstream hosts.)
+    let out = Command::new(heso_bin())
+        .args(["search", "q", "--engines", "ddglite"])
+        .env_remove("HESO_SEARX_URL")
+        .output()
+        .expect("spawn heso search");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown engine"),
+        "a misspelled engine must be rejected with the supported list: {stderr}"
+    );
+    // The error message lists the new wire names so an agent can correct.
+    assert!(
+        stderr.contains("ddg-lite") && stderr.contains("brave") && stderr.contains("marginalia"),
+        "supported-engine hint must include the new names: {stderr}"
     );
 }
 
@@ -284,6 +429,158 @@ async fn searxng_via_env_var() {
     let results = v["results"].as_array().expect("results");
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["title"], serde_json::json!("envvar route"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_against_slow_backend_surfaces_loud_envelope() {
+    // A backend that holds the connection past the per-request `--timeout`
+    // must surface a loud throttle envelope (a timed-out request is a
+    // retryable transport failure → `rate_limited` after retries exhaust),
+    // never a silent empty. With `--timeout 1s` the inner reqwest deadline
+    // fires on each attempt well before any wall-clock backstop.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(serde_json::json!({ "results": [] })),
+        )
+        .mount(&server)
+        .await;
+
+    let out = run_search(&[
+        "slow-query-timeout",
+        "--engines",
+        "searxng",
+        "--searx-url",
+        &server.uri(),
+        "--timeout",
+        "1s",
+    ]);
+    // Sole backend timed out → all-blocked sweep exits non-zero.
+    assert!(
+        !out.status.success(),
+        "a timed-out sole backend must exit non-zero: stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert!(v["results"].as_array().unwrap().is_empty());
+    assert!(
+        v["engines_used"].as_array().unwrap().is_empty(),
+        "a timed-out backend must NOT be listed as used: {v}"
+    );
+    let blocked: Vec<&str> = v["blocked"]
+        .as_array()
+        .expect("blocked array")
+        .iter()
+        .filter_map(|e| e.as_str())
+        .collect();
+    assert_eq!(blocked, vec!["searxng"]);
+    let errors = v["errors"].as_array().expect("errors array");
+    assert_eq!(errors[0]["engine"], serde_json::json!("searxng"));
+    assert_eq!(errors[0]["code"], serde_json::json!("rate_limited"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn on_disk_cache_collapses_repeat_query_to_one_http_hit() {
+    // Two identical queries in the same data directory hit the backend
+    // exactly once: the first fetch writes the on-disk cache, the second
+    // reads it and short-circuits the HTTP call (A.6). Both `heso`
+    // subprocesses run from a shared tempdir so the cache is isolated
+    // from the repo and visible across the two runs.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{
+                "title": "cached row",
+                "url": "https://example.com/cached",
+                "content": "served once, cached thereafter"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let args = [
+        "search",
+        "cache-collapse-query",
+        "--engines",
+        "searxng",
+        "--searx-url",
+        &server.uri(),
+    ];
+    let run = || {
+        Command::new(heso_bin())
+            .args(args)
+            .current_dir(dir.path())
+            .env_remove("HESO_SEARX_URL")
+            .output()
+            .expect("spawn heso search")
+    };
+
+    let first = run();
+    assert!(first.status.success(), "first run failed");
+    let v1: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(v1["results"].as_array().unwrap().len(), 1);
+
+    let second = run();
+    assert!(second.status.success(), "second run failed");
+    let v2: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(v2["results"].as_array().unwrap().len(), 1);
+    assert_eq!(v2["results"][0]["url"], v1["results"][0]["url"]);
+
+    let hits = server.received_requests().await.expect("recorded requests");
+    assert_eq!(
+        hits.len(),
+        1,
+        "the cache must collapse two identical queries to ONE HTTP hit, saw {}",
+        hits.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cache_ttl_zero_disables_short_circuit() {
+    // `HESO_SEARCH_CACHE_TTL=0` opts the process out of the cache, so two
+    // identical queries hit the backend twice — proving the short-circuit
+    // above is the cache, not query dedupe elsewhere.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": [{
+                "title": "uncached",
+                "url": "https://example.com/uncached",
+                "content": "fetched every time"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let args = [
+        "search",
+        "cache-disabled-query",
+        "--engines",
+        "searxng",
+        "--searx-url",
+        &server.uri(),
+    ];
+    let run = || {
+        Command::new(heso_bin())
+            .args(args)
+            .current_dir(dir.path())
+            .env_remove("HESO_SEARX_URL")
+            .env("HESO_SEARCH_CACHE_TTL", "0")
+            .output()
+            .expect("spawn heso search")
+    };
+    let _ = run();
+    let _ = run();
+    let hits = server.received_requests().await.expect("recorded requests");
+    assert_eq!(hits.len(), 2, "TTL=0 must disable the cache short-circuit");
 }
 
 // ============================================================================

@@ -63,6 +63,24 @@ regex = "1"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "rand_core"] }
 rand_core = { version = "0.6", default-features = false, features = ["std", "getrandom"] }
 base64 = { version = "0.22", default-features = false, features = ["std"] }
+# Always-on search resilience (Workstream A; ADR 0026). Runtime-agnostic
+# retry with full-jitter exponential backoff; `fastrand`-only at runtime,
+# per-call `.when()` predicate to retry throttles while accepting genuine
+# empty pages.
+backon = "1.6"
+# Client-side request pacing for the search backend pool. `default-features
+# = false` drops the `unsafe` `quanta` clock and the unused `dashmap`,
+# falling back to the std `Instant` MonotonicClock — load-bearing for the
+# workspace-wide `unsafe_code = "forbid"`. `jitter` enables
+# `until_ready_with_jitter`.
+governor = { version = "0.10", default-features = false, features = ["std", "jitter"] }
+# Jitter source + UA/host rotation index for the search pool. Tiny, no
+# `unsafe` in our use; already pulled transitively, taken as a direct dep.
+fastrand = "2"
+# `Retry-After` HTTP-date parsing for the search retry path. Already
+# pulled transitively through `hyper`; taken as a direct dep so the
+# clamp logic doesn't hand-roll RFC 7231 date grammar.
+httpdate = "1"
 
 [profile.release]
 opt-level = 3

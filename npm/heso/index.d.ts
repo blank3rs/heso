@@ -183,9 +183,16 @@ export interface WriteVerbResult {
 }
 
 /**
- * `heso search <query>` — web search across Mojeek, DuckDuckGo, and
- * Wikipedia (optional SearXNG via `searxUrl`). No API key. Resolves with
- * `{ query, engines_used, results, knowledge }`.
+ * `heso search <query>` — web search across an always-on rotating pool
+ * (Mojeek, Brave, Marginalia, the two DuckDuckGo endpoints) plus a
+ * Wikipedia knowledge block, and SearXNG via `searxUrl`. No API key.
+ * Resolves with `{ query, engines_used, blocked, results, knowledge,
+ * errors }`. A throttled backend is surfaced in `blocked` (and a typed
+ * `errors[]` row whose `code` is `"rate_limited" | "bot_challenge" |
+ * "config_error" | "transport_error"`) rather than folded into a silent
+ * empty; `errors` is `null` only when every attempted backend returned
+ * results. `timeout` (from {@link CommonOptions}) caps EACH backend
+ * request.
  */
 export function search(
   query: string,

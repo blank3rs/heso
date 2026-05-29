@@ -513,22 +513,36 @@ def wait(url: str, **kwargs: Any) -> dict:
 
 
 def search(query: str, **kwargs: Any) -> dict:
-    """``heso search <query>`` — web search across Mojeek, DuckDuckGo, and
-    Wikipedia (optional SearXNG). No API key.
+    """``heso search <query>`` — web search across an always-on rotating
+    pool (Mojeek, Brave, Marginalia, the two DuckDuckGo endpoints) plus a
+    Wikipedia knowledge block, and SearXNG when configured. No API key.
 
-    Returns ``{query, engines_used, results, knowledge}`` as a dict:
-    ``results`` is a list of ``{rank, title, url, snippet, source}`` rows;
-    ``knowledge`` is a single ``{title, summary, url}`` block from
-    Wikipedia (or ``None`` when there's no direct match).
+    Returns ``{query, engines_used, blocked, results, knowledge, errors}``
+    as a dict:
+        results: list of ``{rank, title, url, snippet, source}`` rows.
+        engines_used: backends that returned results (a throttled backend
+            is NOT listed here).
+        knowledge: a single ``{title, summary, url}`` block from Wikipedia
+            (or ``None`` when there's no direct match).
+        blocked: backends throttled/challenged this run (``None`` when
+            nothing was) — surfaced loudly, never a silent empty.
+        errors: ``None`` only when every attempted backend returned
+            results, else a list of ``{engine, code, message, ...}`` rows
+            whose ``code`` is one of ``rate_limited`` / ``bot_challenge`` /
+            ``config_error`` / ``transport_error``.
 
     Common kwargs:
         limit: int — cap on results (default 30, max 100).
-        engines: str — comma-separated subset of ``ddg,mojeek,wiki,searxng``
-            (default ``ddg,mojeek,wiki``).
+        engines: str — comma-separated subset of
+            ``mojeek,brave,marginalia,ddg,ddg-lite,searxng,wiki`` (default
+            ``mojeek,brave,marginalia,ddg,ddg-lite,wiki``).
         searx_url: str — base URL for a SearXNG instance. Also reads
             ``HESO_SEARX_URL`` from the environment.
+        timeout: float — per-backend request budget in seconds; the
+            always-on retry layer may spend it up to 4x per backend.
     """
-    return run("search", query, *_kwargs_to_argv(kwargs))
+    spawn, cli = _split_spawn_opts(kwargs)
+    return run("search", query, *_kwargs_to_argv(cli), **spawn)
 
 
 def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
