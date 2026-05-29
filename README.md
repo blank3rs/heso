@@ -75,10 +75,11 @@ You get JSON: title, description, a heading tree, and a list of clickable elemen
 
 **Find and read things.**
 
-- `heso search "<query>"` — searches the web (Mojeek + DuckDuckGo + Wikipedia, optional SearXNG). No API key.
+- `heso search "<query>"` — searches the web (Mojeek + DuckDuckGo + Wikipedia, optional SearXNG). No API key. Rotates across the backends with backoff so it isn't silently rate-limited; a throttled backend is reported loudly (a `blocked` list + typed `errors[].code`) while partial results still come back from the rest. Never a silent empty. `--timeout` supported.
 - `heso open <url>` — fetches and returns a page summary: title, headings, actionable elements.
 - `heso read <url>` — fetches, runs JS, returns the full picture: title, visible text, actions, forms, cookies, console output, framework detection. One call.
 - `heso read <url> --complete` — same, but heso loops "fire pending observers + click load-more + wait for DOM to settle" until the page stops changing. For lazy-loaded sites.
+- `heso read <url> --js-fetch` — runs inline and linked `<script src=...>` through the engine, so the returned `actions` and `forms` reflect the hydrated DOM, not the static HTML. For client-rendered pages.
 - `heso batch [open|read] <urls...>` — runs many URLs in parallel. Shared cookie jar, JSON-Lines out.
 - `heso wait <url> --selector-exists ".foo"` (also `--text-contains`, `--url-matches`, `--network-idle`, `--time`) — blocks until a condition is true. No polling loop.
 
@@ -87,6 +88,7 @@ You get JSON: title, description, a heading tree, and a list of clickable elemen
 - `heso click <url> @e7` — click by element ref.
 - `heso click <url> --text "Sign in"` — or by visible text, CSS selector, or aria-label.
 - `heso fill <url> @e3 "hello"` — type into an input.
+- `--js` on `click` / `fill` — resolve the ref against the hydrated DOM and act on the post-JS page. Pairs with `read --js-fetch`, which emits the same hydrated graph the refs point into.
 - `heso submit <url> @e9` — submit a form.
 - `heso serve` exposes a JSON-RPC `navigate` method for changing URL inside a stateful session.
 - `heso eval-dom <url> "<js>"` — fetch, run scripts, then run your JS against the resulting DOM.

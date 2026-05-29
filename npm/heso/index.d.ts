@@ -61,8 +61,33 @@ export interface CommonOptions {
   [key: string]: unknown;
 }
 
+/**
+ * Producer signing — shared by the verbs that mint a plat (`open`,
+ * `read`, `stamp`, `run`). The output is signed by default; the body
+ * carries an inline `sig` and a `lineage` pin key.
+ */
+export interface ProducerSignOptions {
+  /**
+   * Emit a bare, unsigned plat (no `sig`, and no `lineage` unless one is
+   * given explicitly). Forwarded as `--no-sign`. Use it to preserve the
+   * byte-for-byte cassette-identity contract.
+   */
+  noSign?: boolean;
+  /**
+   * Lineage label to group plats under one TOFU pin. Forwarded as
+   * `--lineage <LABEL>`; default is derived from the source. Setting it
+   * under `noSign` carries the pin key without the signature.
+   */
+  lineage?: string;
+  /**
+   * Identity key to sign with. Forwarded as `--key <PATH>`; defaults to
+   * `heso-local-data/identity.key`.
+   */
+  key?: string;
+}
+
 /** Options unique to `open`. */
-export interface OpenOptions extends CommonOptions {
+export interface OpenOptions extends CommonOptions, ProducerSignOptions {
   exploreLinks?: number;
   linkCap?: number;
   bestEffort?: boolean;
@@ -70,7 +95,7 @@ export interface OpenOptions extends CommonOptions {
 }
 
 /** Options unique to `read`. */
-export interface ReadOptions extends CommonOptions {
+export interface ReadOptions extends CommonOptions, ProducerSignOptions {
   complete?: boolean;
   include?: string;
   jsFetch?: boolean;
@@ -101,6 +126,13 @@ export interface LocatorOptions extends CommonOptions {
   text?: string;
   selector?: string;
   ariaLabel?: string;
+  /**
+   * Resolve the target against the post-hydration DOM rather than the
+   * static parse. Forwarded as `--js`; pair with `read({jsFetch: true})`,
+   * which emits the same hydrated action graph. Live `--js` actions are
+   * best-effort. (`click` / `fill` only.)
+   */
+  js?: boolean;
 }
 
 /** Options unique to `submit`. */
@@ -314,8 +346,12 @@ export function find(
 /** `heso tree <url>` — full heading-derived page tree. */
 export function tree(url: string, options?: CommonOptions): Promise<Record<string, unknown>>;
 
-/** Options unique to `stamp` / `replay`. */
-export interface PlanOptions extends CommonOptions {
+/**
+ * Options unique to `stamp` / `replay` / `run` / `refresh`. The
+ * producer-sign trio (`noSign`, `lineage`, `key`) applies to `stamp` and
+ * `run`, which mint a plat; `replay` and `refresh` ignore them.
+ */
+export interface PlanOptions extends CommonOptions, ProducerSignOptions {
   /** Seeds determinism shims (`Math.random`, `crypto.getRandomValues`, timers). */
   seed?: number;
   /** `replay` only: return the plan field instead of the per-step log. */
@@ -393,6 +429,28 @@ export function refresh(file: string, options?: PlanOptions): Promise<RefreshRes
 export interface VerifyOptions extends CommonOptions {
   /** Path to a JSON allowlist of base64 pubkeys for sealed envelopes / receipts. */
   trustedKeys?: string;
+  /**
+   * Require the plat's signer to equal this `heso:<fp>` fingerprint.
+   * Forwarded as `--expect-signer <FP>`; a mismatch fails the check.
+   */
+  expectSigner?: string;
+  /**
+   * Require the plat's signer pubkey to equal the base64 Ed25519 key in
+   * this file. Forwarded as `--signer-key <PATH>`; the strongest pin.
+   */
+  signerKey?: string;
+  /**
+   * Path to the TOFU pin store keyed by lineage. Forwarded as
+   * `--known-signers <PATH>`; first contact pins the signer, a later
+   * mismatch fails loud.
+   */
+  knownSigners?: string;
+  /**
+   * Re-pin the signer in the {@link knownSigners} store on a first-seen
+   * or changed signer instead of failing. Forwarded as
+   * `--accept-new-signer`.
+   */
+  acceptNewSigner?: boolean;
 }
 
 /** Options for {@link info}. */
@@ -463,7 +521,8 @@ export function unseal(
  * Today's subcommands are `init` (mint a key) and `show` (print the
  * pubkey). Both accept `[--path P]` (default
  * `heso-local-data/identity.key`) and both emit
- * `{path, public_key, algorithm}` JSON.
+ * `{path, public_key, fingerprint, algorithm}` JSON. The `fingerprint`
+ * is the `heso:<fp>` form you pass to `verify({expectSigner})`.
  *
  * One typed entry instead of one function per subcommand keeps the
  * surface stable as new subcommands land.

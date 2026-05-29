@@ -467,6 +467,14 @@ def open(url: str, **kwargs: Any) -> dict:
     ``no_private_networks=True`` refuses the request when the target
     resolves to a private / loopback / link-local / metadata IP (SSRF
     protection; off by default, global across every network verb).
+
+    The minted plat is signed inline by default; the output carries
+    ``sig`` and ``lineage``. Signing kwargs:
+        no_sign: bool — emit a bare, unsigned plat (``--no-sign``).
+        lineage: str — group the plat under one TOFU pin label,
+            overriding the URL-derived default (``--lineage``).
+        key: str — Ed25519 identity key to sign with (``--key``,
+            default ``heso-local-data/identity.key``).
     """
     spawn, cli = _split_spawn_opts(kwargs)
     return run("open", url, *_kwargs_to_argv(cli), **spawn)
@@ -488,6 +496,12 @@ def read(url: str, **kwargs: Any) -> dict:
         no_private_networks: bool — refuse private/loopback/metadata
             IPs (SSRF protection; off by default, global).
         timeout: float — per-request budget in seconds (default 30).
+
+    The captured plat is signed inline by default (``sig`` + ``lineage``
+    in the output). Signing kwargs:
+        no_sign: bool — emit a bare, unsigned plat (``--no-sign``).
+        lineage: str — group the plat under one TOFU pin label (``--lineage``).
+        key: str — Ed25519 identity key to sign with (``--key``).
     """
     spawn, cli = _split_spawn_opts(kwargs)
     return run("read", url, *_kwargs_to_argv(cli), **spawn)
@@ -582,6 +596,11 @@ def click(url: str, ref: Optional[str] = None, **kwargs: Any) -> dict:
     navigation walked through, empty for direct hits and for clicks
     that did not navigate.
 
+    ``js=True`` resolves the locator against the post-hydration DOM
+    (pair with ``read(js_fetch=True)``, which emits the same hydrated
+    graph). Live ``--js`` clicks are best-effort: a handler that calls
+    fetch() is non-deterministic.
+
     Accepts ``timeout=N`` (seconds, default 30) capping the underlying
     HTTP request.
     """
@@ -611,6 +630,10 @@ def fill(
     When the selector misses, ``ok`` is ``False`` and ``value`` still
     reflects the requested string so the caller can retry with a
     different locator.
+
+    ``js=True`` resolves against the hydrated DOM and snapshots the
+    post-fill page (pair with ``read(js_fetch=True)``); best-effort, as
+    a handler that calls fetch() is non-deterministic.
 
     Accepts ``timeout=N`` (seconds, default 30) capping the underlying
     HTTP request.
@@ -773,12 +796,18 @@ def stamp(path: Union[str, Path], **kwargs: Any) -> dict:
     ``steps`` fields documenting which step failed, and ``run`` raises
     :class:`HesoError` (with the partial plat still on ``stdout``).
 
+    The minted plat is signed inline by default (``sig`` + ``lineage``
+    in the output).
+
     Common kwargs:
         seed: int — RNG seed (default 0).
         template: str — load a v0 plan template from disk.
         values: dict — substitution map for ``{{name}}`` placeholders
             in the template.
         timeout: float — per-network-step budget in seconds (default 30).
+        no_sign: bool — emit a bare, unsigned plat (``--no-sign``).
+        lineage: str — group the plat under one TOFU pin label (``--lineage``).
+        key: str — Ed25519 identity key to sign with (``--key``).
 
     Keyword arguments become CLI flags via the same rules as every
     other verb.
@@ -820,6 +849,13 @@ def run_plat(path: Union[str, Path], **kwargs: Any) -> dict:
     ``no_verify_input=True`` forwards ``--no-verify-input`` to skip both
     checks.
 
+    The fresh plat is signed inline by default (``sig`` + ``lineage`` in
+    the output). Signing kwargs:
+        no_sign: bool — emit a bare, unsigned plat (``--no-sign``).
+        lineage: str — re-group the output under one TOFU pin label,
+            which also engages signing for a bare input (``--lineage``).
+        key: str — Ed25519 identity key to sign with (``--key``).
+
     Keyword arguments (e.g. ``seed=42``) become CLI flags.
     """
     spawn, cli = _split_spawn_opts(kwargs)
@@ -856,7 +892,26 @@ def refresh(path: Union[str, Path], **kwargs: Any) -> dict:
 
 
 def verify(path: Union[str, Path], **kwargs: Any) -> dict:
-    """``heso verify <file>`` — verify integrity and/or signature of a plat, receipt, or sealed envelope."""
+    """``heso verify <file>`` — verify integrity and/or signature of a
+    plat, receipt, or sealed envelope.
+
+    Trust-layer kwargs (strongest first):
+        signer_key: str — path to a base64 Ed25519 public key; the
+            signer MUST equal it (``--signer-key``).
+        expect_signer: str — a ``heso:<fp>`` fingerprint the signer MUST
+            match (``--expect-signer``).
+        trusted_keys: str — JSON file of allowlisted base64 pubkeys; the
+            signer MUST be on the list (also reads ``HESO_TRUSTED_KEYS``).
+        known_signers: str — path to the TOFU pin store. First contact
+            for a ``lineage`` pins the signer; a later mismatch fails
+            loud (``--known-signers``).
+        accept_new_signer: bool — re-pin on a TOFU mismatch instead of
+            failing (``--accept-new-signer``).
+        require_tsa: bool — reject receipts/sealed plats without a valid
+            TSA timestamp (``--require-tsa``).
+        tsa_trusted_roots: str — PEM bundle of trusted timestamp-authority
+            roots (``--tsa-trusted-roots``).
+    """
     spawn, cli = _split_spawn_opts(kwargs)
     return run("verify", str(path), *_kwargs_to_argv(cli), **spawn)
 
@@ -899,7 +954,9 @@ def identity(subcommand: str, *args: str, **kwargs: Any) -> dict:
     Today's subcommands are ``init`` (mint a fresh key) and ``show``
     (print the pubkey). Both accept ``--path PATH`` (default
     ``heso-local-data/identity.key``) and emit
-    ``{path, public_key, algorithm}`` JSON, returned here as a dict.
+    ``{path, public_key, fingerprint, algorithm}`` JSON, returned here
+    as a dict. ``fingerprint`` is the ``heso:<fp>`` form that
+    ``verify(expect_signer=...)`` matches against.
 
     A single typed entry instead of one function per subcommand keeps
     the surface stable as new subcommands land.

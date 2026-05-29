@@ -404,6 +404,9 @@ async function run(args, opts = {}) {
 /**
  * `heso open <url>` — fetch a page and resolve with the agent-shaped
  * summary `{ url, title, description, metadata, tree, actions, plat_hash, ... }`.
+ * The output is signed by default; the body carries `sig` + `lineage`.
+ * Pass `noSign` for a bare plat, `lineage` to group plats under one TOFU
+ * pin, or `key` to sign with a specific identity. Accepts `data:` URLs.
  */
 function open(url, options) {
   const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
@@ -413,6 +416,8 @@ function open(url, options) {
 /**
  * `heso read <url>` — fetch + run JS + return the full picture
  * `{ title, text, tree, actions, forms, cookies, console, framework, content_hash, ... }`.
+ * Signed by default (`sig` + `lineage` on the body); `noSign`, `lineage`,
+ * and `key` control the producer signature. Accepts `data:` URLs.
  */
 function read(url, options) {
   const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
@@ -457,7 +462,9 @@ function search(query, options) {
 /**
  * `heso click <url> [<@ref> | --text | --selector | --aria-label]`.
  * Pass either `ref` as the second positional (e.g. "@e7") or a locator
- * option (`text`, `selector`, `ariaLabel`).
+ * option (`text`, `selector`, `ariaLabel`). Set `js: true` to resolve
+ * the target against the post-hydration DOM (pair with `read({jsFetch:
+ * true})`, which emits the same hydrated graph).
  *
  * Resolves with the unified writing-verb envelope: `{ok, op: "click",
  * url, ref, selector, element_id, value: null, result, console, ...}`.
@@ -487,6 +494,8 @@ function click(url, refOrOptions, maybeOptions) {
  * Two shapes:
  *   fill(url, "@e3", "hello")
  *   fill(url, "hello", { text: "Email" })
+ * Set `js: true` to resolve against the hydrated DOM and snapshot the
+ * post-fill page (pair with `read({jsFetch: true})`).
  *
  * Resolves with `{ok, op: "fill", url, ref, selector, element_id,
  *   value, result, console, ...}`. `value` is the exact string passed
@@ -585,7 +594,8 @@ function tree(url, options) {
 // Plan lifecycle: stamp / replay. `stamp` mints a plat from a plan;
 // `replay` re-runs a plat's embedded plan and returns the per-step log
 // (no plat output). Pass `plan: true` to `replay` to extract the plan
-// field for editing instead.
+// field for editing instead. `stamp` signs its output by default; use
+// `noSign`, `lineage`, and `key` to control the producer signature.
 function stamp(filePath, options) {
   const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
   return _spawnJson(["stamp", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
@@ -597,7 +607,9 @@ function replay(filePath, options) {
 
 // `heso run <plat>` — cassette-backed re-execution. Named `runPlat`
 // here so it doesn't collide with the low-level `run(args, opts)`
-// escape hatch exported below.
+// escape hatch exported below. Re-signs the output by default; `noSign`,
+// `lineage`, and `key` control the producer signature, and
+// `noVerifyInput` skips the input plat's integrity + signature checks.
 function runPlat(filePath, options) {
   const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
   return _spawnJson(["run", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
@@ -625,7 +637,13 @@ async function refresh(filePath, options) {
 // Polymorphic verbs
 // ---------------------------------------------------------------------------
 
-/** `heso verify <file>` — verify integrity and/or signature of a plat, receipt, or sealed envelope. */
+/**
+ * `heso verify <file>` — verify integrity and/or signature of a plat,
+ * receipt, or sealed envelope. Trust options: `expectSigner` pins an
+ * exact signer fingerprint, `signerKey` pins a public-key file,
+ * `knownSigners` points at a TOFU store keyed by lineage, and
+ * `acceptNewSigner` records a first-seen signer into that store.
+ */
 function verify(filePath, options) {
   const { spawnOpts, cliOpts } = _splitSpawnOpts(options);
   return _spawnJson(["verify", String(filePath), ..._optsToArgv(cliOpts)], spawnOpts);
@@ -658,7 +676,8 @@ function unseal(filePath, options) {
 /**
  * `heso identity <subcommand> [args]`. Today's subcommands (`init`,
  * `show`) accept `--path PATH` and emit
- * `{path, public_key, algorithm}` JSON; this wrapper resolves with that.
+ * `{path, public_key, fingerprint, algorithm}` JSON; this wrapper
+ * resolves with that.
  */
 function identity(subcommand, ...args) {
   if (typeof subcommand !== "string" || subcommand === "") {
